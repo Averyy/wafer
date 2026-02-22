@@ -1,0 +1,15 @@
+{
+  "manifest_version": 3,
+  "name": "screenXY Fix",
+  "version": "1.0",
+  "description": "Fixes CDP screenX/screenY bug (Chromium #40280325)",
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_start",
+      "all_frames": true,
+      "world": "MAIN"
+    }
+  ]
+}

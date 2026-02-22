@@ -1,0 +1,475 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="px-captcha">
+<title>Access to this page has been denied</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&display=swap');
+
+body { background-color: #fafbfc; margin: 0; }
+
+div.px-captcha-container {
+  position: fixed; width: 530px; height: 340px;
+  top: 50%; left: 50%; margin-top: -170px; margin-left: -265px;
+  background-color: #fff; border-radius: 3px;
+  box-shadow: 0 2px 9px -1px rgba(0,0,0,0.13);
+  font-family: Roboto, sans-serif;
+}
+div.px-captcha-header {
+  color: #626364; font-size: 29px; font-weight: 500;
+  margin: 67px 0 33px; line-height: 0.83; text-align: center;
+}
+div.px-captcha-message {
+  color: #626364; font-size: 18px; min-height: 48px;
+  margin: 0 0 29px; line-height: 1.33; text-align: center;
+}
+div#px-captcha {
+  min-height: 100px; text-align: center;
+  display: block; min-width: 253px;
+}
+div.px-captcha-refid {
+  border-top: solid 1px #f0eeee; min-height: 27px;
+  margin: 11px 0 0; border-radius: 0 0 3px 3px;
+  background-color: #fafbfc; font-size: 10px;
+  line-height: 2.7; text-align: center; color: #b1b5b8;
+}
+
+/* Loading shimmer (shown before button renders) */
+@keyframes loadingEffect {
+  0% { background-position: 0; }
+  100% { background-position: 60vw; }
+}
+.px-loading-area {
+  width: 253px; height: 50px; margin: auto; display: none;
+}
+.px-loading-area.active {
+  display: block;
+}
+.px-inner-loading-area {
+  width: 253px; height: 50px; border-radius: 100px;
+  animation: loadingEffect 1.2s infinite ease;
+  background: linear-gradient(to right, #f6f6f6 8%, #f0f0f0 18%, #f6f6f6 33%);
+}
+
+/* Debug overlay */
+#debug {
+  position: fixed; bottom: 8px; left: 8px; width: 500px;
+  max-height: 140px; overflow-y: auto;
+  background: rgba(0,0,0,0.85); color: #0f0; padding: 6px 8px;
+  border-radius: 4px; font: 11px monospace; z-index: 9999;
+  white-space: pre-wrap;
+}
+#canvas {
+  position: fixed; top: 0; left: 0; pointer-events: none; z-index: 9998;
+}
+</style>
+</head>
+<body>
+
+<canvas id="canvas"></canvas>
+<div id="debug"></div>
+
+<div id="px-captcha-wrapper" dir="auto">
+  <div class="px-captcha-container">
+    <div class="px-captcha-header">Before we continue...</div>
+    <div class="px-captcha-message">
+      Press &amp; Hold to confirm you are<br>a human (and not a bot).
+    </div>
+    <div id="px-captcha">
+      <!-- Loading shimmer (shown while "captcha.js" loads) -->
+      <div class="px-loading-area active">
+        <div class="px-inner-loading-area"></div>
+      </div>
+      <!-- iframes injected by JS after random delay -->
+    </div>
+    <div class="px-captcha-refid">
+      Reference ID <span id="ref-id"></span>
+    </div>
+  </div>
+</div>
+
+<script>
+// ==========================================================
+// Local PX mock — harder than production
+//
+// Features that mirror (and exceed) real PX behavior:
+// - Decoy iframes: 5-8 invisible frames with same title/role
+// - Honeypot fast fill: first attempt bar fills in <2s
+// - Progress bar reversal: bar can shrink mid-hold
+// - "Try again" text after failed attempts
+// - Tight overshoot grace (0.5s)
+// - Loading delay 2-8s (realistic)
+// - #px-captcha removed 2.5s after solve (real PX behavior)
+// ==========================================================
+
+// --- Config ---
+var LOAD_DELAY_MIN = 2000;
+var LOAD_DELAY_MAX = 8000;
+var HOLD_MIN = 6;
+var HOLD_MAX = 10;
+var OVERSHOOT_GRACE = 0.8;  // tighter than old mock (1s) but allows human reaction
+var NUM_DECOYS = 5 + Math.floor(Math.random() * 4); // 5-8 decoys
+var HONEYPOT_FILL_TIME = 1.5;  // honeypot fills bar in 1.5s
+var MAX_ATTEMPTS = 3;
+
+// --- Debug / Canvas ---
+var canvas = document.getElementById('canvas');
+var ctx = canvas.getContext('2d');
+var debugEl = document.getElementById('debug');
+var T0 = performance.now();
+canvas.width = window.innerWidth;
+canvas.height = window.innerHeight;
+var lastX = -1, lastY = -1, holding = false;
+var attemptCount = 0;
+
+function ts() { return ((performance.now() - T0) / 1000).toFixed(2); }
+function log(m) { debugEl.textContent += '[' + ts() + '] ' + m + '\n'; debugEl.scrollTop = 1e6; }
+
+function drawTrail(x, y) {
+  if (lastX >= 0) {
+    ctx.beginPath(); ctx.moveTo(lastX, lastY); ctx.lineTo(x, y);
+    ctx.strokeStyle = holding ? 'rgba(233,69,96,0.8)' : 'rgba(0,255,136,0.5)';
+    ctx.lineWidth = holding ? 2.5 : 1.5; ctx.stroke();
+  }
+  ctx.beginPath(); ctx.arc(x, y, holding ? 3 : 1.5, 0, Math.PI * 2);
+  ctx.fillStyle = holding ? '#e94560' : '#00ff88'; ctx.fill();
+  lastX = x; lastY = y;
+}
+document.addEventListener('mousemove', function(e) { drawTrail(e.clientX, e.clientY); });
+
+// Mouse relay from iframes
+window.addEventListener('message', function(e) {
+  if (!e.data || !e.data.type) return;
+  var d = e.data;
+  if (d.type === 'mouse_global') { drawTrail(d.x, d.y); return; }
+  if (d.type === 'mousedown') { holding = true; }
+  if (d.type === 'mouseup_fail' || d.type === 'overshoot' || d.type === 'try_again') { holding = false; }
+  if (d.type === 'released_ok') {
+    holding = false;
+    ctx.font = '24px monospace'; ctx.fillStyle = '#00ff88';
+    ctx.fillText('SOLVED in ' + d.holdTime + 's (needed ' + d.required + 's) attempt #' + d.attempt, 20, 30);
+    // Note: #px-captcha removal is handled by the parent-side
+    // polling loop (more robust than postMessage).
+  }
+  if (d.type === 'overshoot') {
+    ctx.font = '24px monospace'; ctx.fillStyle = '#ce0e2d';
+    ctx.fillText('OVERSHOOT! held ' + d.holdTime + 's (needed ' + d.required + 's)', 20, 30);
+    log('FAIL: held too long');
+  }
+  if (d.type === 'try_again') {
+    log('Try again (attempt ' + d.attempt + '/' + MAX_ATTEMPTS + ')');
+  }
+  if (d.type === 'honeypot_caught') {
+    log('HONEYPOT: bot released at fake 100% after ' + d.holdTime + 's');
+  }
+  if (d.type !== 'mouse_global') {
+    var m = d.type;
+    if (d.holdTime) m += ' hold=' + d.holdTime + 's';
+    if (d.required) m += ' need=' + d.required + 's';
+    if (d.attempt) m += ' attempt=' + d.attempt;
+    log(m);
+  }
+});
+
+// --- Generate reference ID ---
+function uuid() {
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+    var r = Math.random() * 16 | 0;
+    return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
+  });
+}
+document.getElementById('ref-id').textContent = uuid();
+
+// --- Decoy iframe HTML ---
+// Matches real PX decoy structure: same title, same role="button",
+// but button is 0x0 or display:none (invisible).
+function makeDecoyHTML(variant) {
+  var styles = [
+    // Variant 0: button exists but 0x0
+    'body{margin:0}#btn-wrap{width:0;height:0;overflow:hidden}',
+    // Variant 1: button display:none
+    'body{margin:0}#btn-wrap{display:none;width:253px;height:48px}',
+    // Variant 2: button opacity:0 and 0x0
+    'body{margin:0}#btn-wrap{width:0;height:0;opacity:0;overflow:hidden}',
+    // Variant 3: parent is hidden
+    'body{margin:0;display:none}#btn-wrap{width:253px;height:48px}',
+  ];
+  var style = styles[variant % styles.length];
+  return '<!DOCTYPE html><html><head>' +
+    '<title>Human verification challenge</title>' +
+    '<style>' + style + '</style>' +
+    '</head><body>' +
+    '<div id="btn-wrap" role="button" tabindex="0" aria-label="Press &amp; Hold">' +
+    '<div id="content"><p>Press &amp; Hold</p></div></div>' +
+    '</body></html>';
+}
+
+// --- Real button iframe HTML ---
+var HOLD_REQUIRED = HOLD_MIN + Math.random() * (HOLD_MAX - HOLD_MIN);
+
+function makeButtonHTML() {
+  return '<!DOCTYPE html><html lang="en-US"><head>' +
+  '<style>' +
+  'body { margin: 1px; white-space: nowrap; user-select: none; overflow: hidden; }' +
+  '#btn-wrap { width: 253px; height: 100%; border-radius: 100px; overflow: hidden;' +
+  '  box-sizing: border-box; position: relative; background: #FFFFFF; z-index: 1;' +
+  '  display: block; margin: auto; cursor: pointer; }' +
+  '#border-ring { position: absolute; top: 0; bottom: 0; right: 0; left: 0;' +
+  '  border-radius: 100px; border: 1px solid #1C79C1; }' +
+  '#content { display: table; margin: 0 auto; width: 100%; height: 48px;' +
+  '  text-align: center; position: relative; }' +
+  '#progress { background: #1C79C1; position: absolute; z-index: -1;' +
+  '  top: -1px; height: 51px; transition: none; }' +
+  '#text-wrap { position: absolute; width: 100%; height: 100%; display: table; }' +
+  '#text { vertical-align: middle; font-family: Roboto, sans-serif; font-size: 20px;' +
+  '  color: #1C79C1; font-weight: normal; display: table-cell; }' +
+  '.solved #content { background: #1C79C1; }' +
+  '.solved #text { color: #fff; }' +
+  '#checkmark { display: none; }' +
+  '#checkmark.draw { display: inline-block; position: absolute;' +
+  '  transform: scaleX(-1) rotate(135deg); height: 30px; width: 11px;' +
+  '  transform-origin: left top; border-right: 5px solid #fff;' +
+  '  border-top: 5px solid #fff; left: -18px; right: 0; top: 50%;' +
+  '  margin: auto; }' +
+  '</style>' +
+  '<title>Human verification challenge</title>' +
+  '</head><body>' +
+  '<div id="btn-wrap" role="button" tabindex="0" aria-label="Press &amp; Hold">' +
+  '  <div id="border-ring"></div>' +
+  '  <div id="content">' +
+  '    <div id="progress"></div>' +
+  '    <div id="text-wrap"><p id="text">Press &amp; Hold</p></div>' +
+  '    <div id="checkmark"></div>' +
+  '  </div>' +
+  '</div>' +
+  '<script>' +
+  // Mouse relay
+  'document.addEventListener("mousemove", function(e) {' +
+  '  var ox=0, oy=0, el=window.frameElement;' +
+  '  while(el) { var r=el.getBoundingClientRect(); ox+=r.x; oy+=r.y;' +
+  '    try { el=el.ownerDocument.defaultView.frameElement; } catch(x) { break; } }' +
+  '  window.top.postMessage({type:"mouse_global",x:e.clientX+ox,y:e.clientY+oy},"*");' +
+  '});' +
+  // Button logic with honeypot + reversal + try again
+  'var HOLD=' + HOLD_REQUIRED.toFixed(2) + ';' +
+  'var GRACE=' + OVERSHOOT_GRACE.toFixed(1) + ';' +
+  'var HONEYPOT_TIME=' + HONEYPOT_FILL_TIME.toFixed(1) + ';' +
+  'var MAX_ATTEMPTS=' + MAX_ATTEMPTS + ';' +
+  'var btn=document.getElementById("btn-wrap");' +
+  'var progress=document.getElementById("progress");' +
+  'var text=document.getElementById("text");' +
+  'var checkmark=document.getElementById("checkmark");' +
+  'var holding=false, start=0, timer=null, solved=false, failed=false;' +
+  'var attempt=0;' +
+  'var honeypotActive=true;' +  // first attempt is ALWAYS a honeypot
+  'function msg(d) { d.attempt=attempt; try { window.top.postMessage(d,"*"); } catch(e) {} }' +
+
+  // --- mousedown ---
+  'btn.addEventListener("mousedown", function(e) {' +
+  '  if (solved || failed) return;' +
+  '  attempt++;' +
+  '  holding = true; start = performance.now();' +
+  '  msg({type:"mousedown"});' +
+
+  // Progress bar fill logic
+  '  timer = setInterval(function() {' +
+  '    var el = (performance.now() - start) / 1000;' +
+
+  // Honeypot mode: fill bar fast (1.5s to 100%), then reverse at 3s
+  '    if (honeypotActive) {' +
+  '      if (el < HONEYPOT_TIME) {' +
+  '        progress.style.width = Math.min(el / HONEYPOT_TIME * 100, 100) + "%";' +
+  '      } else if (el < 3.0) {' +
+  '        progress.style.width = "100%";' +  // hold at 100% briefly
+  '      } else {' +
+  // After 3s, reverse bar to 0% and switch to real mode
+  '        honeypotActive = false;' +
+  '        progress.style.width = "0%";' +
+  '        start = performance.now();' +  // reset timer for real fill
+  '      }' +
+  '    } else {' +
+  // Normal mode: fill proportionally to HOLD time
+  '      var realEl = (performance.now() - start) / 1000;' +
+  '      progress.style.width = Math.min(realEl / HOLD * 100, 100) + "%";' +
+  '      if (realEl >= HOLD && !solved && !failed) {' +
+  '        solved = true;' +
+  '        btn.className = "solved";' +
+  '        text.textContent = "";' +
+  '        checkmark.className = "draw";' +
+  '      }' +
+  '      if (realEl >= HOLD + GRACE && !failed) {' +
+  '        failed = true; solved = false; clearInterval(timer);' +
+  '        btn.className = "";' +
+  '        checkmark.className = "";' +
+  '        text.textContent = "Too long!";' +
+  '        text.style.color = "#ce0e2d";' +
+  '        progress.style.background = "#ce0e2d";' +
+  '        msg({type:"overshoot", holdTime:realEl.toFixed(2), required:HOLD.toFixed(1)});' +
+  '      }' +
+  '    }' +
+  '  }, 50);' +
+  '});' +
+
+  // --- mouseup ---
+  'document.addEventListener("mouseup", function() {' +
+  '  if (!holding) return;' +
+  '  var el = (performance.now() - start) / 1000;' +
+  '  holding = false; clearInterval(timer);' +
+
+  // Released during honeypot phase — caught!
+  '  if (honeypotActive) {' +
+  '    progress.style.width = "0%";' +
+  '    msg({type:"honeypot_caught", holdTime:el.toFixed(2)});' +
+  // Show "try again" after honeypot catch
+  '    if (attempt < MAX_ATTEMPTS) {' +
+  '      text.textContent = "Please try again";' +
+  '      text.style.color = "#626364";' +
+  '      msg({type:"try_again"});' +
+  '      setTimeout(function() {' +
+  '        text.textContent = "Press & Hold";' +
+  '        text.style.color = "#1C79C1";' +
+  '        honeypotActive = false;' +  // disable honeypot for retries
+  '      }, 2000);' +
+  '    } else {' +
+  '      text.textContent = "Failed";' +
+  '      text.style.color = "#ce0e2d";' +
+  '    }' +
+  '    return;' +
+  '  }' +
+
+  // Released after real solve
+  '  if (solved && !failed) {' +
+  '    msg({type:"released_ok", holdTime:el.toFixed(2), required:HOLD.toFixed(1)});' +
+  '    return;' +
+  '  }' +
+
+  // Released too early (normal fail)
+  '  if (!solved && !failed) {' +
+  '    progress.style.width = "0%";' +
+  '    msg({type:"mouseup_fail", holdTime:el.toFixed(2), required:HOLD.toFixed(1)});' +
+  '    if (attempt < MAX_ATTEMPTS) {' +
+  '      text.textContent = "Please try again";' +
+  '      text.style.color = "#626364";' +
+  '      msg({type:"try_again"});' +
+  '      setTimeout(function() {' +
+  '        text.textContent = "Press & Hold";' +
+  '        text.style.color = "#1C79C1";' +
+  '      }, 2000);' +
+  '    } else {' +
+  '      text.textContent = "Failed";' +
+  '      text.style.color = "#ce0e2d";' +
+  '    }' +
+  '  }' +
+  '});' +
+  '<\/script>' +
+  '</body></html>';
+}
+
+// --- Simulate captcha.js loading delay ---
+var loadDelay = LOAD_DELAY_MIN + Math.random() * (LOAD_DELAY_MAX - LOAD_DELAY_MIN);
+log('Captcha loading in ' + (loadDelay / 1000).toFixed(1) + 's');
+log('Hold required: ' + HOLD_REQUIRED.toFixed(1) + 's (overshoot grace: ' + OVERSHOOT_GRACE + 's)');
+log('Decoy iframes: ' + NUM_DECOYS);
+log('Honeypot: ACTIVE on first attempt (fills in ' + HONEYPOT_FILL_TIME + 's)');
+
+setTimeout(function() {
+  log('Injecting iframes...');
+
+  // Hide loading shimmer
+  document.querySelector('.px-loading-area').classList.remove('active');
+
+  var pxDiv = document.getElementById('px-captcha');
+
+  // --- Inject decoy iframes FIRST (before real one) ---
+  // Some decoys before, some after the real iframe
+  var realPosition = 1 + Math.floor(Math.random() * (NUM_DECOYS - 1)); // not first
+  log('Real iframe at position ' + realPosition + ' of ' + (NUM_DECOYS + 1));
+
+  var injected = 0;
+  for (var i = 0; i <= NUM_DECOYS; i++) {
+    if (i === realPosition) {
+      // --- Real button iframe ---
+      var iframe = document.createElement('iframe');
+      iframe.style.cssText = 'display: none; width: 100%; height: 52px; border: 0;' +
+        ' -moz-user-select: none; -webkit-user-select: none; user-select: none;';
+      iframe.title = 'Human verification challenge';
+      iframe.setAttribute('token', uuid());
+      pxDiv.appendChild(iframe);
+
+      var doc = iframe.contentDocument;
+      doc.open();
+      doc.write(makeButtonHTML());
+      doc.close();
+
+      // Make visible after short delay
+      (function(el) {
+        setTimeout(function() {
+          el.style.display = '';
+          log('Real iframe visible (position ' + realPosition + ')');
+        }, 200 + Math.random() * 300);
+      })(iframe);
+    } else {
+      // --- Decoy iframe ---
+      var decoy = document.createElement('iframe');
+      // Some decoys have dimensions, some don't
+      var decoyStyle = [
+        'width: 0; height: 0; border: 0; overflow: hidden;',
+        'width: 100%; height: 52px; border: 0; display: none;',
+        'width: 0; height: 0; border: 0; position: absolute; left: -9999px;',
+        'width: 100%; height: 0; border: 0; overflow: hidden;',
+      ];
+      decoy.style.cssText = decoyStyle[injected % decoyStyle.length];
+      decoy.title = 'Human verification challenge';
+      decoy.setAttribute('token', uuid());
+      pxDiv.appendChild(decoy);
+
+      var ddoc = decoy.contentDocument;
+      ddoc.open();
+      ddoc.write(makeDecoyHTML(injected));
+      ddoc.close();
+
+      injected++;
+    }
+  }
+
+  log('Injected ' + NUM_DECOYS + ' decoys + 1 real iframe');
+
+  // --- Direct DOM polling for solve detection ---
+  // More robust than postMessage (same-origin iframes allow
+  // contentDocument access).  Matches real PX behavior where the
+  // parent page continuously monitors captcha state.
+  var solveDetected = false;
+  var solvePoller = setInterval(function() {
+    if (solveDetected) return;
+    var pxEl = document.getElementById('px-captcha');
+    if (!pxEl) { clearInterval(solvePoller); return; }
+    var iframes = pxEl.querySelectorAll('iframe');
+    for (var j = 0; j < iframes.length; j++) {
+      try {
+        var iDoc = iframes[j].contentDocument;
+        if (!iDoc) continue;
+        var btnWrap = iDoc.getElementById('btn-wrap');
+        if (btnWrap && btnWrap.className === 'solved') {
+          solveDetected = true;
+          clearInterval(solvePoller);
+          log('Solve detected via parent polling');
+          // Simulate page reload: remove #px-captcha after 2.5s
+          setTimeout(function() {
+            var el = document.getElementById('px-captcha');
+            if (el) {
+              el.id = 'px-done';
+              log('Challenge cleared (page would reload here)');
+            }
+          }, 2500);
+          return;
+        }
+      } catch(ex) {}
+    }
+  }, 200);
+
+}, loadDelay);
+</script>
+</body>
+</html>

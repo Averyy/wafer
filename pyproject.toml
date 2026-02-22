@@ -1,0 +1,57 @@
+[project]
+name = "wafer-py"
+dynamic = ["version"]
+description = "Anti-detection HTTP client for Python"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.12"
+authors = [{name = "Avery"}]
+keywords = ["http", "client", "anti-detection", "tls", "fingerprint", "waf", "scraping"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Internet :: WWW/HTTP",
+]
+dependencies = [
+    "rnet>=3.0.0rc21",
+]
+
+[project.urls]
+Homepage = "https://github.com/Averyy/wafer"
+Repository = "https://github.com/Averyy/wafer"
+Issues = "https://github.com/Averyy/wafer/issues"
+
+[project.optional-dependencies]
+browser = ["patchright"]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.9",
+]
+
+[build-system]
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.build.targets.wheel]
+packages = ["wafer"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"wafer/browser/_recordings" = "wafer/browser/_recordings"
+"wafer/browser/_extensions" = "wafer/browser/_extensions"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
+[tool.ruff]
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]

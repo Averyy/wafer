@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>🐁 mousse</title>
+  <link rel="icon" type="image/png" href="/static/favicon.png" sizes="64x64">
+  <link rel="shortcut icon" href="/static/favicon.ico">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=DM+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <!-- Header -->
+  <header class="header">
+    <div class="brand">
+      <span class="brand-icon">🐁</span>
+      <h1>mousse</h1>
+    </div>
+    <div class="stats" id="stats">
+      <div class="stat incomplete active-tab" id="stat-idles" data-mode="idle">
+        <span class="stat-icon">⚠️</span>
+        <span class="stat-label">Idles</span>
+        <span class="stat-value">0/5</span>
+      </div>
+      <div class="stat incomplete" id="stat-paths" data-mode="path">
+        <span class="stat-icon">⚠️</span>
+        <span class="stat-label">Paths</span>
+        <span class="stat-value">0/20</span>
+      </div>
+      <div class="stat incomplete" id="stat-holds" data-mode="hold">
+        <span class="stat-icon">⚠️</span>
+        <span class="stat-label">Holds</span>
+        <span class="stat-value">0/20</span>
+      </div>
+      <div class="stat incomplete" id="stat-drags" data-mode="drag">
+        <span class="stat-icon">⚠️</span>
+        <span class="stat-label">Drags</span>
+        <span class="stat-value">0/20</span>
+      </div>
+      <div class="stat incomplete" id="stat-browses" data-mode="browse">
+        <span class="stat-icon">⚠️</span>
+        <span class="stat-label">Browse</span>
+        <span class="stat-value">0/20</span>
+      </div>
+    </div>
+    <button class="btn manage-btn" id="btn-manage" title="Manage recordings">
+      <span>&#9881;</span>
+    </button>
+
+    <!-- Manage popover -->
+    <div class="manage-popover hidden" id="manage-popover">
+      <div class="manage-header">Manage Recordings</div>
+      <div class="manage-rows" id="manage-rows"></div>
+      <div class="manage-footer">
+        <button class="manage-row-delete manage-delete-all" id="btn-delete-all">Delete everything</button>
+      </div>
+    </div>
+  </header>
+
+  <!-- Controls -->
+  <div class="controls">
+    <div class="controls-left">
+      <div class="tabs">
+        <button class="tab active" data-mode="idle">Idle</button>
+        <button class="tab" data-mode="path">Path</button>
+        <button class="tab" data-mode="hold">Hold</button>
+        <button class="tab" data-mode="drag">Drag</button>
+        <button class="tab" data-mode="browse">Browse</button>
+      </div>
+
+      <div class="separator"></div>
+
+      <select id="viewport-select">
+        <option value="1920x1080">1920 × 1080</option>
+        <option value="1366x768">1366 × 768</option>
+        <option value="1536x864">1536 × 864</option>
+        <option value="1440x900">1440 × 900</option>
+        <option value="1280x720" selected>1280 × 720</option>
+      </select>
+
+      <select id="direction-select" class="hidden">
+        <option value="to_center_from_ul">UL → Center (need 8)</option>
+        <option value="to_center_from_ur">UR → Center (need 5)</option>
+        <option value="to_center_from_l">L → Center (need 4)</option>
+        <option value="to_center_from_bl">BL → Center (need 3)</option>
+        <option value="to_center_from_br">BR → Center (need 3)</option>
+        <option value="to_lower_from_ul">UL → Lower (need 3)</option>
+      </select>
+
+      <span id="direction-info" class="direction-info hidden"></span>
+    </div>
+
+    <div class="controls-right">
+      <button class="btn primary" id="btn-start">
+        <span class="btn-text">Start</span>
+        <kbd>Space</kbd>
+      </button>
+      <button class="btn accept hidden" id="btn-accept">
+        <span class="btn-text">Accept</span>
+        <kbd>Enter</kbd>
+      </button>
+      <button class="btn discard hidden" id="btn-discard">
+        <span class="btn-text">Discard</span>
+        <kbd>Esc</kbd>
+      </button>
+    </div>
+  </div>
+
+  <!-- Canvas -->
+  <div class="canvas-wrap">
+    <canvas id="canvas" width="1280" height="720"></canvas>
+  </div>
+
+  <!-- Recordings panel -->
+  <div class="recordings-panel">
+    <div class="recordings-header">
+      <h3>Recordings</h3>
+    </div>
+    <div class="recordings-grid" id="recordings-grid"></div>
+    <div class="recordings-empty" id="recordings-empty">No recordings yet</div>
+  </div>
+
+  <!-- Countdown overlay (hidden) -->
+  <div class="countdown hidden" id="countdown">
+    <span id="countdown-num">3</span>
+  </div>
+
+  <!-- Preview modal (hidden) -->
+  <div class="modal-overlay hidden" id="modal">
+    <div class="modal">
+      <h3 id="modal-title">Preview</h3>
+      <canvas id="modal-canvas" width="600" height="400"></canvas>
+      <button class="btn modal-close" id="modal-close">
+        <span class="btn-text">Close</span>
+        <kbd>Esc</kbd>
+      </button>
+    </div>
+  </div>
+
+  <script src="/static/recorder.js"></script>
+</body>
+</html>
