@@ -25,8 +25,10 @@ from wafer._errors import (
     EmptyResponse,
     RateLimited,
     TooManyRedirects,
+    WaferTimeout,
 )
 from wafer._fingerprint import chrome_version_from_ua, emulation_for_version
+from wafer._profiles import Profile
 from wafer._response import WaferResponse
 from wafer._retry import RetryState, calculate_backoff, parse_retry_after
 from wafer._solvers import (
@@ -43,8 +45,11 @@ class AsyncSession(BaseSession):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self._client = rnet.Client(**self._build_client_kwargs())
-        self._hydrate_jar_from_cache()
+        if self._profile is Profile.OPERA_MINI:
+            self._client = None  # Opera Mini bypasses rnet entirely
+        else:
+            self._client = rnet.Client(**self._build_client_kwargs())
+            self._hydrate_jar_from_cache()
         self._rotate_lock = asyncio.Lock()
 
     def _hydrate_jar_from_cache(self) -> None:
@@ -336,13 +341,62 @@ class AsyncSession(BaseSession):
     ) -> WaferResponse:
         """Send an HTTP request with retry, backoff, and challenge handling."""
         start_time = time.monotonic()
+
+        # Extract per-request overrides (popped once, reused)
+        extra_headers = kwargs.pop("headers", None)
+        params = kwargs.pop("params", None)
+        req_timeout = kwargs.pop("timeout", None)
+        if params:
+            url = self._apply_params(url, params)
+
+        # Per-request timeout → overall deadline for retry loop
+        if req_timeout is not None:
+            timeout_secs = (
+                req_timeout.total_seconds()
+                if hasattr(req_timeout, "total_seconds")
+                else float(req_timeout)
+            )
+            deadline = start_time + timeout_secs
+        else:
+            timeout_secs = self.timeout.total_seconds()
+            deadline = None  # no per-request deadline
+
+        # Opera Mini: bypass rnet entirely, use stdlib urllib (OpenSSL).
+        # No challenge detection, no fingerprint rotation, no retries.
+        # Opera Mini is a no-JS proxy browser — only GET navigations.
+        if self._profile is Profile.OPERA_MINI:
+            if method.upper() != "GET":
+                raise ValueError(
+                    f"Opera Mini profile only supports GET, got {method!r}"
+                )
+            domain = extract_domain(url) or url
+            if self._rate_limiter:
+                await self._rate_limiter.wait_async(domain)
+            logger.debug("%s %s (Opera Mini)", method, url)
+            timeout = timeout_secs
+            loop = asyncio.get_event_loop()
+            status, resp_headers, text, final_url = await loop.run_in_executor(
+                None,
+                lambda: self._om_identity.request(
+                    url, headers=extra_headers, timeout=timeout,
+                ),
+            )
+            return WaferResponse(
+                status_code=status,
+                content=text.encode("utf-8"),
+                text=text,
+                headers=resp_headers,
+                url=final_url,
+                elapsed=time.monotonic() - start_time,
+                was_retried=False,
+                challenge_type=None,
+                raw=None,
+            )
+
         state = RetryState(self.max_retries, self.max_rotations)
         m = _to_method(method) if isinstance(method, str) else method
         domain = extract_domain(url) or url
         current_url = url
-
-        # Extract per-request headers (popped once, reused each iteration)
-        extra_headers = kwargs.pop("headers", None)
 
         browser_attempted = False
         redirects_followed = 0
@@ -350,6 +404,10 @@ class AsyncSession(BaseSession):
         logger.debug("%s %s", method, url)
 
         while True:
+            # Per-request deadline: abort retry loop if exceeded
+            if deadline is not None and time.monotonic() > deadline:
+                raise WaferTimeout(url, timeout_secs)
+
             # Rate limiting: wait if too soon since last request to this domain
             if self._rate_limiter:
                 await self._rate_limiter.wait_async(domain)
@@ -492,9 +550,11 @@ class AsyncSession(BaseSession):
             # Challenge detection (text responses only — WAF challenges
             # are always HTML, never binary). Runs before 429 handler
             # so challenges on 429 (Kasada, PX) route to browser solve.
+            # Skip for Opera Mini — can't solve challenges.
             challenge = (
                 detect_challenge(status, headers, body)
                 if body is not None
+                and self._profile is not Profile.OPERA_MINI
                 else None
             )
 
@@ -737,6 +797,14 @@ class AsyncSession(BaseSession):
 
     async def patch(self, url: str, **kwargs) -> WaferResponse:
         return await self.request("PATCH", url, **kwargs)
+
+    def add_cookie(self, raw_set_cookie: str, url: str) -> None:
+        """Inject a Set-Cookie header value into the session's cookie jar."""
+        if self._profile is Profile.OPERA_MINI:
+            raise NotImplementedError(
+                "add_cookie() is not supported with Opera Mini profile"
+            )
+        self._client.cookie_jar.add(raw_set_cookie, url)
 
     async def __aenter__(self):
         return self

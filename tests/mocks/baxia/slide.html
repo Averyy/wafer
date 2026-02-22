@@ -1,0 +1,380 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Captcha Interception</title>
+<style>
+/* Exact replica of AliExpress Baxia NoCaptcha punish page styles */
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  font-family: "Segoe UI", Arial, sans-serif;
+  background: #f5f5f5;
+  color: #333;
+}
+#baxia-punish { width: 100%; }
+.header {
+  width: 1024px;
+  margin: 0 auto;
+  height: 52px;
+  display: flex;
+  align-items: center;
+}
+.logo { height: 52px; display: flex; align-items: center; }
+.logo img { height: 28px; }
+.bannar {
+  width: 100%;
+  text-align: center;
+  padding-top: 60px;
+}
+.bg-img-wrap { margin-bottom: 20px; }
+#bg-img { width: 130px; height: 134px; }
+.captcha-tips { text-align: center; padding: 10px 0; }
+.warnning-text {
+  font-size: 16px;
+  color: #666;
+  margin-bottom: 20px;
+}
+/* NoCaptcha slider — exact selectors from live site */
+#nocaptcha {
+  margin-top: 45px;
+  display: block;
+}
+.nc-container { text-align: center; }
+.nc_1_nocaptcha { display: flex; justify-content: center; }
+.nc_wrapper {
+  width: 300px;
+  height: 34px;
+  position: relative;
+  background: #ddd;
+  border-radius: 17px;
+  overflow: hidden;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.nc_scale {
+  width: 300px;
+  height: 34px;
+  position: relative;
+}
+.nc_bg {
+  position: absolute;
+  top: 3px;
+  left: 0;
+  width: 0;
+  height: 28px;
+  background: #4caf50;
+  border-radius: 14px 0 0 14px;
+  transition: none;
+  pointer-events: none;
+}
+.nc_bg.success {
+  background: #4caf50;
+  width: 100% !important;
+  border-radius: 14px;
+}
+.nc_iconfont.btn_slide {
+  position: absolute;
+  top: 2px;
+  left: 0;
+  width: 42px;
+  height: 30px;
+  background: #fff;
+  border: 1px solid #ccc;
+  border-radius: 15px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  color: #999;
+  z-index: 10;
+  touch-action: none;
+  transition: none;
+}
+.nc_iconfont.btn_slide:hover { border-color: #4caf50; color: #4caf50; }
+.nc_iconfont.btn_slide.success {
+  background: #4caf50;
+  border-color: #4caf50;
+  color: #fff;
+}
+.scale_text {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 300px;
+  height: 34px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+}
+.nc-lang-cnt {
+  font-size: 14px;
+  color: #4d4d4d;
+  background: -webkit-gradient(
+    linear, 0% 0%, 100% 0%,
+    from(#4d4d4d), color-stop(0.4, #4d4d4d),
+    color-stop(0.5, #fff), color-stop(0.6, #4d4d4d), to(#4d4d4d)
+  );
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-size: 200% 100%;
+  animation: shimmer 2s infinite;
+}
+.nc-lang-cnt.solved {
+  background: none;
+  -webkit-text-fill-color: #fff;
+}
+@keyframes shimmer {
+  0% { background-position: 100% 0; }
+  100% { background-position: -100% 0; }
+}
+/* QR code section */
+.bx-pu-qrcode-wrap {
+  text-align: center;
+  margin-top: 30px;
+  color: #999;
+  font-size: 12px;
+}
+.captcha-qrcode { margin-bottom: 10px; }
+.captcha-qrcode canvas {
+  width: 80px;
+  height: 80px;
+  border: 1px solid #eee;
+}
+#bx-feedback-btn {
+  color: #999;
+  font-size: 12px;
+  text-decoration: none;
+}
+.copyright {
+  text-align: center;
+  font-size: 12px;
+  color: #ccc;
+  margin-top: 40px;
+}
+/* Verify form (hidden) */
+#nc-verify-form { display: none; }
+/* Status overlay */
+#solve-status {
+  position: fixed;
+  top: 20px;
+  right: 20px;
+  padding: 12px 20px;
+  border-radius: 8px;
+  font-size: 14px;
+  font-weight: 600;
+  display: none;
+  z-index: 100;
+}
+#solve-status.success {
+  display: block;
+  background: #e8f5e9;
+  color: #2e7d32;
+  border: 1px solid #4caf50;
+}
+#solve-status.fail {
+  display: block;
+  background: #fbe9e7;
+  color: #c62828;
+  border: 1px solid #ef5350;
+}
+/* Debug overlay */
+#debug {
+  position: fixed;
+  bottom: 10px;
+  left: 10px;
+  font-size: 11px;
+  color: #999;
+  font-family: monospace;
+}
+</style>
+</head>
+<body>
+
+<div id="baxia-punish" class="baxia-punish captcha pc">
+  <div id="J_Header" class="header clearfix">
+    <h1 id="logo" class="logo">
+      <a href="/">
+        <!-- Placeholder logo text instead of real AliExpress image -->
+        <span style="font-size:20px;color:#e43225;font-weight:bold">AliExpress</span>
+      </a>
+    </h1>
+  </div>
+
+  <div class="wrapper">
+    <div class="content-inside">
+      <div class="bannar">
+        <div class="bg-img-wrap">
+          <!-- Warning icon placeholder -->
+          <svg id="bg-img" width="130" height="134" viewBox="0 0 130 134">
+            <circle cx="65" cy="67" r="50" fill="none" stroke="#f5a623" stroke-width="4"/>
+            <text x="65" y="80" text-anchor="middle" font-size="50" fill="#f5a623">!</text>
+          </svg>
+        </div>
+        <div class="captcha-tips">
+          <div class="warnning-text">
+            Sorry, we have detected unusual traffic from your network.
+          </div>
+          <center>
+            <div id="nocaptcha" style="margin-top: 45px; display: block;" class="sm-pop-inner nc-container">
+              <div class="nc_1_nocaptcha" id="nc_1_nocaptcha">
+                <div id="nc_1_wrapper" class="nc_wrapper">
+                  <div id="nc_1_n1t" class="nc_scale">
+                    <div id="nc_1__bg" class="nc_bg" style="width: 0px;"></div>
+                    <span id="nc_1_n1z" class="nc_iconfont btn_slide"
+                          aria-label="Slider" tabindex="0" role="button"
+                          style="left: 0px;">&raquo;</span>
+                    <div id="nc_1__scale_text" class="scale_text slidetounlock">
+                      <span class="nc-lang-cnt" data-nc-lang="SLIDE">Please slide to verify</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </center>
+        </div>
+      </div>
+
+      <div class="bx-pu-qrcode-wrap">
+        <div class="captcha-qrcode">
+          <canvas width="80" height="80"></canvas>
+        </div>
+        <a id="bx-feedback-btn" href="#">Click to feedback &gt;</a>
+      </div>
+    </div>
+  </div>
+
+  <form id="nc-verify-form"></form>
+
+  <div class="copyright">
+    <span>&copy; 2010-2023 AliExpress.com. All rights reserved.</span>
+  </div>
+</div>
+
+<div id="solve-status"></div>
+<div id="debug"></div>
+
+<script>
+(function() {
+  const handle = document.getElementById('nc_1_n1z');
+  const bg = document.getElementById('nc_1__bg');
+  const track = document.getElementById('nc_1_n1t');
+  const wrapper = document.getElementById('nc_1_wrapper');
+  const text = document.querySelector('.nc-lang-cnt');
+  const status = document.getElementById('solve-status');
+  const debug = document.getElementById('debug');
+
+  const TRACK_W = 300;
+  const HANDLE_W = 42;
+  const MAX_SLIDE = TRACK_W - HANDLE_W;
+
+  // Solve thresholds
+  const SOLVE_THRESHOLD = 0.90; // Must drag >= 90% of max distance
+  const MIN_DRAG_TIME = 0.3;   // Minimum drag duration (seconds)
+  const MAX_DRAG_TIME = 15.0;  // Maximum drag duration
+
+  let dragging = false;
+  let startX = 0;
+  let currentX = 0;
+  let dragStartTime = 0;
+  let solved = false;
+  let mouseEvents = [];
+
+  function updatePosition(offset) {
+    const clamped = Math.max(0, Math.min(offset, MAX_SLIDE));
+    handle.style.left = clamped + 'px';
+    bg.style.width = (clamped + HANDLE_W / 2) + 'px';
+    currentX = clamped;
+    debug.textContent =
+      `offset: ${Math.round(clamped)}px / ${MAX_SLIDE}px ` +
+      `(${(clamped / MAX_SLIDE * 100).toFixed(0)}%) ` +
+      `events: ${mouseEvents.length}`;
+  }
+
+  function checkSolve() {
+    const ratio = currentX / MAX_SLIDE;
+    const dragTime = (Date.now() - dragStartTime) / 1000;
+
+    if (ratio >= SOLVE_THRESHOLD &&
+        dragTime >= MIN_DRAG_TIME &&
+        dragTime <= MAX_DRAG_TIME) {
+      // SUCCESS
+      solved = true;
+      handle.classList.add('success');
+      bg.classList.add('success');
+      text.textContent = 'Verification passed';
+      text.classList.add('solved');
+      updatePosition(MAX_SLIDE);
+      status.textContent = `Solved! (${(ratio * 100).toFixed(0)}% in ${dragTime.toFixed(2)}s, ${mouseEvents.length} events)`;
+      status.className = 'success';
+
+      // Simulate form submission after solve
+      const form = document.getElementById('nc-verify-form');
+      form.style.display = 'none';
+
+      // Set a data attribute for programmatic detection
+      wrapper.dataset.solved = 'true';
+    } else {
+      // FAIL — reset
+      status.textContent =
+        ratio < SOLVE_THRESHOLD
+          ? `Not far enough (${(ratio * 100).toFixed(0)}%)`
+          : dragTime < MIN_DRAG_TIME
+            ? `Too fast (${dragTime.toFixed(2)}s)`
+            : `Too slow (${dragTime.toFixed(2)}s)`;
+      status.className = 'fail';
+      updatePosition(0);
+      setTimeout(() => { status.className = ''; }, 2000);
+    }
+    mouseEvents = [];
+  }
+
+  // Pointer events for drag
+  handle.addEventListener('pointerdown', function(e) {
+    if (solved) return;
+    e.preventDefault();
+    handle.setPointerCapture(e.pointerId);
+    dragging = true;
+    startX = e.clientX;
+    dragStartTime = Date.now();
+    mouseEvents = [];
+  });
+
+  document.addEventListener('pointermove', function(e) {
+    if (!dragging || solved) return;
+    const dx = e.clientX - startX;
+    updatePosition(dx);
+    mouseEvents.push({
+      t: (Date.now() - dragStartTime) / 1000,
+      x: e.clientX,
+      y: e.clientY,
+    });
+  });
+
+  document.addEventListener('pointerup', function(e) {
+    if (!dragging || solved) return;
+    dragging = false;
+    checkSolve();
+  });
+
+  // Also handle leaving the window during drag
+  document.addEventListener('pointercancel', function(e) {
+    if (!dragging || solved) return;
+    dragging = false;
+    checkSolve();
+  });
+
+  // Keyboard accessibility
+  handle.addEventListener('keydown', function(e) {
+    if (solved) return;
+    if (e.key === 'ArrowRight') {
+      const cur = parseInt(handle.style.left) || 0;
+      updatePosition(cur + 10);
+    }
+  });
+})();
+</script>
+
+</body>
+</html>

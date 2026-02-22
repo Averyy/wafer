@@ -31,6 +31,7 @@ class ChallengeType(enum.Enum):
     AMAZON = "amazon"
     VERCEL = "vercel"
     ARKOSE = "arkose"
+    GEETEST = "geetest"
     GENERIC_JS = "generic_js"
 
 
@@ -294,5 +295,16 @@ def detect_challenge(
         if "arkoselabs.com" in body or "funcaptcha" in body.lower():
             logger.info("Challenge detected (body): arkose")
             return ChallengeType.ARKOSE
+
+    # GeeTest v4 — slide CAPTCHA on login/rate-limit pages.
+    # Only trigger on small pages (<100KB) to avoid false positives on
+    # normal pages that embed GeeTest as an optional form component.
+    if status_code == 200 and len(body) < 100_000 and (
+        "initGeetest4" in body
+        or "gcaptcha4.geetest.com" in body
+        or "gt4.js" in body
+    ):
+        logger.info("Challenge detected (body): geetest")
+        return ChallengeType.GEETEST
 
     return None

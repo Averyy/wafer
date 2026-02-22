@@ -13,6 +13,7 @@ WAF-specific logic lives in dedicated modules:
 - ``_perimeterx`` — PerimeterX press-and-hold
 - ``_shape`` — F5 Shape interstitial
 - ``_imperva`` — Imperva / Incapsula reese84
+- ``_drag`` — GeeTest / Alibaba drag/slider puzzle
 """
 
 import csv
@@ -29,6 +30,61 @@ import time
 from dataclasses import dataclass
 
 logger = logging.getLogger("wafer")
+
+# ---------------------------------------------------------------------------
+# Stealth injection (for Baxia/TMD — Patchright doesn't patch webdriver)
+# ---------------------------------------------------------------------------
+
+_STEALTH_SCRIPT = b"""<script>
+Object.defineProperty(Navigator.prototype, 'webdriver', {
+    get: () => false,
+    configurable: true,
+});
+if (window.chrome && !window.chrome.runtime) {
+    window.chrome.runtime = {
+        connect: function() {},
+        sendMessage: function() {},
+    };
+}
+</script>"""
+
+
+def _install_stealth_route(page) -> None:
+    """Intercept document navigations and inject stealth script.
+
+    Patches ``navigator.webdriver`` to false by injecting a script
+    tag at the start of every HTML response.  This runs before any
+    page scripts, unlike ``add_init_script()`` which has DNS issues
+    in Patchright with system Chrome.
+    """
+    def _stealth_route(route):
+        if route.request.resource_type != "document":
+            route.continue_()
+            return
+        try:
+            resp = route.fetch()
+        except Exception:
+            route.continue_()
+            return
+        body = resp.body()
+        if b"<head>" in body:
+            body = body.replace(b"<head>", b"<head>" + _STEALTH_SCRIPT)
+        elif b"<script>" in body:
+            body = _STEALTH_SCRIPT + body
+        # Playwright's route.fetch() returns decompressed body, but
+        # resp.headers retains original Content-Encoding. Forwarding
+        # both causes the browser to double-decompress → garbled HTML.
+        hdrs = {
+            k: v for k, v in resp.headers.items()
+            if k.lower() not in ("content-encoding", "content-length")
+        }
+        route.fulfill(
+            status=resp.status,
+            headers=hdrs,
+            body=body,
+        )
+
+    page.route("**/*", _stealth_route)
 
 
 # ---------------------------------------------------------------------------
@@ -174,6 +230,7 @@ class BrowserSolver:
         self._path_recordings: list[dict] | None = None
         self._hold_recordings: list[list[dict[str, float]]] | None = None
         self._drag_recordings: list[list[dict[str, float]]] | None = None
+        self._slide_recordings: list[dict] | None = None
         self._browse_recordings: list[dict] | None = None
 
     def _ensure_extension(self) -> str | None:
@@ -304,6 +361,7 @@ class BrowserSolver:
         self._path_recordings = []
         self._hold_recordings = []
         self._drag_recordings = []
+        self._slide_recordings = []
         self._browse_recordings = []
 
         try:
@@ -374,10 +432,27 @@ class BrowserSolver:
                 if not name.endswith(".csv"):
                     continue
                 text = f.read_text()
+                meta = _parse_metadata(text.splitlines()[0])
                 rows = _parse_csv_rows(text, ("t", "rx", "ry"))
                 if rows:
                     self._drag_recordings.append(
-                        {"rows": rows, "name": name}
+                        {"rows": rows, "meta": meta, "name": name}
+                    )
+        except Exception:
+            pass
+
+        # --- slide_drags (full-width "slide to verify" drags) ---
+        try:
+            for f in (rec_dir / "slide_drags").iterdir():
+                name = str(f).rsplit("/", 1)[-1]
+                if not name.endswith(".csv"):
+                    continue
+                text = f.read_text()
+                meta = _parse_metadata(text.splitlines()[0])
+                rows = _parse_csv_rows(text, ("t", "rx", "ry"))
+                if rows:
+                    self._slide_recordings.append(
+                        {"rows": rows, "meta": meta, "name": name}
                     )
         except Exception:
             pass
@@ -409,11 +484,12 @@ class BrowserSolver:
 
         logger.info(
             "Loaded %d idle + %d path + %d hold + %d drag"
-            " + %d browse recordings",
+            " + %d slide + %d browse recordings",
             len(self._idle_recordings),
             len(self._path_recordings),
             len(self._hold_recordings),
             len(self._drag_recordings),
+            len(self._slide_recordings),
             len(self._browse_recordings),
         )
         return bool(
@@ -467,18 +543,19 @@ class BrowserSolver:
         )
 
         page.mouse.move(origin_x, origin_y)
-        prev_t = 0.0
+        t0 = time.monotonic()
         final_x, final_y = origin_x, origin_y
 
         for row in recording:
-            delay = (row["t"] - prev_t) * time_scale
+            target_t = row["t"] * time_scale
+            elapsed = time.monotonic() - t0
+            delay = target_t - elapsed
             if delay > 0:
                 time.sleep(delay)
 
             final_x = origin_x + row["dx"]
             final_y = origin_y + row["dy"]
             page.mouse.move(final_x, final_y)
-            prev_t = row["t"]
 
         return final_x, final_y
 
@@ -514,17 +591,18 @@ class BrowserSolver:
         )
 
         page.mouse.move(start_x, start_y)
-        prev_t = 0.0
+        t0 = time.monotonic()
 
         for row in recording:
-            delay = (row["t"] - prev_t) * time_scale
+            target_t = row["t"] * time_scale
+            elapsed = time.monotonic() - t0
+            delay = target_t - elapsed
             if delay > 0:
                 time.sleep(delay)
 
             x = start_x + row["rx"] * dx
             y = start_y + row["ry"] * dy
             page.mouse.move(x, y)
-            prev_t = row["t"]
 
     def _replay_drag(
         self,
@@ -534,26 +612,70 @@ class BrowserSolver:
         end_x: float,
         end_y: float,
     ) -> None:
-        """Replay a recorded drag from start to end."""
-        recording = random.choice(self._drag_recordings)
+        """Replay a recorded drag from start to end.
+
+        Recordings include an optional pre-drag hover phase (natural
+        pause near the handle before clicking).  The ``mousedown_t``
+        metadata field marks when the click happens — events before it
+        are replayed as cursor movement without the button held.
+
+        The recording's ``ry`` values are normalized against the original
+        horizontal track width (not vertical displacement).  This preserves
+        natural vertical wobble even for perfectly horizontal drags where
+        ``end_y ≈ start_y``.
+        """
         dx = end_x - start_x
-        dy = end_y - start_y
+        target_dist = abs(dx)
+
+        # Pick recording with closest original drag distance — a 50px
+        # drag has a fundamentally different speed/deceleration profile
+        # than a 300px drag, so matching distance keeps it natural.
+        def _drag_dist(rec: dict) -> float:
+            meta = rec.get("meta", {})
+            if "start" in meta and "end" in meta:
+                try:
+                    sx, _ = meta["start"].split(",")
+                    ex, _ = meta["end"].split(",")
+                    return abs(int(ex) - int(sx))
+                except (ValueError, IndexError):
+                    pass
+            return 0.0
+
+        # Sort by distance similarity, pick randomly from top 3 closest
+        # to add slight variation while keeping the profile realistic.
+        ranked = sorted(
+            self._drag_recordings,
+            key=lambda r: abs(_drag_dist(r) - target_dist),
+        )
+        pool = ranked[: min(3, len(ranked))]
+        recording = random.choice(pool)
+        rows = recording["rows"]
+        meta = recording.get("meta", {})
+        mousedown_t = float(meta.get("mousedown_t", "0"))
         time_scale = random.uniform(0.85, 1.15)
 
         page.mouse.move(start_x, start_y)
-        page.mouse.down()
-        prev_t = 0.0
+        t0 = time.monotonic()
+        mouse_down = False
 
-        for row in recording:
-            delay = (row["t"] - prev_t) * time_scale
+        for row in rows:
+            # Transition from hover to drag at mousedown_t
+            if not mouse_down and row["t"] >= mousedown_t:
+                mouse_down = True
+                page.mouse.down()
+
+            target_t = row["t"] * time_scale
+            elapsed = time.monotonic() - t0
+            delay = target_t - elapsed
             if delay > 0:
                 time.sleep(delay)
 
             x = start_x + row["rx"] * dx
-            y = start_y + row["ry"] * dy
+            y = start_y + row["ry"] * abs(dx)
             page.mouse.move(x, y)
-            prev_t = row["t"]
 
+        if not mouse_down:
+            page.mouse.down()
         page.mouse.up()
 
     # ------------------------------------------------------------------
@@ -729,6 +851,13 @@ class BrowserSolver:
                     url,
                 )
 
+                # Baxia/TMD: inject stealth script via route
+                # interception to patch navigator.webdriver before
+                # any page scripts run.  Patchright doesn't patch
+                # this on system Chrome.
+                if challenge_type in ("baxia", "tmd"):
+                    _install_stealth_route(page)
+
                 # Kasada: attach /tl listener BEFORE navigation
                 # (the /tl POST can fire during page load)
                 if challenge_type == "kasada":
@@ -881,6 +1010,12 @@ class BrowserSolver:
         elif challenge_type == "imperva":
             from wafer.browser._imperva import wait_for_imperva
             return wait_for_imperva(self, page, timeout_ms)
+        elif challenge_type == "geetest":
+            from wafer.browser._drag import solve_drag
+            return solve_drag(self, page, timeout_ms)
+        elif challenge_type in ("baxia", "tmd"):
+            from wafer.browser._drag import solve_baxia
+            return solve_baxia(self, page, timeout_ms)
         else:
             return self._wait_for_generic(page, timeout_ms)
 

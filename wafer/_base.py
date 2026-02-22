@@ -5,12 +5,14 @@ import logging
 import platform
 import random
 import subprocess
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlencode, urljoin, urlparse
 
 from rnet import CertStore, Emulation, Method
 
 from wafer._cookies import CookieCache
 from wafer._fingerprint import FingerprintManager
+from wafer._opera_mini import OperaMiniIdentity
+from wafer._profiles import Profile
 from wafer._ratelimit import RateLimiter
 
 logger = logging.getLogger("wafer")
@@ -106,6 +108,12 @@ DEFAULT_CONNECT_TIMEOUT = datetime.timedelta(seconds=10)
 DEFAULT_TIMEOUT = datetime.timedelta(seconds=30)
 
 
+def _normalize_timeout(val) -> datetime.timedelta:
+    if isinstance(val, datetime.timedelta):
+        return val
+    return datetime.timedelta(seconds=float(val))
+
+
 _BINARY_CONTENT_PREFIXES = (
     "image/",
     "audio/",
@@ -170,8 +178,8 @@ class BaseSession:
         self,
         emulation: Emulation | None = None,
         headers: dict[str, str] | None = None,
-        connect_timeout: datetime.timedelta | None = None,
-        timeout: datetime.timedelta | None = None,
+        connect_timeout: datetime.timedelta | float | int | None = None,
+        timeout: datetime.timedelta | float | int | None = None,
         max_retries: int = 3,
         max_rotations: int = 10,
         cache_dir: str | None = "./data/wafer/cookies",
@@ -186,16 +194,30 @@ class BaseSession:
         proxy: str | None = None,
         browser_solver=None,
         rotate_every: int | None = None,
+        profile: Profile | None = None,
     ):
+        self._profile = profile
+        self._om_identity = (
+            OperaMiniIdentity()
+            if profile is Profile.OPERA_MINI
+            else None
+        )
+
         self.headers = (
             headers
             if headers is not None
             else dict(DEFAULT_HEADERS)
         )
         self.connect_timeout = (
-            connect_timeout or DEFAULT_CONNECT_TIMEOUT
+            _normalize_timeout(connect_timeout)
+            if connect_timeout is not None
+            else DEFAULT_CONNECT_TIMEOUT
         )
-        self.timeout = timeout or DEFAULT_TIMEOUT
+        self.timeout = (
+            _normalize_timeout(timeout)
+            if timeout is not None
+            else DEFAULT_TIMEOUT
+        )
         self.max_retries = max_retries
         self.max_rotations = max_rotations
         self.follow_redirects = follow_redirects
@@ -244,7 +266,7 @@ class BaseSession:
 
             self._proxy = Proxy.all(proxy)
 
-        # Optional browser solver for JS challenges
+        # Optional browser solver for JS challenges.
         self._browser_solver = browser_solver
 
         # TLS session rotation: rebuild client every N requests
@@ -286,6 +308,13 @@ class BaseSession:
         setting it to empty string in session headers or per-request
         overrides; empty-string values are stripped at the end.
         """
+        # Opera Mini: identity headers are already at client level
+        # (set in _build_client_kwargs). Only return per-request
+        # overrides — returning the full identity here would duplicate
+        # every header at both client and request level.
+        if self._profile is Profile.OPERA_MINI:
+            return dict(extra) if extra else {}
+
         # Client-level headers (same set baked into the rnet Client)
         client_headers = dict(self.headers)
         client_headers.update(self._fingerprint.sec_ch_ua_headers())
@@ -308,12 +337,7 @@ class BaseSession:
             merged.pop("Cache-Control", None)
             # NO X-Requested-With (fetch() never sets it)
             if self._embed_referers:
-                # Origin-only referer (strip path)
-                ref = random.choice(self._embed_referers)
-                parsed_ref = urlparse(ref)
-                merged["Referer"] = (
-                    f"{parsed_ref.scheme}://{parsed_ref.netloc}/"
-                )
+                merged["Referer"] = random.choice(self._embed_referers)
             logger.debug(
                 "Embed mode (xhr): Origin=%s, Referer=%s",
                 self._embed_origin,
@@ -326,11 +350,7 @@ class BaseSession:
             merged["Sec-Fetch-Dest"] = "iframe"
             # No Origin for GET navigations
             if self._embed_referers:
-                ref = random.choice(self._embed_referers)
-                parsed_ref = urlparse(ref)
-                merged["Referer"] = (
-                    f"{parsed_ref.scheme}://{parsed_ref.netloc}/"
-                )
+                merged["Referer"] = random.choice(self._embed_referers)
             logger.debug(
                 "Embed mode (iframe): Referer=%s",
                 merged.get("Referer", "(none)"),
@@ -401,6 +421,18 @@ class BaseSession:
             del self._domain_failures[domain]
 
     @staticmethod
+    def _apply_params(url: str, params: dict[str, str] | None) -> str:
+        """Append query parameters to a URL.
+
+        rnet doesn't support a params= kwarg, so wafer handles it by
+        building the query string into the URL before passing to rnet.
+        """
+        if not params:
+            return url
+        sep = "&" if "?" in url else "?"
+        return url + sep + urlencode(params)
+
+    @staticmethod
     def _resolve_redirect_url(base_url: str, location: str) -> str:
         """Resolve a Location header value to an absolute URL.
 
@@ -439,12 +471,14 @@ class BaseSession:
         return cls(**defaults)
 
     def _build_client_kwargs(self) -> dict:
-        """Build kwargs for rnet Client construction."""
-        # Client-level headers: session defaults + sec-ch-ua only.
-        # Per-request headers (Host, Referer, embed) are added in
-        # _build_headers(url, extra) at request time.
+        """Build kwargs for rnet Client construction.
+
+        Not called for Opera Mini (which bypasses rnet entirely).
+        """
         client_headers = dict(self.headers)
-        client_headers.update(self._fingerprint.sec_ch_ua_headers())
+        client_headers.update(
+            self._fingerprint.sec_ch_ua_headers()
+        )
         kwargs = {
             "emulation": self._fingerprint.current,
             "headers": client_headers,

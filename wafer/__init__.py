@@ -3,7 +3,19 @@
 import logging
 
 from wafer._async import AsyncSession
-from wafer._errors import WaferHTTPError
+from wafer._base import DEFAULT_HEADERS
+from wafer._errors import (
+    ChallengeDetected,
+    ConnectionFailed,
+    EmptyResponse,
+    RateLimited,
+    SessionBlocked,
+    TooManyRedirects,
+    WaferError,
+    WaferHTTPError,
+    WaferTimeout,
+)
+from wafer._profiles import Profile
 from wafer._response import WaferResponse
 from wafer._sync import SyncSession
 
@@ -11,7 +23,17 @@ __all__ = [
     "SyncSession",
     "AsyncSession",
     "WaferResponse",
+    "WaferError",
     "WaferHTTPError",
+    "WaferTimeout",
+    "ChallengeDetected",
+    "RateLimited",
+    "ConnectionFailed",
+    "SessionBlocked",
+    "EmptyResponse",
+    "TooManyRedirects",
+    "Profile",
+    "DEFAULT_HEADERS",
     "get",
     "post",
     "put",

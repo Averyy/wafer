@@ -2,44 +2,29 @@
 
 ## Overview
 
-PerimeterX (HUMAN Security) is the only bot detection vendor that uses a "press and hold" challenge. The user must press and hold a button for 6-10 seconds while PX collects behavioral telemetry (80+ data points from mouse events). Our solver replays recorded human mouse movements via Patchright's CDP `Input.dispatchMouseEvent`, which produces `isTrusted: true` events indistinguishable from real input. No other vendor uses this challenge type — Cloudflare uses Turnstile, Akamai uses JS puzzles, DataDome uses slider CAPTCHAs, Kasada uses invisible PoW.
+PerimeterX (HUMAN Security) uses a "press and hold" challenge: hold a button for 6-10 seconds while PX collects behavioral telemetry (80+ data points). Solver replays recorded human mouse movements via CDP `Input.dispatchMouseEvent` (`isTrusted: true`).
 
 ## Architecture
 
 ```
 wafer/browser/
-  _solver.py          # BrowserSolver: lifecycle, extension/recording management,
-                      #   mouse replay (_replay_idle, _replay_path, _replay_hold),
-                      #   solve() dispatch
-  _perimeterx.py      # PX-specific: _find_px_button, _replay_hold (progress bar
-                      #   watching), _solve_perimeterx, _wait_for_px_solve
-  _extensions/
-    screenxy/          # Chrome extension fixing CDP screenX/screenY bug
-      manifest.json
-      content.js
+  _solver.py          # BrowserSolver: lifecycle, recording management, mouse replay, dispatch
+  _perimeterx.py      # PX-specific: _find_px_button, progress bar monitoring, solve verification
+  _extensions/screenxy/  # Chrome extension fixing CDP screenX/screenY bug
   _recordings/
     idles/             # Pre-interaction page scanning (shared across solvers)
     paths/             # Mouse paths to button (shared across solvers)
     holds/             # Micro-tremor during hold (PX-specific)
-    drags/             # Horizontal drag movements (future: DataDome, GeeTest)
 ```
-
-`_solver.py` owns browser launch, extension loading, recording loading, and generic mouse replay. `_perimeterx.py` owns PX-specific logic: button detection via frame scanning, progress bar monitoring, and solve verification. The solver delegates to `_perimeterx.solve_perimeterx()` when a PX challenge is detected.
 
 ## Key Decisions
 
 | Question | Answer | Why |
 |---|---|---|
-| Mouse paths? | **Recorded human paths** | Undetectable by definition, less code than bezier, future-proof |
-| Hold behavior? | **Recorded human holds** | PX samples 80+ points during hold; real tremor beats synthetic Gaussian |
-| Button detection? | **DOM frame scanning** | Finds `role="button"` in visible PX frames, 2-10ms, zero deps |
-| Detection fallback? | `#px-captcha` bounding box, then viewport heuristic `(w/2, h*0.6)` | Button always near center (PX UX pattern) |
-| Storage format? | **CSV** (one file per recording) | Human-readable, easy to add/edit, git-friendly |
-| Pre-interaction idle? | **Recorded idle movements** | PX monitors all mouse events from page load; no prior movement is a flag |
-| Recording count? | 9 idles + 27 paths + 21 holds + 20 drags | Time-scaling gives hundreds of effective variations |
-| Resolution handling? | Normalized coordinates | Paths as fractions (0-1), holds/idles as absolute px deltas |
-| screenX/screenY? | Browser extension | ~7 lines JS, runs in separate content script world (invisible to PX integrity checks) |
-| External deps? | **None** | No ghost-cursor, no OCR, no LLM, no pynput at runtime |
+| Mouse input? | **Recorded human paths/holds** | Real tremor/wobble undetectable; PX samples 80+ points during hold |
+| Button detection? | **DOM frame scanning** | `role="button"` in visible PX frames only (decoy frames are 0x0) |
+| Pre-interaction idle? | **Required** | PX monitors all mouse events from page load; no prior movement is a flag |
+| screenX/screenY? | **Browser extension** | Fixes CDP bug #40280325. Runs in separate content script world (invisible to PX integrity checks) |
 
 ## Real PX Structure
 
@@ -87,53 +72,7 @@ All IDs are obfuscated random strings. The real button is a 253px pill shape wit
 
 Both wayfair and zillow use identical PX structure (different app IDs only).
 
-## Recording Format
-
-### Paths (`t,rx,ry` — normalized)
-
-```csv
-# type=paths viewport=1280x720 start=64,36 end=640,396 direction=to_center_from_ul
-t,rx,ry
-0.000,0.0000,0.0000
-0.016,0.0230,0.0150
-...
-0.863,1.0000,1.0000
-```
-
-- `t`: seconds since start (float, 3dp)
-- `rx`: `(x - start_x) / (end_x - start_x)` — range 0.0 to ~1.0
-- `ry`: `(y - start_y) / (end_y - start_y)` — range 0.0 to ~1.0
-
-Values slightly outside 0-1 are normal (overshoot, wobble).
-
-### Holds (`t,dx,dy` — absolute pixels)
-
-```csv
-t,dx,dy
-0.000,0.0,0.0
-0.083,0.3,-0.2
-...
-12.017,0.4,-0.1
-```
-
-- `dx/dy`: pixel offset from hold center. Hand tremor is ~+/-2px regardless of screen resolution.
-
-### Idles (`t,dx,dy` — absolute pixels)
-
-Same format as holds but larger movements (+/-50-200px). Replayed from a random origin point on the page.
-
-### Directory Layout
-
-```
-wafer/browser/_recordings/
-  idles/    idle_001.csv ... idle_009.csv
-  paths/    to_center_from_ul_001.csv ... (29 total, grouped by direction)
-  holds/    hold_001.csv ... hold_021.csv
-  drags/    drag_001.csv ... drag_020.csv
-  browses/  browse_001.csv ... browse_020.csv
-```
-
-Recorded via Mousse (`uv run python -m wafer.browser.mousse`). See `wafer/browser/mousse/README.md`.
+Recording format details in `wafer/browser/mousse/README.md`.
 
 ## Solve Flow
 
@@ -203,23 +142,11 @@ PX can reject a hold mid-way — the bar fills to 17-37% then shrinks back to 0%
 
 **Fix**: Use `page.locator("#px-captcha").count()` for exact element presence.
 
-## Live Test Results
+## Live Test Results (Feb 2026)
 
-### Test 1 — Before frame fix (2026-02-20)
+**wayfair.com**: PX triggered after 7 refreshes. First-attempt solve: 3.3% → 99.3% in 9.4s, released 0.48s after 100%. ~20s total from trigger to solve.
 
-PX triggered on attempt 8. Progress always 0% — reading from decoy frame. Held 20s max, PX still accepted (accidental solve via extended hold). 3.5 min total.
-
-### Test 2 — After frame fix, before speed fix (2026-02-20)
-
-PX triggered on attempt 10. Attempts 1-2 failed (progress bar reversed from ~17-37% to 0%). Attempt 3 succeeded: 5.3% -> 100% in 6.5s. 3 min total (30s networkidle timeout per attempt).
-
-### Test 3 — After speed fix (2026-02-20)
-
-PX triggered on attempt 7. **First attempt succeeded**: 3.3% -> 99.3% in 9.4s, released 0.48s after 100%. ~20s from trigger to solve.
-
-### Test 4 — Local mock (2026-02-20)
-
-`tests/test_px_captcha_local.py` with `tests/px_captcha_local.html`. Random 3-15s load delay, random 3-15s hold duration, 1s overshoot grace, decoy frames, honeypot. Solver correctly detects progress bar fill, releases within grace period, detects solve via `#px-captcha` removal. **Pass.**
+**Local mock**: `tests/px_captcha_local.html` — random delays, decoy frames, honeypot. Solver passes reliably.
 
 ## Testing
 
@@ -251,17 +178,3 @@ uv run python tests/test_px_live_wayfair.py    # live site test
 uv run pytest tests/ -x -q                     # 459 unit tests
 ```
 
-## Future: Press-and-Drag
-
-Press-and-hold is PX-only. Press-and-drag (slider) challenges are used by DataDome, GeeTest, Tencent, hCaptcha, and others. Our recording infrastructure handles both.
-
-| Shared | Different |
-|---|---|
-| Same CDP mouse events | Hold = stationary tremor; Drag = intentional horizontal movement |
-| Same `isTrusted` requirement | Hold = 6-10s; Drag = 0.5-2s |
-| Same screenX/screenY fix | Drag requires CV to find target position |
-| Same approach-path recordings | Drag has velocity/acceleration analysis |
-| Same CSV format + normalization | Drag needs different behavioral signals |
-| Same browser fingerprint setup | DataDome has daily rotating encryption keys |
-
-Drag recordings (20 CSVs) are already captured. See `drag-puzzle.md` for the full drag solver spec.

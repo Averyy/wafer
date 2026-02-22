@@ -70,6 +70,17 @@ class TooManyRedirects(WaferError):
         )
 
 
+class WaferTimeout(WaferError, TimeoutError):
+    """Request exceeded its timeout deadline."""
+
+    def __init__(self, url: str, timeout_secs: float):
+        self.url = url
+        self.timeout_secs = timeout_secs
+        super().__init__(
+            f"Request to {url} exceeded {timeout_secs:.1f}s timeout"
+        )
+
+
 class WaferHTTPError(WaferError):
     """HTTP error raised by raise_for_status()."""
 

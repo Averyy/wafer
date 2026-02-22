@@ -1,11 +1,12 @@
 """Tests for WaferResponse wrapper."""
 
+import datetime
 import json
 
 import pytest
 
-from wafer._base import _is_binary_content_type
-from wafer._errors import WaferHTTPError
+from wafer._base import _is_binary_content_type, _normalize_timeout
+from wafer._errors import WaferError, WaferHTTPError, WaferTimeout
 from wafer._response import WaferResponse
 
 
@@ -198,6 +199,138 @@ class TestWaferResponse:
             raw=sentinel,
         )
         assert resp._raw is sentinel
+
+
+class TestGetAll:
+    """Tests for WaferResponse.get_all() multi-value header access."""
+
+    def test_get_all_returns_list_from_joined_headers(self):
+        """Without raw response, splits the joined '; ' string back."""
+        resp = WaferResponse(
+            status_code=200,
+            text="ok",
+            headers={"set-cookie": "a=1; b=2"},
+            url="https://example.com",
+        )
+        # No _raw, so falls back to headers dict
+        result = resp.get_all("set-cookie")
+        assert result == ["a=1; b=2"]
+
+    def test_get_all_missing_key_returns_empty_list(self):
+        resp = WaferResponse(
+            status_code=200,
+            text="ok",
+            headers={},
+            url="https://example.com",
+        )
+        assert resp.get_all("set-cookie") == []
+
+    def test_get_all_single_value_returns_single_element_list(self):
+        resp = WaferResponse(
+            status_code=200,
+            text="ok",
+            headers={"content-type": "text/html"},
+            url="https://example.com",
+        )
+        result = resp.get_all("content-type")
+        assert result == ["text/html"]
+
+    def test_get_all_with_raw_response(self):
+        """With a mock raw response, delegates to raw.headers.get_all()."""
+
+        class MockHeaders:
+            def get_all(self, key):
+                if key == "set-cookie":
+                    return [b"a=1; Path=/", b"b=2; Path=/"]
+                return []
+
+        class MockRaw:
+            headers = MockHeaders()
+
+        resp = WaferResponse(
+            status_code=200,
+            text="ok",
+            headers={"set-cookie": "a=1; Path=/; b=2; Path=/"},
+            url="https://example.com",
+            raw=MockRaw(),
+        )
+        result = resp.get_all("set-cookie")
+        assert result == ["a=1; Path=/", "b=2; Path=/"]
+
+    def test_get_all_with_raw_response_string_values(self):
+        """Raw response returning string values (not bytes)."""
+
+        class MockHeaders:
+            def get_all(self, key):
+                if key == "x-custom":
+                    return ["value1", "value2", "value3"]
+                return []
+
+        class MockRaw:
+            headers = MockHeaders()
+
+        resp = WaferResponse(
+            status_code=200,
+            text="ok",
+            headers={},
+            url="https://example.com",
+            raw=MockRaw(),
+        )
+        result = resp.get_all("x-custom")
+        assert result == ["value1", "value2", "value3"]
+
+    def test_get_all_empty_header_value_returns_empty_list(self):
+        """An empty string header value returns empty list."""
+        resp = WaferResponse(
+            status_code=200,
+            text="ok",
+            headers={"x-empty": ""},
+            url="https://example.com",
+        )
+        assert resp.get_all("x-empty") == []
+
+
+class TestWaferTimeout:
+    """Tests for WaferTimeout exception hierarchy."""
+
+    def test_is_wafer_error(self):
+        assert issubclass(WaferTimeout, WaferError)
+
+    def test_is_timeout_error(self):
+        assert issubclass(WaferTimeout, TimeoutError)
+
+    def test_caught_by_wafer_error(self):
+        with pytest.raises(WaferError):
+            raise WaferTimeout("https://example.com", 10.0)
+
+    def test_caught_by_timeout_error(self):
+        with pytest.raises(TimeoutError):
+            raise WaferTimeout("https://example.com", 10.0)
+
+    def test_attributes(self):
+        exc = WaferTimeout("https://example.com/path", 5.5)
+        assert exc.url == "https://example.com/path"
+        assert exc.timeout_secs == 5.5
+        assert "5.5s" in str(exc)
+
+
+class TestNormalizeTimeout:
+    """Tests for float/int timeout normalization."""
+
+    def test_float_seconds(self):
+        result = _normalize_timeout(10.0)
+        assert isinstance(result, datetime.timedelta)
+        assert result.total_seconds() == 10.0
+
+    def test_int_seconds(self):
+        result = _normalize_timeout(30)
+        assert isinstance(result, datetime.timedelta)
+        assert result.total_seconds() == 30.0
+
+    def test_timedelta_passthrough(self):
+        td = datetime.timedelta(seconds=15)
+        result = _normalize_timeout(td)
+        assert result is td
 
 
 class TestIsBinaryContentType:

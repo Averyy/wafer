@@ -1,0 +1,1288 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GeeTest Slide CAPTCHA Mock</title>
+<style>
+/* === Reset === */
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #f5f5f5; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+
+/* === Demo page wrapper === */
+.demo-page {
+  max-width: 600px; margin: 60px auto; padding: 24px;
+  background: #fff; border-radius: 8px; box-shadow: 0 2px 12px rgba(0,0,0,0.08);
+}
+.demo-page h2 { font-size: 18px; color: #333; margin-bottom: 16px; }
+.demo-page .form-row { margin-bottom: 12px; }
+.demo-page input {
+  width: 100%; padding: 10px 12px; border: 1px solid #ddd; border-radius: 4px;
+  font-size: 14px; outline: none;
+}
+.demo-page input:focus { border-color: #5682fd; }
+
+/* === Trigger button ("Click to verify") — matches geetest_holder + geetest_content === */
+.geetest_btn_click {
+  width: 260px; height: 50px; margin: 16px auto; display: flex;
+  align-items: center; border: 1px solid #ccc; border-radius: 4px;
+  background: linear-gradient(180deg, #fff, #f3f3f3);
+  cursor: pointer; user-select: none; position: relative;
+}
+.geetest_btn_click:hover { background: linear-gradient(180deg, #f4f4f4, #fff); }
+.geetest_btn_click .geetest_bind_icon {
+  width: 24px; height: 24px; margin: 0 8px 0 12px;
+  border: 2px solid #ccc; border-radius: 50%; position: relative;
+}
+.geetest_btn_click .geetest_bind_icon::after {
+  content: ""; position: absolute; left: 6px; top: 2px;
+  width: 8px; height: 13px; border: solid #ccc;
+  border-width: 0 2.5px 2.5px 0; transform: rotate(45deg);
+}
+.geetest_btn_click .geetest_bind_tips {
+  font-size: 14px; color: #666; flex: 1;
+}
+.geetest_btn_click .geetest_box_logo {
+  font-size: 10px; color: #999; margin-right: 10px;
+}
+
+/* === Outer wrappers for both popup and bind modes === */
+/* Popup mode: geetest_popup_wrap */
+.geetest_popup_wrap {
+  color: #292f3a; position: fixed;
+  font-family: Arial, "Helvetica Neue", sans-serif;
+  font-size: 14px; touch-action: none; user-select: none;
+  display: none; top: 0; left: 0; right: 0; bottom: 0;
+  z-index: 9998;
+}
+.geetest_popup_wrap.geetest_boxShow { display: block; }
+
+/* Bind mode: geetest_captcha */
+.geetest_captcha {
+  color: #292f3a; position: fixed;
+  font-family: Arial, "Helvetica Neue", sans-serif;
+  font-size: 14px; touch-action: none; user-select: none;
+  display: none; top: 0; left: 0; right: 0; bottom: 0;
+  z-index: 9998;
+}
+.geetest_captcha.geetest_boxShow { display: block; }
+
+/* Ghost overlay (mask) */
+.geetest_popup_ghost {
+  position: fixed; z-index: 2147483646; top: 0; right: 0; bottom: 0; left: 0;
+  display: none;
+  animation: trans-opacity .5s cubic-bezier(.65,0,.35,1);
+  background-color: rgba(0,0,0,0.3);
+}
+.geetest_boxShow .geetest_popup_ghost { display: block; }
+
+/* Box wrap — centers the dialog */
+.geetest_box_wrap {
+  position: fixed; z-index: 2147483647;
+  top: 50%; left: 50%;
+  width: 340px; max-width: 340px;
+  transform: translate(-50%, -50%);
+  display: none;
+}
+.geetest_boxShow .geetest_box_wrap { display: block; }
+
+/* === Float mode: inline positioning === */
+.geetest_popup_wrap.style-float {
+  position: relative; top: auto; left: auto; right: auto; bottom: auto;
+  z-index: 99; display: none;
+}
+.geetest_popup_wrap.style-float.geetest_boxShow { display: block; }
+.geetest_popup_wrap.style-float .geetest_popup_ghost { display: none; }
+.geetest_popup_wrap.style-float .geetest_box_wrap {
+  position: relative; top: auto; left: auto;
+  transform: none; margin: 8px auto 0; width: 340px;
+}
+
+/* === geetest_box — the actual dialog container === */
+.geetest_box {
+  position: absolute; z-index: 99999;
+  overflow: hidden; width: 100%;
+  border: 1px solid #dedede; border-top: none;
+  margin: 0 auto; background: #fff;
+  box-shadow: 0 4px 10px rgba(0,0,0,0.1);
+  touch-action: none; border-radius: 4px;
+  display: none;
+}
+.geetest_box.geetest_show { display: block; }
+
+/* === Header === */
+.geetest_header {
+  position: relative; top: 0; left: 0;
+  padding-bottom: 17.752%;
+}
+.geetest_title {
+  position: absolute; display: flex;
+  width: 88.76%; height: 90%;
+  align-items: center; justify-content: center;
+  padding: 6px 5.88% 0;
+  color: #292f3a; font-size: 16px; font-weight: 400;
+}
+.geetest_text_tips {
+  font-size: 16px; color: #292f3a; font-weight: 400;
+  text-align: left;
+}
+.geetest_ques_tips { display: none; }
+.geetest_status_bar {
+  position: absolute; top: 0; width: 100%; height: 6px;
+  transition: background .3s cubic-bezier(.65,0,.35,1);
+  border-radius: 4px 4px 0 0;
+}
+.geetest_status_bar.success { background: #39c522; }
+.geetest_status_bar.fail { background: #ff5d39; }
+
+/* === Container / wrap / subitem nesting === */
+.geetest_container {
+  position: relative; overflow: hidden; height: 0;
+  padding-bottom: 76.924%; z-index: 99;
+}
+.geetest_wrap { padding: 0 5.62%; }
+.geetest_subitem { width: 100%; }
+
+/* === Slide subitem === */
+.geetest_slide {
+  position: relative; z-index: 99; display: flex;
+  overflow: hidden; align-items: center; justify-content: center;
+  padding: 0 0 87.17%;
+}
+
+/* === Window (puzzle image area) === */
+.geetest_window {
+  position: absolute; top: 0; left: 0;
+  overflow: hidden; width: 100%;
+}
+
+/* === Background image (with cutout baked in) === */
+.geetest_bg {
+  width: 100%; padding-bottom: 66.7%;
+  background-repeat: no-repeat; background-size: 100%;
+  position: static;
+}
+
+/* === Puzzle piece (draggable slice) === */
+.geetest_slice {
+  position: absolute; top: 0; left: 0;
+  width: 100%; background-size: 100%; cursor: pointer;
+  z-index: 10;
+}
+.geetest_slice .geetest_slice_bg {
+  width: 100%; height: 100%; background-size: 100%;
+}
+.geetest_slice .geetest_slice_animate {
+  position: absolute; top: -50%; left: 0; display: none;
+  width: 120%; height: 100%;
+  transform: translate3d(-10%, 0, 0);
+}
+
+/* === Result tips — slides up from bottom === */
+.geetest_result_tips {
+  position: absolute; z-index: 900;
+  bottom: -32px; left: 5.62%; width: 88.75%;
+  height: 30px; border-radius: 0 0 4px 4px;
+  color: #fff; font-size: 14px; line-height: 30px;
+  text-align: center;
+  transition: bottom .3s ease-in-out;
+}
+.geetest_result_tips.success { bottom: 0; background: #39c522; }
+.geetest_result_tips.fail { bottom: 0; background: #ff5d39; }
+
+/* === Slider === */
+.geetest_slider {
+  position: absolute; bottom: 0; left: 0;
+  width: 100%; padding-bottom: 20%;
+}
+.geetest_track {
+  position: absolute; top: 50%; width: 100%;
+  padding-bottom: 6%; background-color: #dee3eb;
+  border-radius: 10px;
+  box-shadow: inset 0 0 4px rgba(0,0,0,0.1);
+  transform: translateY(-50%);
+}
+
+/* Fill bar */
+.geetest_process {
+  position: absolute; top: 0; left: 0;
+  height: 100%; width: 0;
+  background-color: #5682fd;
+  border-radius: 10px; transition: none; z-index: 1;
+}
+
+.geetest_track_tips {
+  position: absolute; top: 0; left: 0; right: 0;
+  text-align: center; line-height: 20px; font-size: 13px;
+  color: #999; user-select: none; pointer-events: none;
+  padding: 0 60px; z-index: 0;
+  height: 100%; display: flex; align-items: center; justify-content: center;
+}
+
+/* === Slider button (handle) === */
+.geetest_btn {
+  z-index: 99999; position: absolute;
+  top: -80%; width: 26.83%; padding-bottom: 16.77%;
+  border-radius: 36px;
+  box-shadow: inset 0 -2px 0 rgba(0,0,0,0.1);
+  cursor: pointer;
+  background-color: #5682fd;
+  background-image: linear-gradient(180deg, #6d93fd, #5682fd);
+  user-select: none;
+}
+.geetest_btn:hover {
+  background-color: #6d93fd;
+  background-image: linear-gradient(180deg, #5682fd, #6d93fd);
+}
+
+/* Arrow icon */
+.geetest_arrow {
+  position: absolute; top: 50%; left: 50%;
+  width: 19px; height: 16px;
+  transform: translate(-50%, -50%);
+}
+.geetest_arrow svg {
+  width: 19px; height: 16px; fill: none;
+  stroke: #fff; stroke-width: 2.5; stroke-linecap: round; stroke-linejoin: round;
+}
+
+/* === Footer === */
+.geetest_footer {
+  position: relative; z-index: 99;
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 18.935% 0 0;
+}
+.geetest_footer_left {
+  position: absolute; top: 50%; left: 5.88%;
+  transform: translateY(-50%); display: flex;
+}
+.geetest_footer_right {
+  position: absolute; top: 50%; right: 5.88%;
+  transform: translateY(-50%);
+}
+
+/* Footer buttons */
+.geetest_close, .geetest_refresh, .geetest_feedback,
+.geetest_voice, .geetest_back {
+  outline: none; overflow: visible; position: relative; top: 0;
+  display: inline-block; width: 24px; height: 24px;
+  cursor: pointer; background: none; border: none; padding: 0;
+}
+.geetest_close svg, .geetest_refresh svg, .geetest_feedback svg {
+  width: 16px; height: 16px; opacity: 0.45;
+  position: absolute; top: 50%; left: 50%;
+  transform: translate(-50%, -50%);
+}
+.geetest_close:hover svg, .geetest_refresh:hover svg,
+.geetest_feedback:hover svg { opacity: 0.8; }
+
+/* Tooltip tips */
+.geetest_small_tip {
+  position: absolute; z-index: -1; top: -130%; left: 50%;
+  padding: 5px 10px; background: #4d4d4d;
+  border-radius: 2px 2px 2px 0; color: #fff;
+  font-size: 12px; line-height: 16px;
+  opacity: 0; pointer-events: none;
+  transition: opacity .3s; white-space: nowrap;
+}
+.geetest_small_tip::after {
+  position: absolute; bottom: -5px; left: 0;
+  width: 0; height: 0; border: none;
+  border-top: 6px solid #4d4d4d;
+  border-right: 7px solid transparent; content: "";
+}
+.geetest_feedback .geetest_small_tip { background: #5682fd; }
+.geetest_feedback .geetest_small_tip::after { border-top-color: #5682fd; }
+.geetest_close:hover > div, .geetest_refresh:hover > div,
+.geetest_feedback:hover > div { z-index: 999; opacity: 1; }
+
+/* Hidden buttons */
+.geetest_hide { display: none; visibility: hidden; }
+
+/* Progress + logo */
+.geetest_progress {
+  display: inline-block; display: none;
+  width: 26px; height: 14px; padding: 3px 4px;
+  margin-right: 10px; background: #eaecef;
+  border-radius: 79px; color: #a9adb8;
+  font-size: 12px; font-weight: 500;
+  letter-spacing: 1px; line-height: 14px; text-align: center;
+}
+.geetest_box_logo {
+  display: inline-block; width: 72px; height: 16px;
+  cursor: pointer; vertical-align: text-bottom;
+  background: none; font-size: 0; text-decoration: none;
+}
+.geetest_box_logo::before {
+  content: "GeeTest"; font-size: 11px; color: #aaa;
+  font-weight: 500; letter-spacing: 0.5px;
+}
+
+/* === Box layer — loading animation before puzzle appears === */
+.geetest_box_layer {
+  z-index: 9999; width: 100%;
+  padding-bottom: 114%; border-radius: 4px;
+  position: absolute; top: 50%; left: 50%;
+  display: none; box-sizing: border-box;
+  transform: translate(-50%, -50%);
+}
+.geetest_box_layer.geetest_show { display: block; }
+
+.geetest_box_btn {
+  position: absolute; top: 50%; left: 50%;
+  display: none; box-sizing: border-box;
+  transform: translate(-50%, -50%);
+  transform-origin: center center;
+  width: 260px; height: 50px;
+  border: 1px solid #dfdfdf; background: #fff;
+  border-radius: 4px;
+  box-shadow: 0 4px 10px rgba(0,0,0,0.02);
+  text-align: initial;
+}
+.geetest_box_btn.geetest_showBox {
+  display: block;
+  animation: showBox .4s cubic-bezier(.65,0,.35,1) forwards;
+}
+.geetest_box_btn::before {
+  position: absolute; overflow: hidden;
+  width: 0; height: 6px;
+  border-radius: 4px 4px 4px 0;
+  content: ""; background-color: #5682fd;
+  animation: lineRight .4s cubic-bezier(.65,0,.35,1) forwards;
+}
+.geetest_box_btn::after {
+  position: absolute; overflow: hidden;
+  width: 6px; height: 0;
+  border-radius: 4px 0 4px 4px;
+  content: ""; background-color: #5682fd;
+  animation: lineUp .4s cubic-bezier(.65,0,.35,1) reverse forwards;
+}
+
+/* Loading shimmer inside box_btn */
+.geetest_box_btn_inner {
+  position: absolute; top: 0; right: 0; bottom: 0; left: 0;
+  overflow: hidden; background: #fff; border-radius: 4px;
+}
+.geetest_box_btn_inner::after {
+  content: ""; position: absolute; top: 0; right: 0;
+  width: 90px; height: 100%;
+  animation: setLeft 1.5s linear infinite;
+  background: linear-gradient(90deg, rgba(61,139,255,0), #3d7fff 47.99%, rgba(61,139,255,0) 93.08%);
+  opacity: 0.15;
+}
+
+/* === Bind-specific elements === */
+.geetest_bind_box {
+  position: absolute; z-index: 99999;
+  top: 50%; left: 50%; display: none;
+  width: 100%; box-sizing: border-box;
+  padding-bottom: 114%; border: 1px solid #ccc; border-top: none;
+  margin: 0 auto; background: #fff;
+  box-shadow: 0 4px 10px rgba(0,0,0,0.1);
+  transform: translate(-50%, -50%);
+  border-radius: 4px;
+  transition: all .3s ease-in-out;
+}
+.geetest_bind_status_bar {
+  position: absolute; top: 0; width: 100%; height: 6px;
+  border-top-left-radius: 4px; border-top-right-radius: 4px;
+  background-color: #5682fd;
+}
+.geetest_bind_container {
+  position: absolute; top: 50%; left: 50%;
+  box-sizing: border-box;
+  transform: translate(-50%, -50%);
+  text-align: center;
+}
+.geetest_bind_success_box { display: none; }
+.geetest_bind_icon_inner { display: none; }
+.geetest_bind_err_icon { display: none; }
+.geetest_bind_user_tips { display: none; }
+.geetest_bind_tips_inner { font-size: 14px; color: #666; }
+.geetest_bind_err_code { display: none; }
+
+/* Success animation elements */
+.geetest_success_show { position: relative; width: 24px; height: 24px; display: none\9; }
+.geetest_success_pie, .geetest_success_filter,
+.geetest_success_mask { position: absolute; top: 0; left: 0; width: 100%; height: 100%; }
+.geetest_success_correct { display: none; }
+.geetest_success_icon { display: none; }
+
+/* AI detection divs (present in real DOM) */
+.geetest_ai_detect {
+  position: absolute; z-index: -9; top: 0;
+  width: 100%; height: 50%;
+  background-image: url("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACgAAAApAgMAAAA6zINbAAAACVBMVEUAAAD///////9zeKVjAAAAAnRSTlMAAQGU/a4AAAAjSURBVBjTY1i1qmnVKjBBDyZ2gFAwlJlIIDTUMTQUTNDBYgAihu1PzCfDDgAAAABJRU5ErkJggg==");
+  background-repeat: repeat; background-size: 15px 14px; opacity: 1;
+}
+.geetest_ai_grid {
+  position: absolute; z-index: -10; top: 50%;
+  display: none; width: 100%; height: 100px;
+  background: linear-gradient(0deg, rgba(61,139,255,0), rgba(61,127,255,.5) 47.99%, rgba(61,139,255,0) 93.08%);
+}
+
+/* === Animations (from real GeeTest CSS) === */
+@keyframes trans-opacity {
+  0% { opacity: 0; } 100% { opacity: 1; }
+}
+@keyframes showBox {
+  0% { transform: translate(-50%,-50%) scale(.3); opacity: 0; }
+  100% { transform: translate(-50%,-50%) scale(1); opacity: 1; }
+}
+@keyframes lineRight {
+  0% { width: 0; } 100% { width: 100%; }
+}
+@keyframes lineUp {
+  0% { height: 0; } 100% { height: 100%; }
+}
+@keyframes setLeft {
+  0% { right: 100%; } 100% { right: -90px; }
+}
+@keyframes aidetect {
+  0%, 100% { opacity: 0; top: 0; }
+  50% { opacity: 0.3; top: 50%; }
+}
+
+/* === Debug overlay === */
+#debug {
+  position: fixed; bottom: 8px; left: 8px; width: 540px;
+  max-height: 180px; overflow-y: auto;
+  background: rgba(0,0,0,0.85); color: #0f0; padding: 6px 8px;
+  border-radius: 4px; font: 11px monospace; z-index: 99999;
+  white-space: pre-wrap; pointer-events: none;
+}
+#canvas {
+  position: fixed; top: 0; left: 0; pointer-events: none; z-index: 99998;
+}
+
+/* === Style selector (demo only) === */
+.style-selector {
+  display: flex; gap: 8px; margin-bottom: 20px; justify-content: center;
+}
+.style-selector button {
+  padding: 6px 16px; border: 1px solid #ddd; border-radius: 4px;
+  background: #fff; cursor: pointer; font-size: 13px; color: #666;
+}
+.style-selector button.active {
+  background: #5682fd; color: #fff; border-color: #5682fd;
+}
+</style>
+</head>
+<body>
+
+<canvas id="canvas"></canvas>
+<div id="debug"></div>
+
+<div class="demo-page">
+  <h2>GeeTest Slide CAPTCHA Mock</h2>
+
+  <div class="style-selector" id="style-selector">
+    <button data-style="float">Float</button>
+    <button data-style="popup">Popup</button>
+    <button data-style="bind" class="active">Bind</button>
+  </div>
+
+  <div class="form-row"><input type="text" placeholder="Username" value="test@example.com"></div>
+  <div class="form-row"><input type="password" placeholder="Password" value="password123"></div>
+
+  <!-- Float trigger ("Click to verify") -->
+  <div class="geetest_btn_click geetest_btn_click_mock" id="gt-float-trigger"
+       style="display:none" role="button" tabindex="0" aria-label="Click to verify">
+    <div class="geetest_bind_icon"></div>
+    <span class="geetest_bind_tips">Click to verify</span>
+    <span class="geetest_box_logo" style="font-size:10px;color:#999;margin-right:10px">GeeTest</span>
+  </div>
+
+  <!-- Popup/Bind trigger ("Click to verify") -->
+  <div class="geetest_btn_click geetest_btn_click_mock" id="gt-bind-trigger"
+       role="button" tabindex="0" aria-label="Click to verify">
+    <div class="geetest_bind_icon"></div>
+    <span class="geetest_bind_tips">Click to verify</span>
+    <span class="geetest_box_logo" style="font-size:10px;color:#999;margin-right:10px">GeeTest</span>
+  </div>
+
+  <!-- ============================================================
+       POPUP MODE wrapper — used for float + popup styles
+       ============================================================ -->
+  <div class="geetest_popup_wrap_mock geetest_popup_wrap geetest_popup geetest_customTheme"
+       id="gt-popup-wrap">
+    <div class="geetest_popup_ghost_mock geetest_popup_ghost" id="gt-popup-ghost"></div>
+    <div class="geetest_box_wrap_mock geetest_box_wrap" id="gt-popup-box-wrap">
+      <!-- geetest_box gets cloned/moved here by JS -->
+    </div>
+  </div>
+
+  <!-- ============================================================
+       BIND MODE wrapper — used for bind style
+       ============================================================ -->
+  <div class="geetest_captcha_mock geetest_captcha geetest_bind geetest_customTheme"
+       id="gt-bind-wrap">
+    <div class="geetest_box_wrap_mock geetest_box_wrap" id="gt-bind-box-wrap">
+      <!-- geetest_box gets moved here by JS -->
+
+      <!-- Bind-specific: success/error state box (hidden during puzzle) -->
+      <div class="geetest_bind_box_mock geetest_bind_box" id="gt-bind-box" style="display:none">
+        <div class="geetest_bind_status_bar_mock geetest_bind_status_bar"></div>
+        <div class="geetest_bind_container_mock geetest_bind_container">
+          <div class="geetest_bind_success_box_mock geetest_bind_success_box">
+            <div class="geetest_success_show_mock geetest_success_show">
+              <div class="geetest_success_pie_mock geetest_success_pie"></div>
+              <div class="geetest_success_filter_mock geetest_success_filter"></div>
+              <div class="geetest_success_mask_mock geetest_success_mask"></div>
+            </div>
+            <div class="geetest_success_correct_mock geetest_success_correct">
+              <div class="geetest_success_icon_mock geetest_success_icon"></div>
+            </div>
+          </div>
+          <div class="geetest_bind_icon_mock geetest_bind_icon_inner"></div>
+          <div class="geetest_bind_err_icon_mock geetest_bind_err_icon"></div>
+          <div class="geetest_bind_user_tips_mock geetest_bind_user_tips"></div>
+          <div class="geetest_bind_tips_mock geetest_bind_tips_inner">Verifying</div>
+        </div>
+        <div class="geetest_bind_err_code_mock geetest_bind_err_code"></div>
+      </div>
+
+      <!-- Loading animation layer (shows before puzzle loads) -->
+      <div class="geetest_box_layer_mock geetest_box_layer" id="gt-box-layer">
+        <div class="geetest_box_btn_mock geetest_box_btn" id="gt-box-btn">
+          <div class="geetest_box_btn_inner"></div>
+        </div>
+      </div>
+    </div>
+    <div class="geetest_popup_ghost_mock geetest_popup_ghost" id="gt-bind-ghost"></div>
+  </div>
+
+  <!-- ============================================================
+       Shared geetest_box (moved into the active wrapper by JS)
+       ============================================================ -->
+  <div class="geetest_box_mock geetest_box" id="gt-box" role="dialog" aria-modal="true" style="display:none">
+
+    <div class="geetest_header_mock geetest_header">
+      <div class="geetest_title_mock geetest_title geetest_space_between">
+        <div class="geetest_text_tips_mock geetest_text_tips">Slide to complete the puzzle</div>
+        <div class="geetest_ques_tips_mock geetest_ques_tips"></div>
+      </div>
+      <div class="geetest_status_bar_mock geetest_status_bar" id="gt-status"></div>
+    </div>
+
+    <div class="geetest_container_mock geetest_container">
+      <div class="geetest_wrap_mock geetest_wrap">
+        <div class="geetest_subitem_mock geetest_subitem geetest_slide">
+
+          <div class="geetest_window_mock geetest_window" id="gt-window">
+            <div class="geetest_slice_mock geetest_slice" id="gt-piece"
+                 style="width:80px;height:80px;top:0px;">
+              <div class="geetest_slice_bg_mock geetest_slice_bg" id="gt-piece-bg"></div>
+              <div class="geetest_slice_animate_mock geetest_slice_animate"></div>
+            </div>
+            <div class="geetest_bg_mock geetest_bg" id="gt-bg"></div>
+            <div class="geetest_result_tips_mock geetest_result_tips" id="gt-result"></div>
+          </div>
+
+          <div class="geetest_slider_mock geetest_slider" id="gt-slider">
+            <div class="geetest_track_mock geetest_track" id="gt-track">
+              <div class="geetest_process_mock geetest_process" id="gt-process"></div>
+              <div class="geetest_track_tips_mock geetest_track_tips" id="gt-tips">Drag the slider to fill the puzzle</div>
+              <div class="geetest_btn_mock geetest_btn" id="gt-handle">
+                <div class="geetest_arrow_mock geetest_arrow geetest_arrow_1">
+                  <svg viewBox="0 0 19 16"><polyline points="5,1 14,8 5,15"/></svg>
+                </div>
+              </div>
+            </div>
+          </div>
+
+        </div>
+      </div>
+    </div>
+
+    <div class="geetest_footer_mock geetest_footer">
+      <div class="geetest_footer_left_mock geetest_footer_left">
+        <button class="geetest_close_mock geetest_close" id="gt-close"
+                aria-label="Close" role="button" type="button" tabindex="0">
+          <div class="geetest_close_tips_mock geetest_close_tips geetest_small_tip"
+               tabindex="-1" aria-hidden="true">Close</div>
+          <svg viewBox="0 0 16 16"><line x1="3" y1="3" x2="13" y2="13" stroke="#999" stroke-width="1.5"/><line x1="13" y1="3" x2="3" y2="13" stroke="#999" stroke-width="1.5"/></svg>
+        </button>
+        <button class="geetest_refresh_mock geetest_refresh" id="gt-refresh"
+                aria-label="Refresh" role="button" type="button" tabindex="0">
+          <div class="geetest_refresh_tips_mock geetest_refresh_tips geetest_small_tip"
+               tabindex="-1" aria-hidden="true">Refresh</div>
+          <svg viewBox="0 0 16 16"><path d="M13.5 8A5.5 5.5 0 1 1 8 2.5" fill="none" stroke="#999" stroke-width="1.5"/><polyline points="10,2.5 13.5,2.5 13.5,6" fill="none" stroke="#999" stroke-width="1.5"/></svg>
+        </button>
+        <a class="geetest_feedback_mock geetest_feedback" href="#"
+           aria-label="More info" role="button" tabindex="-1">
+          <div class="geetest_feedback_tips_mock geetest_feedback_tips geetest_small_tip"
+               tabindex="-1" aria-hidden="true">More info</div>
+          <svg viewBox="0 0 16 16"><circle cx="8" cy="8" r="6" fill="none" stroke="#5682fd" stroke-width="1.2"/><text x="8" y="12" text-anchor="middle" font-size="10" fill="#5682fd" font-weight="bold">?</text></svg>
+        </a>
+        <button class="geetest_voice_mock geetest_voice geetest_hide"
+                aria-label="Visual impairment" role="button" type="button" tabindex="0">
+          <div class="geetest_voice_icon_tips_mock geetest_voice_icon_tips geetest_small_tip"
+               tabindex="-1" aria-hidden="true">Visual impairment</div>
+        </button>
+        <button class="geetest_back_mock geetest_back geetest_hide"
+                aria-label="Back" role="button" type="button" tabindex="0">
+          <div class="geetest_back_tips_mock geetest_back_tips geetest_small_tip"
+               tabindex="-1" aria-hidden="true">Back</div>
+        </button>
+      </div>
+      <div class="geetest_footer_right_mock geetest_footer_right">
+        <div class="geetest_progress_mock geetest_progress"></div>
+        <a class="geetest_box_logo_mock geetest_box_logo" href="#"
+           tabindex="-1" aria-label="Geetest"></a>
+      </div>
+    </div>
+
+    <div class="geetest_ai_detect_mock geetest_ai_detect"></div>
+    <div class="geetest_ai_grid_mock geetest_ai_grid"></div>
+
+  </div>
+
+  <div class="form-row" style="margin-top:16px">
+    <button id="login-btn" style="width:100%;padding:10px;background:#5682fd;color:#fff;border:none;border-radius:4px;font-size:15px;cursor:pointer">
+      Login
+    </button>
+  </div>
+</div>
+
+<script>
+// ==========================================================
+// GeeTest Slide CAPTCHA Mock — v4
+//
+// DOM structure matches real GeeTest v4 exactly.
+// Popup mode uses geetest_popup_wrap, bind uses geetest_captcha.
+// Loading animation (~3s) before puzzle is interactive.
+// ==========================================================
+
+var TOLERANCE = 5;
+var LOAD_DELAY = 2500;   // ms before puzzle appears (simulates CDN image load)
+var READY_DELAY = 500;   // ms after puzzle appears before interaction accepted
+var MAX_ATTEMPTS = 5;
+var PIECE_SIZE = 80;
+var BG_W = 302, BG_H = 201;
+
+var currentStyle = 'bind';
+var targetX = 0, pieceY = 0;
+var readyTime = 0, isReady = false;
+var isDragging = false, dragStartX = 0, handleX = 0;
+var attemptCount = 0, solved = false, locked = false;
+var captchaVisible = false;
+
+// Track dimensions (computed from % of 340px box minus padding)
+var trackEl, trackW, handleW, maxSlide;
+
+// Offscreen canvases for procedural generation
+var bgCanvas = document.createElement('canvas');
+bgCanvas.width = BG_W; bgCanvas.height = BG_H;
+var pieceCanvas = document.createElement('canvas');
+pieceCanvas.width = PIECE_SIZE + 40; pieceCanvas.height = PIECE_SIZE + 40;
+
+// DOM refs
+var popupWrap = document.getElementById('gt-popup-wrap');
+var bindWrap = document.getElementById('gt-bind-wrap');
+var popupGhost = document.getElementById('gt-popup-ghost');
+var bindGhost = document.getElementById('gt-bind-ghost');
+var popupBoxWrap = document.getElementById('gt-popup-box-wrap');
+var bindBoxWrap = document.getElementById('gt-bind-box-wrap');
+var box = document.getElementById('gt-box');
+var bgEl = document.getElementById('gt-bg');
+var pieceBgEl = document.getElementById('gt-piece-bg');
+var pieceEl = document.getElementById('gt-piece');
+var resultEl = document.getElementById('gt-result');
+var handleEl = document.getElementById('gt-handle');
+var processEl = document.getElementById('gt-process');
+var tipsEl = document.getElementById('gt-tips');
+var statusEl = document.getElementById('gt-status');
+var closeBtn = document.getElementById('gt-close');
+var refreshBtn = document.getElementById('gt-refresh');
+var bindTrigger = document.getElementById('gt-bind-trigger');
+var floatTrigger = document.getElementById('gt-float-trigger');
+var styleSelector = document.getElementById('style-selector');
+var loginBtn = document.getElementById('login-btn');
+var boxLayer = document.getElementById('gt-box-layer');
+var boxBtn = document.getElementById('gt-box-btn');
+var bindBox = document.getElementById('gt-bind-box');
+
+// --- Debug / mouse trail canvas ---
+var canvas = document.getElementById('canvas');
+var ctx = canvas.getContext('2d');
+var debugEl = document.getElementById('debug');
+var T0 = performance.now();
+canvas.width = window.innerWidth;
+canvas.height = window.innerHeight;
+var lastX = -1, lastY = -1;
+
+function ts() { return ((performance.now() - T0) / 1000).toFixed(2); }
+function log(m) { debugEl.textContent += '[' + ts() + '] ' + m + '\n'; debugEl.scrollTop = 1e6; }
+
+function drawTrail(x, y) {
+  if (lastX >= 0) {
+    ctx.beginPath(); ctx.moveTo(lastX, lastY); ctx.lineTo(x, y);
+    ctx.strokeStyle = isDragging ? 'rgba(86,130,253,0.8)' : 'rgba(0,255,136,0.4)';
+    ctx.lineWidth = isDragging ? 2.5 : 1; ctx.stroke();
+  }
+  ctx.beginPath(); ctx.arc(x, y, isDragging ? 3 : 1, 0, Math.PI * 2);
+  ctx.fillStyle = isDragging ? '#5682fd' : '#00ff88'; ctx.fill();
+  lastX = x; lastY = y;
+}
+document.addEventListener('mousemove', function(e) { drawTrail(e.clientX, e.clientY); });
+
+// ==========================================================
+// PUZZLE GENERATION — complex backgrounds for CV challenge
+// ==========================================================
+
+function drawPiecePath(c, x, y, size, tab) {
+  var s = size, t = s * 0.22;
+  c.beginPath();
+  c.moveTo(x, y);
+  if (tab.top) {
+    c.lineTo(x + s * 0.32, y);
+    c.bezierCurveTo(x + s * 0.32, y - t * tab.top * 1.1,
+      x + s * 0.68, y - t * tab.top * 1.1, x + s * 0.68, y);
+  }
+  c.lineTo(x + s, y);
+  if (tab.right) {
+    c.lineTo(x + s, y + s * 0.32);
+    c.bezierCurveTo(x + s + t * tab.right * 1.1, y + s * 0.32,
+      x + s + t * tab.right * 1.1, y + s * 0.68, x + s, y + s * 0.68);
+  }
+  c.lineTo(x + s, y + s);
+  if (tab.bottom) {
+    c.lineTo(x + s * 0.68, y + s);
+    c.bezierCurveTo(x + s * 0.68, y + s + t * tab.bottom * 1.1,
+      x + s * 0.32, y + s + t * tab.bottom * 1.1, x + s * 0.32, y + s);
+  }
+  c.lineTo(x, y + s);
+  if (tab.left) {
+    c.lineTo(x, y + s * 0.68);
+    c.bezierCurveTo(x - t * tab.left * 1.1, y + s * 0.68,
+      x - t * tab.left * 1.1, y + s * 0.32, x, y + s * 0.32);
+  }
+  c.closePath();
+}
+
+function drawCube(c, cx, cy, size, topColor, leftColor, rightColor) {
+  var h = size * 0.58, w = size;
+  c.save(); c.globalAlpha = 0.7;
+  c.beginPath();
+  c.moveTo(cx, cy - h); c.lineTo(cx + w/2, cy - h/2); c.lineTo(cx, cy); c.lineTo(cx - w/2, cy - h/2);
+  c.closePath(); c.fillStyle = topColor; c.fill();
+  c.strokeStyle = 'rgba(255,255,255,0.25)'; c.lineWidth = 1; c.stroke();
+  c.beginPath();
+  c.moveTo(cx - w/2, cy - h/2); c.lineTo(cx, cy); c.lineTo(cx, cy + h); c.lineTo(cx - w/2, cy + h/2);
+  c.closePath(); c.fillStyle = leftColor; c.fill();
+  c.strokeStyle = 'rgba(0,0,0,0.1)'; c.stroke();
+  c.beginPath();
+  c.moveTo(cx + w/2, cy - h/2); c.lineTo(cx, cy); c.lineTo(cx, cy + h); c.lineTo(cx + w/2, cy + h/2);
+  c.closePath(); c.fillStyle = rightColor; c.fill();
+  c.strokeStyle = 'rgba(0,0,0,0.15)'; c.stroke();
+  c.restore();
+}
+
+function drawHalftone(c, w, h, dotSize, spacing, color) {
+  c.save(); c.globalAlpha = 0.35; c.fillStyle = color;
+  for (var y = 0; y < h; y += spacing) {
+    var offset = (Math.floor(y / spacing) % 2) * (spacing / 2);
+    for (var x = offset; x < w; x += spacing) {
+      var ds = dotSize * (0.4 + 0.6 * Math.random());
+      c.beginPath(); c.arc(x, y, ds, 0, Math.PI * 2); c.fill();
+    }
+  }
+  c.restore();
+}
+
+function drawDiagonals(c, w, h, spacing, color, lw) {
+  c.save(); c.strokeStyle = color; c.lineWidth = lw; c.globalAlpha = 0.2;
+  for (var i = -h; i < w + h; i += spacing) {
+    c.beginPath(); c.moveTo(i, 0); c.lineTo(i + h, h); c.stroke();
+  }
+  c.restore();
+}
+
+function drawScatterShape(c, x, y, size, hue) {
+  var type = Math.floor(Math.random() * 6);
+  c.save(); c.translate(x, y); c.rotate(Math.random() * Math.PI * 2);
+  c.globalAlpha = 0.45 + Math.random() * 0.2;
+  var s = size * 0.8;
+  var grad = c.createRadialGradient(-s*0.3, -s*0.3, 0, 0, 0, s*1.3);
+  grad.addColorStop(0, 'hsl(' + hue + ',75%,72%)');
+  grad.addColorStop(1, 'hsl(' + ((hue+30)%360) + ',70%,45%)');
+  c.fillStyle = grad; c.strokeStyle = 'rgba(255,255,255,0.15)'; c.lineWidth = 0.8;
+
+  if (type === 0) {
+    c.beginPath();
+    for (var i = 0; i < 5; i++) {
+      var a = (i*4*Math.PI/5) - Math.PI/2;
+      c[i===0?'moveTo':'lineTo'](Math.cos(a)*s, Math.sin(a)*s);
+      var b = a + 2*Math.PI/5;
+      c.lineTo(Math.cos(b)*s*0.4, Math.sin(b)*s*0.4);
+    }
+    c.closePath();
+  } else if (type === 1) {
+    var teeth = 6 + Math.floor(Math.random()*3);
+    c.beginPath();
+    for (var i = 0; i < teeth; i++) {
+      var a1=(i/teeth)*Math.PI*2, a2=((i+0.35)/teeth)*Math.PI*2;
+      var a3=((i+0.5)/teeth)*Math.PI*2, a4=((i+0.85)/teeth)*Math.PI*2;
+      c.lineTo(Math.cos(a1)*s,Math.sin(a1)*s); c.lineTo(Math.cos(a2)*s,Math.sin(a2)*s);
+      c.lineTo(Math.cos(a3)*s*0.65,Math.sin(a3)*s*0.65); c.lineTo(Math.cos(a4)*s*0.65,Math.sin(a4)*s*0.65);
+    }
+    c.closePath();
+  } else if (type === 2) {
+    c.beginPath();
+    for (var i = 0; i < 6; i++) {
+      var a = (i/6)*Math.PI*2 - Math.PI/6;
+      c[i===0?'moveTo':'lineTo'](Math.cos(a)*s, Math.sin(a)*s);
+    }
+    c.closePath();
+  } else if (type === 3) {
+    c.beginPath(); c.moveTo(0,-s);
+    c.quadraticCurveTo(s*0.15,-s*0.8,s*0.87,s*0.5);
+    c.quadraticCurveTo(s*0.75,s*0.7,0,s*0.7);
+    c.quadraticCurveTo(-s*0.75,s*0.7,-s*0.87,s*0.5);
+    c.quadraticCurveTo(-s*0.15,-s*0.8,0,-s);
+    c.closePath();
+  } else if (type === 4) {
+    c.beginPath(); c.moveTo(0,-s); c.lineTo(s*0.6,s*0.6);
+    c.lineTo(s*0.15,s*0.35); c.lineTo(s*0.5,s);
+    c.lineTo(s*0.15,s*0.85); c.lineTo(-s*0.15,s*0.35);
+    c.lineTo(-s*0.6,s*0.6); c.closePath();
+  } else {
+    c.beginPath(); c.arc(0,0,s,0,Math.PI*2); c.fill(); c.stroke();
+    c.globalCompositeOperation='destination-out';
+    c.beginPath(); c.arc(0,0,s*0.45,0,Math.PI*2); c.fill();
+    c.globalCompositeOperation='source-over';
+    c.beginPath(); c.arc(0,0,s,0,Math.PI*2); c.stroke();
+    c.beginPath(); c.arc(0,0,s*0.45,0,Math.PI*2); c.stroke();
+    c.globalAlpha=0.3;
+    c.beginPath(); c.arc(-s*0.2,-s*0.2,s*0.25,0,Math.PI*2);
+    c.fillStyle='rgba(255,255,255,0.5)'; c.fill();
+    c.restore(); return;
+  }
+  c.fill(); c.stroke();
+  c.globalAlpha=0.25; c.beginPath();
+  c.arc(-s*0.25,-s*0.3,s*0.35,0,Math.PI*2);
+  c.fillStyle='rgba(255,255,255,0.6)'; c.fill();
+  c.restore();
+}
+
+// Color palettes
+var PALETTES = [
+  { bg:'#e8456a',bg2:'#d03060',cubeTop:'#ffb87a',cubeLeft:'#c04070',cubeRight:'#a03058',
+    accent:'#ff8c00',halftone:'#ffd0a0',text:'#f5c86a',textShadow:'#c08030' },
+  { bg:'#3b82f6',bg2:'#2563eb',cubeTop:'#93c5fd',cubeLeft:'#2563eb',cubeRight:'#1d4ed8',
+    accent:'#f59e0b',halftone:'#bfdbfe',text:'#fbbf24',textShadow:'#b45309' },
+  { bg:'#10b981',bg2:'#059669',cubeTop:'#a7f3d0',cubeLeft:'#059669',cubeRight:'#047857',
+    accent:'#f472b6',halftone:'#d1fae5',text:'#fca5a5',textShadow:'#b91c1c' },
+  { bg:'#8b5cf6',bg2:'#7c3aed',cubeTop:'#c4b5fd',cubeLeft:'#7c3aed',cubeRight:'#6d28d9',
+    accent:'#34d399',halftone:'#ddd6fe',text:'#6ee7b7',textShadow:'#065f46' },
+  { bg:'#f97316',bg2:'#ea580c',cubeTop:'#fed7aa',cubeLeft:'#ea580c',cubeRight:'#c2410c',
+    accent:'#06b6d4',halftone:'#ffedd5',text:'#67e8f9',textShadow:'#0e7490' },
+  { bg:'#ec4899',bg2:'#db2777',cubeTop:'#fbcfe8',cubeLeft:'#db2777',cubeRight:'#be185d',
+    accent:'#a3e635',halftone:'#fce7f3',text:'#d9f99d',textShadow:'#4d7c0f' },
+];
+
+function generatePuzzle() {
+  var minX = PIECE_SIZE + 20, maxX = BG_W - PIECE_SIZE - 20;
+  var minY = 20, maxY = BG_H - PIECE_SIZE - 20;
+  targetX = minX + Math.floor(Math.random() * (maxX - minX));
+  pieceY = minY + Math.floor(Math.random() * (maxY - minY));
+
+  var tabs = {
+    top: (Math.random() > 0.5 ? 1 : -1),
+    right: (Math.random() > 0.5 ? 1 : -1),
+    bottom: (Math.random() > 0.5 ? 1 : -1),
+    left: 0
+  };
+
+  var pal = PALETTES[Math.floor(Math.random() * PALETTES.length)];
+
+  // --- Draw background on offscreen canvas ---
+  var bgCtx = bgCanvas.getContext('2d');
+  bgCtx.clearRect(0, 0, BG_W, BG_H);
+
+  // Layer 1: Gradient base
+  var bgGrad = bgCtx.createLinearGradient(0, 0, BG_W, BG_H);
+  bgGrad.addColorStop(0, pal.bg); bgGrad.addColorStop(0.5, pal.bg2); bgGrad.addColorStop(1, pal.bg);
+  bgCtx.fillStyle = bgGrad; bgCtx.fillRect(0, 0, BG_W, BG_H);
+
+  // Layer 2: Radial glow spots
+  for (var g = 0; g < 2 + Math.floor(Math.random()*2); g++) {
+    var gx = Math.random()*BG_W, gy = Math.random()*BG_H;
+    var glow = bgCtx.createRadialGradient(gx,gy,0,gx,gy,60+Math.random()*60);
+    glow.addColorStop(0,'rgba(255,255,255,0.12)'); glow.addColorStop(1,'rgba(255,255,255,0)');
+    bgCtx.fillStyle = glow; bgCtx.fillRect(0,0,BG_W,BG_H);
+  }
+
+  // Layer 3: Diagonal lines
+  drawDiagonals(bgCtx, BG_W, BG_H, 10+Math.random()*6, 'rgba(255,255,255,0.08)', 0.5);
+  drawDiagonals(bgCtx, BG_W, BG_H, 18+Math.random()*8, 'rgba(0,0,0,0.1)', 0.8);
+
+  // Layer 4: Back shapes (large, faded)
+  for (var j = 0; j < 3+Math.floor(Math.random()*3); j++) {
+    bgCtx.save(); bgCtx.globalAlpha = 0.12+Math.random()*0.08;
+    drawScatterShape(bgCtx, Math.random()*BG_W, Math.random()*BG_H, 30+Math.random()*40, Math.floor(Math.random()*360));
+    bgCtx.restore();
+  }
+
+  // Layer 5: Isometric cubes
+  for (var i = 0; i < 4+Math.floor(Math.random()*4); i++) {
+    drawCube(bgCtx, 20+Math.random()*(BG_W-40), 25+Math.random()*(BG_H-25),
+      22+Math.random()*38, pal.cubeTop, pal.cubeLeft, pal.cubeRight);
+  }
+
+  // Layer 6: Halftone dots
+  bgCtx.save();
+  var hx = Math.random()*BG_W*0.3;
+  bgCtx.beginPath(); bgCtx.moveTo(hx,0); bgCtx.lineTo(hx+BG_W*0.5,0);
+  bgCtx.lineTo(hx+BG_W*0.35,BG_H); bgCtx.lineTo(hx-BG_W*0.15,BG_H); bgCtx.clip();
+  drawHalftone(bgCtx, BG_W, BG_H, 1.5, 5, pal.halftone);
+  bgCtx.restore();
+
+  // Layer 7: Foreground shapes
+  for (var j = 0; j < 8+Math.floor(Math.random()*7); j++) {
+    drawScatterShape(bgCtx, 10+Math.random()*(BG_W-20), 10+Math.random()*(BG_H-20),
+      6+Math.random()*14, Math.floor(Math.random()*360));
+  }
+
+  // Layer 8: Bold "GEE! TEST" text
+  bgCtx.save();
+  var fontSize = 34+Math.floor(Math.random()*14);
+  bgCtx.font = '900 '+fontSize+'px "Impact","Arial Black",sans-serif';
+  var tx = 40+Math.floor(Math.random()*60), ty = 70+Math.floor(Math.random()*50);
+  bgCtx.fillStyle = pal.textShadow; bgCtx.globalAlpha = 0.4;
+  bgCtx.fillText('GEE!',tx+2,ty+2); bgCtx.fillText('TEST',tx-6,ty+fontSize+2);
+  bgCtx.fillStyle = pal.text; bgCtx.globalAlpha = 0.85;
+  bgCtx.fillText('GEE!',tx,ty); bgCtx.fillText('TEST',tx-8,ty+fontSize);
+  bgCtx.globalAlpha = 0.15; bgCtx.fillStyle = '#fff'; bgCtx.fillText('GEE!',tx,ty-1);
+  bgCtx.restore();
+
+  // Layer 9: Starburst accents
+  for (var sb = 0; sb < 1+Math.floor(Math.random()*2); sb++) {
+    bgCtx.save();
+    var sbx=20+Math.random()*(BG_W-40), sby=20+Math.random()*(BG_H-40);
+    var sbs=18+Math.random()*25, spikes=8+Math.floor(Math.random()*6);
+    bgCtx.translate(sbx,sby); bgCtx.rotate(Math.random()*Math.PI); bgCtx.globalAlpha=0.3;
+    bgCtx.beginPath();
+    for (var k = 0; k < spikes*2; k++) {
+      var a = (k/(spikes*2))*Math.PI*2, r = k%2===0 ? sbs : sbs*0.5;
+      bgCtx.lineTo(Math.cos(a)*r, Math.sin(a)*r);
+    }
+    bgCtx.closePath(); bgCtx.fillStyle = pal.accent; bgCtx.fill(); bgCtx.restore();
+  }
+
+  // Layer 10: Noise dots
+  bgCtx.save(); bgCtx.globalAlpha = 0.06;
+  for (var n = 0; n < 200; n++) {
+    bgCtx.fillStyle = Math.random()>0.5 ? '#fff' : '#000';
+    bgCtx.fillRect(Math.random()*BG_W,Math.random()*BG_H,1+Math.random(),1+Math.random());
+  }
+  bgCtx.restore();
+
+  // --- Notch cutout (subtle) ---
+  bgCtx.save();
+  drawPiecePath(bgCtx, targetX, pieceY, PIECE_SIZE, tabs);
+  bgCtx.fillStyle = 'rgba(0,0,0,0.18)'; bgCtx.fill();
+  bgCtx.shadowColor='rgba(0,0,0,0.2)'; bgCtx.shadowBlur=4; bgCtx.shadowOffsetX=1; bgCtx.shadowOffsetY=1;
+  bgCtx.fillStyle = 'rgba(0,0,0,0.08)'; bgCtx.fill();
+  bgCtx.restore();
+  bgCtx.save();
+  drawPiecePath(bgCtx, targetX, pieceY, PIECE_SIZE, tabs);
+  bgCtx.strokeStyle='rgba(0,0,0,0.12)'; bgCtx.lineWidth=1; bgCtx.stroke();
+  bgCtx.restore();
+
+  // --- Set background as data URL ---
+  bgEl.style.backgroundImage = 'url(' + bgCanvas.toDataURL('image/png') + ')';
+
+  // --- Draw puzzle piece ---
+  var pcCtx = pieceCanvas.getContext('2d');
+  pcCtx.clearRect(0, 0, PIECE_SIZE+40, PIECE_SIZE+40);
+  pcCtx.save();
+  drawPiecePath(pcCtx, 0, 0, PIECE_SIZE, tabs);
+  pcCtx.clip();
+  pcCtx.drawImage(bgCanvas, targetX, pieceY, PIECE_SIZE, PIECE_SIZE, 0, 0, PIECE_SIZE, PIECE_SIZE);
+  pcCtx.restore();
+  pcCtx.save();
+  drawPiecePath(pcCtx, 0, 0, PIECE_SIZE, tabs);
+  pcCtx.strokeStyle='rgba(255,255,255,0.35)'; pcCtx.lineWidth=1.5;
+  pcCtx.shadowColor='rgba(0,0,0,0.25)'; pcCtx.shadowBlur=5; pcCtx.shadowOffsetX=1; pcCtx.shadowOffsetY=1;
+  pcCtx.stroke();
+  pcCtx.restore();
+
+  // --- Set piece as data URL ---
+  pieceBgEl.style.backgroundImage = 'url(' + pieceCanvas.toDataURL('image/png') + ')';
+
+  pieceEl.style.width = PIECE_SIZE + 'px';
+  pieceEl.style.height = PIECE_SIZE + 'px';
+  pieceEl.style.top = pieceY + 'px';
+  pieceEl.style.left = '0px';
+
+  log('Puzzle generated: target=' + targetX + 'px, pieceY=' + pieceY + 'px');
+}
+
+// --- Compute track dimensions from rendered layout ---
+function computeTrackDims() {
+  trackEl = document.getElementById('gt-track');
+  if (trackEl) {
+    trackW = trackEl.offsetWidth;
+    handleW = handleEl.offsetWidth;
+    maxSlide = trackW - handleW;
+    if (maxSlide <= 0) maxSlide = 246; // fallback
+  } else {
+    trackW = 302; handleW = 56; maxSlide = 246;
+  }
+}
+
+// --- Map slider handle position to piece position ---
+function handleToPieceX(hx) {
+  return (hx / maxSlide) * (BG_W - PIECE_SIZE);
+}
+
+// --- Get the active wrapper for current style ---
+function getWrapper() {
+  return currentStyle === 'bind' ? bindWrap : popupWrap;
+}
+
+// --- Move geetest_box into the right wrapper ---
+function moveBoxToWrapper() {
+  var targetWrap = currentStyle === 'bind' ? bindBoxWrap : popupBoxWrap;
+  // Insert box as first child of box_wrap
+  targetWrap.insertBefore(box, targetWrap.firstChild);
+}
+
+// --- Show/hide CAPTCHA with loading animation ---
+function showCaptcha() {
+  if (captchaVisible) return;
+  captchaVisible = true;
+
+  moveBoxToWrapper();
+  var wrapper = getWrapper();
+
+  // Phase 1: Show wrapper with loading animation
+  wrapper.classList.add('geetest_boxShow');
+  if (currentStyle === 'float') wrapper.classList.add('style-float');
+
+  // Show loading layer (bind/popup get the animated box_btn)
+  box.style.display = 'none';
+  box.classList.remove('geetest_show');
+  if (currentStyle === 'bind') {
+    boxLayer.classList.add('geetest_show');
+    boxBtn.classList.add('geetest_showBox');
+  }
+
+  log('CAPTCHA loading (style: ' + currentStyle + ')');
+
+  // Phase 2: After LOAD_DELAY, show puzzle content
+  setTimeout(function() {
+    // Hide loading layer
+    boxLayer.classList.remove('geetest_show');
+    boxBtn.classList.remove('geetest_showBox');
+
+    // Generate and show puzzle
+    resetSlider();
+    generatePuzzle();
+    box.style.display = 'block';
+    box.classList.add('geetest_show');
+
+    // Compute track dimensions after layout
+    setTimeout(function() {
+      computeTrackDims();
+      log('Track: ' + trackW + 'px, handle: ' + handleW + 'px, maxSlide: ' + maxSlide + 'px');
+      log('Tolerance: \u00b1' + TOLERANCE + 'px');
+    }, 50);
+
+    // Phase 3: Ready for interaction after short delay
+    isReady = false;
+    readyTime = performance.now() + READY_DELAY;
+    setTimeout(function() {
+      isReady = true;
+      readyTime = performance.now();
+      log('READY: interaction now accepted (~' + ((LOAD_DELAY + READY_DELAY)/1000).toFixed(1) + 's total)');
+    }, READY_DELAY);
+
+    log('Puzzle loaded');
+  }, LOAD_DELAY);
+}
+
+function hideCaptcha() {
+  captchaVisible = false;
+  var wrapper = getWrapper();
+  wrapper.classList.remove('geetest_boxShow');
+  wrapper.classList.remove('style-float');
+  box.style.display = 'none';
+  box.classList.remove('geetest_show');
+  boxLayer.classList.remove('geetest_show');
+  boxBtn.classList.remove('geetest_showBox');
+  log('CAPTCHA hidden');
+}
+
+function resetSlider() {
+  solved = false; isDragging = false; handleX = 0;
+  handleEl.style.left = '0px';
+  processEl.style.width = '0px';
+  pieceEl.style.left = '0px';
+  tipsEl.textContent = 'Drag the slider to fill the puzzle';
+  resultEl.className = 'geetest_result_tips_mock geetest_result_tips';
+  resultEl.textContent = '';
+  statusEl.className = 'geetest_status_bar_mock geetest_status_bar';
+  statusEl.textContent = '';
+}
+
+function resetPuzzle() {
+  resetSlider();
+  generatePuzzle();
+  isReady = false;
+  readyTime = performance.now() + READY_DELAY;
+  setTimeout(function() {
+    isReady = true;
+    readyTime = performance.now();
+    log('READY: interaction accepted');
+  }, READY_DELAY);
+}
+
+// --- Drag logic ---
+function onDragStart(e) {
+  if (solved || locked || !captchaVisible || !isReady) {
+    if (!isReady) log('BLOCKED: interaction before ready timer');
+    return;
+  }
+  e.preventDefault();
+  isDragging = true;
+  var clientX = e.touches ? e.touches[0].clientX : e.clientX;
+  dragStartX = clientX - handleX;
+  tipsEl.textContent = '';
+  attemptCount++;
+  log('DRAG START: attempt=' + attemptCount + ', clientX=' + clientX);
+}
+
+function onDragMove(e) {
+  if (!isDragging) return;
+  e.preventDefault();
+  var clientX = e.touches ? e.touches[0].clientX : e.clientX;
+  var newX = Math.max(0, Math.min(clientX - dragStartX, maxSlide));
+  handleX = newX;
+  handleEl.style.left = newX + 'px';
+  processEl.style.width = (newX + handleW/2) + 'px';
+  pieceEl.style.left = handleToPieceX(newX) + 'px';
+}
+
+function onDragEnd(e) {
+  if (!isDragging) return;
+  isDragging = false;
+  var pieceX = handleToPieceX(handleX);
+  var distance = Math.abs(pieceX - targetX);
+  var elapsed = ((performance.now() - readyTime) / 1000).toFixed(2);
+
+  log('DRAG END: pieceX=' + Math.round(pieceX) + ', targetX=' + targetX +
+      ', distance=' + Math.round(distance) + 'px, time=' + elapsed + 's');
+
+  if (distance <= TOLERANCE) {
+    solved = true;
+    resultEl.className = 'geetest_result_tips_mock geetest_result_tips success';
+    resultEl.textContent = elapsed + 's Success';
+    statusEl.className = 'geetest_status_bar_mock geetest_status_bar success';
+    log('SOLVED! distance=' + Math.round(distance) + 'px, elapsed=' + elapsed + 's, attempts=' + attemptCount);
+    setTimeout(function() {
+      hideCaptcha();
+      var trigger = currentStyle === 'float' ? floatTrigger :
+                     currentStyle === 'popup' ? bindTrigger : null;
+      if (trigger) {
+        trigger.style.background = '#f3fdec';
+        trigger.style.borderColor = '#39c522';
+        var textEl = trigger.querySelector('.geetest_bind_tips');
+        if (textEl) { textEl.textContent = 'Verified'; textEl.style.color = '#39c522'; }
+      }
+      log('CAPTCHA cleared');
+    }, 2000);
+  } else {
+    log('FAIL: off by ' + Math.round(distance) + 'px');
+    resultEl.className = 'geetest_result_tips_mock geetest_result_tips fail';
+    if (attemptCount >= MAX_ATTEMPTS) {
+      locked = true;
+      resultEl.textContent = 'Too many attempts';
+      statusEl.className = 'geetest_status_bar_mock geetest_status_bar fail';
+      log('LOCKED OUT');
+    } else {
+      resultEl.textContent = 'Please try again';
+      statusEl.className = 'geetest_status_bar_mock geetest_status_bar fail';
+      setTimeout(function() {
+        resetPuzzle();
+        log('Puzzle reset');
+      }, 1200);
+    }
+  }
+}
+
+// --- Event listeners ---
+handleEl.addEventListener('mousedown', onDragStart);
+handleEl.addEventListener('touchstart', onDragStart);
+document.addEventListener('mousemove', onDragMove);
+document.addEventListener('touchmove', onDragMove);
+document.addEventListener('mouseup', onDragEnd);
+document.addEventListener('touchend', onDragEnd);
+
+closeBtn.addEventListener('click', function() { hideCaptcha(); log('Closed'); });
+refreshBtn.addEventListener('click', function() {
+  attemptCount = 0; locked = false; resetPuzzle(); log('Refreshed');
+});
+
+// Float & Popup: "Click to verify" triggers captcha
+bindTrigger.addEventListener('click', function() {
+  if (currentStyle === 'popup') showCaptcha();
+});
+floatTrigger.addEventListener('click', function() {
+  if (currentStyle === 'float') showCaptcha();
+});
+// Bind: "login" button triggers captcha modal
+loginBtn.addEventListener('click', function() {
+  if (currentStyle === 'bind' && !captchaVisible) showCaptcha();
+  else if (solved) log('LOGIN: form would submit');
+  else if (!captchaVisible) { log('LOGIN: captcha required'); showCaptcha(); }
+});
+popupGhost.addEventListener('click', function() { hideCaptcha(); });
+bindGhost.addEventListener('click', function() { hideCaptcha(); });
+
+// --- Style switching ---
+function setStyle(style) {
+  currentStyle = style;
+  hideCaptcha();
+  solved = false; attemptCount = 0; locked = false;
+
+  bindTrigger.style.display = 'none';
+  floatTrigger.style.display = 'none';
+  bindTrigger.style.background = '';
+  bindTrigger.style.borderColor = '';
+  floatTrigger.style.background = '';
+  floatTrigger.style.borderColor = '';
+  var btexts = document.querySelectorAll('.geetest_bind_tips');
+  for (var i = 0; i < btexts.length; i++) {
+    btexts[i].textContent = 'Click to verify'; btexts[i].style.color = '';
+  }
+
+  if (style === 'float') floatTrigger.style.display = 'flex';
+  else if (style === 'popup') bindTrigger.style.display = 'flex';
+
+  var btns = styleSelector.querySelectorAll('button');
+  for (var j = 0; j < btns.length; j++)
+    btns[j].classList.toggle('active', btns[j].dataset.style === style);
+
+  log('Style: ' + style);
+}
+
+var styleBtns = styleSelector.querySelectorAll('button');
+for (var i = 0; i < styleBtns.length; i++)
+  styleBtns[i].addEventListener('click', function() { setStyle(this.dataset.style); });
+
+// --- Init ---
+var params = new URLSearchParams(window.location.search);
+var initStyle = params.get('style') || 'bind';
+if (['float', 'popup', 'bind'].indexOf(initStyle) === -1) initStyle = 'bind';
+
+log('GeeTest Slide CAPTCHA Mock v4');
+log('Style: ' + initStyle + ' (?style=float|popup|bind)');
+log('Load delay: ' + LOAD_DELAY + 'ms + ' + READY_DELAY + 'ms ready');
+log('Tolerance: \u00b1' + TOLERANCE + 'px, max attempts: ' + MAX_ATTEMPTS);
+setStyle(initStyle);
+</script>
+</body>
+</html>

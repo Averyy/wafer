@@ -118,6 +118,9 @@ class CookieCache:
             logger.debug(
                 "Skipped %d expired cookies for %s", expired, domain
             )
+            if not valid:
+                # All cookies expired — remove the file
+                self.clear(domain)
         return valid
 
     def save(self, domain: str, cookies: list[dict]) -> None:
@@ -126,6 +129,12 @@ class CookieCache:
             return
 
         now = time.time()
+
+        # Sweep stale domain files every ~10 saves
+        self._sweep_counter = getattr(self, "_sweep_counter", 0) + 1
+        if self._sweep_counter >= 10:
+            self._sweep_counter = 0
+            self._sweep_expired(now)
         existing = self._load_raw(domain)
 
         by_name: dict[str, dict] = {}
@@ -204,6 +213,38 @@ class CookieCache:
         if not self._cache_dir.exists():
             return []
         return [p.stem for p in self._cache_dir.glob("*.json")]
+
+    def _sweep_expired(self, now: float) -> None:
+        """Delete domain files where all cookies have expired.
+
+        Only inspects files not modified in the last 24 hours —
+        recently-written files almost certainly have valid cookies.
+        """
+        if not self._cache_dir.exists():
+            return
+        stale_threshold = now - 86400  # 24 hours
+        for path in self._cache_dir.glob("*.json"):
+            try:
+                if path.stat().st_mtime > stale_threshold:
+                    continue
+                with open(path) as f:
+                    entries = json.load(f)
+                if not isinstance(entries, list) or not entries:
+                    path.unlink(missing_ok=True)
+                    continue
+                has_valid = any(
+                    e.get("expires", 0) == 0
+                    or e.get("expires", 0) > now
+                    for e in entries
+                )
+                if not has_valid:
+                    path.unlink(missing_ok=True)
+                    logger.debug(
+                        "Swept expired cookie file: %s",
+                        path.stem,
+                    )
+            except (json.JSONDecodeError, OSError):
+                pass
 
     def _write_atomic(self, domain: str, entries: list[dict]) -> None:
         """Atomic write: temp file + flock + rename."""

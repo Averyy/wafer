@@ -246,14 +246,25 @@ DataDome **deactivated the image-matching slider globally** in Jan 2026. Replace
 | `soundcloud.com` | DataDome | pass | 2026-02-21: 200 47KB via TLS |
 | `seatgeek.com` | DataDome | pass | 2026-02-21: 200 838KB via TLS |
 
-### Alibaba Cloud CAPTCHA 2.0 (no drag solver yet)
+### Alibaba Baxia CAPTCHA (no drag solver yet)
 
-Alibaba's proprietary CAPTCHA. Slider mode (behavioral only) and puzzle mode (CV needed). See `drag-puzzle.md`.
+Alibaba's proprietary CAPTCHA (internal name: **Baxia**). Loaded via `baxiaCommon.js` from `assets.alicdn.com`. Slider mode (behavioral only) and puzzle mode (CV needed). `nc_` CSS prefix for NoCaptcha elements. See `drag-puzzle.md`.
 
 | URL | Challenge Type | Status | Notes |
 |---|---|---|---|
-| `aliexpress.com` | Alibaba slider/puzzle | no-drag | Primary drag solver target; login flow triggers slider |
-| `taobao.com` | Alibaba slider/puzzle | no-drag | Same backend; login-walled; Chinese IP required |
+| `aliexpress.com` | Alibaba Baxia | no-drag | 2026-02-22: Baxia SDK (`baxiaCommon.js`, `AWSC/awsc.js`) loads on all pages. Real browser passes invisible check — no interactive CAPTCHA triggered via search or login. Need deeper rate-limiting or non-browser client to trigger slider/puzzle. |
+| `taobao.com` | Alibaba Baxia | no-drag | Same Baxia backend; login-walled; Chinese IP required |
+
+### GeeTest v4 Slide
+
+GeeTest solver working (CV notch detection + mousse replay). 12/12 consecutive on demo. GeeTest loads dynamically in SPAs — need browser-level testing on real sites (navigate to login, submit form, observe if slide triggers).
+
+| URL | Challenge Type | Status | Notes |
+|---|---|---|---|
+| `geetest.com/en/adaptive-captcha-demo` | GeeTest v4 slide | browser-solve | 2026-02-22: **SOLVED** 12/12+ consecutive. CV + mousse replay. |
+| `bilibili.com` | Custom captcha | untested | 2026-02-22: **NOT GeeTest v4.** Custom captcha (`body__captcha-img_wp`). May have switched vendors. |
+| `kucoin.com` | GeeTest v4 slide | unverified | 2026-02-22: No GeeTest on login page load. SPA, may need form submission to trigger. |
+| `aerlingus.com` | GeeTest v3 click | unverified | 2026-02-22: **GeeTest v3** (gt.js + fullpage.9.2.0), not v4. Click-to-verify, not slide puzzle. 84 geetest elements. |
 
 ### Other Slider/Puzzle CAPTCHAs
 
@@ -317,8 +328,9 @@ Wafer has **no Arkose Labs solver**. Arkose presents 3D puzzle CAPTCHAs (rotate,
 | **Imperva** | Yes | 6 | Browser solve + cookie replay. Handles modern reese84, legacy ___utmvc, and classic incap_ses. |
 | **Kasada** | Yes | 7 | Browser solve extracts CT from ips.js/p.js. Cookie-based auth confirmed on realestate.com.au. CD (PoW) needs ST from /tl. |
 | **F5 Shape** | Yes | 3 | Browser solve — passive wait for istlWasHere interstitial to clear. |
+| **GeeTest v4** (slide) | Yes | 4 | Browser solve with CV notch detection + recorded mouse replay. **SOLVED** 12/12+ on demo. bilibili NOT GeeTest; aerlingus is GeeTest v3. |
 | **Arkose Labs** (FunCaptcha) | **No** | 4 | 3D puzzle CAPTCHA on login flows. Microsoft, Roblox, GitHub, EA. |
-| **Alibaba CAPTCHA 2.0** | **No** (planned) | 2 | Needs drag solver for slider/puzzle. See `drag-puzzle.md`. |
+| **Alibaba Baxia** | **No** (planned) | 2 | Baxia SDK on all AliExpress pages. Real browser passes invisible check — interactive CAPTCHA hard to trigger. |
 | **Chinese custom** (JD, Shopee) | **No** | 3 | Each has proprietary slider; needs per-vendor work. |
 | **In-house** (Shein, LinkedIn, etc.) | **No** | 10 | No generic approach; each is unique. |
 

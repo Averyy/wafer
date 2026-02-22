@@ -220,8 +220,8 @@ class TestEmbedMode:
         assert headers.get("Sec-Fetch-Dest") == "empty"
 
     @patch("time.sleep")
-    def test_embed_uses_referer_pool_origin_only(self, mock_sleep):
-        """Embed mode should use origin-only Referer (strip path)."""
+    def test_embed_uses_full_referer(self, mock_sleep):
+        """Embed mode should send full Referer URL (not origin-only)."""
         session, mock = make_sync_session(
             [MockResponse(200, body="ok")],
             embed_origin=self.SEAWAY_ORIGIN,
@@ -230,8 +230,7 @@ class TestEmbedMode:
         session.get(self.MT_TILE_URL)
 
         headers = mock.last_kwargs.get("headers", {})
-        # Should be origin-only, path stripped
-        assert headers.get("Referer") == "https://seaway-greatlakes.com/"
+        assert headers.get("Referer") == self.SEAWAY_REFERER
 
     @patch("time.sleep")
     def test_embed_no_referer_without_pool(self, mock_sleep):
@@ -267,7 +266,7 @@ class TestEmbedMode:
 
         headers = mock.last_kwargs.get("headers", {})
         # Should use embed referer pool, not auto-referer chain
-        assert headers.get("Referer") == "https://seaway-greatlakes.com/"
+        assert headers.get("Referer") == self.SEAWAY_REFERER
 
     @patch("time.sleep")
     def test_non_embed_mode_no_origin(self, mock_sleep):
@@ -294,8 +293,8 @@ class TestEmbedMode:
         headers = mock.last_kwargs.get("headers", {})
         assert headers.get("Origin") == self.SEAWAY_ORIGIN
         assert "X-Requested-With" not in headers
-        # Origin-only Referer (path stripped)
-        assert headers.get("Referer") == "https://seaway-greatlakes.com/"
+        # Full Referer URL
+        assert headers.get("Referer") == self.SEAWAY_REFERER
 
 
 # ---------------------------------------------------------------------------
@@ -487,7 +486,8 @@ class TestIframeEmbedMode:
 
         headers = mock.last_kwargs.get("headers", {})
         assert headers.get("Referer") == (
-            "https://seaway-greatlakes.com/"
+            "https://seaway-greatlakes.com/marine_traffic"
+            "/en/marineTraffic_stCatherine.html"
         )
 
     @patch("time.sleep")

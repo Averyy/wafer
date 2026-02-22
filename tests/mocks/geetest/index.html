@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>GeeTest CAPTCHA Mocks</title>
+<style>
+body { font-family: -apple-system, sans-serif; max-width: 600px; margin: 40px auto; padding: 20px; color: #333; }
+h1 { font-size: 22px; margin-bottom: 8px; }
+p { color: #666; font-size: 14px; margin-bottom: 24px; }
+.cards { display: flex; flex-direction: column; gap: 12px; }
+a.card {
+  display: block; padding: 16px 20px; border: 1px solid #e0e0e0; border-radius: 6px;
+  text-decoration: none; color: #333; transition: border-color 0.2s, box-shadow 0.2s;
+}
+a.card:hover { border-color: #4a90d9; box-shadow: 0 2px 8px rgba(74,144,217,0.15); }
+a.card h3 { font-size: 15px; margin: 0 0 4px; }
+a.card p { margin: 0; font-size: 13px; color: #888; }
+.card.disabled { opacity: 0.4; pointer-events: none; }
+.card .badge { font-size: 11px; padding: 2px 6px; border-radius: 3px; margin-left: 8px; }
+.badge.ready { background: #e6f7e6; color: #389e0d; }
+.badge.todo { background: #fff7e6; color: #d48806; }
+.styles { display: flex; gap: 8px; margin-top: 8px; }
+.styles a {
+  font-size: 12px; padding: 3px 10px; border: 1px solid #ddd; border-radius: 3px;
+  text-decoration: none; color: #4a90d9;
+}
+.styles a:hover { background: #f0f7ff; }
+</style>
+</head>
+<body>
+<h1>GeeTest CAPTCHA Mocks</h1>
+<p>Local reconstructions of GeeTest v4 CAPTCHA challenges for offline solver testing and mousse recording.</p>
+
+<div class="cards">
+  <a class="card" href="slide.html?style=bind">
+    <h3>Slide CAPTCHA <span class="badge ready">Ready</span></h3>
+    <p>Drag slider to align puzzle piece with notch cutout. All 3 animation styles supported.</p>
+    <div class="styles">
+      <a href="slide.html?style=float">Float</a>
+      <a href="slide.html?style=popup">Popup</a>
+      <a href="slide.html?style=bind">Bind</a>
+    </div>
+  </a>
+
+  <div class="card disabled">
+    <h3>Icon CAPTCHA <span class="badge todo">TODO</span></h3>
+    <p>Click icons in the correct order. Not yet implemented.</p>
+  </div>
+
+  <div class="card disabled">
+    <h3>Gobang CAPTCHA <span class="badge todo">TODO</span></h3>
+    <p>Connect-five game challenge. Not yet implemented.</p>
+  </div>
+
+  <div class="card disabled">
+    <h3>IconCrush CAPTCHA <span class="badge todo">TODO</span></h3>
+    <p>Match-3 icon crushing challenge. Not yet implemented.</p>
+  </div>
+</div>
+</body>
+</html>

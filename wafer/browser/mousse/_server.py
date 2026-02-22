@@ -7,7 +7,7 @@ from pathlib import Path
 
 _STATIC_DIR = Path(__file__).resolve().parent / "_static"
 _RECORDINGS_DIR = Path(__file__).resolve().parent.parent / "_recordings"
-_CATEGORIES = ("idles", "paths", "holds", "drags", "browses")
+_CATEGORIES = ("idles", "paths", "holds", "drags", "slide_drags", "browses")
 
 _CONTENT_TYPES = {
     ".html": "text/html; charset=utf-8",
@@ -18,7 +18,10 @@ _CONTENT_TYPES = {
 }
 
 # Target counts per the press-and-hold spec
-_TARGETS = {"idles": 30, "paths": 26, "holds": 20, "drags": 20, "browses": 20}
+_TARGETS = {
+    "idles": 30, "paths": 26, "holds": 20,
+    "drags": 20, "slide_drags": 15, "browses": 20,
+}
 
 _PATH_TARGETS = {
     "to_center_from_ul": 8,
@@ -194,6 +197,8 @@ class MousseHandler(BaseHTTPRequestHandler):
                 prefix = "hold"
             elif rec_type == "drags":
                 prefix = "drag"
+            elif rec_type == "slide_drags":
+                prefix = "slide"
             elif rec_type == "browses":
                 prefix = "browse"
             else:

@@ -45,6 +45,8 @@ resp.headers       # dict[str, str] — lowercase keys
 resp.url           # str — final URL after redirects
 resp.json()        # parsed JSON
 resp.raise_for_status()  # raises WaferHTTPError if not ok
+resp.get_all(key)  # list[str] — all values for a header (e.g. Set-Cookie)
+resp.retry_after   # float | None — parsed Retry-After header (seconds)
 
 # Metadata
 resp.elapsed        # float — seconds from request to response
@@ -64,9 +66,9 @@ session = SyncSession(
     # TLS fingerprint (defaults to newest Chrome)
     emulation=None,  # or rnet.Emulation.Chrome145
 
-    # Timeouts
-    connect_timeout=datetime.timedelta(seconds=10),
-    timeout=datetime.timedelta(seconds=30),
+    # Timeouts (float seconds or timedelta)
+    timeout=30,                                    # float/int seconds
+    connect_timeout=datetime.timedelta(seconds=10),  # or timedelta
 
     # Retry behavior
     max_retries=3,       # retries on 5xx / connection errors
@@ -123,11 +125,30 @@ Session methods (reuse connection, cookies, fingerprint):
 ```python
 session.get(url, **kwargs)
 session.post(url, **kwargs)
-session.request("CUSTOM", url, **kwargs)
-# ... all standard HTTP methods
+session.request("PATCH", url, **kwargs)
+# ... all standard HTTP methods (GET, POST, PUT, DELETE, HEAD, OPTIONS, PATCH, TRACE)
 ```
 
-All `**kwargs` are passed through to rnet (headers, body, params, etc.).
+All `**kwargs` are passed through to rnet. Common per-request options:
+
+```python
+import datetime
+
+# Custom headers (merged with session defaults; see wafer.DEFAULT_HEADERS)
+resp = session.get(url, headers={"X-Custom": "value"})
+
+# Per-request timeout (overrides session-level timeout)
+resp = session.get(url, timeout=datetime.timedelta(seconds=5))
+
+# Query parameters
+resp = session.get(url, params={"q": "search", "page": "1"})
+
+# Request body
+resp = session.post(url, json={"key": "value"})
+resp = session.post(url, form={"user": "alice", "pass": "secret"})  # URL-encoded
+resp = session.post(url, data=b"raw bytes")
+resp = session.post(url, content="string body")
+```
 
 ## TLS Fingerprinting
 
@@ -145,6 +166,45 @@ session = SyncSession(emulation=Emulation.Chrome145)
 The `sec-ch-ua` header is auto-generated to match the emulated Chrome version using the same GREASE algorithm as Chromium source.
 
 On repeated 403s, wafer automatically rotates to a different Chrome profile (different TLS fingerprint) and retries. After browser solving, the fingerprint is matched to the browser's real Chrome version.
+
+## Opera Mini Profile
+
+`Profile.OPERA_MINI` impersonates Opera Mini in Extreme/Mini data-saving mode. Real Opera Mini is a proxy browser: Opera's servers fetch pages, render them server-side with the Presto engine (frozen since 2015), and send compressed output to the phone. It is a pure HTTP/1.1 client with no JavaScript capability.
+
+This profile **bypasses rnet entirely** and uses Python's stdlib `urllib` with system OpenSSL for HTTP transport. This avoids Chrome-specific header leakage (no `Sec-Ch-Ua`, no `Sec-Fetch-*`) and produces a TLS fingerprint consistent with a server-side proxy (OpenSSL), not a browser (BoringSSL).
+
+Because Opera Mini cannot execute JavaScript, **challenge detection, fingerprint rotation, retry logic, and browser solving are all disabled** when this profile is active. Rate limiting still applies.
+
+Headers are realistic Opera Mini Extreme mode headers: Presto User-Agent string, `X-OperaMini-Features`, `X-OperaMini-Phone`, `X-OperaMini-Phone-UA`, `Device-Stock-UA`, and Opera Mini's distinct `Accept-Encoding` order. All version data (client versions, server/transcoder versions, device models) comes from confirmed real-world captures, not algorithmic guessing. A new randomized identity (device, locale, feature set) is bound per session.
+
+```python
+from wafer import SyncSession, AsyncSession, Profile
+
+# Sync
+with SyncSession(profile=Profile.OPERA_MINI) as session:
+    resp = session.get("https://example.com")
+    print(resp.status_code)
+    print(resp.text)
+
+# Async
+async with AsyncSession(profile=Profile.OPERA_MINI) as session:
+    resp = await session.get("https://example.com")
+```
+
+| Feature | Chrome (default) | Opera Mini |
+|---|---|---|
+| HTTP transport | rnet (Rust + BoringSSL) | stdlib urllib (system OpenSSL) |
+| HTTP version | HTTP/2 | HTTP/1.1 only |
+| TLS fingerprint | Chrome Emulation | System OpenSSL (server-like) |
+| User-Agent | Chrome | Opera Mini Presto proxy |
+| sec-ch-ua / Sec-Fetch-* | Generated | Not sent |
+| Challenge detection | All 14 WAF types | Disabled |
+| Fingerprint rotation | Cycles Chrome versions | Disabled |
+| Browser solving | Supported | Not available |
+| Rate limiting | Per-domain | Per-domain (same) |
+| Retry on 5xx | Yes | No (bypasses retry loop) |
+| HTTP methods | All (GET, POST, PUT, etc.) | GET only (`ValueError` on others) |
+| `add_cookie()` | Supported | Not supported (`NotImplementedError`) |
 
 ## Challenge Detection
 
@@ -201,6 +261,7 @@ Features:
 - LRU eviction (max 50 entries per domain by default)
 - Cookies from browser solving are automatically cached
 - Cached cookies are hydrated into the rnet cookie jar on session creation
+- `session.add_cookie(raw_set_cookie, url)` injects a `Set-Cookie` value into the jar (e.g., from browser solving replay)
 
 ## Rate Limiting
 
@@ -262,7 +323,7 @@ session = SyncSession(
 resp = session.get("https://www.marinetraffic.com/getData/get_data_json_4/z:11/X:285/Y:374/station:0")
 ```
 
-Sets: `Sec-Fetch-Mode: cors`, `Sec-Fetch-Dest: empty`, `Origin`, `Accept: */*`. No `X-Requested-With` (fetch() never sets it). Referer is origin-only (matches `strict-origin-when-cross-origin` policy).
+Sets: `Sec-Fetch-Mode: cors`, `Sec-Fetch-Dest: empty`, `Origin`, `Accept: */*`. Referer sends the full URL from `embed_referers` (matching `strict-origin-when-cross-origin` for same-protocol requests). No `X-Requested-With` — add it per-request for jQuery-style XHR: `headers={"X-Requested-With": "XMLHttpRequest"}`.
 
 ### Iframe Mode (navigation)
 
@@ -372,14 +433,14 @@ session = wafer.SyncSession(
 )
 for cookie in result.cookies:
     cookie_str = format_cookie_str(cookie)
-    session._client.cookie_jar.add(cookie_str, "https://api.target.com")
+    session.add_cookie(cookie_str, "https://api.target.com")
 
 resp = session.get("https://api.target.com/data")
 ```
 
 ## Mouse Recorder (Mousse)
 
-Dev tool for recording human mouse movements used by the browser solver. Recordings drive PerimeterX press-and-hold, drag-puzzle solvers, and browse replay (background mouse/scroll activity during all solver wait loops). See [`wafer/browser/mousse/README.md`](wafer/browser/mousse/README.md) for full documentation.
+Dev tool for recording human mouse movements used by the browser solver. Recordings drive PerimeterX press-and-hold, drag/slide puzzle solvers (GeeTest, Baxia/AliExpress), and browse replay (background mouse/scroll activity during all solver wait loops). Six recording modes: idle, path, hold, drag (puzzle), slide (full-width "slide to verify"), and browse. See [`wafer/browser/mousse/README.md`](wafer/browser/mousse/README.md) for full documentation.
 
 ```bash
 uv run python -m wafer.browser.mousse
@@ -390,8 +451,9 @@ uv run python -m wafer.browser.mousse
 All exceptions inherit from `WaferError`:
 
 ```python
-from wafer._errors import (
+from wafer import (
     WaferError,          # base
+    WaferTimeout,        # request exceeded timeout (also a TimeoutError)
     ChallengeDetected,   # WAF challenge unsolvable
     RateLimited,         # HTTP 429
     SessionBlocked,      # too many consecutive failures
@@ -407,9 +469,13 @@ except ChallengeDetected as e:
     print(e.challenge_type)  # "cloudflare"
     print(e.url)
     print(e.status_code)
+except WaferTimeout as e:
+    print(e.timeout_secs)    # deadline exceeded
 except RateLimited as e:
     print(e.retry_after)     # seconds, or None
 ```
+
+`WaferTimeout` inherits from both `WaferError` and `TimeoutError`, so `except WaferError` catches everything including timeouts.
 
 ## Logging
 
@@ -435,6 +501,8 @@ wafer/
   _solvers.py       # Inline solvers (ACW, Amazon, TMD)
   _cookies.py       # JSON disk cache with TTL and LRU
   _fingerprint.py   # Emulation profiles, sec-ch-ua generation
+  _profiles.py      # Profile enum (OPERA_MINI, etc.)
+  _opera_mini.py    # Opera Mini identity generation + stdlib HTTP transport
   _kasada.py        # Kasada CD (proof-of-work) generation
   _retry.py         # Retry strategy and backoff
   _ratelimit.py     # Per-domain rate limiting
@@ -450,6 +518,7 @@ wafer/
     _kasada.py      # Kasada challenge solver
     _shape.py       # F5 Shape challenge solver
     _awswaf.py      # AWS WAF challenge solver
+    _cv.py          # CV notch detection for drag/slider puzzles
 ```
 
 ## Development

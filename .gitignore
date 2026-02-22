@@ -28,4 +28,4 @@ data/
 # Dev artifacts
 tests/px_frame_dumps/
 tests/smoke_results.json
-docs/todo-*.md
+recon_output/

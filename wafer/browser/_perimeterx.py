@@ -361,7 +361,7 @@ def poll_perimeterx_cookies(page, timeout_ms: int) -> bool:
             try:
                 # Use element query, not string search — CSS class
                 # names like "px-captcha-container" cause false matches
-                # in page.content() (press-and-hold.md bug #7).
+                # in page.content() (perimeterx.md bug #7).
                 el = page.locator("#px-captcha")
                 if el.count() == 0:
                     time.sleep(0.5)

@@ -92,5 +92,13 @@ class WaferResponse:
         if not self.ok:
             raise WaferHTTPError(self.status_code, self.url)
 
+    def get_all(self, key: str) -> list[str]:
+        """Return all values for a header key (e.g. individual Set-Cookie entries)."""
+        if self._raw is None:
+            val = self.headers.get(key, "")
+            return [val] if val else []
+        return [v.decode() if isinstance(v, bytes) else v
+                for v in self._raw.headers.get_all(key)]
+
     def __repr__(self) -> str:
         return f"<WaferResponse [{self.status_code}]>"

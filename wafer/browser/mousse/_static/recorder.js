@@ -1,7 +1,7 @@
 /* Mousse — mouse movement recorder */
 
 // ── State ──────────────────────────────────────────────────────────────
-let mode = "idle"; // idle | path | hold | drag | browse
+let mode = "idle"; // idle | path | hold | drag | slide_drag | browse
 let state = "ready"; // ready | countdown | recording | preview
 let points = []; // raw captured points [{t, x, y}]
 let startTime = 0;
@@ -75,17 +75,157 @@ function getZones(direction) {
   return zones[direction];
 }
 
-function getDragZone() {
+// ── Drag puzzle state ───────────────────────────────────────────────────
+// Randomized per recording: track width 200-400px, random notch position,
+// random puzzle piece size. Simulates real slider CAPTCHAs so recordings
+// capture the fast-approach + slow-placement behavior at realistic scale.
+let dragPuzzle = null;
+
+function randomizeDragPuzzle() {
   const W = canvas.width, H = canvas.height;
+  const trackW = 200 + Math.floor(Math.random() * 201); // 200-400px
+  const trackH = 40;
+  const trackX = Math.floor((W - trackW) / 2); // centered
+  const trackY = Math.floor(H * 0.55);
+
+  // Puzzle piece: 40-80px wide
+  const pieceW = 40 + Math.floor(Math.random() * 41);
+  const pieceH = pieceW; // square
+
+  // Notch position: 15-95% along the usable track (covers short to near-end drags)
+  const usable = trackW - pieceW;
+  const notchFrac = 0.15 + Math.random() * 0.8;
+  const notchX = trackX + Math.floor(notchFrac * usable);
+  const notchY = Math.floor(H * 0.25) + Math.floor(Math.random() * (trackY - Math.floor(H * 0.25) - pieceH - 20));
+
+  // Background image area (above the track)
+  const bgX = trackX;
+  const bgY = notchY - 20;
+  const bgW = trackW;
+  const bgH = trackY - bgY - 10;
+
+  // Random palette for visual variety
+  const hue = Math.floor(Math.random() * 360);
+
+  dragPuzzle = {
+    trackX, trackY, trackW, trackH,
+    pieceW, pieceH,
+    notchX, notchY,
+    bgX, bgY, bgW, bgH,
+    hue,
+    // Handle starts at left edge of track
+    handleX: trackX,
+    handleY: trackY,
+    // Target: notch X is where the piece center should land
+    targetX: notchX + pieceW / 2,
+  };
+}
+
+function getDragZone() {
+  if (!dragPuzzle) randomizeDragPuzzle();
+  const p = dragPuzzle;
+  const handleW = p.trackH + 6;
   return {
-    start: { x: W * 0.08, y: H * 0.5 },
-    end: { x: W * 0.92, y: H * 0.5 },
+    start: { x: p.trackX + handleW / 2, y: p.trackY + p.trackH / 2 },
+    end: { x: p.targetX, y: p.trackY + p.trackH / 2 },
   };
 }
 
 function getHoldTarget() {
   return { x: canvas.width * 0.5, y: canvas.height * 0.5 };
 }
+
+// ── Slide drag state (simple left→right, no puzzle) ──────────────────
+let slideTrack = null;
+
+function randomizeSlideTrack() {
+  const W = canvas.width, H = canvas.height;
+  const trackW = 300; // exact Baxia NoCaptcha width
+  const trackH = 34;  // exact Baxia height
+  const trackX = Math.floor((W - trackW) / 2);
+  const trackY = Math.floor(H * 0.55);
+  const handleW = 42; // exact Baxia handle width
+
+  slideTrack = {
+    trackX, trackY, trackW, trackH, handleW,
+    handleX: trackX,
+    handleY: trackY,
+    maxSlide: trackW - handleW,
+  };
+}
+
+function getSlideZone() {
+  if (!slideTrack) randomizeSlideTrack();
+  const s = slideTrack;
+  return {
+    start: { x: s.trackX + s.handleW / 2, y: s.trackY + s.trackH / 2 },
+    end: { x: s.trackX + s.maxSlide + s.handleW / 2, y: s.trackY + s.trackH / 2 },
+  };
+}
+
+function drawSlideTrack() {
+  if (!slideTrack) randomizeSlideTrack();
+  const s = slideTrack;
+  const z = getSlideZone();
+
+  // Track background
+  ctx.fillStyle = "#333";
+  ctx.beginPath();
+  ctx.roundRect(s.trackX, s.trackY, s.trackW, s.trackH, 17);
+  ctx.fill();
+
+  // Fill bar (grows with drag)
+  let fillW = 0;
+  if (slideTrack._currentX !== undefined) {
+    fillW = slideTrack._currentX - z.start.x + s.handleW / 2;
+  }
+  if (fillW > 0) {
+    ctx.fillStyle = "#4caf50";
+    ctx.beginPath();
+    ctx.roundRect(s.trackX, s.trackY + 3, Math.min(fillW, s.trackW), s.trackH - 6, 14);
+    ctx.fill();
+  }
+
+  // "Slide to verify" text
+  ctx.fillStyle = "rgba(255,255,255,0.3)";
+  ctx.font = "14px 'DM Sans', sans-serif";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText("Slide to verify", s.trackX + s.trackW / 2, s.trackY + s.trackH / 2);
+
+  // Handle
+  let handleDrawX = s.trackX;
+  if (slideTrack._currentX !== undefined) {
+    handleDrawX = s.trackX + (slideTrack._currentX - z.start.x);
+  }
+  ctx.fillStyle = "#fff";
+  ctx.beginPath();
+  ctx.roundRect(handleDrawX, s.trackY + 2, s.handleW, s.trackH - 4, 15);
+  ctx.fill();
+  ctx.strokeStyle = "#999";
+  ctx.lineWidth = 1;
+  ctx.stroke();
+
+  // ">>" arrows on handle
+  ctx.fillStyle = "#999";
+  ctx.font = "bold 16px sans-serif";
+  ctx.textAlign = "center";
+  ctx.fillText("»", handleDrawX + s.handleW / 2, s.trackY + s.trackH / 2);
+
+  // "Sorry" text above
+  ctx.fillStyle = "rgba(255,255,255,0.4)";
+  ctx.font = "16px 'DM Sans', sans-serif";
+  ctx.fillText("Sorry, we have detected unusual traffic", canvas.width / 2, s.trackY - 60);
+
+  // Distance info
+  ctx.fillStyle = "rgba(255,255,255,0.2)";
+  ctx.font = "12px 'JetBrains Mono', monospace";
+  const dragDist = Math.round(z.end.x - z.start.x);
+  ctx.fillText(`${s.trackW}px track, ${dragDist}px slide`, s.trackX + s.trackW / 2, s.trackY + s.trackH + 20);
+}
+
+// Slide drag reuses drag state machine (approach → hover → drag)
+// but always drags to the right edge of the track.
 
 // ── Drawing helpers ────────────────────────────────────────────────────
 function clear() {
@@ -187,36 +327,161 @@ function drawGuides() {
       ctx.fillText("Press Space, then click and hold the red circle (12s)", canvas.width / 2, canvas.height - 20);
     }
   } else if (mode === "drag") {
-    const z = getDragZone();
-    drawCircle(z.start.x, z.start.y, ZONE_R, "#4ecca3", "START");
-    drawCircle(z.end.x, z.end.y, ZONE_R, "#e94560", "END");
-    ctx.strokeStyle = "#2a2a4a";
-    ctx.lineWidth = 2;
-    ctx.setLineDash([8, 8]);
-    ctx.beginPath();
-    ctx.moveTo(z.start.x, z.start.y);
-    ctx.lineTo(z.end.x, z.end.y);
-    ctx.stroke();
-    ctx.setLineDash([]);
-    // State-aware instruction text (prevents overlap)
-    ctx.font = "14px monospace";
-    ctx.textAlign = "center";
-    if (state === "recording" && dragStarted && dragReady) {
-      ctx.fillStyle = "#e94560";
-      ctx.fillText("Go \u2014 drag to the red zone!", canvas.width / 2, canvas.height - 20);
-    } else if (state === "recording" && dragStarted) {
-      ctx.fillStyle = "#4ecca3";
-      ctx.fillText("Hold still...", canvas.width / 2, canvas.height - 20);
-    } else if (state === "recording") {
-      ctx.fillStyle = "#4ecca3";
-      ctx.fillText("Move cursor into the green zone", canvas.width / 2, canvas.height - 20);
-    } else {
+    if (state === "ready") {
+      // Don't show puzzle until recording starts
       ctx.fillStyle = "#808090";
-      ctx.fillText("Press Space to begin", canvas.width / 2, canvas.height - 20);
+      ctx.font = "16px monospace";
+      ctx.textAlign = "center";
+      ctx.fillText("Drag puzzle — approach, pause, then drag", canvas.width / 2, canvas.height / 2 - 10);
+      ctx.font = "12px monospace";
+      ctx.fillText("Press Space to begin (random puzzle each time)", canvas.width / 2, canvas.height / 2 + 16);
+    } else {
+      drawDragPuzzle();
+      ctx.font = "14px monospace";
+      ctx.textAlign = "center";
+      if (dragStarted) {
+        ctx.fillStyle = "#e94560";
+        ctx.fillText("Drag to the notch \u2014 release when placed!", canvas.width / 2, canvas.height - 20);
+      } else if (dragApproached) {
+        ctx.fillStyle = "#4ecca3";
+        ctx.fillText("Pause naturally (look at puzzle), then click and drag", canvas.width / 2, canvas.height - 20);
+      } else {
+        ctx.fillStyle = "#808090";
+        ctx.fillText("Move cursor to the slider handle", canvas.width / 2, canvas.height - 20);
+      }
+    }
+  } else if (mode === "slide_drag") {
+    if (state === "ready") {
+      ctx.fillStyle = "#808090";
+      ctx.font = "16px monospace";
+      ctx.textAlign = "center";
+      ctx.fillText("Slide to verify — approach, pause, then slide right", canvas.width / 2, canvas.height / 2 - 10);
+      ctx.font = "12px monospace";
+      ctx.fillText("Press Space to begin (300px track, full-width drag)", canvas.width / 2, canvas.height / 2 + 16);
+    } else {
+      drawSlideTrack();
+      ctx.font = "14px monospace";
+      ctx.textAlign = "center";
+      if (dragStarted) {
+        ctx.fillStyle = "#e94560";
+        ctx.fillText("Slide all the way right \u2014 release at the end!", canvas.width / 2, canvas.height - 20);
+      } else if (dragApproached) {
+        ctx.fillStyle = "#4ecca3";
+        ctx.fillText("Pause naturally, then click and slide to the right", canvas.width / 2, canvas.height - 20);
+      } else {
+        ctx.fillStyle = "#808090";
+        ctx.fillText("Move cursor to the slider handle", canvas.width / 2, canvas.height - 20);
+      }
     }
   } else if (mode === "browse") {
     drawBrowsePage();
   }
+}
+
+// ── Drag puzzle rendering ─────────────────────────────────────────────
+function drawDragPuzzle() {
+  if (!dragPuzzle) randomizeDragPuzzle();
+  const p = dragPuzzle;
+
+  // Background "image" area — random colored shapes to simulate a puzzle background
+  ctx.fillStyle = `hsl(${p.hue}, 25%, 20%)`;
+  ctx.fillRect(p.bgX, p.bgY, p.bgW, p.bgH);
+  ctx.strokeStyle = `hsl(${p.hue}, 30%, 30%)`;
+  ctx.lineWidth = 1;
+  ctx.strokeRect(p.bgX, p.bgY, p.bgW, p.bgH);
+
+  // Draw some random shapes in the background for visual texture
+  const rng = mulberry32(p.hue * 137 + p.trackW);
+  for (let i = 0; i < 12; i++) {
+    const sx = p.bgX + rng() * p.bgW;
+    const sy = p.bgY + rng() * p.bgH;
+    const sr = 8 + rng() * 25;
+    const sh = (p.hue + Math.floor(rng() * 120)) % 360;
+    ctx.fillStyle = `hsla(${sh}, 40%, 35%, 0.5)`;
+    ctx.beginPath();
+    if (rng() > 0.5) {
+      ctx.arc(sx, sy, sr, 0, Math.PI * 2);
+    } else {
+      ctx.rect(sx - sr / 2, sy - sr / 2, sr, sr);
+    }
+    ctx.fill();
+  }
+
+  // Notch cutout (darker area where piece should go)
+  ctx.fillStyle = `hsla(0, 0%, 0%, 0.4)`;
+  ctx.fillRect(p.notchX, p.notchY, p.pieceW, p.pieceH);
+  ctx.strokeStyle = `hsla(0, 0%, 100%, 0.15)`;
+  ctx.lineWidth = 1;
+  ctx.strokeRect(p.notchX, p.notchY, p.pieceW, p.pieceH);
+
+  // Puzzle piece — moves with drag, starts at left side
+  const z = getDragZone();
+  let pieceDrawX = p.bgX; // default: left side
+  let handleDrawX = p.trackX; // default: left edge
+  if (p._currentX !== undefined) {
+    // Offset from start position
+    const dragOffset = p._currentX - z.start.x;
+    pieceDrawX = p.bgX + dragOffset;
+    handleDrawX = p.trackX + dragOffset;
+  }
+
+  // Draw piece
+  ctx.fillStyle = `hsl(${p.hue}, 30%, 40%)`;
+  ctx.fillRect(pieceDrawX, p.notchY, p.pieceW, p.pieceH);
+  ctx.strokeStyle = `hsl(${p.hue}, 40%, 55%)`;
+  ctx.lineWidth = 2;
+  ctx.strokeRect(pieceDrawX, p.notchY, p.pieceW, p.pieceH);
+  // Inner detail on piece
+  ctx.fillStyle = `hsl(${p.hue}, 35%, 50%)`;
+  const inset = Math.floor(p.pieceW * 0.2);
+  ctx.fillRect(pieceDrawX + inset, p.notchY + inset, p.pieceW - inset * 2, p.pieceH - inset * 2);
+
+  // Slider track
+  ctx.fillStyle = "#dee3eb";
+  ctx.fillRect(p.trackX, p.trackY, p.trackW, p.trackH);
+  ctx.strokeStyle = "#bcc3d0";
+  ctx.lineWidth = 1;
+  ctx.strokeRect(p.trackX, p.trackY, p.trackW, p.trackH);
+
+  // Track label
+  ctx.fillStyle = "#8090a0";
+  ctx.font = "11px sans-serif";
+  ctx.textAlign = "center";
+  ctx.fillText(`${p.trackW}px track`, p.trackX + p.trackW / 2, p.trackY + p.trackH + 16);
+
+  // Slider handle — moves with drag
+  const handleW = p.trackH + 6;
+  const handleH = p.trackH - 4;
+  const hx = handleDrawX - 1;
+  const hy = p.trackY + 2;
+  ctx.fillStyle = "#5682fd";
+  ctx.beginPath();
+  ctx.roundRect(hx, hy, handleW, handleH, 4);
+  ctx.fill();
+
+  // Arrow on handle
+  ctx.fillStyle = "#fff";
+  ctx.font = "16px sans-serif";
+  ctx.textAlign = "center";
+  ctx.fillText("\u25B6", hx + handleW / 2, p.trackY + p.trackH / 2 + 6);
+
+  // Track info
+  ctx.fillStyle = "#606080";
+  ctx.font = "10px monospace";
+  ctx.textAlign = "left";
+  const dragDist = Math.round(z.end.x - z.start.x);
+  ctx.fillText(`${p.pieceW}px piece, ${dragDist}px drag`, p.bgX + p.bgW + 8, p.notchY + p.pieceH / 2 + 4);
+}
+
+// Simple seedable PRNG for deterministic puzzle shapes
+function mulberry32(seed) {
+  let s = seed | 0;
+  return function() {
+    s = (s + 0x6D2B79F5) | 0;
+    let t = Math.imul(s ^ (s >>> 15), 1 | s);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
 }
 
 // ── Browse page rendering ──────────────────────────────────────────────
@@ -342,8 +607,11 @@ document.querySelectorAll(".stat[data-mode]").forEach(stat => {
   stat.addEventListener("click", () => switchMode(stat.dataset.mode));
 });
 
-// Also track drag recording state
-let dragStarted = false;
+// Drag recording state: approach → hover → mousedown → drag
+let dragApproached = false; // cursor entered handle zone, pre-drag recording started
+let dragStarted = false;    // mousedown happened, actively dragging
+let dragMouseDown = false;  // mouse button currently held
+let dragMousedownT = null;  // time of mousedown relative to recording start
 
 // Browse mode: scroll events captured separately
 let browseScrollEvents = [];
@@ -376,9 +644,10 @@ directionSelect.addEventListener("change", () => {
 
 // ── Stats ──────────────────────────────────────────────────────────────
 function updateStats(data) {
-  for (const cat of ["idles", "paths", "holds", "drags", "browses"]) {
+  for (const cat of ["idles", "paths", "holds", "drags", "slide_drags", "browses"]) {
     const el = document.getElementById(`stat-${cat}`);
     const info = data[cat];
+    if (!el || !info) continue;
     const valueEl = el.querySelector(".stat-value");
     if (valueEl) valueEl.textContent = `${info.count}/${info.target}`;
     const iconEl = el.querySelector(".stat-icon");
@@ -394,7 +663,7 @@ function updateStats(data) {
 }
 
 function syncActiveTab() {
-  const modeToStat = { idle: "stat-idles", path: "stat-paths", hold: "stat-holds", drag: "stat-drags", browse: "stat-browses" };
+  const modeToStat = { idle: "stat-idles", path: "stat-paths", hold: "stat-holds", drag: "stat-drags", slide_drag: "stat-slide_drags", browse: "stat-browses" };
   for (const [m, id] of Object.entries(modeToStat)) {
     document.getElementById(id).classList.toggle("active-tab", m === mode);
   }
@@ -415,9 +684,10 @@ function renderRecordings(data) {
   recordingsGrid.innerHTML = "";
   const emptyEl = document.getElementById("recordings-empty");
   let total = 0;
-  for (const cat of ["idles", "paths", "holds", "drags", "browses"]) total += data[cat].files.length;
+  for (const cat of ["idles", "paths", "holds", "drags", "slide_drags", "browses"]) total += (data[cat]?.files?.length || 0);
   if (emptyEl) emptyEl.classList.toggle("hidden", total > 0);
-  for (const cat of ["idles", "paths", "holds", "drags", "browses"]) {
+  for (const cat of ["idles", "paths", "holds", "drags", "slide_drags", "browses"]) {
+    if (!data[cat]) continue;
     for (const file of data[cat].files) {
       const thumb = document.createElement("div");
       thumb.className = "recording-thumb";
@@ -631,9 +901,25 @@ function startRecording() {
     updateButtons();
     drawGuides();
   } else if (mode === "drag") {
-    // Drag: wait for cursor to enter start zone (like path)
+    // Randomize puzzle for each recording — approach handle, pause, then drag
+    randomizeDragPuzzle();
+    delete dragPuzzle._currentX;
     state = "recording";
+    dragApproached = false;
     dragStarted = false;
+    dragMouseDown = false;
+    dragMousedownT = null;
+    updateButtons();
+    drawGuides();
+  } else if (mode === "slide_drag") {
+    // Slide to verify — same state machine as drag but full-width target
+    randomizeSlideTrack();
+    delete slideTrack._currentX;
+    state = "recording";
+    dragApproached = false;
+    dragStarted = false;
+    dragMouseDown = false;
+    dragMousedownT = null;
     updateButtons();
     drawGuides();
   } else if (mode === "browse") {
@@ -744,50 +1030,93 @@ canvas.addEventListener("mousemove", (e) => {
       }
     }
   } else if (mode === "drag") {
-    if (!dragStarted) {
-      // Check if cursor entered start zone
+    if (!dragApproached) {
+      // Check if cursor entered handle zone — starts pre-drag recording
       const z = getDragZone();
-      const dx = p.x - z.start.x, dy = p.y - z.start.y;
-      if (Math.sqrt(dx * dx + dy * dy) < ZONE_R) {
-        dragStarted = true;
-        dragReady = false;
+      const dx2 = p.x - z.start.x, dy2 = p.y - z.start.y;
+      if (Math.sqrt(dx2 * dx2 + dy2 * dy2) < ZONE_R + 10) {
+        dragApproached = true;
         startTime = performance.now();
         points = [{ t: 0, x: p.x, y: p.y }];
         drawGuides();
-        // After 500ms dwell, allow end-zone detection
-        setTimeout(() => {
-          if (!dragStarted) return;
-          dragReady = true;
-          drawGuides();
-        }, 500);
-        // Timeout after 5s
+        // Timeout after 10s
         recordingTimer = setTimeout(() => {
-          showStatus("Drag recording timed out (5s)", "error");
+          showStatus("Drag recording timed out (10s)", "error");
           discardRecording();
-        }, 5000);
+        }, 10000);
       }
-    } else {
+    } else if (!dragStarted) {
+      // Pre-drag hover phase — capture natural pause near handle
       points.push({ t: (performance.now() - startTime) / 1000, x: p.x, y: p.y });
-      // Draw trail
+      // Subtle hover trail
       if (points.length >= 2) {
         const prev = points[points.length - 2];
-        ctx.strokeStyle = "#e94560";
-        ctx.lineWidth = 2;
+        ctx.strokeStyle = "#4ecca340";
+        ctx.lineWidth = 1;
         ctx.lineCap = "round";
         ctx.beginPath();
         ctx.moveTo(prev.x, prev.y);
         ctx.lineTo(p.x, p.y);
         ctx.stroke();
       }
-      // Check if reached end zone — keep recording 500ms to capture settle
-      const z = getDragZone();
-      const dx = p.x - z.end.x, dy = p.y - z.end.y;
-      if (dragReady && Math.sqrt(dx * dx + dy * dy) < ZONE_R && !settleTimer) {
-        settleTimer = setTimeout(() => {
-          clearTimeout(recordingTimer);
-          finishRecording();
-        }, 500);
+    } else if (dragMouseDown) {
+      // Active drag phase
+      points.push({ t: (performance.now() - startTime) / 1000, x: p.x, y: p.y });
+      // Redraw entire puzzle with piece at current drag position
+      dragPuzzle._currentX = p.x;
+      clear();
+      drawDragPuzzle();
+      // Redraw full trail on top
+      if (points.length >= 2) {
+        drawPath(points, "#e94560", 2);
       }
+      // Instruction text
+      ctx.font = "14px monospace";
+      ctx.textAlign = "center";
+      ctx.fillStyle = "#e94560";
+      ctx.fillText("Drag to the notch \u2014 release when placed!", canvas.width / 2, canvas.height - 20);
+    }
+  } else if (mode === "slide_drag") {
+    if (!dragApproached) {
+      // Check if cursor entered handle zone
+      const z = getSlideZone();
+      const dx2 = p.x - z.start.x, dy2 = p.y - z.start.y;
+      if (Math.sqrt(dx2 * dx2 + dy2 * dy2) < ZONE_R + 10) {
+        dragApproached = true;
+        startTime = performance.now();
+        points = [{ t: 0, x: p.x, y: p.y }];
+        drawGuides();
+        recordingTimer = setTimeout(() => {
+          showStatus("Slide recording timed out (10s)", "error");
+          discardRecording();
+        }, 10000);
+      }
+    } else if (!dragStarted) {
+      // Pre-drag hover phase
+      points.push({ t: (performance.now() - startTime) / 1000, x: p.x, y: p.y });
+      if (points.length >= 2) {
+        const prev = points[points.length - 2];
+        ctx.strokeStyle = "#4ecca340";
+        ctx.lineWidth = 1;
+        ctx.lineCap = "round";
+        ctx.beginPath();
+        ctx.moveTo(prev.x, prev.y);
+        ctx.lineTo(p.x, p.y);
+        ctx.stroke();
+      }
+    } else if (dragMouseDown) {
+      // Active slide phase
+      points.push({ t: (performance.now() - startTime) / 1000, x: p.x, y: p.y });
+      slideTrack._currentX = p.x;
+      clear();
+      drawSlideTrack();
+      if (points.length >= 2) {
+        drawPath(points, "#e94560", 2);
+      }
+      ctx.font = "14px monospace";
+      ctx.textAlign = "center";
+      ctx.fillStyle = "#e94560";
+      ctx.fillText("Slide all the way right \u2014 release at the end!", canvas.width / 2, canvas.height - 20);
     }
   } else if (mode === "hold" && holdActive) {
     points.push({ t: (performance.now() - startTime) / 1000, x: p.x, y: p.y });
@@ -801,7 +1130,25 @@ canvas.addEventListener("mousemove", (e) => {
 });
 
 canvas.addEventListener("mousedown", (e) => {
-  if (state !== "recording" || mode !== "hold") return;
+  if (state !== "recording") return;
+
+  // Drag/slide_drag mode: mousedown transitions from pre-drag hover to active drag
+  if ((mode === "drag" || mode === "slide_drag") && dragApproached && !dragStarted) {
+    const p = canvasCoords(e);
+    const z = mode === "slide_drag" ? getSlideZone() : getDragZone();
+    const dx = p.x - z.start.x, dy = p.y - z.start.y;
+    // Must click near the handle
+    if (Math.sqrt(dx * dx + dy * dy) < ZONE_R + 10) {
+      dragStarted = true;
+      dragMouseDown = true;
+      dragMousedownT = (performance.now() - startTime) / 1000;
+      points.push({ t: dragMousedownT, x: p.x, y: p.y });
+      drawGuides();
+    }
+    return;
+  }
+
+  if (mode !== "hold") return;
   const p = canvasCoords(e);
   const t = getHoldTarget();
   const dx = p.x - t.x, dy = p.y - t.y;
@@ -846,12 +1193,32 @@ canvas.addEventListener("mousedown", (e) => {
   animFrameId = requestAnimationFrame(updateProgress);
 });
 
-canvas.addEventListener("mouseup", () => {
+canvas.addEventListener("mouseup", (e) => {
   if (holdActive) endHold();
+
+  // Drag/slide_drag mode: mouseup finishes the recording
+  if ((mode === "drag" || mode === "slide_drag") && dragStarted && dragMouseDown) {
+    dragMouseDown = false;
+    // Record the final release point
+    const p = canvasCoords(e);
+    points.push({ t: (performance.now() - startTime) / 1000, x: p.x, y: p.y });
+    if (points.length < 5) {
+      showStatus("Drag too short (need 5+ events)", "error");
+      discardRecording();
+      return;
+    }
+    clearTimeout(recordingTimer);
+    finishRecording();
+  }
 });
 
 canvas.addEventListener("mouseleave", () => {
   if (holdActive) endHold();
+  if ((mode === "drag" || mode === "slide_drag") && dragStarted && dragMouseDown) {
+    dragMouseDown = false;
+    showStatus("Mouse left canvas during drag", "error");
+    discardRecording();
+  }
 });
 
 canvas.addEventListener("wheel", (e) => {
@@ -950,14 +1317,23 @@ function finishRecording() {
     ctx.textAlign = "center";
     ctx.fillText(`${points.length} events, ${points[points.length - 1].t.toFixed(1)}s`, canvas.width / 2, canvas.height - 20);
   } else if (mode === "drag") {
-    const z = getDragZone();
-    drawCircle(z.start.x, z.start.y, ZONE_R, "#4ecca3", "START");
-    drawCircle(z.end.x, z.end.y, ZONE_R, "#e94560", "END");
+    drawDragPuzzle();
     drawPath(points, "#e94560", 2);
     ctx.fillStyle = "#808090";
     ctx.font = "14px monospace";
     ctx.textAlign = "center";
-    ctx.fillText(`${points.length} events, ${points[points.length - 1].t.toFixed(1)}s`, canvas.width / 2, canvas.height - 20);
+    const z = getDragZone();
+    const dragDist = Math.round(z.end.x - z.start.x);
+    ctx.fillText(`${points.length} events, ${points[points.length - 1].t.toFixed(1)}s, ${dragDist}px target drag`, canvas.width / 2, canvas.height - 20);
+  } else if (mode === "slide_drag") {
+    drawSlideTrack();
+    drawPath(points, "#e94560", 2);
+    ctx.fillStyle = "#808090";
+    ctx.font = "14px monospace";
+    ctx.textAlign = "center";
+    const z = getSlideZone();
+    const slideDist = Math.round(z.end.x - z.start.x);
+    ctx.fillText(`${points.length} events, ${points[points.length - 1].t.toFixed(1)}s, ${slideDist}px slide`, canvas.width / 2, canvas.height - 20);
   } else if (mode === "hold") {
     // Scatter plot of jitter
     const cx = canvas.width / 2, cy = canvas.height / 2;
@@ -1095,7 +1471,13 @@ async function acceptRecording() {
     };
   } else if (mode === "drag") {
     const z = getDragZone();
-    const sx = points[0].x, sy = points[0].y;
+    // Use mousedown point as drag origin (pre-drag hover is relative to this)
+    let mdIdx = 0;
+    if (dragMousedownT !== null) {
+      mdIdx = points.findIndex(p => p.t >= dragMousedownT);
+      if (mdIdx < 0) mdIdx = 0;
+    }
+    const sx = points[mdIdx].x, sy = points[mdIdx].y;
     const ex = z.end.x, ey = z.end.y;
     const dxRange = ex - sx;
 
@@ -1106,19 +1488,61 @@ async function acceptRecording() {
     }
 
     // ry normalized relative to horizontal displacement (captures wobble)
+    // Pre-drag hover events will have rx ≈ 0 (small jitter around handle)
     const rows = points.map(p => [
       parseFloat(p.t.toFixed(3)),
       parseFloat(((p.x - sx) / dxRange).toFixed(4)),
       parseFloat(((p.y - sy) / dxRange).toFixed(4)),
     ]);
+    const meta = {
+      viewport: vpStr,
+      start: `${Math.round(sx)},${Math.round(sy)}`,
+      end: `${Math.round(ex)},${Math.round(ey)}`,
+    };
+    if (dragMousedownT !== null) {
+      meta.mousedown_t = dragMousedownT.toFixed(3);
+    }
     payload = {
       type: "drags",
       columns: ["t", "rx", "ry"],
-      metadata: {
-        viewport: vpStr,
-        start: `${Math.round(sx)},${Math.round(sy)}`,
-        end: `${Math.round(ex)},${Math.round(ey)}`,
-      },
+      metadata: meta,
+      rows,
+    };
+  } else if (mode === "slide_drag") {
+    const z = getSlideZone();
+    let mdIdx = 0;
+    if (dragMousedownT !== null) {
+      mdIdx = points.findIndex(p => p.t >= dragMousedownT);
+      if (mdIdx < 0) mdIdx = 0;
+    }
+    const sx = points[mdIdx].x, sy = points[mdIdx].y;
+    const ex = z.end.x;
+    const dxRange = ex - sx;
+
+    if (Math.abs(dxRange) < 1) {
+      showStatus("Slide too short — discarding", "error");
+      discardRecording();
+      return;
+    }
+
+    // Normalize same as drag: rx relative to total slide distance, ry relative to |dxRange|
+    const rows = points.map(p => [
+      parseFloat(p.t.toFixed(3)),
+      parseFloat(((p.x - sx) / dxRange).toFixed(4)),
+      parseFloat(((p.y - sy) / dxRange).toFixed(4)),
+    ]);
+    const meta = {
+      viewport: vpStr,
+      start: `${Math.round(sx)},${Math.round(sy)}`,
+      end: `${Math.round(ex)},${Math.round(z.end.y)}`,
+    };
+    if (dragMousedownT !== null) {
+      meta.mousedown_t = dragMousedownT.toFixed(3);
+    }
+    payload = {
+      type: "slide_drags",
+      columns: ["t", "rx", "ry"],
+      metadata: meta,
       rows,
     };
   } else if (mode === "hold") {
@@ -1168,8 +1592,11 @@ function discardRecording() {
   holdActive = false;
   pathStarted = false;
   pathReady = false;
+  dragApproached = false;
   dragStarted = false;
   dragReady = false;
+  dragMouseDown = false;
+  dragMousedownT = null;
   browseScrollEvents = [];
   if (settleTimer) { clearTimeout(settleTimer); settleTimer = null; }
   const pb = document.getElementById("hold-progress");
@@ -1183,8 +1610,11 @@ function resetState() {
   points = [];
   pathStarted = false;
   pathReady = false;
+  dragApproached = false;
   dragStarted = false;
   dragReady = false;
+  dragMouseDown = false;
+  dragMousedownT = null;
   browseScrollEvents = [];
   if (settleTimer) { clearTimeout(settleTimer); settleTimer = null; }
   holdActive = false;
@@ -1256,7 +1686,7 @@ document.addEventListener("click", (e) => {
 function populateManage() {
   manageRows.innerHTML = "";
   let totalFiles = 0;
-  for (const cat of ["idles", "paths", "holds", "drags", "browses"]) {
+  for (const cat of ["idles", "paths", "holds", "drags", "slide_drags", "browses"]) {
     const info = allRecordings[cat] || { files: [], count: 0, target: 0 };
     totalFiles += info.count;
     const row = document.createElement("div");
@@ -1288,12 +1718,12 @@ function populateManage() {
 
 btnDeleteAll.addEventListener("click", async () => {
   let total = 0;
-  for (const cat of ["idles", "paths", "holds", "drags", "browses"]) {
+  for (const cat of ["idles", "paths", "holds", "drags", "slide_drags", "browses"]) {
     total += (allRecordings[cat]?.count || 0);
   }
   if (total === 0) return;
   if (!confirm(`Delete ALL ${total} recordings?`)) return;
-  for (const cat of ["idles", "paths", "holds", "drags", "browses"]) {
+  for (const cat of ["idles", "paths", "holds", "drags", "slide_drags", "browses"]) {
     for (const file of (allRecordings[cat]?.files || [])) {
       await fetch(`/api/recordings/${cat}/${file}`, { method: "DELETE" });
     }

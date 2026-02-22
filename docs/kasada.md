@@ -160,10 +160,6 @@ Does NOT need:
 | `draftkings.com` | unverified | Aggressive behavioral scoring. May use full CT+CD enforcement. |
 | `bet365.com` | unverified | Kasada + in-house (hardest known deployment). |
 
-Previously listed but **not Kasada** (verified Feb 2026):
-- `canadagoose.com` — DOSarrest (status 463), not Kasada
-- `hyatt.com` was originally listed as "Akamai only" — actually has both Akamai CDN + Kasada server-side
-
 ## References
 
 ### Open Source Tools
@@ -185,11 +181,6 @@ Previously listed but **not Kasada** (verified Feb 2026):
 - [kasada_cryptoPow.js gist](https://gist.github.com/Fweak/d101137cd4b909b9694457a7b1debb7c) (Fweak, Feb 2024) — **Fully extracted CD PoW algorithm**: SHA-256 hash grinding, `tp-v2-input` platform string, difficulty/subchallenges parameters
 - Commercial solvers (Hyper Solutions, antibot.to, Solverly, MeshPrivacy) accept script content as input — confirming dynamic interpretation is required for CT, not hardcoded logic
 
-### Commercial APIs (for reference/fallback)
+### Commercial APIs (fallback)
 
-| Service | Approach | Notes |
-|---------|----------|-------|
-| Hyper Solutions (`hyper-sdk-py`) | Server-side CT + CD generation | Python/JS/Go SDKs. Accepts script content as input. |
-| antibot.to | API for CT + CD | CD response: `{workTime, id, answers, duration}` |
-| Solverly | API for both phases | Similar to Hyper |
-| nocaptcha (chrisyp.github.io) | "Pure calculation mode" for CD | Confirms CT reusable, CD single-use |
+Hyper Solutions, antibot.to, Solverly, nocaptcha — all accept script content as input, confirming dynamic interpretation needed for CT. CD is single-use, CT is reusable.

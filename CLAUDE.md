@@ -5,10 +5,11 @@ Anti-detection HTTP client for Python. Wraps rnet with opinionated defaults for 
 ## References
 
 - `README.md` — full API documentation, architecture, usage examples
-- `docs/press-and-hold.md` — PerimeterX press-and-hold solver spec (architecture, bugs, live results)
-- `docs/todo-drag-puzzle.md` — drag/slider puzzle solver spec (DataDome, GeeTest, AliExpress, etc.)
 - `docs/site-list.md` — WAF benchmark targets organized by tier and vendor
-- `docs/kasada.md` — Kasada solver status, reference docs, and open validation gaps
+- `docs/perimeterx.md` — PerimeterX press-and-hold solver (architecture, bugs, live results)
+- `docs/kasada.md` — Kasada solver (CT/CD, open ST validation gap)
+- `docs/baxia.md` — Baxia/AliExpress slider solver (stealth, behavioral signals, TMD flow)
+- `docs/geetest.md` — GeeTest v4 slide CAPTCHA solver (CV, demo interaction, widget structure)
 - `wafer/browser/mousse/README.md` — mouse movement recorder tool docs
 
 ## Site List Maintenance
@@ -90,9 +91,15 @@ Also: **never send Host per-request** — rnet auto-sets it from the URL. Sendin
 - rnet's `Emulation` enum is the source of truth for browser fingerprints
 - Always default to the newest Chrome `Emulation` profile available (currently Chrome145)
 
+## Documentation Pattern
+
+**`docs/` is for long-term solver reference docs** — one per solver/WAF type. Each doc covers: status, architecture, key decisions, vendor behavior, detection signals, and test infrastructure. Keep them well-organized and essential — no task checklists, no recon procedures, no completed TODO items. Delete one-off recon scripts and task plans when done; preserve the knowledge in the solver doc.
+
+Current solver docs: `perimeterx.md`, `kasada.md`, `baxia.md`, `geetest.md`. Add new ones as solvers are built.
+
 ## Mousse (Mouse Recorder)
 
-Changes to mousse must update both `wafer/browser/mousse/README.md` and the "Mouse Recorder" section in `README.md`. Recording formats and targets are also referenced in `press-and-hold.md` and `drag-puzzle.md` — keep consistent.
+Changes to mousse must update both `wafer/browser/mousse/README.md` and the "Mouse Recorder" section in `README.md`. Recording formats and targets are also referenced in `perimeterx.md` and `baxia.md` — keep consistent.
 
 ### Browse Replay in Solvers
 

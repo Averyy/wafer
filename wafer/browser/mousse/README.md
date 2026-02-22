@@ -1,6 +1,6 @@
 # Mousse — Mouse Movement Recorder
 
-Dev tool for recording human mouse movements used by wafer's browser solver. Records idles, paths, holds, drags, and browses as CSV files consumed at runtime by `_solver.py`.
+Dev tool for recording human mouse movements used by wafer's browser solver. Records idles, paths, holds, drags, slide_drags, and browses as CSV files consumed at runtime by `_solver.py`.
 
 ## Usage
 
@@ -32,14 +32,33 @@ Move from a green start zone to a red end zone. Press Space, enter green zone, h
 Click and hold inside the red target circle for up to 12 seconds. Captures micro-tremor. Stored as `t,dx,dy` pixel deltas from mousedown point.
 
 ### Drag (20 needed)
-Horizontal drag from left green zone to right red zone. Same flow as paths (Space, enter start zone, dwell, drag to end). Stored as `t,rx,ry` normalized fractions.
+Simulate solving a slider puzzle. Press Space to see the puzzle, then:
+
+1. **Approach**: Move cursor to the slider handle (recording starts when you enter the handle zone)
+2. **Pause**: Hover near the handle naturally — look at the puzzle, decide where to drag. This pre-drag dwell (0.5-2s) is captured in the recording and replayed before mousedown, replacing synthetic sleep timers
+3. **Drag**: Click and drag horizontally to the notch position, release when placed
+
+The pause before clicking is critical — it captures real human "thinking time" and micro-jitter that WAF behavioral models check for. Don't rush it.
+
+Stored as `t,rx,ry` normalized fractions with `mousedown_t` in metadata marking when the drag phase begins. Pre-drag events have `rx ≈ 0` (hovering near handle).
+
+### Slide (15 needed)
+Simulate a "slide to verify" CAPTCHA — a confident full-width left-to-right drag. The slider matches real Baxia/AliExpress NoCaptcha dimensions (300px track, 42px handle, 34px height). Press Space to see the slider, then:
+
+1. **Approach**: Move cursor to the handle (recording starts when you enter the handle zone)
+2. **Pause**: Hover briefly near the handle — quick natural pause, no puzzle to study
+3. **Slide**: Click and drag all the way to the right edge, release at the end
+
+Unlike puzzle drags (which require careful placement), slides should be confident and fast — the real CAPTCHA checks behavioral signals, not positional accuracy.
+
+Stored as `t,rx,ry` normalized fractions (same format as puzzle drags) with `mousedown_t` in metadata. Saved to `slide_drags/` directory.
 
 ### Browse (20 needed)
 Simulate exploring a page — move mouse around naturally AND scroll up/down. Press Space, then move and scroll for 8 seconds. The fake page has randomized content length (3-12 sections) per recording to capture different scroll behaviors for short vs long pages. Section count is saved in metadata for page-length matching during replay. Captures both mouse movement and scroll wheel events. Stored as `t,dx,dy,scroll_y` where `scroll_y` is the wheel deltaY (0 for mouse-only events, positive for scroll-down, negative for scroll-up).
 
 ## Output
 
-CSV files saved to `wafer/browser/_recordings/{idles,paths,holds,drags,browses}/`.
+CSV files saved to `wafer/browser/_recordings/{idles,paths,holds,drags,slide_drags,browses}/`.
 
 Each CSV has a metadata comment line, header row, then data:
 
