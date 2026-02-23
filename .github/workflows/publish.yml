@@ -21,13 +21,13 @@ jobs:
         run: uv python install 3.12
 
       - name: Install dependencies
-        run: uv venv && uv pip install ".[dev]"
+        run: uv venv && uv pip install ".[dev,browser]"
 
       - name: Lint
         run: uv run ruff check wafer/ tests/
 
       - name: Test
-        run: uv run pytest tests/ -x -q --ignore=tests/test_session.py
+        run: uv run pytest tests/ -x -q
 
       - name: Build
         run: uv build
