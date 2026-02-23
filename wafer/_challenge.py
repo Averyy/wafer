@@ -32,6 +32,8 @@ class ChallengeType(enum.Enum):
     VERCEL = "vercel"
     ARKOSE = "arkose"
     GEETEST = "geetest"
+    HCAPTCHA = "hcaptcha"
+    RECAPTCHA = "recaptcha"
     GENERIC_JS = "generic_js"
 
 
@@ -42,6 +44,8 @@ JS_ONLY_CHALLENGES = frozenset({
     ChallengeType.CLOUDFLARE,
     ChallengeType.KASADA,
     ChallengeType.VERCEL,
+    ChallengeType.HCAPTCHA,
+    ChallengeType.RECAPTCHA,
     ChallengeType.GENERIC_JS,
 })
 
@@ -274,6 +278,19 @@ def detect_challenge(
             logger.info("Challenge detected (body): arkose")
             return ChallengeType.ARKOSE
 
+        # hCaptcha — checkbox/image CAPTCHA on login/gate pages
+        if "hcaptcha.com" in body_lower or "h-captcha" in body_lower:
+            logger.info("Challenge detected (body): hcaptcha")
+            return ChallengeType.HCAPTCHA
+
+        # reCAPTCHA — checkbox/invisible CAPTCHA
+        if (
+            "google.com/recaptcha" in body_lower
+            or "g-recaptcha" in body_lower
+        ):
+            logger.info("Challenge detected (body): recaptcha")
+            return ChallengeType.RECAPTCHA
+
         # Generic JS fallback — 403/429 with script tag + small body
         if "<script" in body_lower and len(body) < 50_000:
             logger.info("Challenge detected: generic_js")
@@ -306,5 +323,21 @@ def detect_challenge(
     ):
         logger.info("Challenge detected (body): geetest")
         return ChallengeType.GEETEST
+
+    # hCaptcha on 200 — small challenge/gate page
+    if status_code == 200 and len(body) < 100_000 and (
+        "hcaptcha.com/1/api.js" in body
+        or "data-hcaptcha-widget-id" in body
+    ):
+        logger.info("Challenge detected (body): hcaptcha")
+        return ChallengeType.HCAPTCHA
+
+    # reCAPTCHA on 200 — small challenge/gate page
+    if status_code == 200 and len(body) < 100_000 and (
+        "google.com/recaptcha" in body
+        or "g-recaptcha" in body
+    ):
+        logger.info("Challenge detected (body): recaptcha")
+        return ChallengeType.RECAPTCHA
 
     return None

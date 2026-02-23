@@ -4,7 +4,7 @@
 
 **Detection**: Done. HTTP-level: `/_____tmd_____/punish` in response body (`_challenge.py`). Browser-level: `#nc_1_n1z` handle or `#nc_1_wrapper` in DOM (`_drag.py::detect_drag_vendor`).
 
-**Browser solve**: Done. Live-solved on AliExpress (Feb 2026). Stealth route injection patches `navigator.webdriver`. Result detected via URL navigation (page leaves punish URL).
+**Browser solve**: Done. Live-solved on AliExpress (Feb 2026). System Chrome with `--disable-blink-features=AutomationControlled` provides native `navigator.webdriver=false`. Result detected via URL navigation (page leaves punish URL).
 
 **Dispatch**: `challenge_type="tmd"` or `"baxia"` routes to `solve_baxia()` in `_solver.py`.
 
@@ -12,8 +12,7 @@
 
 ```
 wafer/browser/
-  _solver.py          # BrowserSolver: stealth route injection (_install_stealth_route),
-                      #   mouse replay, solve() dispatch for "baxia"/"tmd"
+  _solver.py          # BrowserSolver: mouse replay, solve() dispatch for "baxia"/"tmd"
   _drag.py            # Baxia-specific: _find_baxia_frame, _get_baxia_geometry,
                       #   _attempt_baxia_drag (retry loop), _check_baxia_result,
                       #   _page_left_punish, solve_baxia
@@ -66,15 +65,11 @@ wafer/browser/
 
 ### navigator.webdriver — Root Cause of All Rejections
 
-Baxia NoCaptcha SDK checks `navigator.webdriver` and auto-rejects any interaction from automated browsers, regardless of mouse behavior quality. Patchright 1.58.0 does NOT patch this.
+Baxia NoCaptcha SDK checks `navigator.webdriver` and auto-rejects any interaction from automated browsers, regardless of mouse behavior quality.
 
-**Fix**: `_install_stealth_route(page)` in `_solver.py` intercepts document navigations via `page.route("**/*", ...)` and injects a `<script>` tag that overrides `Navigator.prototype.webdriver` getter to return `false`. Runs before any page scripts.
+**Fix**: `--disable-blink-features=AutomationControlled` Chrome launch flag makes `navigator.webdriver` return `false` via a native `[native code]` getter. No JS injection needed. System Chrome headful provides real plugins, WebGL, permissions, and voices natively.
 
-**What failed**:
-- `page.add_init_script()` — breaks DNS resolution in Patchright (`ERR_NAME_NOT_RESOLVED`)
-- `--disable-blink-features=AutomationControlled` — doesn't fix webdriver in Patchright
-- CDP `Page.addScriptToEvaluateOnNewDocument` — doesn't override the getter
-- Patchright's own Chromium — same `webdriver=true`
+**Previous approach (removed)**: Route interception injected JS overrides into every document response. This was actively harmful — the `() => false` arrow function was detectable via `toString()`, and route interception broke WAF iframes (DataDome WASM PoW, CSP, SRI).
 
 ### Result Detection via URL Navigation
 

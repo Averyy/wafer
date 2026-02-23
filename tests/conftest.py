@@ -268,6 +268,7 @@ def make_sync_session(responses, **session_kwargs):
     session._request_count = 0
     session._profile = session_kwargs.get("profile", None)
     session._om_identity = None
+    session._safari_identity = None
 
     use_cookie_jar = session_kwargs.get("use_cookie_jar", False)
     jar = MockJar() if use_cookie_jar else None
@@ -320,6 +321,7 @@ def make_async_session(responses, **session_kwargs):
     session._rotate_lock = asyncio.Lock()
     session._profile = session_kwargs.get("profile", None)
     session._om_identity = None
+    session._safari_identity = None
 
     async_responses = to_async_responses(responses)
     use_cookie_jar = session_kwargs.get("use_cookie_jar", False)

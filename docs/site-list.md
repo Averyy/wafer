@@ -5,6 +5,18 @@
 > Never assume a site's challenge type — confirm by inspecting response headers, cookies,
 > and body content against a live fetch. Mark unverified sites accordingly.
 
+## Maintenance Rules
+
+**Keep this list continuously up to date.** WAF challenges are intermittent — a site that passes today may challenge tomorrow. Update whenever:
+
+- A site escalates to a browser challenge or interactive CAPTCHA during testing
+- A previously-passing site starts returning 403s or challenge pages
+- A new WAF vendor, challenge type, or unique behavior is encountered
+- A site's tier changes (e.g., was Tier 2 TLS-only, now requires browser solve)
+- Live testing produces new status data (pass/fail/browser-solve)
+
+When updating, change the **Status** column and add a date + note. Don't assume a site's current behavior is permanent.
+
 **Status values:**
 - `pass` — confirmed working via TLS only (rnet Emulation)
 - `browser-solve` — needs browser solver, confirmed working
@@ -54,8 +66,8 @@ Passes with rnet Chrome Emulation (JA3/JA4 + H2 fingerprint match).
 | `aircanada.com` | Akamai (_abck + bm_sz) | pass | 301 -> Akamai challenge page with sensor scripts |
 | `crateandbarrel.com` | Akamai (_abck) | pass | 2026-02-21: 200 689KB via TLS. Sensor script + akam-sw.js service worker confirmed |
 | `nike.com` | Akamai (_abck + bm_sz) | pass | 2026-02-21: 200 691KB via TLS |
-| `ebay.com` | Akamai (_abck) | pass | 2026-02-21: 200 806KB via TLS |
-| `delta.com` | Akamai | pass | 2026-02-21: 200 16KB via TLS. Airline-grade Akamai; small homepage |
+| `www.ebay.com` | Akamai (_abck) | pass | 2026-02-21: 200 806KB via TLS. Bare `ebay.com` redirects to `www.` |
+| `www.delta.com` | Akamai | pass | 2026-02-21: 200 16KB via TLS. Airline-grade Akamai; small homepage. Bare `delta.com` refuses connections — must use `www.` |
 | `costco.com` | Akamai | pass | 2026-02-21: 200 3.4MB via TLS. Major US warehouse retail |
 | `kroger.com` | Akamai | pass | 2026-02-21: 200 513KB via TLS. Major US grocery |
 | `samsclub.com` | Akamai | pass | 2026-02-21: 200 495KB via TLS. Walmart subsidiary |
@@ -143,14 +155,14 @@ Requires browser solver for initial solve, then TLS client replays cached cookie
 |---|---|---|---|
 | `g2.com` | DataDome | pass | 2026-02-21: 200 420KB via TLS — no DD challenge on homepage. Previously required browser-solve. |
 | `airbnb.com` | DataDome | pass | 2026-02-21: 200 583KB via TLS — no DD challenge on homepage |
-| `neimanmarcus.com` | DataDome | browser-solve | 2026-02-21: Browser-solve verified. 403→browser→datadome cookie→200 760KB |
+| `neimanmarcus.com` | DataDome | browser-solve | 2026-02-21: Browser-solve verified. 403→browser→datadome cookie→200 760KB. 2026-02-22: passed TLS-only (intermittent) |
 | `idealista.com` | DataDome | browser-solve | 2026-02-21: Browser-solve verified. 403→browser→datadome cookie→200 89KB |
 | `ra.co` | DataDome | pass | 2026-02-21: 200 340KB via TLS (3.0s slow) |
 | `klwines.com` | DataDome | pass | 2026-02-21: 200 292KB via TLS |
 | `leboncoin.fr` | DataDome | pass | 2026-02-21: 200 357KB via TLS — no DD challenge on homepage |
 | `allegro.pl` | DataDome | browser-solve | 2026-02-21: Browser-solve verified. 403→browser→datadome cookie→200 1.3MB |
 | `deezer.com` | DataDome | pass | 2026-02-21: 200 188KB via TLS |
-| `tripadvisor.com` | DataDome | browser-solve | 2026-02-21: Browser-solve verified. 403→browser→datadome cookie→200 379KB. Major travel site |
+| `tripadvisor.com` | DataDome | browser-solve | 2026-02-21: Browser-solve verified. 403→browser→datadome cookie→200 379KB. Major travel site. 2026-02-22: passed TLS-only (intermittent) |
 
 ### Akamai
 
@@ -173,14 +185,14 @@ Requires browser solver for initial solve, then TLS client replays cached cookie
 |---|---|---|---|
 | `amadeus.com` | Imperva (reese84) | pass | 2026-02-21: 200 183KB via TLS — no challenge on homepage. Previously required browser-solve |
 | `anz.com.au` | Imperva (reese84) | pass | 2026-02-21: 200 323KB via TLS |
-| `www.hkbea.com/html/en/index.html` | Imperva (incap_ses) | untested | 2026-02-21: Bare `hkbea.com` DNS NXDomain — only `www.hkbea.com` resolves. URL updated. |
+| `www.hkbea.com/html/en/index.html` | Imperva (incap_ses) | pass | 2026-02-22: 200 162KB via TLS. Bare `hkbea.com` DNS NXDomain — only `www.hkbea.com` resolves. |
 | `appdev.pwc.com` | Imperva (___utmvc) | pass | 2026-02-21: 200 3KB via TLS — Imperva challenge not triggered |
 
 ### AWS WAF
 
 | URL | Challenge Type | Status | Notes |
 |---|---|---|---|
-| `amazon.com` | AWS WAF JS challenge | browser-solve | 2026-02-21: Browser-solve verified. 202→browser→aws-waf-token→200 790KB |
+| `amazon.com` | AWS WAF JS challenge | browser-solve | 2026-02-21: Browser-solve verified. 202→browser→aws-waf-token→200 790KB. 2026-02-22: passed TLS-only (intermittent) |
 | `booking.com` | AWS WAF | browser-solve | 2026-02-21: Browser-solve verified. 202→browser→200 487KB |
 | `shutterstock.com` | DataDome | browser-solve | 2026-02-21: Browser-solve verified. 403→browser→datadome cookie→200 978KB. **Reclassified from AWS WAF to DataDome** |
 | `stubhub.com` | AWS WAF | pass | 2026-02-21: 200 182KB via TLS |
@@ -189,7 +201,7 @@ Requires browser solver for initial solve, then TLS client replays cached cookie
 
 Kasada solver: browser solve extracts CT token from ips.js/p.js response, cookies provide session auth. CD (proof-of-work) requires ST from /tl endpoint — not all deployments provide it.
 
-**Validation gap**: No site found that returns `x-kpsdk-st`. The CT+CD per-request header injection path (`generate_cd()`) is unit-tested but has zero live validation. Both confirmed sites use cookie-only auth (no ST). Looking for a Kasada deployment with ST to validate the full flow — see `kasada.md` "Open: ST/CD Flow Validation".
+**Validation gap**: No site found that returns `x-kpsdk-st`. The CT+CD per-request header injection path (`generate_cd()`) is unit-tested but has zero live validation. Both confirmed sites use cookie-only auth (no ST). Looking for a Kasada deployment with ST to validate the full flow — see `ref-kasada.md` "Open: ST/CD Flow Validation".
 
 | URL | Challenge Type | Status | Notes |
 |---|---|---|---|
@@ -199,14 +211,14 @@ Kasada solver: browser solve extracts CT token from ips.js/p.js response, cookie
 | `vividseats.com` | Kasada (client-side) | pass | 2026-02-21: 200 343KB via TLS. No server-side enforcement |
 | `footlocker.co.uk` | Kasada (client-side) | pass | 2026-02-21: 200 593KB via TLS. Kasada SDK in page but no server-side enforcement |
 | `wizzair.com` | Kasada (unverified) | pass | 2026-02-21: 200 1.9MB via TLS (302→/en-gb→200). No Kasada markers found |
-| `gql.twitch.tv/integrity` | Kasada (API) | untested | 2026-02-21: Returns x-kpsdk-ct on POST (no browser needed). Twitch uses Kasada for integrity tokens. |
+| `gql.twitch.tv/integrity` | Kasada (API, full CT+CD) | untested | 2026-02-23: Confirmed full Kasada flow (p.js from k.twitchcdn.net, /tl returns both CT+ST). Commercial solvers confirm CD required. API-style POST, not page-navigate. Needs browser solver extension to capture ST from /tl response. |
 
 ### F5 Shape
 
 | URL | Challenge Type | Status | Notes |
 |---|---|---|---|
 | `nordstrom.com` | F5 Shape | browser-solve | 2026-02-21: 200+istlWasHere detected, browser-solve → 42 cookies, E2E 407KB real page |
-| `target.com` | F5 Shape | unverified | Custom `ssx.mod.js`; no Shape markers found |
+| `target.com` | F5 Shape | pass | 2026-02-22: 200 342KB via TLS. Custom `ssx.mod.js`; no Shape markers found |
 
 ## Tier 4: Interactive CAPTCHA (press-and-hold, slider)
 
@@ -225,7 +237,7 @@ Requires browser solver with human-like mouse input.
 | `academy.com` | PX press-and-hold | pass | 2026-02-21: 200 855KB via TLS |
 | `belk.com` | PX press-and-hold | pass | 2026-02-21: 200 1.4MB via TLS |
 | `realtor.com` | Kasada | browser-solve | 2026-02-21: Browser-solve verified. 429→browser→kasada cookies→200 286KB. **Reclassified from PX to Kasada** |
-| `homedepot.com` | Akamai | browser-solve | 2026-02-21: Browser-solve verified. akamai challenge→browser→200 971KB. **Reclassified from PX to Akamai** |
+| `homedepot.com` | Akamai | browser-solve | 2026-02-21: Browser-solve verified. akamai challenge→browser→200 971KB. **Reclassified from PX to Akamai**. 2026-02-22: passed TLS-only (intermittent) |
 | `indeed.com` | PX | pass | 2026-02-21: 200 660KB via TLS |
 | `priceline.com` | PX | pass | 2026-02-21: 200 625KB via TLS |
 | `lanebryant.com` | PX | pass | 2026-02-21: 200 515KB via TLS |
@@ -235,25 +247,25 @@ Requires browser solver with human-like mouse input.
 | `bkstr.com` | PX | pass | 2026-02-21: 200 31KB via TLS |
 | `hibbett.com` | PX press-and-hold | blocked | 2026-02-21: PX challenge for TLS but browser passes without challenge → no _px3 cookie → cookie replay impossible. IP burned during testing. Sneaker retailer, aggressive PX config |
 
-### DataDome (slider globally deactivated Jan 2026)
+### DataDome (slider + VM PoW)
 
-DataDome **deactivated the image-matching slider globally** in Jan 2026. Replaced with VM fingerprint (`plv3`) + WASM PoW, which run automatically in a real browser. These sites now use the JS interstitial flow, same as Tier 3 DataDome above.
+DataDome shifted to VM fingerprint (`plv3`) + WASM PoW in Jan 2026, which auto-resolve in a real browser. A jigsaw puzzle slider (ArgoZhang/SliderCaptcha) may still appear on some deployments. Solver handles both: auto-resolve (no interaction) and puzzle slider (CV notch detection + mousse drag).
 
 | URL | Challenge Type | Status | Notes |
 |---|---|---|---|
 | `pokemoncenter.com` | DataDome | pass | 2026-02-21: 200 698KB via TLS — no DD challenge on homepage |
-| `etsy.com` | DataDome | browser-solve | 2026-02-21: Browser-solve verified. 403→browser→datadome cookie→200 238KB |
+| `etsy.com` | DataDome | browser-solve | 2026-02-21: Browser-solve verified. 403→browser→datadome cookie→200 238KB. 2026-02-22: passed TLS-only (intermittent) |
 | `soundcloud.com` | DataDome | pass | 2026-02-21: 200 47KB via TLS |
 | `seatgeek.com` | DataDome | pass | 2026-02-21: 200 838KB via TLS |
 
-### Alibaba Baxia CAPTCHA (no drag solver yet)
+### Alibaba Baxia CAPTCHA
 
-Alibaba's proprietary CAPTCHA (internal name: **Baxia**). Loaded via `baxiaCommon.js` from `assets.alicdn.com`. Slider mode (behavioral only) and puzzle mode (CV needed). `nc_` CSS prefix for NoCaptcha elements. See `drag-puzzle.md`.
+Alibaba's proprietary CAPTCHA (internal name: **Baxia**). Loaded via `baxiaCommon.js` from `assets.alicdn.com`. Slider mode (full-width drag, behavioral only) solved with mousse replay. `nc_` CSS prefix for NoCaptcha elements. See `docs/ref-baxia.md`.
 
 | URL | Challenge Type | Status | Notes |
 |---|---|---|---|
-| `aliexpress.com` | Alibaba Baxia | no-drag | 2026-02-22: Baxia SDK (`baxiaCommon.js`, `AWSC/awsc.js`) loads on all pages. Real browser passes invisible check — no interactive CAPTCHA triggered via search or login. Need deeper rate-limiting or non-browser client to trigger slider/puzzle. |
-| `taobao.com` | Alibaba Baxia | no-drag | Same Baxia backend; login-walled; Chinese IP required |
+| `aliexpress.com` | Alibaba Baxia | browser-solve | 2026-02-22: Baxia SDK (`baxiaCommon.js`, `AWSC/awsc.js`) loads on all pages. Solver live-tested. Real browser often passes invisible check — interactive CAPTCHA triggers on rate-limiting or punish redirect. |
+| `taobao.com` | Alibaba Baxia | browser-solve | Same Baxia backend; login-walled; Chinese IP required |
 
 ### GeeTest v4 Slide
 
@@ -263,7 +275,7 @@ GeeTest solver working (CV notch detection + mousse replay). 12/12 consecutive o
 |---|---|---|---|
 | `geetest.com/en/adaptive-captcha-demo` | GeeTest v4 slide | browser-solve | 2026-02-22: **SOLVED** 12/12+ consecutive. CV + mousse replay. |
 | `bilibili.com` | Custom captcha | untested | 2026-02-22: **NOT GeeTest v4.** Custom captcha (`body__captcha-img_wp`). May have switched vendors. |
-| `kucoin.com` | GeeTest v4 slide | unverified | 2026-02-22: No GeeTest on login page load. SPA, may need form submission to trigger. |
+| `kucoin.com` | GeeTest v4 slide | pass | 2026-02-22: 200 394KB via TLS. No GeeTest triggered. SPA, may need form submission to trigger. |
 | `aerlingus.com` | GeeTest v3 click | unverified | 2026-02-22: **GeeTest v3** (gt.js + fullpage.9.2.0), not v4. Click-to-verify, not slide puzzle. 84 geetest elements. |
 
 ### Other Slider/Puzzle CAPTCHAs
@@ -322,15 +334,17 @@ Wafer has **no Arkose Labs solver**. Arkose presents 3D puzzle CAPTCHAs (rotate,
 |---|---|---|---|
 | **Cloudflare** (JS + Turnstile) | Yes | 15 | Browser solve + cookie replay. 30 min TTL. |
 | **Akamai** | Yes | 18 | Browser solve. Cookie replay difficult (_abck continuously validated). |
-| **DataDome** | Yes | 17 | Browser solve + cookie replay. Match OS. Slider deactivated Jan 2026; VM+PoW runs in browser. |
+| **DataDome** | Yes | 17 | Browser solve + cookie replay. Match OS. VM+PoW auto-resolves in browser. Puzzle slider solver ready (CV + mousse drag) if DD escalates. |
 | **PerimeterX** (press-and-hold) | Yes | 21 | Browser solve with recorded mouse input. **SOLVED** on wayfair. |
 | **AWS WAF** | Yes | 6 | Browser solve for JS challenge. |
 | **Imperva** | Yes | 6 | Browser solve + cookie replay. Handles modern reese84, legacy ___utmvc, and classic incap_ses. |
 | **Kasada** | Yes | 7 | Browser solve extracts CT from ips.js/p.js. Cookie-based auth confirmed on realestate.com.au. CD (PoW) needs ST from /tl. |
 | **F5 Shape** | Yes | 3 | Browser solve — passive wait for istlWasHere interstitial to clear. |
 | **GeeTest v4** (slide) | Yes | 4 | Browser solve with CV notch detection + recorded mouse replay. **SOLVED** 12/12+ on demo. bilibili NOT GeeTest; aerlingus is GeeTest v3. |
+| **hCaptcha** (checkbox) | Yes | 1 | Browser solve — checkbox click + token poll. Image escalation detected, not solved. |
+| **reCAPTCHA v2** (checkbox) | Yes | 1 | Browser solve — checkbox click + token poll. Image escalation detected, not solved. Demo: `google.com/recaptcha/api2/demo`. |
 | **Arkose Labs** (FunCaptcha) | **No** | 4 | 3D puzzle CAPTCHA on login flows. Microsoft, Roblox, GitHub, EA. |
-| **Alibaba Baxia** | **No** (planned) | 2 | Baxia SDK on all AliExpress pages. Real browser passes invisible check — interactive CAPTCHA hard to trigger. |
+| **Alibaba Baxia** | Yes | 2 | Browser solve with full-width drag + mousse replay. Live-tested on AliExpress. Real browser passes invisible check — interactive CAPTCHA hard to trigger externally. |
 | **Chinese custom** (JD, Shopee) | **No** | 3 | Each has proprietary slider; needs per-vendor work. |
 | **In-house** (Shein, LinkedIn, etc.) | **No** | 10 | No generic approach; each is unique. |
 

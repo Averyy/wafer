@@ -14,6 +14,8 @@ WAF-specific logic lives in dedicated modules:
 - ``_shape`` — F5 Shape interstitial
 - ``_imperva`` — Imperva / Incapsula reese84
 - ``_drag`` — GeeTest / Alibaba drag/slider puzzle
+- ``_hcaptcha`` — hCaptcha checkbox
+- ``_recaptcha`` — reCAPTCHA v2 checkbox
 """
 
 import csv
@@ -24,6 +26,7 @@ import math
 import os
 import random
 import shutil
+import sys
 import tempfile
 import threading
 import time
@@ -32,59 +35,25 @@ from dataclasses import dataclass
 logger = logging.getLogger("wafer")
 
 # ---------------------------------------------------------------------------
-# Stealth injection (for Baxia/TMD — Patchright doesn't patch webdriver)
+# Stealth: no JS injection needed.
+#
+# The ``--disable-blink-features=AutomationControlled`` launch flag
+# makes ``navigator.webdriver`` return ``false`` via a native getter
+# (``[native code]``).  Real system Chrome headful provides native
+# plugins, WebGL, permissions, chrome.csi/loadTimes, and voices.
+#
+# Previous approach: injected JS overrides via route interception or
+# CDP.  This was actively harmful because:
+# - navigator.webdriver override replaced a native getter with an
+#   arrow function detectable via ``toString()``
+# - chrome.runtime stub had only 2 keys + non-native functions
+# - speechSynthesis.getVoices wrapper leaked source in toString()
+# - Route interception broke WAF iframes (DataDome WASM PoW)
+#
+# If a future Chrome/Patchright change breaks native stealth, use
+# CDP ``Page.addScriptToEvaluateOnNewDocument`` (requires
+# ``Page.enable`` first, do NOT detach the session).
 # ---------------------------------------------------------------------------
-
-_STEALTH_SCRIPT = b"""<script>
-Object.defineProperty(Navigator.prototype, 'webdriver', {
-    get: () => false,
-    configurable: true,
-});
-if (window.chrome && !window.chrome.runtime) {
-    window.chrome.runtime = {
-        connect: function() {},
-        sendMessage: function() {},
-    };
-}
-</script>"""
-
-
-def _install_stealth_route(page) -> None:
-    """Intercept document navigations and inject stealth script.
-
-    Patches ``navigator.webdriver`` to false by injecting a script
-    tag at the start of every HTML response.  This runs before any
-    page scripts, unlike ``add_init_script()`` which has DNS issues
-    in Patchright with system Chrome.
-    """
-    def _stealth_route(route):
-        if route.request.resource_type != "document":
-            route.continue_()
-            return
-        try:
-            resp = route.fetch()
-        except Exception:
-            route.continue_()
-            return
-        body = resp.body()
-        if b"<head>" in body:
-            body = body.replace(b"<head>", b"<head>" + _STEALTH_SCRIPT)
-        elif b"<script>" in body:
-            body = _STEALTH_SCRIPT + body
-        # Playwright's route.fetch() returns decompressed body, but
-        # resp.headers retains original Content-Encoding. Forwarding
-        # both causes the browser to double-decompress → garbled HTML.
-        hdrs = {
-            k: v for k, v in resp.headers.items()
-            if k.lower() not in ("content-encoding", "content-length")
-        }
-        route.fulfill(
-            status=resp.status,
-            headers=hdrs,
-            body=body,
-        )
-
-    page.route("**/*", _stealth_route)
 
 
 # ---------------------------------------------------------------------------
@@ -292,7 +261,17 @@ class BrowserSolver:
                 "Install with: pip install wafer-py[browser]"
             ) from None
 
-        launch_args = ["--disable-blink-features=AutomationControlled"]
+        launch_args = [
+            "--disable-blink-features=AutomationControlled",
+            # Force real GPU instead of SwiftShader.  Without this,
+            # WebGL exposes "SwiftShader" as the renderer — a dead
+            # giveaway for automated browsers.  Metal on macOS,
+            # ANGLE+GL on Linux/Windows.
+            "--enable-gpu",
+            "--use-gl=angle",
+        ]
+        if sys.platform == "darwin":
+            launch_args.append("--use-angle=metal")
 
         ext_dir = self._ensure_extension()
         if ext_dir:
@@ -335,8 +314,12 @@ class BrowserSolver:
     def _create_context(self):
         """Create a new browser context with realistic settings."""
         viewport = random.choice(_VIEWPORTS)
+        # macOS Retina displays are always DPR 2.  Non-Retina Macs
+        # are extinct.  Linux/Windows default to 1.
+        dpr = 2 if sys.platform == "darwin" else 1
         return self._browser.new_context(
             viewport={"width": viewport[0], "height": viewport[1]},
+            device_scale_factor=dpr,
         )
 
     # ------------------------------------------------------------------
@@ -851,12 +834,10 @@ class BrowserSolver:
                     url,
                 )
 
-                # Baxia/TMD: inject stealth script via route
-                # interception to patch navigator.webdriver before
-                # any page scripts run.  Patchright doesn't patch
-                # this on system Chrome.
-                if challenge_type in ("baxia", "tmd"):
-                    _install_stealth_route(page)
+                # No JS stealth injection needed.  The launch flag
+                # --disable-blink-features=AutomationControlled
+                # handles navigator.webdriver natively.  See comment
+                # block at top of file for rationale.
 
                 # Kasada: attach /tl listener BEFORE navigation
                 # (the /tl POST can fire during page load)
@@ -1016,6 +997,12 @@ class BrowserSolver:
         elif challenge_type in ("baxia", "tmd"):
             from wafer.browser._drag import solve_baxia
             return solve_baxia(self, page, timeout_ms)
+        elif challenge_type == "hcaptcha":
+            from wafer.browser._hcaptcha import wait_for_hcaptcha
+            return wait_for_hcaptcha(self, page, timeout_ms)
+        elif challenge_type == "recaptcha":
+            from wafer.browser._recaptcha import wait_for_recaptcha
+            return wait_for_recaptcha(self, page, timeout_ms)
         else:
             return self._wait_for_generic(page, timeout_ms)
 

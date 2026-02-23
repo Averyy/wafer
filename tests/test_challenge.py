@@ -572,6 +572,84 @@ class TestArkose:
 
 
 # ---------------------------------------------------------------------------
+# hCaptcha
+# ---------------------------------------------------------------------------
+
+
+class TestHCaptcha:
+    def test_hcaptcha_403_detected(self):
+        """403 + hcaptcha.com body → HCAPTCHA."""
+        body = '<script src="https://hcaptcha.com/1/api.js"></script>'
+        assert detect_challenge(403, {}, body) == ChallengeType.HCAPTCHA
+
+    def test_hcaptcha_429_h_captcha(self):
+        """429 + h-captcha class → HCAPTCHA."""
+        body = '<div class="h-captcha" data-sitekey="abc"></div>'
+        assert detect_challenge(429, {}, body) == ChallengeType.HCAPTCHA
+
+    def test_hcaptcha_200_small_body_detected(self):
+        """200 + small body + hcaptcha.com/1/api.js → HCAPTCHA."""
+        body = (
+            '<html><head><script src="https://hcaptcha.com/1/api.js">'
+            '</script></head><body>Verify</body></html>'
+        )
+        assert detect_challenge(200, {}, body) == ChallengeType.HCAPTCHA
+
+    def test_hcaptcha_200_widget_id(self):
+        """200 + data-hcaptcha-widget-id → HCAPTCHA."""
+        body = '<div data-hcaptcha-widget-id="abc">Verify</div>'
+        assert detect_challenge(200, {}, body) == ChallengeType.HCAPTCHA
+
+    def test_hcaptcha_200_large_body_not_detected(self):
+        """200 + >100KB body + hcaptcha markers → None (normal page)."""
+        body = 'hcaptcha.com/1/api.js ' + 'x' * 120_000
+        assert detect_challenge(200, {}, body) is None
+
+    def test_hcaptcha_in_js_only_challenges(self):
+        from wafer._challenge import JS_ONLY_CHALLENGES
+        assert ChallengeType.HCAPTCHA in JS_ONLY_CHALLENGES
+
+
+# ---------------------------------------------------------------------------
+# reCAPTCHA
+# ---------------------------------------------------------------------------
+
+
+class TestReCaptcha:
+    def test_recaptcha_403_detected(self):
+        """403 + g-recaptcha body → RECAPTCHA."""
+        body = '<div class="g-recaptcha" data-sitekey="abc"></div>'
+        assert detect_challenge(403, {}, body) == ChallengeType.RECAPTCHA
+
+    def test_recaptcha_403_google_url(self):
+        """403 + google.com/recaptcha script → RECAPTCHA."""
+        body = '<script src="https://www.google.com/recaptcha/api.js"></script>'
+        assert detect_challenge(403, {}, body) == ChallengeType.RECAPTCHA
+
+    def test_recaptcha_200_small_body_detected(self):
+        """200 + small body + google.com/recaptcha → RECAPTCHA."""
+        body = (
+            '<html><head><script src="https://www.google.com/recaptcha/'
+            'api.js"></script></head><body>Verify</body></html>'
+        )
+        assert detect_challenge(200, {}, body) == ChallengeType.RECAPTCHA
+
+    def test_recaptcha_200_g_recaptcha_div(self):
+        """200 + g-recaptcha div → RECAPTCHA."""
+        body = '<div class="g-recaptcha" data-sitekey="abc">Solve</div>'
+        assert detect_challenge(200, {}, body) == ChallengeType.RECAPTCHA
+
+    def test_recaptcha_200_large_body_not_detected(self):
+        """200 + >100KB body → None."""
+        body = 'google.com/recaptcha g-recaptcha ' + 'x' * 120_000
+        assert detect_challenge(200, {}, body) is None
+
+    def test_recaptcha_in_js_only_challenges(self):
+        from wafer._challenge import JS_ONLY_CHALLENGES
+        assert ChallengeType.RECAPTCHA in JS_ONLY_CHALLENGES
+
+
+# ---------------------------------------------------------------------------
 # Generic JS Challenge
 # ---------------------------------------------------------------------------
 

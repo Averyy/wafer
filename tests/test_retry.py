@@ -266,11 +266,12 @@ class TestSyncRetryLoop:
             session.get("https://example.com")
 
     def test_challenge_detected_rotates(self, mock_sleep):
+        """Non-JS-only challenge (DataDome) rotates fingerprint."""
         session, mock = make_sync_session([
             MockResponse(
                 403,
-                headers={"cf-mitigated": "challenge"},
-                body="<html>CF challenge</html>",
+                headers={"Set-Cookie": "datadome=abc123; Path=/"},
+                body="<html>datadome challenge</html>",
             ),
             MockResponse(200, body="OK"),
         ])
@@ -322,14 +323,13 @@ class TestSyncRetryLoop:
         assert mock.request_count == 5
 
     def test_challenge_on_non_403_status(self, mock_sleep):
-        """Challenge detected on non-403 status (e.g., 202 AWS WAF)."""
+        """Challenge detected on non-403 status (e.g., Shape 200)."""
         session, mock = make_sync_session([
             MockResponse(
-                202,
-                headers={"x-amzn-waf-action": "challenge"},
-                body="<script>gokuProps</script>",
+                200,
+                body="<html>istlWasHere</html>",
             ),
-            MockResponse(200, body="Real page"),
+            MockResponse(200, body="<html>Real page content here</html>"),
         ])
         resp = session.get("https://example.com")
         assert resp.status_code == 200
@@ -369,6 +369,45 @@ class TestSyncRetryLoop:
         ])
         resp = session.post("https://example.com/api")
         assert resp.status_code == 200
+
+    def test_js_only_challenge_fast_fails_without_browser(
+        self, mock_sleep
+    ):
+        """CF challenge + no browser solver → ChallengeDetected after 1 request."""
+        session, mock = make_sync_session(
+            [
+                MockResponse(
+                    403,
+                    headers={"cf-mitigated": "challenge"},
+                    body="CF challenge",
+                ),
+            ]
+            * 10,
+            max_rotations=10,
+        )
+        with pytest.raises(ChallengeDetected) as exc_info:
+            session.get("https://example.com")
+        assert exc_info.value.challenge_type == "cloudflare"
+        assert mock.request_count == 1
+
+    def test_non_js_challenge_still_rotates(self, mock_sleep):
+        """Akamai challenge + no browser → still rotates (not in JS_ONLY)."""
+        session, mock = make_sync_session(
+            [
+                MockResponse(
+                    403,
+                    headers={
+                        "Set-Cookie": "_abck=abc123; Path=/",
+                    },
+                    body="",
+                ),
+                MockResponse(200, body="OK"),
+            ],
+            max_rotations=10,
+        )
+        resp = session.get("https://example.com")
+        assert resp.status_code == 200
+        assert mock.request_count == 2
 
 
 # ---------------------------------------------------------------------------
@@ -444,6 +483,47 @@ class TestAsyncRetryLoop:
         with patch("wafer._async.asyncio.sleep", return_value=None):
             with pytest.raises(ChallengeDetected):
                 await session.get("https://example.com")
+
+    @pytest.mark.asyncio
+    async def test_js_only_challenge_fast_fails_without_browser(self):
+        """CF challenge + no browser solver → ChallengeDetected after 1 request."""
+        session, mock = make_async_session(
+            [
+                MockResponse(
+                    403,
+                    headers={"cf-mitigated": "challenge"},
+                    body="CF challenge",
+                ),
+            ]
+            * 10,
+            max_rotations=10,
+        )
+        with patch("wafer._async.asyncio.sleep", return_value=None):
+            with pytest.raises(ChallengeDetected) as exc_info:
+                await session.get("https://example.com")
+        assert exc_info.value.challenge_type == "cloudflare"
+        assert mock.request_count == 1
+
+    @pytest.mark.asyncio
+    async def test_non_js_challenge_still_rotates(self):
+        """Akamai challenge + no browser → still rotates."""
+        session, mock = make_async_session(
+            [
+                MockResponse(
+                    403,
+                    headers={
+                        "Set-Cookie": "_abck=abc123; Path=/",
+                    },
+                    body="",
+                ),
+                MockResponse(200, body="OK"),
+            ],
+            max_rotations=10,
+        )
+        with patch("wafer._async.asyncio.sleep", return_value=None):
+            resp = await session.get("https://example.com")
+        assert resp.status_code == 200
+        assert mock.request_count == 2
 
 
 # ---------------------------------------------------------------------------

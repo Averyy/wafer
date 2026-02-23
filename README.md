@@ -206,9 +206,47 @@ async with AsyncSession(profile=Profile.OPERA_MINI) as session:
 | HTTP methods | All (GET, POST, PUT, etc.) | GET only (`ValueError` on others) |
 | `add_cookie()` | Supported | Not supported (`NotImplementedError`) |
 
+## Safari Profile
+
+`Profile.SAFARI` impersonates Safari 26 on macOS (M3/M4 hardware). Unlike Opera Mini, Safari uses rnet for HTTP transport but with custom `TlsOptions` and `Http2Options` instead of Chrome's `Emulation` profiles. This produces a TLS+H2 fingerprint matching real Safari 26.2/26.3 M3/M4 exactly.
+
+Safari gets all of wafer's features — challenge detection, cookie caching, retry, rate limiting, browser solving, and session rotation. The only difference is the TLS/H2/header identity.
+
+```python
+from wafer import SyncSession, AsyncSession, Profile
+
+# Default (US English locale)
+with SyncSession(profile=Profile.SAFARI) as session:
+    resp = session.get("https://example.com")
+
+# Canadian English locale
+with SyncSession(profile=Profile.SAFARI, safari_locale="ca") as session:
+    resp = session.get("https://example.com")
+
+# Async
+async with AsyncSession(profile=Profile.SAFARI) as session:
+    resp = await session.get("https://example.com")
+```
+
+| Feature | Chrome (default) | Safari |
+|---|---|---|
+| HTTP transport | rnet (Emulation) | rnet (custom TlsOptions + Http2Options) |
+| TLS fingerprint | Chrome 145 | Safari 26 M3/M4 |
+| H2 fingerprint | Chrome SETTINGS/WINDOW | Safari SETTINGS/WINDOW (m,s,a,p pseudo order) |
+| User-Agent | Chrome | Safari 26.x |
+| sec-ch-ua | Generated (9 headers) | Not sent (Safari omits client hints) |
+| Sec-Fetch-User | `?1` | Not sent |
+| Priority header | Not sent | `u=0, i` |
+| Accept | Chrome-style (avif, webp) | Safari-style (`*/*;q=0.8`) |
+| Challenge detection | All 16 WAF types | All 16 WAF types |
+| Fingerprint rotation | Cycles Chrome versions | Rebuilds client (new TLS session, same Safari fingerprint) |
+| Browser solving | Supported | Supported (keeps Safari TLS identity after solve) |
+
+Safari is particularly effective against DataDome, which heavily fingerprints the TLS layer — Safari's profile is less commonly spoofed than Chrome's.
+
 ## Challenge Detection
 
-Wafer detects 14 WAF challenge types from response status, headers, and body:
+Wafer detects 16 WAF challenge types from response status, headers, and body:
 
 | WAF | Detection |
 |-----|-----------|
@@ -224,6 +262,8 @@ Wafer detects 14 WAF challenge types from response status, headers, and body:
 | TMD | TMD session validation pattern |
 | Amazon | CAPTCHA page with `amzn` markers |
 | Arkose / FunCaptcha | `arkoselabs.com` or `funcaptcha` markers |
+| hCaptcha | `hcaptcha.com` script, `h-captcha` div |
+| reCAPTCHA | `google.com/recaptcha` script, `g-recaptcha` div |
 | Vercel | Vercel bot protection challenge |
 | Generic JS | Unclassified JavaScript challenges |
 
@@ -377,7 +417,7 @@ if result:
 
 Uses [Patchright](https://github.com/AieatAssignment/Patchright) (patched Playwright) with real system Chrome for maximum stealth. Persistent browser instance with idle timeout. Thread-safe.
 
-Supports: Cloudflare (managed + Turnstile), Akamai, DataDome, PerimeterX (including press-and-hold), Imperva, Kasada, F5 Shape, AWS WAF, and generic JS challenges.
+Supports: Cloudflare (managed + Turnstile), Akamai, DataDome (VM PoW + puzzle slider), PerimeterX (including press-and-hold), Imperva, Kasada, F5 Shape, AWS WAF, GeeTest v4 (slide puzzle), Alibaba Baxia (slider), hCaptcha (checkbox), reCAPTCHA v2 (checkbox), and generic JS challenges.
 
 ## Iframe Intercept
 
@@ -501,8 +541,9 @@ wafer/
   _solvers.py       # Inline solvers (ACW, Amazon, TMD)
   _cookies.py       # JSON disk cache with TTL and LRU
   _fingerprint.py   # Emulation profiles, sec-ch-ua generation
-  _profiles.py      # Profile enum (OPERA_MINI, etc.)
+  _profiles.py      # Profile enum (OPERA_MINI, SAFARI)
   _opera_mini.py    # Opera Mini identity generation + stdlib HTTP transport
+  _safari.py        # Safari 26 identity — TLS options, H2 options, headers
   _kasada.py        # Kasada CD (proof-of-work) generation
   _retry.py         # Retry strategy and backoff
   _ratelimit.py     # Per-domain rate limiting
@@ -518,6 +559,9 @@ wafer/
     _kasada.py      # Kasada challenge solver
     _shape.py       # F5 Shape challenge solver
     _awswaf.py      # AWS WAF challenge solver
+    _hcaptcha.py    # hCaptcha checkbox solver
+    _recaptcha.py   # reCAPTCHA v2 checkbox solver
+    _drag.py        # GeeTest / Baxia drag/slider puzzle solver
     _cv.py          # CV notch detection for drag/slider puzzles
 ```
 

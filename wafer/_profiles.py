@@ -17,6 +17,4 @@ class Profile(Enum):
     server-side proxy architecture.
     """
     OPERA_MINI = "opera_mini"
-    # Future profiles could include other proxy browsers, WebView
-    # impersonation, Googlebot, etc. -- but only add them when there's
-    # a real consumer with a real use case.
+    SAFARI = "safari"

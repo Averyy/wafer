@@ -27,6 +27,7 @@ Issues = "https://github.com/Averyy/wafer/issues"
 
 [project.optional-dependencies]
 browser = ["patchright", "opencv-python-headless"]
+audio = ["faster-whisper"]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",

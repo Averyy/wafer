@@ -24,12 +24,30 @@
 
 The CD code is unit-tested (`tests/test_kasada.py::TestGenerateCD`) and the algorithm matches the public spec (Fweak gist, Feb 2024), but end-to-end proof against a real WAF is missing.
 
-**What we need**: A Kasada deployment that returns `x-kpsdk-st` and enforces CT+CD headers per-request. Candidates:
-- `gql.twitch.tv/integrity` — API-style Kasada (POST, returns x-kpsdk-ct directly). Structurally different from page-navigate flow; may need a different interception strategy.
-- `draftkings.com` — aggressive behavioral scoring, may use full CT+CD enforcement
-- Any new Kasada site that rejects cookie-only auth with a 429
+### 2026-02-23 Investigation: Twitch Integrity
 
-**When found**: test the full flow (browser solve → CT+ST cached → subsequent requests carry CT + fresh CD → 200). If CD is rejected, compare our output against the reference algorithm and debug.
+**`gql.twitch.tv/integrity`** uses the full Kasada CT+CD flow:
+
+1. Kasada `p.js` is hosted at `k.twitchcdn.net` (CDN-specific Kasada script URL)
+2. The script opens a hidden iframe to `gql.twitch.tv/{uuid1}/{uuid2}/fp?x-kpsdk-v=j-0.0.0`
+3. ips.js VM runs fingerprinting + challenge solving inside the iframe
+4. VM POSTs to the `/tl` endpoint → response returns **both `x-kpsdk-ct` AND `x-kpsdk-st`**
+5. The patched `window.fetch` injects CT+CD headers on the actual POST to `/integrity`
+
+This is confirmed by multiple commercial Kasada solver APIs (EzCaptcha, Hyper Solutions, MeshPrivacy) which all document the Twitch flow as requiring `x-kpsdk-cd` generated from the `x-kpsdk-st` value.
+
+**Key difference from realestate.com.au/hyatt.com**: Twitch is an API-style Kasada deployment (POST to `/integrity`, not a page-navigate flow). The Kasada script patches `window.fetch` to automatically inject headers — our current browser solver intercepts the `/tl` response but doesn't capture the patched fetch's headers.
+
+**Next step**: To validate `generate_cd()` end-to-end, the browser solver needs to:
+1. Intercept the `/tl` response to capture both `x-kpsdk-ct` and `x-kpsdk-st`
+2. Use `generate_cd(st)` to produce `x-kpsdk-cd` for subsequent requests
+3. POST to `/integrity` with CT+CD headers via rnet
+
+This requires extending `setup_kasada_listener` in `_kasada.py` to also capture ST from the `/tl` response headers. The current listener only captures CT.
+
+**Other candidates**:
+- `draftkings.com` — 2026-02-21: TLS passes Cloudflare on homepage. Kasada presence unverified on deeper pages.
+- Any Kasada site that rejects cookie-only auth with a 429
 
 ## How Kasada Works
 

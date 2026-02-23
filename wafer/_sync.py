@@ -106,14 +106,15 @@ class SyncSession(BaseSession):
 
     def _retire_session(self, domain: str) -> None:
         """Full identity reset: new fingerprint, empty jar, clear cache."""
-        self._fingerprint.reset()
+        if self._fingerprint is not None:
+            self._fingerprint.reset()
         if self._cookie_cache:
             self._cookie_cache.clear(domain)
         self._client = rnet.blocking.Client(**self._build_client_kwargs())
         self._hydrate_jar_from_cache()
         self._domain_failures.pop(domain, None)
         logger.warning(
-            "Session retired for %s: new fingerprint=%s",
+            "Session retired for %s: emulation=%s",
             domain,
             self.emulation,
         )
@@ -248,12 +249,14 @@ class SyncSession(BaseSession):
                 cookies=target_cookies,
             )
 
-        # Match emulation to browser's Chrome version
-        chrome_ver = chrome_version_from_ua(result.user_agent)
-        if chrome_ver:
-            em = emulation_for_version(chrome_ver)
-            if em:
-                self._fingerprint.reset(em)
+        # Match emulation to browser's Chrome version.
+        # Skip for Safari — keep Safari TLS identity after browser solve.
+        if self._fingerprint is not None:
+            chrome_ver = chrome_version_from_ua(result.user_agent)
+            if chrome_ver:
+                em = emulation_for_version(chrome_ver)
+                if em:
+                    self._fingerprint.reset(em)
 
         # Rebuild client (rehydrates cookies from cache)
         self._rebuild_client()
@@ -573,7 +576,8 @@ class SyncSession(BaseSession):
                 )
                 time.sleep(delay)
                 if not retired:
-                    self._fingerprint.rotate()
+                    if self._fingerprint is not None:
+                        self._fingerprint.rotate()
                     self._rebuild_client()
                 continue
 
@@ -634,6 +638,27 @@ class SyncSession(BaseSession):
                     if browser_result:
                         continue
 
+                # No browser solver — rotation can't help JS-only challenges
+                if (
+                    self._browser_solver is None
+                    and challenge in JS_ONLY_CHALLENGES
+                ):
+                    if self.max_rotations == 0:
+                        return self._make_response(
+                            status_code=status,
+                            content=raw_content,
+                            text=body,
+                            headers=headers,
+                            url=current_url,
+                            start_time=start_time,
+                            was_retried=was_retried,
+                            challenge_type=challenge.value,
+                            raw=resp,
+                        )
+                    raise ChallengeDetected(
+                        challenge.value, current_url, status
+                    )
+
                 # Fallback: rotate fingerprint
                 if not state.can_rotate:
                     # Last resort: browser solve (once per request)
@@ -685,7 +710,8 @@ class SyncSession(BaseSession):
                 if should_retire:
                     self._retire_session(domain)
                 else:
-                    self._fingerprint.rotate()
+                    if self._fingerprint is not None:
+                        self._fingerprint.rotate()
                     self._rebuild_client()
                 delay = calculate_backoff(
                     state.rotation_retries - 1,
@@ -736,7 +762,7 @@ class SyncSession(BaseSession):
             # Success — reset failure counter, pin fingerprint, track URL
             self._record_success(domain)
             self._record_url(current_url)
-            if state.rotation_retries > 0:
+            if state.rotation_retries > 0 and self._fingerprint is not None:
                 self._fingerprint.pin()
 
             return self._make_response(

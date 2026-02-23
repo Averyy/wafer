@@ -2072,7 +2072,9 @@ class TestWaitForDataDome:
             solved_cookies,   # second poll — solved!
         ]
         page.frames = []
-        mock_mono.side_effect = [0.0, 0.5, 1.0, 1.5]
+        # deadline(0.0) + grace(0.5) + while(1.0) + grace_check(1.5)
+        # + while(2.0) — second iteration finds solved cookie
+        mock_mono.side_effect = [0.0, 0.5, 1.0, 1.5, 2.0]
 
         assert wait_for_datadome(solver, page, 10000) is True
 
@@ -2101,6 +2103,7 @@ class TestWaitForDataDome:
         solver = MagicMock()
 
         # URL changes to t=bv mid-solve
+        # Read order: initial check, loop1 check, loop2 check (t=bv)
         url_values = [
             "https://geo.captcha-delivery.com/captcha/?dd=...",
             "https://geo.captcha-delivery.com/captcha/?dd=...",
@@ -2111,7 +2114,9 @@ class TestWaitForDataDome:
             {"name": "datadome", "value": "same_token"},
         ]
         page.frames = []
-        mock_mono.side_effect = [0.0, 0.5, 1.0]
+        # deadline(0.0) + grace(0.5) + while1(1.0) + grace1(1.5)
+        # + while2(2.0) → loop2 url reads t=bv → returns False
+        mock_mono.side_effect = [0.0, 0.5, 1.0, 1.5, 2.0]
 
         assert wait_for_datadome(solver, page, 10000) is False
 

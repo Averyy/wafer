@@ -104,3 +104,12 @@ wafer/browser/mousse/
 ```
 
 Zero external dependencies — stdlib `http.server` + vanilla JS.
+
+## Browse Replay in Solvers
+
+All browser solver wait loops must use `_replay_browse_chunk()` instead of bare `time.sleep()`. This replays recorded mouse movement and scrolling during idle waits, preventing WAF VMs from detecting zero-activity bot signals. Pattern:
+
+1. `state = solver._start_browse(page, x, y)` at solver start
+2. `solver._replay_browse_chunk(page, state, N)` replacing each `time.sleep(N)`
+
+Falls back to `time.sleep` transparently when no browse recordings are loaded.

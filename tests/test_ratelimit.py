@@ -312,13 +312,13 @@ class TestSyncSessionRetirement:
         When max_rotations is hit on a real challenge, ChallengeDetected is
         raised. Retirement should not fire on the final iteration.
         """
-        cf_resp = MockResponse(
+        dd_resp = MockResponse(
             403,
-            headers={"cf-mitigated": "challenge"},
-            body="<html>CF challenge</html>",
+            headers={"Set-Cookie": "datadome=abc123; Path=/"},
+            body="<html>datadome challenge</html>",
         )
         session, mock = make_sync_session(
-            [cf_resp] * 10,
+            [dd_resp] * 10,
             max_rotations=2,
             max_failures=5,  # high threshold so retirement doesn't
         )                        # interfere with the budget test

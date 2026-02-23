@@ -14,6 +14,7 @@ from wafer._fingerprint import FingerprintManager
 from wafer._opera_mini import OperaMiniIdentity
 from wafer._profiles import Profile
 from wafer._ratelimit import RateLimiter
+from wafer._safari import SafariIdentity
 
 logger = logging.getLogger("wafer")
 
@@ -195,6 +196,7 @@ class BaseSession:
         browser_solver=None,
         rotate_every: int | None = None,
         profile: Profile | None = None,
+        safari_locale: str = "us",
     ):
         self._profile = profile
         self._om_identity = (
@@ -202,12 +204,18 @@ class BaseSession:
             if profile is Profile.OPERA_MINI
             else None
         )
-
-        self.headers = (
-            headers
-            if headers is not None
-            else dict(DEFAULT_HEADERS)
+        self._safari_identity = (
+            SafariIdentity(locale=safari_locale)
+            if profile is Profile.SAFARI
+            else None
         )
+
+        if headers is not None:
+            self.headers = headers
+        elif self._safari_identity is not None:
+            self.headers = self._safari_identity.client_headers()
+        else:
+            self.headers = dict(DEFAULT_HEADERS)
         self.connect_timeout = (
             _normalize_timeout(connect_timeout)
             if connect_timeout is not None
@@ -224,9 +232,12 @@ class BaseSession:
         self.max_redirects = max_redirects
         self.max_failures = max_failures
 
-        self._fingerprint = FingerprintManager(
-            emulation or DEFAULT_EMULATION
-        )
+        if profile is Profile.SAFARI:
+            self._fingerprint = None
+        else:
+            self._fingerprint = FingerprintManager(
+                emulation or DEFAULT_EMULATION
+            )
 
         # Per-domain rate limiter
         if rate_limit > 0:
@@ -273,7 +284,12 @@ class BaseSession:
         self._rotate_every = rotate_every
         self._request_count = 0
 
-        if embed_origin:
+        if profile is Profile.SAFARI:
+            logger.debug(
+                "Session created with Safari profile, timeout=%s",
+                self.timeout,
+            )
+        elif embed_origin:
             logger.info(
                 "Session created in embed mode: origin=%s, "
                 "referers=%d, emulation=%s",
@@ -289,8 +305,10 @@ class BaseSession:
             )
 
     @property
-    def emulation(self) -> Emulation:
+    def emulation(self) -> Emulation | None:
         """Current Emulation profile (delegates to FingerprintManager)."""
+        if self._fingerprint is None:
+            return None
         return self._fingerprint.current
 
     def _build_headers(
@@ -315,9 +333,13 @@ class BaseSession:
         if self._profile is Profile.OPERA_MINI:
             return dict(extra) if extra else {}
 
-        # Client-level headers (same set baked into the rnet Client)
+        # Client-level headers (same set baked into the rnet Client).
+        # Safari: no sec-ch-ua headers (Safari doesn't send client hints).
         client_headers = dict(self.headers)
-        client_headers.update(self._fingerprint.sec_ch_ua_headers())
+        if self._fingerprint is not None:
+            client_headers.update(
+                self._fingerprint.sec_ch_ua_headers()
+            )
 
         # Full merged headers (same logic as before)
         merged = dict(client_headers)
@@ -474,18 +496,32 @@ class BaseSession:
         """Build kwargs for rnet Client construction.
 
         Not called for Opera Mini (which bypasses rnet entirely).
+        Safari uses TlsOptions + Http2Options (no Emulation).
+        Chrome uses Emulation (no TlsOptions).
         """
-        client_headers = dict(self.headers)
-        client_headers.update(
-            self._fingerprint.sec_ch_ua_headers()
-        )
-        kwargs = {
-            "emulation": self._fingerprint.current,
-            "headers": client_headers,
-            "connect_timeout": self.connect_timeout,
-            "timeout": self.timeout,
-            "cookie_store": True,
-        }
+        if self._safari_identity is not None:
+            # Safari: custom TLS + H2, no Emulation
+            kwargs = {
+                "tls_options": self._safari_identity.tls_options(),
+                "http2_options": self._safari_identity.http2_options(),
+                "headers": dict(self.headers),
+                "connect_timeout": self.connect_timeout,
+                "timeout": self.timeout,
+                "cookie_store": True,
+            }
+        else:
+            # Chrome: Emulation + sec-ch-ua headers
+            client_headers = dict(self.headers)
+            client_headers.update(
+                self._fingerprint.sec_ch_ua_headers()
+            )
+            kwargs = {
+                "emulation": self._fingerprint.current,
+                "headers": client_headers,
+                "connect_timeout": self.connect_timeout,
+                "timeout": self.timeout,
+                "cookie_store": True,
+            }
         if _SYSTEM_CERT_STORE is not None:
             kwargs["verify"] = _SYSTEM_CERT_STORE
         if self._proxy is not None:
