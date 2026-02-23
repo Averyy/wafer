@@ -17,13 +17,14 @@ classifiers = [
     "Topic :: Internet :: WWW/HTTP",
 ]
 dependencies = [
-    "rnet>=3.0.0rc21",
+    "rnet>=3.0.0rc21,<4",
 ]
 
 [project.urls]
 Homepage = "https://github.com/Averyy/wafer"
 Repository = "https://github.com/Averyy/wafer"
 Issues = "https://github.com/Averyy/wafer/issues"
+Changelog = "https://github.com/Averyy/wafer/releases"
 
 [project.optional-dependencies]
 browser = ["patchright", "opencv-python-headless"]
@@ -40,13 +41,13 @@ build-backend = "hatchling.build"
 
 [tool.hatch.version]
 source = "vcs"
+fallback-version = "0.0.0"
 
 [tool.hatch.build.targets.wheel]
 packages = ["wafer"]
 
-[tool.hatch.build.targets.wheel.force-include]
-"wafer/browser/_recordings" = "wafer/browser/_recordings"
-"wafer/browser/_extensions" = "wafer/browser/_extensions"
+[tool.hatch.build]
+exclude = [".DS_Store", "**/.DS_Store", "**/.gitkeep"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

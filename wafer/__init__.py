@@ -1,6 +1,12 @@
 """wafer -- Anti-detection HTTP client for Python."""
 
 import logging
+from importlib.metadata import PackageNotFoundError, version
+
+try:
+    __version__ = version("wafer-py")
+except PackageNotFoundError:
+    __version__ = "0.0.0"
 
 from wafer._async import AsyncSession
 from wafer._base import DEFAULT_HEADERS
@@ -20,6 +26,7 @@ from wafer._response import WaferResponse
 from wafer._sync import SyncSession
 
 __all__ = [
+    "__version__",
     "SyncSession",
     "AsyncSession",
     "WaferResponse",
