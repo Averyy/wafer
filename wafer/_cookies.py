@@ -115,11 +115,10 @@ class CookieCache:
                 valid.append(e)
         expired = len(entries) - len(valid)
         if expired > 0:
-            logger.debug(
-                "Skipped %d expired cookies for %s", expired, domain
-            )
-            if not valid:
-                # All cookies expired — remove the file
+            if valid:
+                # Rewrite file without expired entries
+                self._write_atomic(domain, valid)
+            else:
                 self.clear(domain)
         return valid
 
