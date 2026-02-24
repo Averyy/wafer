@@ -145,23 +145,26 @@ class TestSyncRetryLoop:
         assert resp.text == "<html>Real content</html>"
         assert mock.request_count == 3
 
-    def test_403_rotates_fingerprint(self, mock_sleep):
+    def test_403_rotates_to_safari(self, mock_sleep):
         session, mock = make_sync_session([
             MockResponse(403, body="Denied"),
             MockResponse(200, body="OK"),
         ])
         session.get("https://example.com")
-        # Should have rotated and pinned after success
-        assert session._fingerprint.pinned
+        # Should have switched to Safari on rotation
+        assert session._safari_identity is not None
+        assert session._fingerprint is None
 
-    def test_403_pins_fingerprint_after_success(self, mock_sleep):
+    def test_403_safari_fallback_after_rotation(self, mock_sleep):
         session, mock = make_sync_session([
             MockResponse(403, body="Denied"),
             MockResponse(200, body="OK"),
         ])
-        assert not session._fingerprint.pinned
+        assert session._fingerprint is not None
         session.get("https://example.com")
-        assert session._fingerprint.pinned
+        # After rotation, session switched to Safari (no fingerprint)
+        assert session._safari_identity is not None
+        assert session._fingerprint is None
 
     def test_no_pin_without_rotation(self, mock_sleep):
         session, mock = make_sync_session([

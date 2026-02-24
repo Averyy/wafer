@@ -587,22 +587,17 @@ class TestHCaptcha:
         body = '<div class="h-captcha" data-sitekey="abc"></div>'
         assert detect_challenge(429, {}, body) == ChallengeType.HCAPTCHA
 
-    def test_hcaptcha_200_small_body_detected(self):
-        """200 + small body + hcaptcha.com/1/api.js → HCAPTCHA."""
+    def test_hcaptcha_200_not_detected(self):
+        """200 + hcaptcha markers → None (not a gate, could be a form)."""
         body = (
             '<html><head><script src="https://hcaptcha.com/1/api.js">'
             '</script></head><body>Verify</body></html>'
         )
-        assert detect_challenge(200, {}, body) == ChallengeType.HCAPTCHA
+        assert detect_challenge(200, {}, body) is None
 
-    def test_hcaptcha_200_widget_id(self):
-        """200 + data-hcaptcha-widget-id → HCAPTCHA."""
+    def test_hcaptcha_200_widget_id_not_detected(self):
+        """200 + data-hcaptcha-widget-id → None (embedded form)."""
         body = '<div data-hcaptcha-widget-id="abc">Verify</div>'
-        assert detect_challenge(200, {}, body) == ChallengeType.HCAPTCHA
-
-    def test_hcaptcha_200_large_body_not_detected(self):
-        """200 + >100KB body + hcaptcha markers → None (normal page)."""
-        body = 'hcaptcha.com/1/api.js ' + 'x' * 120_000
         assert detect_challenge(200, {}, body) is None
 
     def test_hcaptcha_in_js_only_challenges(self):
@@ -626,22 +621,17 @@ class TestReCaptcha:
         body = '<script src="https://www.google.com/recaptcha/api.js"></script>'
         assert detect_challenge(403, {}, body) == ChallengeType.RECAPTCHA
 
-    def test_recaptcha_200_small_body_detected(self):
-        """200 + small body + google.com/recaptcha → RECAPTCHA."""
+    def test_recaptcha_200_not_detected(self):
+        """200 + recaptcha markers → None (not a gate, could be a form)."""
         body = (
             '<html><head><script src="https://www.google.com/recaptcha/'
             'api.js"></script></head><body>Verify</body></html>'
         )
-        assert detect_challenge(200, {}, body) == ChallengeType.RECAPTCHA
+        assert detect_challenge(200, {}, body) is None
 
-    def test_recaptcha_200_g_recaptcha_div(self):
-        """200 + g-recaptcha div → RECAPTCHA."""
+    def test_recaptcha_200_g_recaptcha_div_not_detected(self):
+        """200 + g-recaptcha div → None (embedded form)."""
         body = '<div class="g-recaptcha" data-sitekey="abc">Solve</div>'
-        assert detect_challenge(200, {}, body) == ChallengeType.RECAPTCHA
-
-    def test_recaptcha_200_large_body_not_detected(self):
-        """200 + >100KB body → None."""
-        body = 'google.com/recaptcha g-recaptcha ' + 'x' * 120_000
         assert detect_challenge(200, {}, body) is None
 
     def test_recaptcha_in_js_only_challenges(self):

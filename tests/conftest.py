@@ -234,6 +234,7 @@ def make_sync_session(responses, **session_kwargs):
     session = SyncSession.__new__(SyncSession)
 
     session.headers = dict(DEFAULT_HEADERS)
+
     session.connect_timeout = DEFAULT_CONNECT_TIMEOUT
     session.timeout = DEFAULT_TIMEOUT
     session.max_retries = session_kwargs.get("max_retries", 3)
@@ -269,6 +270,7 @@ def make_sync_session(responses, **session_kwargs):
     session._profile = session_kwargs.get("profile", None)
     session._om_identity = None
     session._safari_identity = None
+    session._safari_locale = "us"
     session._client_headers = session._compute_client_headers()
 
     use_cookie_jar = session_kwargs.get("use_cookie_jar", False)
@@ -287,6 +289,7 @@ def make_async_session(responses, **session_kwargs):
     session = AsyncSession.__new__(AsyncSession)
 
     session.headers = dict(DEFAULT_HEADERS)
+
     session.connect_timeout = DEFAULT_CONNECT_TIMEOUT
     session.timeout = DEFAULT_TIMEOUT
     session.max_retries = session_kwargs.get("max_retries", 3)
@@ -323,6 +326,7 @@ def make_async_session(responses, **session_kwargs):
     session._profile = session_kwargs.get("profile", None)
     session._om_identity = None
     session._safari_identity = None
+    session._safari_locale = "us"
     session._client_headers = session._compute_client_headers()
 
     async_responses = to_async_responses(responses)

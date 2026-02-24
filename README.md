@@ -73,7 +73,7 @@ session = SyncSession(
 
     # Retry behavior
     max_retries=3,       # retries on 5xx / connection errors
-    max_rotations=10,    # fingerprint rotations on 403/challenge
+    max_rotations=1,     # fingerprint rotations on 403/challenge (switches to Safari)
 
     # Cookies
     cache_dir="./data/wafer/cookies",  # disk persistence (default; None to disable)
@@ -147,7 +147,7 @@ session = SyncSession(emulation=Emulation.Chrome145)
 
 The `sec-ch-ua` header is auto-generated to match the emulated Chrome version using the same GREASE algorithm as Chromium source.
 
-On repeated 403s, wafer automatically rotates to a different Chrome profile (different TLS fingerprint) and retries. After browser solving, the fingerprint is matched to the browser's real Chrome version.
+On a 403 or challenge, wafer automatically switches from Chrome to Safari (fundamentally different TLS/H2 fingerprint) and retries. This is more effective than cycling between Chrome versions, which share nearly identical fingerprints.
 
 ## Opera Mini Profile
 
@@ -211,9 +211,9 @@ Wafer detects 16 WAF challenge types from response status, headers, and body:
 | Generic JS | Unclassified JavaScript challenges |
 
 When a challenge is detected, wafer:
-1. Tries inline solving (ACW, Amazon, TMD -no browser needed)
-2. Rotates TLS fingerprint and retries
-3. Falls back to browser solver if configured
+1. Tries inline solving (ACW, Amazon, TMD - no browser needed)
+2. Tries browser solver if configured (for JS-only challenges like Cloudflare, reCAPTCHA)
+3. Switches from Chrome to Safari and retries
 4. Raises `ChallengeDetected` if all attempts fail
 
 ## Inline Solvers
@@ -262,7 +262,7 @@ Both sync and async sessions block/await until the rate limit allows the next re
 Wafer uses separate counters for different failure modes:
 
 - **Retries** (`max_retries=3`): For 5xx server errors and connection failures. Exponential backoff.
-- **Rotations** (`max_rotations=10`): For 403/challenge responses. Rotates to a different Chrome TLS fingerprint and retries.
+- **Rotations** (`max_rotations=1`): For 403/challenge responses. On the first failure, wafer switches from Chrome to Safari (fundamentally different TLS/H2 fingerprint) and retries.
 
 After `max_failures` consecutive failures on a domain, the session is retired (full identity reset). Set to `None` to disable.
 

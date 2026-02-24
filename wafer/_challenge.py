@@ -326,20 +326,5 @@ def detect_challenge(
         logger.info("Challenge detected (body): geetest")
         return ChallengeType.GEETEST
 
-    # hCaptcha on 200 — small challenge/gate page
-    if status_code == 200 and len(body) < 100_000 and (
-        "hcaptcha.com/1/api.js" in body
-        or "data-hcaptcha-widget-id" in body
-    ):
-        logger.info("Challenge detected (body): hcaptcha")
-        return ChallengeType.HCAPTCHA
-
-    # reCAPTCHA on 200 — small challenge/gate page
-    if status_code == 200 and len(body) < 100_000 and (
-        "google.com/recaptcha" in body
-        or "g-recaptcha" in body
-    ):
-        logger.info("Challenge detected (body): recaptcha")
-        return ChallengeType.RECAPTCHA
 
     return None

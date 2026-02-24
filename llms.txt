@@ -118,7 +118,8 @@ SyncSession(
     profile: Profile | None = None,           # Profile.OPERA_MINI or Profile.SAFARI
     safari_locale: str = "us",                # "us" or "ca" (only used with Profile.SAFARI)
 
-    # Custom headers (replaces DEFAULT_HEADERS entirely if provided)
+    # Custom headers (replaces DEFAULT_HEADERS entirely if provided).
+    # Prefer per-request headers= kwarg for one-off overrides.
     headers: dict[str, str] | None = None,
 
     # Timeouts (int, float seconds, or datetime.timedelta)
@@ -127,7 +128,7 @@ SyncSession(
 
     # Retry behavior
     max_retries: int = 3,       # for 5xx, connection errors, empty 200
-    max_rotations: int = 10,    # for 403/challenge (rotates TLS fingerprint)
+    max_rotations: int = 1,     # for 403/challenge (rotates TLS fingerprint)
 
     # Session health
     max_failures: int | None = 3,  # consecutive failures per domain before full identity reset; None to disable
@@ -324,7 +325,7 @@ capabilities and trade-offs.
 
 - TLS + HTTP/2 fingerprint matches real Chrome (currently Chrome 145)
 - Auto-generates `sec-ch-ua` Client Hints headers
-- Fingerprint rotation on 403: cycles through Chrome versions automatically
+- On 403/challenge: switches to Safari profile (different TLS/H2 fingerprint)
 - All features enabled: challenge detection, retry, rotation, browser solving
 - Pass `emulation=rnet.Emulation.Chrome145` to pin a specific version
 
@@ -353,7 +354,7 @@ These are all automatic. Do not write code to handle these yourself:
 - **Redirects** - 3xx followed automatically (POST -> GET on 301/302/303). 304 Not Modified passes through untouched.
 - **Referer headers** - set automatically from the last URL visited per domain
 - **Cookies** - managed in-memory and optionally persisted to disk; no manual cookie jar needed
-- **WAF challenges** - detected, retried with rotated TLS fingerprints, and browser-solved if configured
+- **WAF challenges** - detected, browser-solved if configured, retried with Safari fallback (different TLS fingerprint)
 - **Rate limiting** - per-hostname delays enforced automatically when `rate_limit` is set
 - **TLS fingerprint** - sec-ch-ua headers auto-generated to match the Chrome version
 - **Binary responses** - detected via Content-Type. `resp.content` preserves raw bytes exactly (safe for PDFs, images, etc.). `resp.text` decodes with UTF-8 replacement characters.
@@ -494,9 +495,9 @@ logging.getLogger("wafer").setLevel(logging.DEBUG)
    out of scope (no cleanup needed without a browser solver). See Session Lifecycle.
 
 8. **Challenge handling is automatic.** You do not need to detect or solve challenges
-   yourself. Wafer retries, rotates fingerprints, and invokes the browser solver
-   (if configured) inside its retry loop. Just catch `ChallengeDetected` if all
-   attempts fail.
+   yourself. Wafer tries browser solving (if configured), then falls back from
+   Chrome to Safari (different TLS fingerprint), inside its retry loop. Just
+   catch `ChallengeDetected` if all attempts fail.
 
 9. **Redirects are followed by default.** You do not need to check for 3xx or
    follow Location headers manually. 304 Not Modified is NOT followed - it passes

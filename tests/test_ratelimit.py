@@ -175,7 +175,8 @@ class TestSyncSessionRetirement:
             nonlocal retired
             retired = True
             # Reset fingerprint and clear failures like real retire
-            session._fingerprint.reset()
+            if session._fingerprint is not None:
+                session._fingerprint.reset()
             session._domain_failures.pop(domain, None)
 
         session._retire_session = track_retire
@@ -211,7 +212,8 @@ class TestSyncSessionRetirement:
         def track_retire(domain):
             nonlocal retired
             retired = True
-            session._fingerprint.reset()
+            if session._fingerprint is not None:
+                session._fingerprint.reset()
             session._domain_failures.pop(domain, None)
 
         session._retire_session = track_retire
@@ -248,7 +250,8 @@ class TestSyncSessionRetirement:
 
         # Wire up real _retire_session (needs to use cookie_cache)
         def real_retire(domain):
-            session._fingerprint.reset()
+            if session._fingerprint is not None:
+                session._fingerprint.reset()
             if session._cookie_cache:
                 session._cookie_cache.clear(domain)
             session._domain_failures.pop(domain, None)
@@ -276,7 +279,8 @@ class TestSyncSessionRetirement:
 
         def real_retire(domain):
             nonlocal was_reset
-            session._fingerprint.reset()
+            if session._fingerprint is not None:
+                session._fingerprint.reset()
             was_reset = True
             session._domain_failures.pop(domain, None)
 
@@ -418,7 +422,8 @@ class TestAsyncSessionRetirement:
         async def track_retire(domain):
             nonlocal retired
             retired = True
-            session._fingerprint.reset()
+            if session._fingerprint is not None:
+                session._fingerprint.reset()
             session._domain_failures.pop(domain, None)
 
         session._retire_session = track_retire

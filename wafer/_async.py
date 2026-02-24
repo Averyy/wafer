@@ -600,12 +600,11 @@ class AsyncSession(BaseSession):
                     await self._retire_session(domain)
 
                 state.use_rotation()
+                rotation_floor = self._rotation_delay()
                 delay = (
-                    retry_after
+                    max(retry_after, rotation_floor)
                     if retry_after is not None
-                    else calculate_backoff(
-                        state.rotation_retries - 1
-                    )
+                    else rotation_floor
                 )
                 logger.debug(
                     "429 rate limited, waiting %.1fs (rotation %d/%d)",
@@ -613,7 +612,12 @@ class AsyncSession(BaseSession):
                 )
                 await asyncio.sleep(delay)
                 if not retired:
-                    if self._fingerprint is not None:
+                    if (
+                        self._fingerprint is not None
+                        and self._safari_identity is None
+                    ):
+                        self._switch_to_safari()
+                    elif self._fingerprint is not None:
                         self._fingerprint.rotate()
                     self._rebuild_client()
                 continue
@@ -752,20 +756,22 @@ class AsyncSession(BaseSession):
                 if should_retire:
                     await self._retire_session(domain)
                 else:
-                    if self._fingerprint is not None:
+                    # Safari fallback: fundamentally different TLS
+                    # fingerprint, much more effective than another Chrome
+                    if (
+                        self._fingerprint is not None
+                        and self._safari_identity is None
+                    ):
+                        self._switch_to_safari()
+                    elif self._fingerprint is not None:
                         self._fingerprint.rotate()
                     self._rebuild_client()
-                delay = calculate_backoff(
-                    state.rotation_retries - 1,
-                    base=0.5,
-                    max_delay=10.0,
-                )
+                delay = self._rotation_delay()
                 logger.debug(
-                    "%s at %s, rotated to %s (rotation %d/%d), "
+                    "%s at %s, rotated (rotation %d/%d), "
                     "waiting %.1fs",
                     challenge.value if challenge else "403",
                     current_url,
-                    self.emulation,
                     state.rotation_retries,
                     self.max_rotations,
                     delay,

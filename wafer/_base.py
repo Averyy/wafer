@@ -214,7 +214,7 @@ class BaseSession:
         connect_timeout: datetime.timedelta | float | int | None = None,
         timeout: datetime.timedelta | float | int | None = None,
         max_retries: int = 3,
-        max_rotations: int = 10,
+        max_rotations: int = 1,
         cache_dir: str | None = "./data/wafer/cookies",
         max_failures: int | None = 3,
         rate_limit: float = 0.0,
@@ -236,6 +236,7 @@ class BaseSession:
             if profile is Profile.OPERA_MINI
             else None
         )
+        self._safari_locale = safari_locale
         self._safari_identity = (
             SafariIdentity(locale=safari_locale)
             if profile is Profile.SAFARI
@@ -482,6 +483,27 @@ class BaseSession:
         """Record a successful response for a domain, resetting failures."""
         if domain in self._domain_failures:
             del self._domain_failures[domain]
+
+    def _switch_to_safari(self) -> None:
+        """Switch from Chrome to Safari identity for rotation fallback.
+
+        Safari has a fundamentally different TLS/H2 fingerprint, making
+        it much more effective than rotating between Chrome versions.
+        Only called for default Chrome sessions (not Safari or Opera Mini).
+        """
+        self._safari_identity = SafariIdentity(locale=self._safari_locale)
+        self._fingerprint = None
+        self.headers = self._safari_identity.client_headers()
+        logger.info("Rotation fallback: switched to Safari profile")
+
+    def _rotation_delay(self) -> float:
+        """Delay before a rotation retry: rate limiter interval + 1s.
+
+        Ensures rotation retries never fire faster than the user's
+        configured rate limit, with an extra 1s penalty on top.
+        """
+        base = self._rate_limiter.min_interval if self._rate_limiter else 0.0
+        return base + 1.0
 
     @staticmethod
     def _apply_params(url: str, params: dict[str, str] | None) -> str:
