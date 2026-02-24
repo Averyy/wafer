@@ -269,6 +269,7 @@ def make_sync_session(responses, **session_kwargs):
     session._profile = session_kwargs.get("profile", None)
     session._om_identity = None
     session._safari_identity = None
+    session._client_headers = session._compute_client_headers()
 
     use_cookie_jar = session_kwargs.get("use_cookie_jar", False)
     jar = MockJar() if use_cookie_jar else None
@@ -322,6 +323,7 @@ def make_async_session(responses, **session_kwargs):
     session._profile = session_kwargs.get("profile", None)
     session._om_identity = None
     session._safari_identity = None
+    session._client_headers = session._compute_client_headers()
 
     async_responses = to_async_responses(responses)
     use_cookie_jar = session_kwargs.get("use_cookie_jar", False)

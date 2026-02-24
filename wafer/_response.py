@@ -26,6 +26,9 @@ class WaferResponse:
         "url",
         "challenge_type",
         "was_retried",
+        "retries",
+        "rotations",
+        "inline_solves",
         "elapsed",
         "_raw",
     )
@@ -40,6 +43,9 @@ class WaferResponse:
         text: str | None = None,
         challenge_type: str | None = None,
         was_retried: bool = False,
+        retries: int = 0,
+        rotations: int = 0,
+        inline_solves: int = 0,
         elapsed: float = 0.0,
         raw=None,
     ):
@@ -53,6 +59,9 @@ class WaferResponse:
         self.url = url
         self.challenge_type = challenge_type
         self.was_retried = was_retried
+        self.retries = retries
+        self.rotations = rotations
+        self.inline_solves = inline_solves
         self.elapsed = elapsed
         self._raw = raw
 

@@ -16,6 +16,7 @@ WAF-specific logic lives in dedicated modules:
 - ``_drag`` — GeeTest / Alibaba drag/slider puzzle
 - ``_hcaptcha`` — hCaptcha checkbox
 - ``_recaptcha`` — reCAPTCHA v2 checkbox
+- ``_recaptcha_grid`` — reCAPTCHA v2 image grid (YOLO)
 """
 
 import csv
@@ -201,6 +202,37 @@ class BrowserSolver:
         self._drag_recordings: list[list[dict[str, float]]] | None = None
         self._slide_recordings: list[dict] | None = None
         self._browse_recordings: list[dict] | None = None
+        self._grid_recordings: list[dict] | None = None
+
+    _browser_installed = False
+
+    def _ensure_browser_installed(self) -> None:
+        """Auto-install patchright browser binaries if missing."""
+        if BrowserSolver._browser_installed:
+            return
+        import subprocess
+
+        from patchright._impl._driver import (
+            compute_driver_executable,
+            get_driver_env,
+        )
+
+        driver = compute_driver_executable()
+        env = get_driver_env()
+        result = subprocess.run(
+            [*driver, "install", "chromium"],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                "Failed to install patchright browser binaries. "
+                "Install manually with: patchright install chromium\n"
+                f"{result.stderr}"
+            )
+        logger.debug("patchright browsers ready")
+        BrowserSolver._browser_installed = True
 
     def _ensure_extension(self) -> str | None:
         """Extract the screenX/screenY fix extension to a temp dir.
@@ -260,6 +292,8 @@ class BrowserSolver:
                 "patchright is required for browser solving. "
                 "Install with: pip install wafer-py[browser]"
             ) from None
+
+        self._ensure_browser_installed()
 
         launch_args = [
             "--disable-blink-features=AutomationControlled",
@@ -346,6 +380,7 @@ class BrowserSolver:
         self._drag_recordings = []
         self._slide_recordings = []
         self._browse_recordings = []
+        self._grid_recordings = []
 
         try:
             rec_dir = (
@@ -465,14 +500,37 @@ class BrowserSolver:
         except Exception:
             pass
 
+        # --- grids (short-hop paths for tile clicking) ---
+        try:
+            for f in (rec_dir / "grids").iterdir():
+                name = str(f).rsplit("/", 1)[-1]
+                if not name.endswith(".csv"):
+                    continue
+                text = f.read_text()
+                meta = _parse_metadata(text.splitlines()[0])
+                angle = _angle_from_metadata(meta)
+                rows = _parse_csv_rows(text, ("t", "rx", "ry"))
+                if rows:
+                    self._grid_recordings.append(
+                        {
+                            "rows": rows,
+                            "angle": angle,
+                            "meta": meta,
+                            "name": name,
+                        }
+                    )
+        except Exception:
+            pass
+
         logger.info(
             "Loaded %d idle + %d path + %d hold + %d drag"
-            " + %d slide + %d browse recordings",
+            " + %d slide + %d grid + %d browse recordings",
             len(self._idle_recordings),
             len(self._path_recordings),
             len(self._hold_recordings),
             len(self._drag_recordings),
             len(self._slide_recordings),
+            len(self._grid_recordings),
             len(self._browse_recordings),
         )
         return bool(
@@ -491,8 +549,10 @@ class BrowserSolver:
         start_y: float,
         target_x: float,
         target_y: float,
+        pool: list[dict] | None = None,
     ) -> dict:
         """Pick a recorded path whose direction best matches the move."""
+        recordings = pool if pool is not None else self._path_recordings
         angle = math.atan2(
             target_y - start_y, target_x - start_x
         )
@@ -501,7 +561,7 @@ class BrowserSolver:
             diff = abs(rec["angle"] - angle)
             return min(diff, 2 * math.pi - diff)
 
-        best = min(self._path_recordings, key=_angle_diff)
+        best = min(recordings, key=_angle_diff)
         return best
 
     def _replay_idle(
@@ -549,10 +609,11 @@ class BrowserSolver:
         start_y: float,
         target_x: float,
         target_y: float,
+        pool: list[dict] | None = None,
     ) -> None:
         """Replay a recorded human path from start to target."""
         rec = self._pick_path(
-            start_x, start_y, target_x, target_y
+            start_x, start_y, target_x, target_y, pool=pool
         )
         recording = rec["rows"]
         dx = target_x - start_x

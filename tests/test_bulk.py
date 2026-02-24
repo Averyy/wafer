@@ -1,5 +1,7 @@
 """Tests for bulk mode: return-not-raise, max_failures=None, rotate_every."""
 
+from unittest.mock import patch
+
 import pytest
 
 from tests.conftest import (
@@ -25,7 +27,8 @@ class TestHealthThresholdNone:
             max_rotations=5,
             max_failures=None,
         )
-        resp = session.get("https://example.com/test")
+        with patch("time.sleep"):
+            resp = session.get("https://example.com/test")
         assert resp.status_code == 200
         # All 5 rotations used + final success = 6 requests
         assert mock.request_count == 6

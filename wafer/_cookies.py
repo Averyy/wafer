@@ -70,6 +70,7 @@ class CookieCache:
     ):
         self._cache_dir = Path(cache_dir)
         self._max_entries = max_entries
+        self._sweep_counter = 0
 
     def _domain_path(self, domain: str) -> Path:
         safe = (
@@ -130,7 +131,7 @@ class CookieCache:
         now = time.time()
 
         # Sweep stale domain files every ~10 saves
-        self._sweep_counter = getattr(self, "_sweep_counter", 0) + 1
+        self._sweep_counter += 1
         if self._sweep_counter >= 10:
             self._sweep_counter = 0
             self._sweep_expired(now)

@@ -35,11 +35,11 @@ Captured from wayfair.com and zillow.com (2026-02-20). Full dumps in `tests/px_f
 ```
 Frame 0: main page
 ├── Frame 1: about:blank (empty placeholder)
-├── Frame 2: about:blank (decoy button — "Press & Hold")
-├── Frame 3: about:blank (decoy button — "Press & Hold")
-├── Frame 4: about:blank (REAL button — has accessibility text)
-├── Frame 5: about:blank (decoy button — "Press & Hold")
-└── Frame 6: about:blank (decoy button — "Press & Hold")
+├── Frame 2: about:blank (decoy button -"Press & Hold")
+├── Frame 3: about:blank (decoy button -"Press & Hold")
+├── Frame 4: about:blank (REAL button -has accessibility text)
+├── Frame 5: about:blank (decoy button -"Press & Hold")
+└── Frame 6: about:blank (decoy button -"Press & Hold")
 ```
 
 PX creates 5-6 `about:blank` iframes inside `#px-captcha`. All have identical `<title>Human verification challenge</title>` and `role="button"` elements. **Only one** has elements with a visible bounding box (> 10px). The rest are decoys (0x0 invisible elements). This is the single biggest trap in PX solving.
@@ -51,7 +51,7 @@ PX creates 5-6 `about:blank` iframes inside `#px-captcha`. All have identical `<
   <div class="px-captcha-container">    <!-- centered modal, 530px wide -->
     <div class="px-captcha-header">     <!-- "Before we continue..." -->
     <div class="px-captcha-message">    <!-- "Press & Hold to confirm..." -->
-    <div id="px-captcha"                <!-- THE CLICK TARGET — 530x100 -->
+    <div id="px-captcha"                <!-- THE CLICK TARGET -530x100 -->
          style="display: block; min-width: 253px;">
       <iframe title="Human verification challenge" ...>
       <!-- captcha.js creates nested about:blank sub-frames -->
@@ -79,7 +79,7 @@ Recording format details in `wafer/browser/mousse/README.md`.
 ```
 1. Wait 1.5-3.0s for challenge page to render
 2. _find_px_button: scan frames for role="button" with visible bounding box
-   → returns (x, y, frame) — frame reference needed for progress monitoring
+   → returns (x, y, frame) -frame reference needed for progress monitoring
 3. _replay_idle: 2-4s of casual page scanning from random origin
 4. _replay_path: move from idle endpoint to button (direction-matched recording)
 5. Brief hover: 0.3-0.8s (human reads button text)
@@ -106,9 +106,9 @@ Time scaling (+/-15%) on all recordings gives hundreds of effective variations f
 
 ### 1. Decoy Frames
 
-PX creates multiple iframes with identical `<title>Human verification challenge</title>` and `role="button"`. Only ONE has visible elements (bounding_box > 10px). Reading the progress bar from a decoy frame always returns 0% — the hold runs to max duration and PX rejects it.
+PX creates multiple iframes with identical `<title>Human verification challenge</title>` and `role="button"`. Only ONE has visible elements (bounding_box > 10px). Reading the progress bar from a decoy frame always returns 0% -the hold runs to max duration and PX rejects it.
 
-**Fix**: `_find_px_button` checks `bounding_box > 10px` on each frame's button element. Returns `(x, y, frame)` — the frame reference is passed to progress monitoring.
+**Fix**: `_find_px_button` checks `bounding_box > 10px` on each frame's button element. Returns `(x, y, frame)` -the frame reference is passed to progress monitoring.
 
 ### 2. Honeypot Fast Fill
 
@@ -134,7 +134,7 @@ Chromium bug #40280325: `Input.dispatchMouseEvent` sets `screenX = clientX` inst
 
 ### 6. Progress Bar Reversal
 
-PX can reject a hold mid-way — the bar fills to 17-37% then shrinks back to 0%. Normal behavior (suspected: click position too extreme, or behavioral scoring). Retry succeeds within 1-3 attempts.
+PX can reject a hold mid-way -the bar fills to 17-37% then shrinks back to 0%. Normal behavior (suspected: click position too extreme, or behavioral scoring). Retry succeeds within 1-3 attempts.
 
 ### 7. Solve Detection False Positive
 
@@ -146,15 +146,15 @@ PX can reject a hold mid-way — the bar fills to 17-37% then shrinks back to 0%
 
 **wayfair.com**: PX triggered after 7 refreshes. First-attempt solve: 3.3% → 99.3% in 9.4s, released 0.48s after 100%. ~20s total from trigger to solve.
 
-**Local mock**: `tests/px_captcha_local.html` — random delays, decoy frames, honeypot. Solver passes reliably.
+**Local mock**: `tests/px_captcha_local.html` -random delays, decoy frames, honeypot. Solver passes reliably.
 
 ## Testing
 
 ### How to Trigger PX
 
-**Method 1: Repeat refreshes** — 7-10 refreshes on `wayfair.com/v/account/authentication/login` triggers the challenge.
+**Method 1: Repeat refreshes** -7-10 refreshes on `wayfair.com/v/account/authentication/login` triggers the challenge.
 
-**Method 2: Suspicious User-Agent** — Set UA to `HeadlessChrome` or `PhantomJS` for immediate bot classification.
+**Method 2: Suspicious User-Agent** -Set UA to `HeadlessChrome` or `PhantomJS` for immediate bot classification.
 
 **Tips**: Clear cookies between attempts. If solved recently, wait 5-10 minutes or append random string to UA.
 
@@ -162,15 +162,15 @@ PX can reject a hold mid-way — the bar fills to 17-37% then shrinks back to 0%
 
 | Site | URL | Reliability |
 |---|---|---|
-| Wayfair | `wayfair.com/v/account/authentication/login` | HIGH — confirmed + solved |
-| Zillow | `zillow.com` | HIGH — captured frame dumps |
-| Walmart | `walmart.com/blocked` | HIGH — has reCAPTCHA fallback |
-| DigiKey | `digikey.com` | HIGH — PX + Cloudflare |
-| StockX | `stockx.com` | MEDIUM — may pass without challenge |
+| Wayfair | `wayfair.com/v/account/authentication/login` | HIGH -confirmed + solved |
+| Zillow | `zillow.com` | HIGH -captured frame dumps |
+| Walmart | `walmart.com/blocked` | HIGH -has reCAPTCHA fallback |
+| DigiKey | `digikey.com` | HIGH -PX + Cloudflare |
+| StockX | `stockx.com` | MEDIUM -may pass without challenge |
 
 ### Local Mock
 
-`tests/px_captcha_local.html` — realistic PX mock matching real frame structure. Random load delay, random hold duration, decoy frames, honeypot, progress bar, overshoot detection.
+`tests/px_captcha_local.html` -realistic PX mock matching real frame structure. Random load delay, random hold duration, decoy frames, honeypot, progress bar, overshoot detection.
 
 ```bash
 uv run python tests/test_px_captcha_local.py   # visual mock test

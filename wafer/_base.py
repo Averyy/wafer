@@ -11,6 +11,8 @@ from rnet import CertStore, Emulation, Method
 
 from wafer._cookies import CookieCache
 from wafer._fingerprint import FingerprintManager
+from wafer._kasada import generate_cd
+from wafer._kasada import get_session as get_kasada_session
 from wafer._opera_mini import OperaMiniIdentity
 from wafer._profiles import Profile
 from wafer._ratelimit import RateLimiter
@@ -145,6 +147,32 @@ def _is_binary_content_type(content_type: str) -> bool:
     return any(ct.startswith(p) for p in _BINARY_CONTENT_PREFIXES)
 
 
+def _is_challengeable_content_type(content_type: str) -> bool:
+    """Check if a Content-Type could be a WAF challenge page.
+
+    WAF challenges are always HTML pages. JSON/XML API responses should
+    never be browser-solved - even if they contain challenge markers in
+    cookies/headers (e.g. AliExpress MTop API returns x5secdata cookies
+    on JSON 200 responses). Browser-solving a JSON endpoint just renders
+    raw JSON and times out.
+
+    Returns True for HTML and unknown/missing content types (conservative).
+    """
+    ct = content_type.lower().split(";")[0].strip()
+    if not ct:
+        return True  # Unknown - assume HTML (conservative)
+    # Explicit non-HTML text types that should NOT trigger challenge solving
+    if ct in (
+        "application/json",
+        "application/xml",
+        "text/xml",
+        "text/plain",
+        "text/csv",
+    ):
+        return False
+    return True
+
+
 def _decode_headers(header_map) -> dict[str, str]:
     """Decode rnet HeaderMap to lowercase string dict.
 
@@ -155,21 +183,25 @@ def _decode_headers(header_map) -> dict[str, str]:
     """
     result: dict[str, str] = {}
     for raw_key in header_map.keys():
-        k = (
-            raw_key.decode("ascii", errors="replace").lower()
-            if isinstance(raw_key, bytes)
-            else str(raw_key).lower()
-        )
+        k = raw_key.decode("ascii", errors="replace").lower()
         all_vals = header_map.get_all(k)
-        parts = []
-        for val in all_vals:
-            parts.append(
-                val.decode("utf-8", errors="replace")
-                if isinstance(val, bytes)
-                else str(val)
-            )
+        parts = [v.decode("utf-8", errors="replace") for v in all_vals]
         result[k] = "; ".join(parts)
     return result
+
+
+def _extract_location(header_map) -> str:
+    """Extract Location header from raw HeaderMap without full decode.
+
+    Used on redirect hops to avoid decoding every header just to
+    read Location.
+    """
+    raw = header_map.get("location")
+    if raw is None:
+        return ""
+    if isinstance(raw, bytes):
+        return raw.decode("utf-8", errors="replace")
+    return str(raw)
 
 
 class BaseSession:
@@ -284,6 +316,9 @@ class BaseSession:
         self._rotate_every = rotate_every
         self._request_count = 0
 
+        # Cache client-level headers for fast delta in _build_headers
+        self._client_headers = self._compute_client_headers()
+
         if profile is Profile.SAFARI:
             logger.debug(
                 "Session created with Safari profile, timeout=%s",
@@ -311,6 +346,18 @@ class BaseSession:
             return None
         return self._fingerprint.current
 
+    def _compute_client_headers(self) -> dict[str, str]:
+        """Compute client-level headers snapshot.
+
+        Cached as self._client_headers to avoid regenerating sec-ch-ua
+        strings on every _build_headers call. Must be refreshed after
+        fingerprint rotation (_build_client_kwargs does this).
+        """
+        headers = dict(self.headers)
+        if self._fingerprint is not None:
+            headers.update(self._fingerprint.sec_ch_ua_headers())
+        return headers
+
     def _build_headers(
         self, url: str, extra: dict[str, str] | None = None,
     ) -> dict[str, str]:
@@ -333,13 +380,8 @@ class BaseSession:
         if self._profile is Profile.OPERA_MINI:
             return dict(extra) if extra else {}
 
-        # Client-level headers (same set baked into the rnet Client).
-        # Safari: no sec-ch-ua headers (Safari doesn't send client hints).
-        client_headers = dict(self.headers)
-        if self._fingerprint is not None:
-            client_headers.update(
-                self._fingerprint.sec_ch_ua_headers()
-            )
+        # Use cached client-level headers (refreshed on rotation/rebuild)
+        client_headers = self._client_headers
 
         # Full merged headers (same logic as before)
         merged = dict(client_headers)
@@ -389,8 +431,7 @@ class BaseSession:
         # valid ST. Sending CT without CD is worse than neither —
         # Kasada rejects unaccompanied tokens. Cookie-based auth
         # (without CT/CD headers) works for some deployments.
-        from wafer._kasada import generate_cd, get_session
-        kasada = get_session(domain)
+        kasada = get_kasada_session(domain)
         if kasada and kasada.st:
             merged["x-kpsdk-ct"] = kasada.ct
             merged["x-kpsdk-cd"] = generate_cd(kasada.st)
@@ -480,14 +521,12 @@ class BaseSession:
         """Constructor with defaults tuned for high-volume bulk scraping.
 
         Returns responses instead of raising on 429/challenge/empty when
-        rotation/retry is opted out. Disables health retirement and
-        cookie disk caching.
+        rotation/retry is opted out. Disables health retirement.
         """
         defaults = {
             "max_retries": 1,
             "max_rotations": 0,
             "max_failures": None,
-            "cache_dir": None,
         }
         defaults.update(kwargs)
         return cls(**defaults)
@@ -498,7 +537,13 @@ class BaseSession:
         Not called for Opera Mini (which bypasses rnet entirely).
         Safari uses TlsOptions + Http2Options (no Emulation).
         Chrome uses Emulation (no TlsOptions).
+
+        Also refreshes the cached _client_headers snapshot so that
+        _build_headers picks up any fingerprint changes.
         """
+        # Refresh cached client headers (fingerprint may have rotated)
+        self._client_headers = self._compute_client_headers()
+
         if self._safari_identity is not None:
             # Safari: custom TLS + H2, no Emulation
             kwargs = {
@@ -511,13 +556,10 @@ class BaseSession:
             }
         else:
             # Chrome: Emulation + sec-ch-ua headers
-            client_headers = dict(self.headers)
-            client_headers.update(
-                self._fingerprint.sec_ch_ua_headers()
-            )
+            # (reuse cached _client_headers instead of regenerating)
             kwargs = {
                 "emulation": self._fingerprint.current,
-                "headers": client_headers,
+                "headers": dict(self._client_headers),
                 "connect_timeout": self.connect_timeout,
                 "timeout": self.timeout,
                 "cookie_store": True,

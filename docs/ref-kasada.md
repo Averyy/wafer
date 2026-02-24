@@ -11,12 +11,12 @@
 **Integration**: Done. Session cache with 30-min TTL, CT+CD header injection in `_build_headers()`, cookie-only fallback when ST=0.
 
 **Validated against real sites (Feb 2026)**:
-- `realestate.com.au` — server-side 429, browser-solve PASS, cookie auth 5/5 durability
-- `hyatt.com` — server-side 429 (also Akamai CDN), browser-solve PASS, cookie auth 5/5, 43 cookies
+- `realestate.com.au` -server-side 429, browser-solve PASS, cookie auth 5/5 durability
+- `hyatt.com` -server-side 429 (also Akamai CDN), browser-solve PASS, cookie auth 5/5, 43 cookies
 
 **Skipped items** (resolved or not worth pursuing):
-- CDP console detection mitigation — resolved by Patchright (removes `Runtime.enable` + `Console.enable`) and Chrome V8 engine patch (Chrome 137+, May 2025). Solver works without any mitigation code.
-- Full VM reimplementation — not justified. Browser-for-CT + Python-CD architecture is excellent. VM engine is achievable but browser API mocks (~460 LOC) require ongoing monthly maintenance as Kasada adds fingerprint checks. No public working implementation exists.
+- CDP console detection mitigation -resolved by Patchright (removes `Runtime.enable` + `Console.enable`) and Chrome V8 engine patch (Chrome 137+, May 2025). Solver works without any mitigation code.
+- Full VM reimplementation -not justified. Browser-for-CT + Python-CD architecture is excellent. VM engine is achievable but browser API mocks (~460 LOC) require ongoing monthly maintenance as Kasada adds fingerprint checks. No public working implementation exists.
 
 ## Open: ST/CD Flow Validation
 
@@ -36,7 +36,7 @@ The CD code is unit-tested (`tests/test_kasada.py::TestGenerateCD`) and the algo
 
 This is confirmed by multiple commercial Kasada solver APIs (EzCaptcha, Hyper Solutions, MeshPrivacy) which all document the Twitch flow as requiring `x-kpsdk-cd` generated from the `x-kpsdk-st` value.
 
-**Key difference from realestate.com.au/hyatt.com**: Twitch is an API-style Kasada deployment (POST to `/integrity`, not a page-navigate flow). The Kasada script patches `window.fetch` to automatically inject headers — our current browser solver intercepts the `/tl` response but doesn't capture the patched fetch's headers.
+**Key difference from realestate.com.au/hyatt.com**: Twitch is an API-style Kasada deployment (POST to `/integrity`, not a page-navigate flow). The Kasada script patches `window.fetch` to automatically inject headers -our current browser solver intercepts the `/tl` response but doesn't capture the patched fetch's headers.
 
 **Next step**: To validate `generate_cd()` end-to-end, the browser solver needs to:
 1. Intercept the `/tl` response to capture both `x-kpsdk-ct` and `x-kpsdk-st`
@@ -46,14 +46,14 @@ This is confirmed by multiple commercial Kasada solver APIs (EzCaptcha, Hyper So
 This requires extending `setup_kasada_listener` in `_kasada.py` to also capture ST from the `/tl` response headers. The current listener only captures CT.
 
 **Other candidates**:
-- `draftkings.com` — 2026-02-21: TLS passes Cloudflare on homepage. Kasada presence unverified on deeper pages.
+- `draftkings.com` -2026-02-21: TLS passes Cloudflare on homepage. Kasada presence unverified on deeper pages.
 - Any Kasada site that rejects cookie-only auth with a 429
 
 ## How Kasada Works
 
 ### Token Model
 
-Kasada uses three tokens. The critical insight is that CT and CD are **completely separable** — CT requires a browser, CD does not.
+Kasada uses three tokens. The critical insight is that CT and CD are **completely separable** -CT requires a browser, CD does not.
 
 | Token | What It Contains | How Often | Browser Required? |
 |-------|-----------------|-----------|-------------------|
@@ -145,24 +145,24 @@ def generate_cd(st: int, difficulty: int = 10, subchallenges: int = 2) -> dict:
 
 #### Key Parameters
 
-- `"tp-v2-input"` — platform input identifier (stable across observed deployments)
+- `"tp-v2-input"` -platform input identifier (stable across observed deployments)
 - `difficulty` = 10 (typical), `subchallenges` = 2 (typical)
 - Per-nonce: `2^52 / (parseInt(hash[0:13], 16) + 1) >= difficulty / subchallenges`
 
-**Stability**: The CD PoW algorithm was publicly extracted in Feb 2024 (Fweak gist) and remains unchanged as of Feb 2026. The `"tp-v2-input"` string, SHA-256 hash grinding, and difficulty parameters are a **protocol** — changing them would require coordinated rollout across all Kasada customer deployments and break every cached p.js in browsers. This is fundamentally different from the VM bytecode (which rotates per-load) — the PoW wire format is stable infrastructure.
+**Stability**: The CD PoW algorithm was publicly extracted in Feb 2024 (Fweak gist) and remains unchanged as of Feb 2026. The `"tp-v2-input"` string, SHA-256 hash grinding, and difficulty parameters are a **protocol** -changing them would require coordinated rollout across all Kasada customer deployments and break every cached p.js in browsers. This is fundamentally different from the VM bytecode (which rotates per-load) -the PoW wire format is stable infrastructure.
 
 **Caveat**: Hyper Solutions Go SDK recently added a `Script` field to `KasadaPowInput`, suggesting some sites may derive difficulty or platform input from the ips.js script itself. If so, it's still trivial to regex out the parameters without running the VM.
 
 #### CD Inputs (Minimal)
 
 Only needs:
-- `st` — the `x-kpsdk-st` value from `/tl` response
+- `st` -the `x-kpsdk-st` value from `/tl` response
 
 Does NOT need:
-- ~~`ct`~~ — not used in CD computation
-- ~~`script`~~ — not needed for standard PoW (may be needed for parameter extraction on some sites)
-- ~~`domain`~~ — not used in the hash
-- ~~Browser APIs~~ — zero DOM/canvas/WebGL involvement
+- ~~`ct`~~ -not used in CD computation
+- ~~`script`~~ -not needed for standard PoW (may be needed for parameter extraction on some sites)
+- ~~`domain`~~ -not used in the hash
+- ~~Browser APIs~~ -zero DOM/canvas/WebGL involvement
 
 ## Test Sites
 
@@ -188,17 +188,17 @@ Does NOT need:
 | [ips-disassembler](https://github.com/umasii/ips-disassembler) | 56 | Node.js tool that disassembles ips.js VM bytecode into human-readable opcodes. Research tool. |
 | [Kasada-Deobfuscated](https://github.com/Humphryyy/Kasada-Deobfuscated) | 23 | Partial deobfuscation of p.js outer layer. VM logic still intact. |
 | [kasada-dissembler](https://github.com/jtwmyd/kasada-dissembler) | 5 | Modified VM interpreter that traces every opcode with labels. Runs in browser console. |
-| [Kasada-Reverse-new](https://github.com/chenpython/Kasada-Reverse-new) | — | Python scripts for dynamic VM dumping (`VM.py`) and TEA encryption extraction (`encryption.py`). |
-| [Kasada-Solver](https://github.com/tramodule/Kasada-Solver) | — | Token lifecycle documentation. Describes CT/CD/H token model and three-layer defense architecture. |
+| [Kasada-Reverse-new](https://github.com/chenpython/Kasada-Reverse-new) | -| Python scripts for dynamic VM dumping (`VM.py`) and TEA encryption extraction (`encryption.py`). |
+| [Kasada-Solver](https://github.com/tramodule/Kasada-Solver) | -| Token lifecycle documentation. Describes CT/CD/H token model and three-layer defense architecture. |
 | [kasada_cryptoPow.js](https://gist.github.com/Fweak/d101137cd4b909b9694457a7b1debb7c) | gist | **Fully extracted CD PoW algorithm.** SHA-256 hash grinding with `tp-v2-input` platform string. The key breakthrough that makes pure-Python CD generation possible. |
 
 ### Research
 
-- [nullpt.rs "Devirtualizing Nike.com's Bot Protection"](https://nullpt.rs/devirtualizing-nike-vm-1) (umasi, Jan 2023) — Definitive reverse-engineering of ips.js VM: bytecode decoding, opcode identification, string table extraction. [Part 2](https://nullpt.rs/devirtualizing-nike-vm-2): TEA encryption, full disassembly
-- [nullpt.rs "Reversing Vercel's BotID"](https://nullpt.rs/reversing-botid) (veritas, Jun 2025) — Confirms Kasada VM architecture unchanged through mid-2025
-- [kasada_cryptoPow.js gist](https://gist.github.com/Fweak/d101137cd4b909b9694457a7b1debb7c) (Fweak, Feb 2024) — **Fully extracted CD PoW algorithm**: SHA-256 hash grinding, `tp-v2-input` platform string, difficulty/subchallenges parameters
-- Commercial solvers (Hyper Solutions, antibot.to, Solverly, MeshPrivacy) accept script content as input — confirming dynamic interpretation is required for CT, not hardcoded logic
+- [nullpt.rs "Devirtualizing Nike.com's Bot Protection"](https://nullpt.rs/devirtualizing-nike-vm-1) (umasi, Jan 2023) -Definitive reverse-engineering of ips.js VM: bytecode decoding, opcode identification, string table extraction. [Part 2](https://nullpt.rs/devirtualizing-nike-vm-2): TEA encryption, full disassembly
+- [nullpt.rs "Reversing Vercel's BotID"](https://nullpt.rs/reversing-botid) (veritas, Jun 2025) -Confirms Kasada VM architecture unchanged through mid-2025
+- [kasada_cryptoPow.js gist](https://gist.github.com/Fweak/d101137cd4b909b9694457a7b1debb7c) (Fweak, Feb 2024) -**Fully extracted CD PoW algorithm**: SHA-256 hash grinding, `tp-v2-input` platform string, difficulty/subchallenges parameters
+- Commercial solvers (Hyper Solutions, antibot.to, Solverly, MeshPrivacy) accept script content as input -confirming dynamic interpretation is required for CT, not hardcoded logic
 
 ### Commercial APIs (fallback)
 
-Hyper Solutions, antibot.to, Solverly, nocaptcha — all accept script content as input, confirming dynamic interpretation needed for CT. CD is single-use, CT is reusable.
+Hyper Solutions, antibot.to, Solverly, nocaptcha -all accept script content as input, confirming dynamic interpretation needed for CT. CD is single-use, CT is reusable.

@@ -1,6 +1,6 @@
-# Mousse — Mouse Movement Recorder
+# Mousse -Mouse Movement Recorder
 
-Dev tool for recording human mouse movements used by wafer's browser solver. Records idles, paths, holds, drags, slide_drags, and browses as CSV files consumed at runtime by `_solver.py`.
+Dev tool for recording human mouse movements used by wafer's browser solver. Records idles, paths, holds, drags, slide_drags, grids, and browses as CSV files consumed at runtime by `_solver.py`.
 
 ## Usage
 
@@ -14,7 +14,7 @@ Optional: `--port 9000` to use a different port.
 ## Recording Modes
 
 ### Idle (30 needed)
-Natural mouse movement — pretend you're reading a page. Press Space, move around for 1-4 seconds (randomized per recording). Stored as `t,dx,dy` pixel deltas.
+Natural mouse movement -pretend you're reading a page. Press Space, move around for 1-4 seconds (randomized per recording). Stored as `t,dx,dy` pixel deltas.
 
 ### Path (26 needed across 6 directions)
 Move from a green start zone to a red end zone. Press Space, enter green zone, hold 500ms, move to red zone, hold 500ms. Stored as `t,rx,ry` normalized fractions (resolution-independent).
@@ -35,30 +35,43 @@ Click and hold inside the red target circle for up to 12 seconds. Captures micro
 Simulate solving a slider puzzle. Press Space to see the puzzle, then:
 
 1. **Approach**: Move cursor to the slider handle (recording starts when you enter the handle zone)
-2. **Pause**: Hover near the handle naturally — look at the puzzle, decide where to drag. This pre-drag dwell (0.5-2s) is captured in the recording and replayed before mousedown, replacing synthetic sleep timers
+2. **Pause**: Hover near the handle naturally -look at the puzzle, decide where to drag. This pre-drag dwell (0.5-2s) is captured in the recording and replayed before mousedown, replacing synthetic sleep timers
 3. **Drag**: Click and drag horizontally to the notch position, release when placed
 
-The pause before clicking is critical — it captures real human "thinking time" and micro-jitter that WAF behavioral models check for. Don't rush it.
+The pause before clicking is critical -it captures real human "thinking time" and micro-jitter that WAF behavioral models check for. Don't rush it.
 
 Stored as `t,rx,ry` normalized fractions with `mousedown_t` in metadata marking when the drag phase begins. Pre-drag events have `rx ≈ 0` (hovering near handle).
 
 ### Slide (15 needed)
-Simulate a "slide to verify" CAPTCHA — a confident full-width left-to-right drag. The slider matches real Baxia/AliExpress NoCaptcha dimensions (300px track, 42px handle, 34px height). Press Space to see the slider, then:
+Simulate a "slide to verify" CAPTCHA -a confident full-width left-to-right drag. The slider matches real Baxia/AliExpress NoCaptcha dimensions (300px track, 42px handle, 34px height). Press Space to see the slider, then:
 
 1. **Approach**: Move cursor to the handle (recording starts when you enter the handle zone)
-2. **Pause**: Hover briefly near the handle — quick natural pause, no puzzle to study
+2. **Pause**: Hover briefly near the handle -quick natural pause, no puzzle to study
 3. **Slide**: Click and drag all the way to the right edge, release at the end
 
-Unlike puzzle drags (which require careful placement), slides should be confident and fast — the real CAPTCHA checks behavioral signals, not positional accuracy.
+Unlike puzzle drags (which require careful placement), slides should be confident and fast -the real CAPTCHA checks behavioral signals, not positional accuracy.
 
 Stored as `t,rx,ry` normalized fractions (same format as puzzle drags) with `mousedown_t` in metadata. Saved to `slide_drags/` directory.
 
+### Grid (30 needed - 10 sessions x 3 segments)
+Short mouse hops between grid tiles for reCAPTCHA image grid solving. Press Space to see a 3x3 tile grid with 3 randomly highlighted targets. Click each target tile in order (1, 2, 3). After the 3rd click, the recording auto-finishes.
+
+Each accepted session produces **3 separate CSV files** - one per tile-to-tile hop:
+
+1. **Segment 1**: cursor start -> first tile click (approach + dwell)
+2. **Segment 2**: first tile click -> second tile click (pause + move + dwell)
+3. **Segment 3**: second tile click -> third tile click (pause + move + dwell)
+
+Each segment captures the full natural cycle between clicks - post-click pause, scanning, movement, and pre-click dwell are all baked into the timing data.
+
+Targets are randomized each session (never all in the same row or column) so recordings cover all 8 directions naturally. Stored as `t,rx,ry` normalized fractions (same format as paths). Typical segment duration: 0.4-1.2s.
+
 ### Browse (20 needed)
-Simulate exploring a page — move mouse around naturally AND scroll up/down. Press Space, then move and scroll for 8 seconds. The fake page has randomized content length (3-12 sections) per recording to capture different scroll behaviors for short vs long pages. Section count is saved in metadata for page-length matching during replay. Captures both mouse movement and scroll wheel events. Stored as `t,dx,dy,scroll_y` where `scroll_y` is the wheel deltaY (0 for mouse-only events, positive for scroll-down, negative for scroll-up).
+Simulate exploring a page -move mouse around naturally AND scroll up/down. Press Space, then move and scroll for 8 seconds. The fake page has randomized content length (3-12 sections) per recording to capture different scroll behaviors for short vs long pages. Section count is saved in metadata for page-length matching during replay. Captures both mouse movement and scroll wheel events. Stored as `t,dx,dy,scroll_y` where `scroll_y` is the wheel deltaY (0 for mouse-only events, positive for scroll-down, negative for scroll-up).
 
 ## Output
 
-CSV files saved to `wafer/browser/_recordings/{idles,paths,holds,drags,slide_drags,browses}/`.
+CSV files saved to `wafer/browser/_recordings/{idles,paths,holds,drags,slide_drags,grids,browses}/`.
 
 Each CSV has a metadata comment line, header row, then data:
 
@@ -103,7 +116,7 @@ wafer/browser/mousse/
     style.css    # dark theme
 ```
 
-Zero external dependencies — stdlib `http.server` + vanilla JS.
+Zero external dependencies -stdlib `http.server` + vanilla JS.
 
 ## Browse Replay in Solvers
 

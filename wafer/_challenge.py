@@ -216,15 +216,17 @@ def detect_challenge(
                 logger.info("Challenge detected (body): akamai behavioral")
                 return ChallengeType.AKAMAI
 
+    # Compute body_lower once for all remaining case-insensitive checks
+    body_lower = body.lower()
+
     # F5 Shape body markers — checked on any status code because Shape
     # returns 200 for interstitial challenge pages (nordstrom.com).
-    if "istlwashere" in body.lower() or "_imp_apg_r_" in body:
+    if "istlwashere" in body_lower or "_imp_apg_r_" in body:
         logger.info("Challenge detected (body): shape")
         return ChallengeType.SHAPE
 
-    # Body-based detection for 403/429 (compute body_lower once)
+    # Body-based detection for 403/429
     if status_code in (403, 429):
-        body_lower = body.lower()
 
         # Akamai body markers — bazadebezolkohpepadr is the obfuscated
         # global variable set by Akamai Bot Manager's sensor script.
@@ -303,13 +305,13 @@ def detect_challenge(
     # NOTE: x-cdn header alone is NOT sufficient — real Imperva-CDN
     # pages also have it, causing false re-detection after solve.
     if status_code == 200 and len(body) < 5_000:
-        if "_incapsula_resource" in body.lower():
+        if "_incapsula_resource" in body_lower:
             logger.info("Challenge detected (body): imperva interstitial")
             return ChallengeType.IMPERVA
 
     # Arkose Labs on 200 — embedded enforcement widget on login/signup pages
     if status_code == 200 and len(body) < 100_000:
-        if "arkoselabs.com" in body or "funcaptcha" in body.lower():
+        if "arkoselabs.com" in body or "funcaptcha" in body_lower:
             logger.info("Challenge detected (body): arkose")
             return ChallengeType.ARKOSE
 

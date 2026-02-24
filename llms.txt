@@ -1,0 +1,515 @@
+# wafer
+
+> Anti-detection HTTP client for Python wrapping rnet (Rust + BoringSSL).
+
+This file is for LLMs writing code that uses wafer. It contains the exact
+API surface, types, defaults, constraints, and common mistakes. Read this
+instead of guessing from the README or training data.
+
+Package name on PyPI: `wafer-py`. Import name: `wafer`. Python >=3.12.
+
+## Install Modes
+
+There are exactly two install modes:
+
+```bash
+pip install wafer-py            # core
+pip install wafer-py[browser]   # core + browser solving
+```
+
+**Core** (`wafer-py`) provides the TLS client with browser-grade fingerprints,
+automatic challenge detection, retry with fingerprint rotation, cookie caching,
+rate limiting, and inline solving for challenges that don't need JavaScript
+(ACW, Amazon CAPTCHA, TMD). Many sites work with core alone - wafer's TLS
+fingerprint is enough to pass without triggering challenges.
+
+**Browser** (`wafer-py[browser]`) adds everything in core plus a real Chrome
+browser solver for challenges that require JavaScript execution. Installs
+Patchright (patched Chromium), ONNX Runtime (for reCAPTCHA/GeeTest CV models),
+OpenCV, and Pillow. Use this when targeting sites with Cloudflare Turnstile,
+DataDome, PerimeterX press-and-hold, Kasada, AWS WAF, hCaptcha, reCAPTCHA,
+or other JS challenges. The `from wafer.browser import BrowserSolver` import
+is only available with this extra installed.
+
+**uv note:** wafer depends on rnet which is currently a release candidate.
+If using uv, add `prerelease = "allow"` under `[tool.uv]` in pyproject.toml,
+or pass `--prerelease=allow` on the command line. pip handles this automatically.
+
+---
+
+## Quick Example
+
+```python
+import wafer
+from wafer import SyncSession, AsyncSession, ChallengeDetected, RateLimited
+
+# One-shot (creates and tears down a session per call):
+resp = wafer.get("https://example.com")
+
+# Session (reuses TLS identity, cookies, fingerprint across requests):
+with SyncSession(rate_limit=2.0) as session:
+    try:
+        resp = session.get("https://protected-site.com")
+        resp.raise_for_status()
+        data = resp.json()
+    except ChallengeDetected as e:
+        ...  # e.challenge_type, e.url, e.status_code
+    except RateLimited as e:
+        ...  # e.retry_after (seconds or None)
+
+# Async:
+async with AsyncSession() as session:
+    resp = await session.get("https://example.com")
+```
+
+For multiple requests, prefer a session over one-shot calls - it reuses the
+TLS identity and cookie jar across requests, which is both faster and gives
+better anti-detection behavior.
+
+---
+
+## Public API
+
+```python
+from wafer import (
+    SyncSession,       # synchronous session
+    AsyncSession,      # async session (same API; request methods are coroutines)
+    WaferResponse,     # response object
+    Profile,           # enum: OPERA_MINI, SAFARI
+    DEFAULT_HEADERS,   # dict[str, str] - default Accept/Accept-Language/etc headers
+    # Errors (all inherit WaferError):
+    WaferError,
+    WaferHTTPError,    # raised by raise_for_status() on non-2xx
+    WaferTimeout,      # also inherits TimeoutError
+    ChallengeDetected, # WAF challenge unsolvable after all retries
+    RateLimited,       # HTTP 429 after all retries
+    ConnectionFailed,  # network/TLS error after all retries
+    EmptyResponse,     # 200 with empty body after all retries
+    TooManyRedirects,  # redirect loop exceeded max_redirects
+    SessionBlocked,    # exported but not raised internally; for caller use
+)
+
+# Module-level convenience (each creates a one-shot SyncSession with defaults).
+# These are SYNC ONLY - there are no async module-level functions.
+# **kwargs are per-request kwargs only (headers, params, timeout, json, form, body).
+# Session-constructor kwargs (rate_limit, proxy, etc.) are NOT accepted here.
+wafer.get(url, **kwargs) -> WaferResponse
+wafer.post(url, **kwargs) -> WaferResponse
+wafer.put(url, **kwargs) -> WaferResponse
+wafer.delete(url, **kwargs) -> WaferResponse
+wafer.head(url, **kwargs) -> WaferResponse
+wafer.options(url, **kwargs) -> WaferResponse
+wafer.patch(url, **kwargs) -> WaferResponse
+```
+
+---
+
+## Session Constructor
+
+`SyncSession` and `AsyncSession` accept identical kwargs. All optional.
+Both support context managers (`with` / `async with`).
+
+```python
+SyncSession(
+    # TLS identity (Chrome profiles from rnet)
+    emulation: rnet.Emulation | None = None,  # default: Emulation.Chrome145 (newest)
+
+    # Non-Chrome profiles (overrides emulation)
+    profile: Profile | None = None,           # Profile.OPERA_MINI or Profile.SAFARI
+    safari_locale: str = "us",                # "us" or "ca" (only used with Profile.SAFARI)
+
+    # Custom headers (replaces DEFAULT_HEADERS entirely if provided)
+    headers: dict[str, str] | None = None,
+
+    # Timeouts (int, float seconds, or datetime.timedelta)
+    connect_timeout=10,   # default: 10s
+    timeout=30,           # default: 30s (also serves as retry loop deadline when passed per-request)
+
+    # Retry behavior
+    max_retries: int = 3,       # for 5xx, connection errors, empty 200
+    max_rotations: int = 10,    # for 403/challenge (rotates TLS fingerprint)
+
+    # Session health
+    max_failures: int | None = 3,  # consecutive failures per domain before full identity reset; None to disable
+
+    # Cookie persistence (path is relative to CWD; use absolute path for consistency)
+    cache_dir: str | None = "./data/wafer/cookies",  # None to disable disk cache (in-memory only)
+
+    # Rate limiting (per session, per hostname - "example.com" and "api.example.com" are separate.
+    # Two sessions hitting the same host enforce their limits independently.)
+    rate_limit: float = 0.0,    # min seconds between requests to same hostname
+    rate_jitter: float = 0.0,   # random 0..jitter added to interval
+
+    # TLS session rotation
+    rotate_every: int | None = None,  # rebuild TLS session every N requests
+
+    # Redirects (304 Not Modified is NOT treated as a redirect - it passes through)
+    follow_redirects: bool = True,
+    max_redirects: int = 10,
+
+    # Proxy
+    proxy: str | None = None,   # "socks5://user:pass@host:port", "http://...", etc.
+
+    # Embed mode (both modes select a random Referer from embed_referers)
+    embed: str | None = None,           # "xhr" or "iframe"
+    embed_origin: str | None = None,    # Origin header value
+    embed_referers: list[str] | None = None,  # random Referer picked per request
+
+    # Browser solver (requires [browser] extra)
+    browser_solver=None,  # BrowserSolver instance or None
+)
+```
+
+### Bulk mode constructor
+
+```python
+session = SyncSession.bulk(**kwargs)
+# Equivalent to: SyncSession(max_retries=1, max_rotations=0, max_failures=None, **kwargs)
+# Returns responses instead of raising on 429/challenge/empty.
+```
+
+---
+
+## Request Methods
+
+```python
+# Session methods:
+session.get(url, **kwargs) -> WaferResponse
+session.post(url, **kwargs) -> WaferResponse
+session.put(url, **kwargs) -> WaferResponse
+session.delete(url, **kwargs) -> WaferResponse
+session.head(url, **kwargs) -> WaferResponse
+session.options(url, **kwargs) -> WaferResponse
+session.patch(url, **kwargs) -> WaferResponse
+session.request(method: str, url: str, **kwargs) -> WaferResponse
+
+# Cookie injection (sync on both SyncSession and AsyncSession - not a coroutine):
+session.add_cookie(raw_set_cookie: str, url: str) -> None
+# raw_set_cookie is a Set-Cookie header string, e.g. "name=value; Path=/; Secure"
+# Raises NotImplementedError for Opera Mini profile.
+```
+
+### Per-request kwargs
+
+- `headers: dict[str, str]` - merged over session headers AND embed mode headers (per-request wins over both)
+- `params: dict[str, str]` - appended to URL as query string
+- `timeout: int | float | timedelta` - per-request deadline for the entire retry loop
+- `json: dict` - JSON body (auto-sets Content-Type)
+- `form: dict` - form-encoded body
+- `body: bytes | str` - raw body
+- `multipart` - multipart form data (pass-through to rnet; see rnet docs for format)
+
+---
+
+## WaferResponse
+
+```python
+resp.status_code    # int
+resp.ok             # bool (200 <= status < 300)
+resp.text           # str (lazy UTF-8 decode with replacement characters for invalid bytes)
+resp.content        # bytes (raw body, preserved exactly - safe for binary like PDFs/images)
+resp.headers        # dict[str, str] (lowercase keys, string values)
+resp.url            # str (final URL after redirects)
+resp.json(**kwargs) # parsed JSON (passes kwargs to json.loads; raises json.JSONDecodeError on invalid JSON)
+resp.raise_for_status()  # raises WaferHTTPError if not ok
+resp.get_all(key)   # list[str] - all values for a header (e.g. Set-Cookie)
+resp.retry_after    # float | None - parsed Retry-After header
+
+# Retry metadata:
+resp.elapsed        # float (seconds)
+resp.was_retried    # bool
+resp.retries        # int (normal retries used)
+resp.rotations      # int (fingerprint rotations used)
+resp.inline_solves  # int (inline challenge solves)
+resp.challenge_type # str | None (e.g. "cloudflare", "datadome")
+```
+
+`resp.headers` is a plain `dict[str, str]` with lowercase keys. Use `.items()`,
+`.get()`, `[]`, etc. normally. For example, `resp.headers.get("etag")` (lowercase).
+
+---
+
+## Error Hierarchy
+
+```
+WaferError (base)
+  +- ChallengeDetected    .challenge_type: str, .url: str, .status_code: int
+  +- RateLimited          .url: str, .retry_after: float | None
+  +- ConnectionFailed     .url: str, .reason: str
+  +- EmptyResponse        .url: str, .status_code: int
+  +- TooManyRedirects     .url: str, .max_redirects: int
+  +- WaferTimeout         .url: str, .timeout_secs: float  (also inherits TimeoutError)
+  +- WaferHTTPError       .status_code: int, .url: str  (raised by raise_for_status())
+  +- SessionBlocked       .url: str, .consecutive_failures: int  (not raised internally)
+```
+
+`except WaferError` catches everything including WaferTimeout.
+
+`SessionBlocked` is exported for caller use but wafer itself does not raise it.
+When `max_failures` consecutive failures occur on a domain, wafer silently resets
+the session identity (new TLS fingerprint, cleared cookies for that domain, new
+cookie jar) and continues retrying. It does not raise.
+
+### When wafer raises vs returns
+
+Default mode (`max_rotations > 0`):
+- 403 + challenge detected -> raises `ChallengeDetected` after exhausting rotations
+- 429 without challenge -> raises `RateLimited` after exhausting rotations
+- 200 with empty body -> raises `EmptyResponse` after exhausting retries
+- Connection error -> raises `ConnectionFailed` after exhausting retries
+- 5xx -> returns response after exhausting retries
+- Other 4xx (400, 401, 404, etc.) -> returns response immediately (no retry)
+
+No-rotation mode (`max_rotations = 0`, including `.bulk()`):
+- 403, 429, challenge, empty 200 -> returns response (never raises for these)
+- Connection error -> still raises `ConnectionFailed`
+- Other 4xx, 5xx -> same as default (returns response)
+
+---
+
+## Concurrency and Thread Safety
+
+**AsyncSession** is safe to use from multiple concurrent coroutines. Internally
+uses an asyncio.Lock for TLS rotation. You can share a single AsyncSession
+across many `asyncio.Task`s.
+
+**SyncSession** is NOT thread-safe. Create one session per thread. For
+concurrent workloads, either use AsyncSession with asyncio, or create separate
+SyncSession instances in each thread.
+
+**Module-level functions** (`wafer.get()`, etc.) are thread-safe because each
+call creates and tears down its own independent SyncSession.
+
+**Cookie cache** (`cache_dir`) uses file locking. Multiple sessions (even
+across threads/processes) can share the same `cache_dir` safely.
+
+---
+
+## Session Lifecycle
+
+Sessions have no `close()` or `aclose()` method. Cleanup options:
+
+```python
+# Preferred: context manager
+with SyncSession(browser_solver=solver) as session:
+    ...  # solver.close() called on exit
+
+async with AsyncSession(browser_solver=solver) as session:
+    ...  # solver.close() called on exit
+
+# Without context manager: call __exit__ / __aexit__ directly
+session.__exit__(None, None, None)
+# or for async:
+await session.__aexit__(None, None, None)
+```
+
+**Without a browser solver, sessions have no resources to clean up.** Letting
+them go out of scope or setting to `None` is fine. The context manager only
+matters when a `browser_solver` is attached.
+
+**Shared BrowserSolver warning:** `__exit__` / `__aexit__` calls
+`browser_solver.close()`. If you share one BrowserSolver across multiple
+sessions, exiting ANY session closes the solver for ALL of them. Either
+use one session per solver, or call `solver.close()` yourself at the end
+instead of relying on context managers.
+
+---
+
+## Profiles
+
+The `profile=` parameter selects the browser identity. Each has different
+capabilities and trade-offs.
+
+### Chrome (default, no profile= needed)
+
+- TLS + HTTP/2 fingerprint matches real Chrome (currently Chrome 145)
+- Auto-generates `sec-ch-ua` Client Hints headers
+- Fingerprint rotation on 403: cycles through Chrome versions automatically
+- All features enabled: challenge detection, retry, rotation, browser solving
+- Pass `emulation=rnet.Emulation.Chrome145` to pin a specific version
+
+### Safari (`profile=Profile.SAFARI`)
+
+- TLS + HTTP/2 fingerprint matches real Safari 26 on macOS M3/M4
+- No `sec-ch-ua` headers (Safari doesn't send Client Hints)
+- All features except fingerprint rotation (only one Safari profile)
+- `safari_locale=` param: `"us"` (default) or `"ca"`
+- More effective than Chrome against DataDome (less commonly spoofed TLS)
+
+### Opera Mini (`profile=Profile.OPERA_MINI`)
+
+- Impersonates Opera Mini in Extreme data-saving mode
+- GET only (raises ValueError on POST, PUT, etc.)
+- No challenge detection, no retry, no browser solving
+- Rate limiting still works
+- Useful for fetching server-side rendered pages that Opera Mini triggers
+
+---
+
+## What Wafer Handles (do not reimplement)
+
+These are all automatic. Do not write code to handle these yourself:
+
+- **Redirects** - 3xx followed automatically (POST -> GET on 301/302/303). 304 Not Modified passes through untouched.
+- **Referer headers** - set automatically from the last URL visited per domain
+- **Cookies** - managed in-memory and optionally persisted to disk; no manual cookie jar needed
+- **WAF challenges** - detected, retried with rotated TLS fingerprints, and browser-solved if configured
+- **Rate limiting** - per-hostname delays enforced automatically when `rate_limit` is set
+- **TLS fingerprint** - sec-ch-ua headers auto-generated to match the Chrome version
+- **Binary responses** - detected via Content-Type. `resp.content` preserves raw bytes exactly (safe for PDFs, images, etc.). `resp.text` decodes with UTF-8 replacement characters.
+
+---
+
+## Challenge Types
+
+Wafer detects 17 WAF/challenge types automatically. When a challenge cannot be
+solved, `ChallengeDetected.challenge_type` and `resp.challenge_type` contain
+one of these strings:
+
+```
+"cloudflare"   - Cloudflare managed challenge / Turnstile
+"akamai"       - Akamai Bot Manager
+"datadome"     - DataDome
+"perimeterx"   - PerimeterX / HUMAN Security
+"imperva"      - Imperva / Incapsula
+"kasada"       - Kasada
+"shape"        - F5 Shape
+"awswaf"       - AWS WAF
+"acw"          - Alibaba Cloud WAF (solved inline, no browser needed)
+"tmd"          - Alibaba TMD (solved inline, no browser needed)
+"amazon"       - Amazon CAPTCHA (solved inline, no browser needed)
+"vercel"       - Vercel bot protection
+"arkose"       - Arkose Labs / FunCaptcha
+"geetest"      - GeeTest v4
+"hcaptcha"     - hCaptcha
+"recaptcha"    - reCAPTCHA v2
+"generic_js"   - unclassified JS challenge
+```
+
+Some challenges (Cloudflare, AWS WAF, Kasada, Vercel, hCaptcha, reCAPTCHA,
+generic_js) require a browser solver - TLS fingerprint rotation alone cannot
+help. Pass a `BrowserSolver` to the session to handle these automatically.
+
+---
+
+## Browser Solver
+
+Requires `pip install wafer-py[browser]`. Uses Patchright (patched Playwright).
+
+```python
+from wafer.browser import BrowserSolver, SolveResult, InterceptResult
+
+solver = BrowserSolver(
+    headless=False,       # default: False. Headful recommended for stealth
+    idle_timeout=300.0,   # default: 300s. Close browser after N seconds idle
+    solve_timeout=30.0,   # default: 30s. Max seconds per solve attempt
+)
+
+# Automatic usage (pass to session):
+session = SyncSession(browser_solver=solver)
+resp = session.get("https://protected-site.com")  # auto-solves challenges
+
+# Manual solve:
+result: SolveResult | None = solver.solve(url, challenge_type)
+# result.cookies: list[dict] - browser cookies
+# result.user_agent: str - browser's real User-Agent
+# result.extras: dict | None - WAF-specific data (e.g. Kasada CT/ST)
+# result.response: CapturedResponse | None - passthrough content if no challenge
+
+# Iframe intercept (for embedded widgets):
+result: InterceptResult | None = solver.intercept_iframe(
+    embedder_url="https://parent-page.com",
+    target_domain="widget-domain.com",
+    timeout=30.0,
+)
+# result.cookies: list[dict]
+# result.responses: list[CapturedResponse]
+# result.user_agent: str
+
+# Explicit cleanup (also called by session context manager __exit__):
+solver.close()
+```
+
+The solver is thread-safe and reuses a single browser instance with idle timeout.
+Supports: Cloudflare, Akamai, DataDome, PerimeterX (press-and-hold), Imperva,
+Kasada, F5 Shape, AWS WAF, GeeTest v4 (slide), Baxia (slider), hCaptcha,
+reCAPTCHA v2 (checkbox + image grid via YOLO+ONNX), generic JS.
+
+---
+
+## Embed Mode
+
+Impersonates requests from an iframe or fetch() call. Sets Sec-Fetch-*, Origin,
+Referer headers to match browser behavior. Both modes pick a random Referer from
+`embed_referers` on each request.
+
+### XHR mode (`embed="xhr"`)
+- Sets: `Sec-Fetch-Site: cross-site`, `Sec-Fetch-Mode: cors`, `Sec-Fetch-Dest: empty`
+- Sets: `Origin` from embed_origin, `Accept: */*`
+- Sets: random `Referer` from embed_referers list
+- Removes: `Upgrade-Insecure-Requests`, `Cache-Control`
+- Does NOT set `X-Requested-With` (fetch() never sets it)
+
+### Iframe mode (`embed="iframe"`)
+- Sets: `Sec-Fetch-Site: cross-site`, `Sec-Fetch-Mode: navigate`, `Sec-Fetch-Dest: iframe`
+- No Origin header for GET navigations
+- Sets: random `Referer` from embed_referers list
+
+Per-request `headers=` override embed mode headers. If you pass
+`headers={"Sec-Fetch-Site": "same-origin"}`, it replaces the embed mode value.
+
+---
+
+## Logging
+
+Silent by default (`NullHandler`). Enable:
+
+```python
+import logging
+logging.getLogger("wafer").setLevel(logging.DEBUG)
+```
+
+---
+
+## Common Mistakes
+
+1. **Do not pass `emulation=` and `profile=` together.** Profile overrides emulation.
+   Chrome is the default when neither is set.
+
+2. **`resp.headers` is a plain `dict[str, str]` with lowercase keys.** Use
+   `resp.headers.get("etag")`, not `resp.headers.get("ETag")`.
+
+3. **Body kwarg is `body=`, not `data=`.** Use `body=` (raw bytes/str), `json=`
+   (JSON dict), or `form=` (form-encoded dict). There is no `data=` parameter.
+
+4. **No `auth=` parameter.** Set Authorization header manually via `headers=`.
+
+5. **No streaming.** All responses are fully buffered. There is no `stream`,
+   `iter_content()`, or `iter_lines()`.
+
+6. **No `Session.cookies` jar attribute.** Use `session.add_cookie(raw_set_cookie, url)`
+   to inject cookies. The cookie jar is managed internally.
+
+7. **No `close()` method on sessions.** Use context managers, or let sessions go
+   out of scope (no cleanup needed without a browser solver). See Session Lifecycle.
+
+8. **Challenge handling is automatic.** You do not need to detect or solve challenges
+   yourself. Wafer retries, rotates fingerprints, and invokes the browser solver
+   (if configured) inside its retry loop. Just catch `ChallengeDetected` if all
+   attempts fail.
+
+9. **Redirects are followed by default.** You do not need to check for 3xx or
+   follow Location headers manually. 304 Not Modified is NOT followed - it passes
+   through as a normal response. Disable redirect following with `follow_redirects=False`.
+
+10. **`raise_for_status()` raises `WaferHTTPError`**, not a generic exception.
+    Catch it specifically if you need the status code: `e.status_code`, `e.url`.
+
+11. **No `resp.cookies` or `resp.history`.** To read response cookies, use
+    `resp.get_all("set-cookie")`. There is no redirect history - only `resp.url`
+    (the final URL after all redirects).
+
+12. **Empty 200 responses raise, not return.** Unlike requests/curl_cffi which
+    return a response with empty `.text`, wafer raises `EmptyResponse` after
+    exhausting retries. If you want the response object back instead, use
+    `.bulk()` or set `max_retries=0`.

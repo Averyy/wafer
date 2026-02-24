@@ -1,7 +1,7 @@
 /* Mousse — mouse movement recorder */
 
 // ── State ──────────────────────────────────────────────────────────────
-let mode = "idle"; // idle | path | hold | drag | slide_drag | browse
+let mode = "idle"; // idle | path | hold | drag | slide_drag | grid | browse
 let state = "ready"; // ready | countdown | recording | preview
 let points = []; // raw captured points [{t, x, y}]
 let startTime = 0;
@@ -224,8 +224,138 @@ function drawSlideTrack() {
   ctx.fillText(`${s.trackW}px track, ${dragDist}px slide`, s.trackX + s.trackW / 2, s.trackY + s.trackH + 20);
 }
 
-// Slide drag reuses drag state machine (approach → hover → drag)
+// Slide drag reuses drag state machine (approach -> hover -> drag)
 // but always drags to the right edge of the track.
+
+// ── Grid layout helpers ───────────────────────────────────────────────
+const GRID_TILE_SIZE = 100;
+const GRID_GAP = 4;
+const GRID_COLS = 3;
+const GRID_ROWS = 3;
+
+function getGridOrigin() {
+  const totalW = GRID_COLS * GRID_TILE_SIZE + (GRID_COLS - 1) * GRID_GAP;
+  const totalH = GRID_ROWS * GRID_TILE_SIZE + (GRID_ROWS - 1) * GRID_GAP;
+  return {
+    x: Math.floor((canvas.width - totalW) / 2),
+    y: Math.floor((canvas.height - totalH) / 2),
+  };
+}
+
+function getTileBounds(tileIdx) {
+  const origin = getGridOrigin();
+  const col = tileIdx % GRID_COLS;
+  const row = Math.floor(tileIdx / GRID_COLS);
+  const x = origin.x + col * (GRID_TILE_SIZE + GRID_GAP);
+  const y = origin.y + row * (GRID_TILE_SIZE + GRID_GAP);
+  return { x, y, w: GRID_TILE_SIZE, h: GRID_TILE_SIZE };
+}
+
+function getTileCenter(tileIdx) {
+  const b = getTileBounds(tileIdx);
+  return { x: b.x + b.w / 2, y: b.y + b.h / 2 };
+}
+
+function hitTestTile(px, py) {
+  for (let i = 0; i < 9; i++) {
+    const b = getTileBounds(i);
+    if (px >= b.x && px <= b.x + b.w && py >= b.y && py <= b.y + b.h) return i;
+  }
+  return -1;
+}
+
+function randomizeGrid() {
+  // Pick 3 unique random tile indices, ensuring at least 2 different directions
+  for (let attempt = 0; attempt < 50; attempt++) {
+    const indices = [];
+    while (indices.length < 3) {
+      const idx = Math.floor(Math.random() * 9);
+      if (!indices.includes(idx)) indices.push(idx);
+    }
+    // Check: not all 3 in the same row or same column
+    const rows = indices.map(i => Math.floor(i / 3));
+    const cols = indices.map(i => i % 3);
+    const sameRow = rows[0] === rows[1] && rows[1] === rows[2];
+    const sameCol = cols[0] === cols[1] && cols[1] === cols[2];
+    if (!sameRow && !sameCol) {
+      gridTargets = indices;
+      return;
+    }
+  }
+  // Fallback: just use any 3 distinct tiles
+  gridTargets = [0, 4, 8];
+}
+
+function drawGrid() {
+  const origin = getGridOrigin();
+  const totalW = GRID_COLS * GRID_TILE_SIZE + (GRID_COLS - 1) * GRID_GAP;
+  const totalH = GRID_ROWS * GRID_TILE_SIZE + (GRID_ROWS - 1) * GRID_GAP;
+
+  // Background
+  ctx.fillStyle = "#111122";
+  ctx.fillRect(origin.x - 8, origin.y - 8, totalW + 16, totalH + 16);
+  ctx.strokeStyle = "#2a2a4a";
+  ctx.lineWidth = 1;
+  ctx.strokeRect(origin.x - 8, origin.y - 8, totalW + 16, totalH + 16);
+
+  for (let i = 0; i < 9; i++) {
+    const b = getTileBounds(i);
+    const targetIdx = gridTargets.indexOf(i);
+    const isTarget = targetIdx !== -1;
+    const isClicked = gridClicks.some(c => c.tile === i);
+    const isCurrentTarget = isTarget && targetIdx === gridPhase - 1;
+
+    // Tile fill
+    if (isClicked) {
+      ctx.fillStyle = "#1a3a2a";
+    } else {
+      ctx.fillStyle = "#1a1a2e";
+    }
+    ctx.fillRect(b.x, b.y, b.w, b.h);
+
+    // Tile border
+    if (isCurrentTarget) {
+      ctx.strokeStyle = "#4ecca3";
+      ctx.lineWidth = 3;
+    } else if (isTarget && !isClicked) {
+      ctx.strokeStyle = "#4ecca380";
+      ctx.lineWidth = 2;
+    } else {
+      ctx.strokeStyle = "#2a2a4a";
+      ctx.lineWidth = 1;
+    }
+    ctx.strokeRect(b.x, b.y, b.w, b.h);
+
+    // Label for target tiles
+    if (isTarget) {
+      ctx.fillStyle = isClicked ? "#4ecca350" : (isCurrentTarget ? "#4ecca3" : "#4ecca380");
+      ctx.font = "bold 24px 'JetBrains Mono', monospace";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillText(String(targetIdx + 1), b.x + b.w / 2, b.y + b.h / 2);
+    }
+  }
+
+  // Instructions
+  ctx.font = "14px monospace";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "alphabetic";
+  if (gridPhase === 4) {
+    ctx.fillStyle = "#4ecca3";
+    ctx.fillText("Settling...", canvas.width / 2, origin.y + totalH + 30);
+  } else if (gridPhase >= 1 && gridPhase <= 3) {
+    if (!gridStarted) {
+      ctx.fillStyle = "#808090";
+      ctx.fillText("Move cursor into tile 1", canvas.width / 2, origin.y + totalH + 30);
+    } else if (!gridReady) {
+      ctx.fillStyle = "#4ecca3";
+      ctx.fillText("Hold still...", canvas.width / 2, origin.y + totalH + 30);
+    } else {
+      ctx.fillStyle = "#4ecca3";
+      ctx.fillText(`Click tile ${gridPhase}`, canvas.width / 2, origin.y + totalH + 30);
+    }
+  }
+}
 
 // ── Drawing helpers ────────────────────────────────────────────────────
 function clear() {
@@ -372,6 +502,17 @@ function drawGuides() {
         ctx.fillStyle = "#808090";
         ctx.fillText("Move cursor to the slider handle", canvas.width / 2, canvas.height - 20);
       }
+    }
+  } else if (mode === "grid") {
+    if (state === "ready") {
+      ctx.fillStyle = "#808090";
+      ctx.font = "16px monospace";
+      ctx.textAlign = "center";
+      ctx.fillText("Grid tile hops for reCAPTCHA solver", canvas.width / 2, canvas.height / 2 - 10);
+      ctx.font = "12px monospace";
+      ctx.fillText("Press Space to begin (click 3 highlighted tiles)", canvas.width / 2, canvas.height / 2 + 16);
+    } else {
+      drawGrid();
     }
   } else if (mode === "browse") {
     drawBrowsePage();
@@ -589,6 +730,7 @@ function drawBrowsePage() {
 function switchMode(newMode) {
   if (state !== "ready") return;
   mode = newMode;
+  location.hash = mode;
   tabs.forEach(t => t.classList.toggle("active", t.dataset.mode === mode));
   directionSelect.classList.toggle("hidden", mode !== "path");
   directionInfo.classList.toggle("hidden", mode !== "path");
@@ -619,6 +761,13 @@ let browseScrollEvents = [];
 let browsePageSections = 6; // default, randomized on each start
 let browseScrollOffset = 0; // current scroll position in the fake page
 
+// Grid mode: 3x3 tile grid for short-hop recordings
+let gridTargets = [];    // 3 random tile indices (0-8)
+let gridClicks = [];     // [{t, x, y, tile}, ...] click events
+let gridPhase = 0;       // 0=waiting for grid hover, 1/2/3=waiting for nth click, 4=settling
+let gridStarted = false; // true once cursor entered first target tile
+let gridReady = false;   // true after 500ms dwell in first tile
+
 // Dwell: true once the 500ms start-zone dwell is complete
 let pathReady = false;
 let dragReady = false;
@@ -644,7 +793,7 @@ directionSelect.addEventListener("change", () => {
 
 // ── Stats ──────────────────────────────────────────────────────────────
 function updateStats(data) {
-  for (const cat of ["idles", "paths", "holds", "drags", "slide_drags", "browses"]) {
+  for (const cat of ["idles", "paths", "holds", "drags", "slide_drags", "grids", "browses"]) {
     const el = document.getElementById(`stat-${cat}`);
     const info = data[cat];
     if (!el || !info) continue;
@@ -663,7 +812,7 @@ function updateStats(data) {
 }
 
 function syncActiveTab() {
-  const modeToStat = { idle: "stat-idles", path: "stat-paths", hold: "stat-holds", drag: "stat-drags", slide_drag: "stat-slide_drags", browse: "stat-browses" };
+  const modeToStat = { idle: "stat-idles", path: "stat-paths", hold: "stat-holds", drag: "stat-drags", slide_drag: "stat-slide_drags", grid: "stat-grids", browse: "stat-browses" };
   for (const [m, id] of Object.entries(modeToStat)) {
     document.getElementById(id).classList.toggle("active-tab", m === mode);
   }
@@ -684,9 +833,9 @@ function renderRecordings(data) {
   recordingsGrid.innerHTML = "";
   const emptyEl = document.getElementById("recordings-empty");
   let total = 0;
-  for (const cat of ["idles", "paths", "holds", "drags", "slide_drags", "browses"]) total += (data[cat]?.files?.length || 0);
+  for (const cat of ["idles", "paths", "holds", "drags", "slide_drags", "grids", "browses"]) total += (data[cat]?.files?.length || 0);
   if (emptyEl) emptyEl.classList.toggle("hidden", total > 0);
-  for (const cat of ["idles", "paths", "holds", "drags", "slide_drags", "browses"]) {
+  for (const cat of ["idles", "paths", "holds", "drags", "slide_drags", "grids", "browses"]) {
     if (!data[cat]) continue;
     for (const file of data[cat].files) {
       const thumb = document.createElement("div");
@@ -922,6 +1071,20 @@ function startRecording() {
     dragMousedownT = null;
     updateButtons();
     drawGuides();
+  } else if (mode === "grid") {
+    randomizeGrid();
+    gridClicks = [];
+    gridPhase = 1;
+    state = "recording";
+    startTime = performance.now();
+    points = [];
+    updateButtons();
+    drawGuides();
+    // Timeout after 20s
+    recordingTimer = setTimeout(() => {
+      showStatus("Grid recording timed out (20s)", "error");
+      discardRecording();
+    }, 20000);
   } else if (mode === "browse") {
     // Randomize page length: 6-24 sections (always scrollable)
     browsePageSections = 6 + Math.floor(Math.random() * 19);
@@ -1118,6 +1281,37 @@ canvas.addEventListener("mousemove", (e) => {
       ctx.fillStyle = "#e94560";
       ctx.fillText("Slide all the way right \u2014 release at the end!", canvas.width / 2, canvas.height - 20);
     }
+  } else if (mode === "grid") {
+    if (!gridStarted) {
+      // Wait for cursor to enter the first target tile, then 500ms dwell
+      const firstTile = gridTargets[0];
+      const b = getTileBounds(firstTile);
+      if (p.x >= b.x && p.x <= b.x + b.w && p.y >= b.y && p.y <= b.y + b.h) {
+        gridStarted = true;
+        gridReady = false;
+        startTime = performance.now();
+        points = [{ t: 0, x: p.x, y: p.y }];
+        drawGuides();
+        setTimeout(() => {
+          if (!gridStarted) return;
+          gridReady = true;
+          drawGuides();
+        }, 500);
+      }
+    } else {
+      points.push({ t: (performance.now() - startTime) / 1000, x: p.x, y: p.y });
+      // Draw trail
+      if (points.length >= 2) {
+        const prev = points[points.length - 2];
+        ctx.strokeStyle = "#4ecca3";
+        ctx.lineWidth = 2;
+        ctx.lineCap = "round";
+        ctx.beginPath();
+        ctx.moveTo(prev.x, prev.y);
+        ctx.lineTo(p.x, p.y);
+        ctx.stroke();
+      }
+    }
   } else if (mode === "hold" && holdActive) {
     points.push({ t: (performance.now() - startTime) / 1000, x: p.x, y: p.y });
     // Draw jitter dot
@@ -1144,6 +1338,36 @@ canvas.addEventListener("mousedown", (e) => {
       dragMousedownT = (performance.now() - startTime) / 1000;
       points.push({ t: dragMousedownT, x: p.x, y: p.y });
       drawGuides();
+    }
+    return;
+  }
+
+  if (mode === "grid" && gridStarted && gridReady && gridPhase >= 1 && gridPhase <= 3) {
+    const p = canvasCoords(e);
+    const tile = hitTestTile(p.x, p.y);
+    const expectedTile = gridTargets[gridPhase - 1];
+    if (tile === expectedTile) {
+      const t = (performance.now() - startTime) / 1000;
+      gridClicks.push({ t, x: p.x, y: p.y, tile });
+      points.push({ t, x: p.x, y: p.y });
+
+      if (gridPhase >= 3) {
+        // All 3 tiles clicked - keep recording 500ms for post-click dwell
+        gridPhase = 4;
+        setTimeout(() => {
+          clearTimeout(recordingTimer);
+          finishRecording();
+        }, 500);
+      } else {
+        gridPhase++;
+      }
+      // Redraw grid to show clicked state
+      clear();
+      drawGrid();
+      // Redraw trail
+      if (points.length >= 2) {
+        drawPath(points, "#4ecca3", 2);
+      }
     }
     return;
   }
@@ -1334,6 +1558,30 @@ function finishRecording() {
     const z = getSlideZone();
     const slideDist = Math.round(z.end.x - z.start.x);
     ctx.fillText(`${points.length} events, ${points[points.length - 1].t.toFixed(1)}s, ${slideDist}px slide`, canvas.width / 2, canvas.height - 20);
+  } else if (mode === "grid") {
+    drawGrid();
+    drawPath(points, "#4ecca3", 2);
+    // Mark click points
+    for (let i = 0; i < gridClicks.length; i++) {
+      const c = gridClicks[i];
+      ctx.beginPath();
+      ctx.arc(c.x, c.y, 6, 0, Math.PI * 2);
+      ctx.fillStyle = "#e94560";
+      ctx.fill();
+      ctx.fillStyle = "#fff";
+      ctx.font = "bold 10px monospace";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillText(String(i + 1), c.x, c.y);
+    }
+    ctx.fillStyle = "#808090";
+    ctx.font = "14px monospace";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "alphabetic";
+    ctx.fillText(
+      `${points.length} events, ${points[points.length - 1].t.toFixed(1)}s, 3 segments`,
+      canvas.width / 2, canvas.height - 20
+    );
   } else if (mode === "hold") {
     // Scatter plot of jitter
     const cx = canvas.width / 2, cy = canvas.height / 2;
@@ -1545,6 +1793,75 @@ async function acceptRecording() {
       metadata: meta,
       rows,
     };
+  } else if (mode === "grid") {
+    // Split points into 3 segments at click boundaries and save each separately
+    if (gridClicks.length !== 3) {
+      showStatus("Need exactly 3 clicks", "error");
+      discardRecording();
+      return;
+    }
+
+    const segments = [];
+    // Segment boundaries: [0..click1], [click1..click2], [click2..end]
+    // Last segment includes post-click dwell (500ms settle after 3rd click)
+    const clickTimes = gridClicks.map(c => c.t);
+    const lastT = points[points.length - 1].t;
+    const boundaries = [0, clickTimes[0], clickTimes[1], lastT];
+    for (let s = 0; s < 3; s++) {
+      const tStart = boundaries[s];
+      const tEnd = boundaries[s + 1];
+      const seg = points.filter(p => p.t >= tStart - 0.001 && p.t <= tEnd + 0.001);
+      if (seg.length < 2) {
+        showStatus(`Segment ${s + 1} too short`, "error");
+        discardRecording();
+        return;
+      }
+      segments.push(seg);
+    }
+
+    // Save each segment as a separate recording
+    let savedCount = 0;
+    for (let s = 0; s < 3; s++) {
+      const seg = segments[s];
+      const sx = seg[0].x, sy = seg[0].y;
+      const ex = seg[seg.length - 1].x, ey = seg[seg.length - 1].y;
+      const dxRange = ex - sx, dyRange = ey - sy;
+      const dist = Math.sqrt(dxRange * dxRange + dyRange * dyRange);
+
+      // Normalize: rx/ry relative to the distance
+      const normFactor = dist > 1 ? dist : 1;
+      const tOffset = seg[0].t;
+      const rows = seg.map(p => [
+        parseFloat((p.t - tOffset).toFixed(3)),
+        parseFloat(((p.x - sx) / normFactor).toFixed(4)),
+        parseFloat(((p.y - sy) / normFactor).toFixed(4)),
+      ]);
+
+      const segPayload = {
+        type: "grids",
+        columns: ["t", "rx", "ry"],
+        metadata: {
+          viewport: vpStr,
+          start: `${Math.round(sx)},${Math.round(sy)}`,
+          end: `${Math.round(ex)},${Math.round(ey)}`,
+        },
+        direction: "grid_hop",
+        rows,
+      };
+
+      const resp = await fetch("/api/save", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(segPayload),
+      });
+      const result = await resp.json();
+      if (resp.ok) savedCount++;
+    }
+
+    showStatus(`Saved ${savedCount} grid hop segments`, "success");
+    refreshRecordings();
+    resetState();
+    return;
   } else if (mode === "hold") {
     const rows = points.map(p => [
       parseFloat(p.t.toFixed(3)),
@@ -1598,6 +1915,11 @@ function discardRecording() {
   dragMouseDown = false;
   dragMousedownT = null;
   browseScrollEvents = [];
+  gridClicks = [];
+  gridPhase = 0;
+  gridTargets = [];
+  gridStarted = false;
+  gridReady = false;
   if (settleTimer) { clearTimeout(settleTimer); settleTimer = null; }
   const pb = document.getElementById("hold-progress");
   if (pb) pb.remove();
@@ -1616,6 +1938,11 @@ function resetState() {
   dragMouseDown = false;
   dragMousedownT = null;
   browseScrollEvents = [];
+  gridClicks = [];
+  gridPhase = 0;
+  gridTargets = [];
+  gridStarted = false;
+  gridReady = false;
   if (settleTimer) { clearTimeout(settleTimer); settleTimer = null; }
   holdActive = false;
   holdStartPos = null;
@@ -1686,7 +2013,7 @@ document.addEventListener("click", (e) => {
 function populateManage() {
   manageRows.innerHTML = "";
   let totalFiles = 0;
-  for (const cat of ["idles", "paths", "holds", "drags", "slide_drags", "browses"]) {
+  for (const cat of ["idles", "paths", "holds", "drags", "slide_drags", "grids", "browses"]) {
     const info = allRecordings[cat] || { files: [], count: 0, target: 0 };
     totalFiles += info.count;
     const row = document.createElement("div");
@@ -1718,12 +2045,12 @@ function populateManage() {
 
 btnDeleteAll.addEventListener("click", async () => {
   let total = 0;
-  for (const cat of ["idles", "paths", "holds", "drags", "slide_drags", "browses"]) {
+  for (const cat of ["idles", "paths", "holds", "drags", "slide_drags", "grids", "browses"]) {
     total += (allRecordings[cat]?.count || 0);
   }
   if (total === 0) return;
   if (!confirm(`Delete ALL ${total} recordings?`)) return;
-  for (const cat of ["idles", "paths", "holds", "drags", "slide_drags", "browses"]) {
+  for (const cat of ["idles", "paths", "holds", "drags", "slide_drags", "grids", "browses"]) {
     for (const file of (allRecordings[cat]?.files || [])) {
       await fetch(`/api/recordings/${cat}/${file}`, { method: "DELETE" });
     }
@@ -1734,5 +2061,11 @@ btnDeleteAll.addEventListener("click", async () => {
 });
 
 // ── Init ───────────────────────────────────────────────────────────────
+// Restore mode from URL hash
+const validModes = ["idle", "path", "hold", "drag", "slide_drag", "grid", "browse"];
+const hashMode = location.hash.slice(1);
+if (hashMode && validModes.includes(hashMode)) {
+  switchMode(hashMode);
+}
 resizeCanvas();
 refreshRecordings();

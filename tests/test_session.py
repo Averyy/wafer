@@ -59,7 +59,9 @@ class TestSyncSession:
         assert resp.ok is True
 
     def test_response_ok_false_for_4xx(self):
-        session, _ = make_sync_session([ok_response(403)])
+        session, _ = make_sync_session(
+            [ok_response(403)], max_rotations=0,
+        )
         resp = session.get("https://example.com")
         assert resp.ok is False
 

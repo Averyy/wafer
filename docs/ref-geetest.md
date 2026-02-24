@@ -26,19 +26,19 @@ wafer/browser/
 
 ## GeeTest Demo Interaction
 
-**URL**: `https://www.geetest.com/en/adaptive-captcha-demo` — Next.js React app.
+**URL**: `https://www.geetest.com/en/adaptive-captcha-demo` -Next.js React app.
 
 1. Navigate to demo URL, wait for load (5s)
-2. **Select "Slide CAPTCHA"** — defaults to "No CAPTCHA" otherwise (nothing appears)
-3. Select animation style: Float, Popup, or **Bind** (only Bind reliably shows puzzle — Float/Popup auto-pass invisible check)
+2. **Select "Slide CAPTCHA"** -defaults to "No CAPTCHA" otherwise (nothing appears)
+3. Select animation style: Float, Popup, or **Bind** (only Bind reliably shows puzzle -Float/Popup auto-pass invisible check)
 4. Click `aria-label="Click to verify"` button
 5. Wait ~3s for puzzle widget to render
 
-**Critical**: Tab selection uses `.tab-item.tab-item-1` div (not the button inside — div intercepts pointer events). Scroll 400px down to avoid sticky header.
+**Critical**: Tab selection uses `.tab-item.tab-item-1` div (not the button inside -div intercepts pointer events). Scroll 400px down to avoid sticky header.
 
 ## Widget Structure
 
-- **No iframes, no shadow DOM** — widget injected directly into host page DOM
+- **No iframes, no shadow DOM** -widget injected directly into host page DOM
 - CSS classes use hash suffixes: `geetest_slider_<hash>` (e.g., `geetest_slider_1fb54cb8`)
 - Puzzle images served as PNGs from `static.geetest.com` CDN, set as `background-image` on `<div>` elements (NOT canvas, NOT `<img>`)
 - Background: 300×200px RGB PNG (50-130KB). Piece: 80×80px RGBA PNG with alpha (8-10KB).
@@ -46,12 +46,12 @@ wafer/browser/
 ### Selectors
 
 ```
-.geetest_bg          — background image div
-.geetest_slice_bg    — puzzle piece div
-.geetest_btn         — drag handle
-.geetest_track       — slider track
-.geetest_box         — widget container
-.geetest_result_tips — success/fail message (class includes "success" or "fail")
+.geetest_bg          -background image div
+.geetest_slice_bg    -puzzle piece div
+.geetest_btn         -drag handle
+.geetest_track       -slider track
+.geetest_box         -widget container
+.geetest_result_tips -success/fail message (class includes "success" or "fail")
 ```
 
 ### Outer Wrapper by Style
@@ -87,8 +87,8 @@ Algorithm in `_cv.py::find_notch`:
 
 ## Test Infrastructure
 
-- **Mock**: `tests/mocks/geetest/slide.html` — all 3 styles, procedural puzzles, real DOM structure, loading animation, solve detection
-- **Test images**: `tests/mocks/geetest/images/` — 5 bg/piece pairs for CV validation
-- **Unit tests**: `tests/test_cv.py` — 16 tests
-- **Demo**: `tests/demo_cv_solve.py` — offline E2E solve against mock
-- **Live test**: `tests/live_geetest_demo.py` — 12/12 on real demo
+- **Mock**: `tests/mocks/geetest/slide.html` -all 3 styles, procedural puzzles, real DOM structure, loading animation, solve detection
+- **Test images**: `tests/mocks/geetest/images/` -5 bg/piece pairs for CV validation
+- **Unit tests**: `tests/test_cv.py` -16 tests
+- **Demo**: `tests/demo_cv_solve.py` -offline E2E solve against mock
+- **Live test**: `tests/live_geetest_demo.py` -12/12 on real demo

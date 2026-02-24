@@ -9,7 +9,9 @@ from rnet import Method
 from wafer._base import (
     BaseSession,
     _decode_headers,
+    _extract_location,
     _is_binary_content_type,
+    _is_challengeable_content_type,
     _to_method,
 )
 from wafer._challenge import (
@@ -197,8 +199,8 @@ class SyncSession(BaseSession):
 
         Returns:
             WaferResponse: browser got real content without challenge
-                (passthrough — caller should return this directly).
-            True: challenge solved, cookies injected — caller should
+                (passthrough - caller should return this directly).
+            True: challenge solved, cookies injected - caller should
                 retry the TLS request.
             False: browser solve failed.
         """
@@ -311,6 +313,7 @@ class SyncSession(BaseSession):
         content: bytes | None = None,
         text: str | None = None,
         challenge_type: str | None = None,
+        state: RetryState | None = None,
         raw=None,
     ) -> WaferResponse:
         if content is None and text is not None:
@@ -323,6 +326,9 @@ class SyncSession(BaseSession):
             url=url,
             elapsed=time.monotonic() - start_time,
             was_retried=was_retried,
+            retries=state.normal_retries if state else 0,
+            rotations=state.rotation_retries if state else 0,
+            inline_solves=state.inline_solves if state else 0,
             challenge_type=challenge_type,
             raw=raw,
         )
@@ -438,8 +444,7 @@ class SyncSession(BaseSession):
                 and 300 <= status < 400
                 and status != 304
             ):
-                headers_decoded = _decode_headers(resp.headers)
-                location = headers_decoded.get("location", "")
+                location = _extract_location(resp.headers)
                 if location:
                     if redirects_followed >= self.max_redirects:
                         raise TooManyRedirects(
@@ -514,6 +519,7 @@ class SyncSession(BaseSession):
                         url=current_url,
                         start_time=start_time,
                         was_retried=was_retried,
+                        state=state,
                         raw=resp,
                     )
                 state.use_retry()
@@ -525,14 +531,19 @@ class SyncSession(BaseSession):
                 time.sleep(delay)
                 continue
 
-            # Challenge detection (text responses only — WAF challenges
-            # are always HTML, never binary). Runs before 429 handler
-            # so challenges on 429 (Kasada, PX) route to browser solve.
-            # Skip for Opera Mini — can't solve challenges.
+            # Challenge detection (HTML responses only — WAF challenges
+            # are always HTML pages). Skip for:
+            # - Binary content (images, PDFs, etc.)
+            # - Non-HTML text (JSON, XML) — API endpoints may have
+            #   challenge markers in cookies/headers but browser-solving
+            #   the API URL itself can't work (renders raw JSON).
+            # - Opera Mini — can't solve challenges.
+            content_type = headers.get("content-type", "")
             challenge = (
                 detect_challenge(status, headers, body)
                 if body is not None
                 and self._profile is not Profile.OPERA_MINI
+                and _is_challengeable_content_type(content_type)
                 else None
             )
 
@@ -551,6 +562,7 @@ class SyncSession(BaseSession):
                             url=current_url,
                             start_time=start_time,
                             was_retried=was_retried,
+                            state=state,
                             raw=resp,
                         )
                     raise RateLimited(current_url, retry_after)
@@ -653,6 +665,7 @@ class SyncSession(BaseSession):
                             start_time=start_time,
                             was_retried=was_retried,
                             challenge_type=challenge.value,
+                            state=state,
                             raw=resp,
                         )
                     raise ChallengeDetected(
@@ -691,6 +704,7 @@ class SyncSession(BaseSession):
                                 start_time=start_time,
                                 was_retried=was_retried,
                                 challenge_type=challenge.value,
+                                state=state,
                                 raw=resp,
                             )
                         raise ChallengeDetected(
@@ -704,6 +718,7 @@ class SyncSession(BaseSession):
                         url=current_url,
                         start_time=start_time,
                         was_retried=was_retried,
+                        state=state,
                         raw=resp,
                     )
                 state.use_rotation()
@@ -747,6 +762,7 @@ class SyncSession(BaseSession):
                             url=current_url,
                             start_time=start_time,
                             was_retried=was_retried,
+                            state=state,
                             raw=resp,
                         )
                     raise EmptyResponse(current_url, status)
@@ -773,6 +789,7 @@ class SyncSession(BaseSession):
                 url=current_url,
                 start_time=start_time,
                 was_retried=was_retried,
+                state=state,
                 raw=resp,
             )
 
