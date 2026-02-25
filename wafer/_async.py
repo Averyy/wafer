@@ -454,9 +454,6 @@ class AsyncSession(BaseSession):
 
             status = resp.status.as_int()
 
-            # Write-through: cache any Set-Cookie headers
-            await self._cache_response_cookies(current_url, resp)
-
             # Record request timestamp for rate limiting
             if self._rate_limiter:
                 self._rate_limiter.record(domain)
@@ -612,7 +609,14 @@ class AsyncSession(BaseSession):
                 )
                 await asyncio.sleep(delay)
                 if not retired:
-                    if (
+                    if state.rotation_retries == 1:
+                        # First rotation: fresh TLS session + clear
+                        # domain cookies (tainted by old fingerprint).
+                        if self._cookie_cache:
+                            await asyncio.to_thread(
+                                self._cookie_cache.clear, domain
+                            )
+                    elif (
                         self._fingerprint is not None
                         and self._safari_identity is None
                     ):
@@ -756,9 +760,14 @@ class AsyncSession(BaseSession):
                 if should_retire:
                     await self._retire_session(domain)
                 else:
-                    # Safari fallback: fundamentally different TLS
-                    # fingerprint, much more effective than another Chrome
-                    if (
+                    if state.rotation_retries == 1:
+                        # First rotation: fresh TLS session + clear
+                        # domain cookies (tainted by old fingerprint).
+                        if self._cookie_cache:
+                            await asyncio.to_thread(
+                                self._cookie_cache.clear, domain
+                            )
+                    elif (
                         self._fingerprint is not None
                         and self._safari_identity is None
                     ):

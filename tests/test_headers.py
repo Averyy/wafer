@@ -202,8 +202,9 @@ class TestEmbedMode:
         )
         session.get(self.MT_TILE_URL)
 
-        headers = mock.last_kwargs.get("headers", {})
-        assert headers.get("Accept") == "*/*"
+        # Accept is set at client level (not per-request) to avoid
+        # HTTP/2 header duplication.
+        assert session._client_headers.get("Accept") == "*/*"
 
     @patch("time.sleep")
     def test_embed_sets_sec_fetch_headers(self, mock_sleep):

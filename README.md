@@ -1,5 +1,7 @@
 # wafer
 
+> **Proof of concept.** This project is experimental and not intended for production use. Expect breaking changes, rough edges, and missing features.
+
 Anti-detection HTTP client for Python. Built on [rnet](https://github.com/0x676e67/rnet) (Rust + BoringSSL).
 
 Handles TLS fingerprinting, WAF challenge detection/solving, cookie caching, retry with backoff, rate limiting, embed mode for iframe/XHR impersonation, and proxy support.
@@ -73,10 +75,10 @@ session = SyncSession(
 
     # Retry behavior
     max_retries=3,       # retries on 5xx / connection errors
-    max_rotations=1,     # fingerprint rotations on 403/challenge (switches to Safari)
+    max_rotations=2,     # fingerprint rotations on 403/challenge (fresh session → Safari)
 
-    # Cookies
-    cache_dir="./data/wafer/cookies",  # disk persistence (default; None to disable)
+    # Cookies (disk cache for solver cookies; recommended with BrowserSolver)
+    cache_dir=None,  # default: in-memory only; set a path to persist solver cookies
 
     # Session health
     max_failures=3,      # consecutive failures before session retirement (None to disable)
@@ -228,13 +230,13 @@ These run automatically during the retry loop.
 
 ## Cookie Cache
 
-Cookies are always enabled (in-memory jar) and optionally persisted to disk as JSON with TTL tracking and LRU eviction:
+Cookies are always enabled (in-memory jar). With `BrowserSolver`, enable disk persistence to avoid re-solving expensive WAF challenges across restarts:
 
 ```python
-# Disk persistence enabled (default: ./data/wafer/cookies)
+# Disk persistence for solver cookies (recommended with BrowserSolver)
 session = SyncSession(cache_dir="./data/wafer/cookies")
 
-# Disable disk persistence (in-memory only)
+# In-memory only (default)
 session = SyncSession(cache_dir=None)
 ```
 

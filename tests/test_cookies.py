@@ -643,8 +643,15 @@ class TestSessionCookieCacheDisabled:
         bs = BaseSession(cache_dir=None)
         assert bs._cookie_cache is None
 
-    def test_cookie_cache_created_by_default(self):
+    def test_cookie_cache_none_by_default(self):
+        """Default cache_dir=None means no disk cache."""
         from wafer._base import BaseSession
 
         bs = BaseSession()
+        assert bs._cookie_cache is None
+
+    def test_cookie_cache_created_with_path(self):
+        from wafer._base import BaseSession
+
+        bs = BaseSession(cache_dir="./data/wafer/cookies")
         assert bs._cookie_cache is not None

@@ -47,9 +47,9 @@ Sec-Fetch-User, Sec-Fetch-Dest, Accept-Encoding, Accept-Language, Cookie
 
 ## Embed Mode Header Details
 
-**XHR mode** sets: `Sec-Fetch-Mode: cors`, `Sec-Fetch-Dest: empty`, `Origin`, `Accept: */*`. Referer sends the full URL from `embed_referers` (matching `strict-origin-when-cross-origin` for same-protocol requests). No `X-Requested-With` -add it per-request for jQuery-style XHR: `headers={"X-Requested-With": "XMLHttpRequest"}`.
+**XHR mode** sets: `Sec-Fetch-Mode: cors`, `Sec-Fetch-Dest: empty`, `Origin`, `Accept: */*`. Computes `Sec-Fetch-Site` from `embed_origin` vs request URL (`same-origin`, `same-site`, or `cross-site`). Strips navigation headers (`Cache-Control`, `Upgrade-Insecure-Requests`). Referer sends the full URL from `embed_referers`. No `X-Requested-With` -add it per-request for jQuery-style XHR: `headers={"X-Requested-With": "XMLHttpRequest"}`.
 
-**Iframe mode** sets: `Sec-Fetch-Mode: navigate`, `Sec-Fetch-Dest: iframe`, `Sec-Fetch-Site: cross-site`. No `Origin` (GET navigations don't send it). Keeps navigation `Accept` and `Upgrade-Insecure-Requests`.
+**Iframe mode** sets: `Sec-Fetch-Mode: navigate`, `Sec-Fetch-Dest: iframe`. Computes `Sec-Fetch-Site` (same as XHR). No `Origin` (GET navigations don't send it). Keeps navigation `Accept` and `Upgrade-Insecure-Requests`.
 
 ## WAF Detection Layers for Embed Requests
 

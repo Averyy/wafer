@@ -431,9 +431,6 @@ class SyncSession(BaseSession):
 
             status = resp.status.as_int()
 
-            # Write-through: cache any Set-Cookie headers
-            self._cache_response_cookies(current_url, resp)
-
             # Record request timestamp for rate limiting
             if self._rate_limiter:
                 self._rate_limiter.record(domain)
@@ -587,7 +584,12 @@ class SyncSession(BaseSession):
                 )
                 time.sleep(delay)
                 if not retired:
-                    if (
+                    if state.rotation_retries == 1:
+                        # First rotation: fresh TLS session + clear
+                        # domain cookies (tainted by old fingerprint).
+                        if self._cookie_cache:
+                            self._cookie_cache.clear(domain)
+                    elif (
                         self._fingerprint is not None
                         and self._safari_identity is None
                     ):
@@ -729,7 +731,12 @@ class SyncSession(BaseSession):
                 if should_retire:
                     self._retire_session(domain)
                 else:
-                    if (
+                    if state.rotation_retries == 1:
+                        # First rotation: fresh TLS session + clear
+                        # domain cookies (tainted by old fingerprint).
+                        if self._cookie_cache:
+                            self._cookie_cache.clear(domain)
+                    elif (
                         self._fingerprint is not None
                         and self._safari_identity is None
                     ):

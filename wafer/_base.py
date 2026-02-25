@@ -214,8 +214,8 @@ class BaseSession:
         connect_timeout: datetime.timedelta | float | int | None = None,
         timeout: datetime.timedelta | float | int | None = None,
         max_retries: int = 3,
-        max_rotations: int = 1,
-        cache_dir: str | None = "./data/wafer/cookies",
+        max_rotations: int = 2,
+        cache_dir: str | None = None,
         max_failures: int | None = 3,
         rate_limit: float = 0.0,
         rate_jitter: float = 0.0,
@@ -353,11 +353,77 @@ class BaseSession:
         Cached as self._client_headers to avoid regenerating sec-ch-ua
         strings on every _build_headers call. Must be refreshed after
         fingerprint rotation (_build_client_kwargs does this).
+
+        Embed mode adjustments happen here (not in _build_headers) because
+        rnet's header model is additive: per-request headers cannot remove
+        or replace client-level headers, they only add. Setting a header
+        at both levels creates HTTP/2 duplicates that WAFs detect.
         """
         headers = dict(self.headers)
         if self._fingerprint is not None:
             headers.update(self._fingerprint.sec_ch_ua_headers())
+
+        if self._embed:
+            # Strip Sec-Fetch-* from client level. _build_headers sets
+            # the correct values per-request (they vary by URL for
+            # Sec-Fetch-Site). Leaving them at client level would create
+            # HTTP/2 duplicates, especially after Safari fallback (which
+            # sets Sec-Fetch-Dest: document, Sec-Fetch-Mode: navigate).
+            for key in list(headers):
+                if key.startswith("Sec-Fetch-"):
+                    del headers[key]
+
+        if self._embed == "xhr":
+            # XHR/fetch never sends navigation-only headers. Strip from
+            # client level since rnet can't remove them per-request.
+            headers.pop("Cache-Control", None)
+            headers.pop("Upgrade-Insecure-Requests", None)
+            # Replace navigation Accept with XHR Accept at client level
+            # (setting it per-request would duplicate with the old value).
+            headers["Accept"] = "*/*"
+
         return headers
+
+    def _compute_sec_fetch_site(self, url: str) -> str:
+        """Compute Sec-Fetch-Site based on embed_origin vs request URL.
+
+        Returns "same-origin", "same-site", or "cross-site" per the spec.
+        """
+        if not self._embed_origin:
+            return "cross-site"
+
+        origin = urlparse(self._embed_origin)
+        request = urlparse(url)
+        origin_host = origin.hostname or ""
+        request_host = request.hostname or ""
+
+        # Same origin: same scheme + host + port
+        origin_port = origin.port or (443 if origin.scheme == "https" else 80)
+        request_port = request.port or (443 if request.scheme == "https" else 80)
+        if (
+            origin.scheme == request.scheme
+            and origin_host == request_host
+            and origin_port == request_port
+        ):
+            return "same-origin"
+
+        # Same site: same scheme + same registrable domain (TLD+1 heuristic)
+        origin_parts = origin_host.rsplit(".", 2)
+        request_parts = request_host.rsplit(".", 2)
+        origin_root = (
+            ".".join(origin_parts[-2:])
+            if len(origin_parts) >= 2
+            else origin_host
+        )
+        request_root = (
+            ".".join(request_parts[-2:])
+            if len(request_parts) >= 2
+            else request_host
+        )
+        if origin.scheme == request.scheme and origin_root == request_root:
+            return "same-site"
+
+        return "cross-site"
 
     def _build_headers(
         self, url: str, extra: dict[str, str] | None = None,
@@ -391,33 +457,31 @@ class BaseSession:
         domain = parsed.hostname or ""
 
         if self._embed == "xhr":
-            # XHR/fetch impersonation
+            # XHR/fetch impersonation. Accept and navigation headers
+            # already fixed at client level by _compute_client_headers.
             merged["Origin"] = self._embed_origin or ""
-            merged["Sec-Fetch-Site"] = "cross-site"
+            merged["Sec-Fetch-Site"] = self._compute_sec_fetch_site(url)
             merged["Sec-Fetch-Mode"] = "cors"
             merged["Sec-Fetch-Dest"] = "empty"
-            merged["Accept"] = "*/*"
-            # Remove navigation-only headers
-            merged.pop("Upgrade-Insecure-Requests", None)
-            merged.pop("Cache-Control", None)
-            # NO X-Requested-With (fetch() never sets it)
             if self._embed_referers:
                 merged["Referer"] = random.choice(self._embed_referers)
             logger.debug(
-                "Embed mode (xhr): Origin=%s, Referer=%s",
+                "Embed mode (xhr): Origin=%s, Sec-Fetch-Site=%s, Referer=%s",
                 self._embed_origin,
+                merged["Sec-Fetch-Site"],
                 merged.get("Referer", "(none)"),
             )
         elif self._embed == "iframe":
             # Iframe navigation impersonation
-            merged["Sec-Fetch-Site"] = "cross-site"
+            merged["Sec-Fetch-Site"] = self._compute_sec_fetch_site(url)
             merged["Sec-Fetch-Mode"] = "navigate"
             merged["Sec-Fetch-Dest"] = "iframe"
             # No Origin for GET navigations
             if self._embed_referers:
                 merged["Referer"] = random.choice(self._embed_referers)
             logger.debug(
-                "Embed mode (iframe): Referer=%s",
+                "Embed mode (iframe): Sec-Fetch-Site=%s, Referer=%s",
+                merged["Sec-Fetch-Site"],
                 merged.get("Referer", "(none)"),
             )
         else:

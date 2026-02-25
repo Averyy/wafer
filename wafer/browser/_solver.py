@@ -186,6 +186,13 @@ class BrowserSolver:
         idle_timeout: float = 300.0,
         solve_timeout: float = 30.0,
     ):
+        try:
+            import patchright  # noqa: F401
+        except ImportError:
+            raise ImportError(
+                "BrowserSolver requires the [browser] extra. "
+                "Install it with: pip install wafer-py[browser]"
+            ) from None
         self._headless = headless
         self._idle_timeout = idle_timeout
         self._solve_timeout = solve_timeout

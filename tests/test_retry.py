@@ -145,24 +145,24 @@ class TestSyncRetryLoop:
         assert resp.text == "<html>Real content</html>"
         assert mock.request_count == 3
 
-    def test_403_rotates_to_safari(self, mock_sleep):
+    def test_403_first_rotation_fresh_session(self, mock_sleep):
         session, mock = make_sync_session([
             MockResponse(403, body="Denied"),
             MockResponse(200, body="OK"),
         ])
         session.get("https://example.com")
-        # Should have switched to Safari on rotation
-        assert session._safari_identity is not None
-        assert session._fingerprint is None
-
-    def test_403_safari_fallback_after_rotation(self, mock_sleep):
-        session, mock = make_sync_session([
-            MockResponse(403, body="Denied"),
-            MockResponse(200, body="OK"),
-        ])
+        # First rotation: fresh TLS session, same fingerprint (no Safari)
+        assert session._safari_identity is None
         assert session._fingerprint is not None
+
+    def test_403_second_rotation_safari(self, mock_sleep):
+        session, mock = make_sync_session([
+            MockResponse(403, body="Denied"),
+            MockResponse(403, body="Denied"),
+            MockResponse(200, body="OK"),
+        ])
         session.get("https://example.com")
-        # After rotation, session switched to Safari (no fingerprint)
+        # Second rotation: switch to Safari
         assert session._safari_identity is not None
         assert session._fingerprint is None
 

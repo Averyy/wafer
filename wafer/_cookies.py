@@ -65,7 +65,7 @@ class CookieCache:
 
     def __init__(
         self,
-        cache_dir: str = "./data/wafer/cookies",
+        cache_dir: str,
         max_entries: int = 50,
     ):
         self._cache_dir = Path(cache_dir)

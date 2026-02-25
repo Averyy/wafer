@@ -128,13 +128,13 @@ SyncSession(
 
     # Retry behavior
     max_retries: int = 3,       # for 5xx, connection errors, empty 200
-    max_rotations: int = 1,     # for 403/challenge (rotates TLS fingerprint)
+    max_rotations: int = 2,     # for 403/challenge (see rotation escalation below)
 
     # Session health
     max_failures: int | None = 3,  # consecutive failures per domain before full identity reset; None to disable
 
     # Cookie persistence (path is relative to CWD; use absolute path for consistency)
-    cache_dir: str | None = "./data/wafer/cookies",  # None to disable disk cache (in-memory only)
+    cache_dir: str | None = None,  # disk path for solver cookie persistence; None = in-memory only
 
     # Rate limiting (per session, per hostname - "example.com" and "api.example.com" are separate.
     # Two sessions hitting the same host enforce their limits independently.)
@@ -266,6 +266,16 @@ No-rotation mode (`max_rotations = 0`, including `.bulk()`):
 - Connection error -> still raises `ConnectionFailed`
 - Other 4xx, 5xx -> same as default (returns response)
 
+### Rotation escalation
+
+On 403 or challenge, rotations escalate in order:
+
+1. **Fresh TLS session** (rotation 1) - rebuilds the rnet client (new TLS session, empty cookie jar) with the same Chrome fingerprint. Also clears that domain's disk cookie cache (if `cache_dir` is set) so stale cookies aren't rehydrated. Often sufficient when the 403 is from a stale TLS session or tainted cookies, not a fingerprint block.
+2. **Safari profile switch** (rotation 2) - switches to a completely different TLS fingerprint (Safari instead of Chrome). Much more effective against fingerprint-based blocks.
+3. **Chrome version rotation** (rotation 3+) - if already on Safari, rotates Chrome emulation versions.
+
+With the default `max_rotations=2`, wafer tries fresh session then Safari before giving up. Set `max_rotations=3` or higher if you need Chrome version rotation as well.
+
 ---
 
 ## Concurrency and Thread Safety
@@ -281,8 +291,13 @@ SyncSession instances in each thread.
 **Module-level functions** (`wafer.get()`, etc.) are thread-safe because each
 call creates and tears down its own independent SyncSession.
 
-**Cookie cache** (`cache_dir`) uses file locking. Multiple sessions (even
-across threads/processes) can share the same `cache_dir` safely.
+**Cookie cache** (`cache_dir`) is off by default (`None`). When set, only solver
+cookies (browser-solved WAF challenges, inline solvers) are persisted to disk.
+Normal response `Set-Cookie` headers live only in the in-memory cookie jar and
+are lost on session rebuild. This prevents stale cookies from poisoning fresh TLS
+sessions (WAFs bind cookies to TLS fingerprints). Recommended for `BrowserSolver`
+users - browser solve cookies are expensive to obtain and worth persisting across
+restarts. Uses file locking, so multiple sessions can share the same path safely.
 
 ---
 
@@ -440,24 +455,33 @@ reCAPTCHA v2 (checkbox + image grid via YOLO+ONNX), generic JS.
 
 ## Embed Mode
 
-Impersonates requests from an iframe or fetch() call. Sets Sec-Fetch-*, Origin,
-Referer headers to match browser behavior. Both modes pick a random Referer from
-`embed_referers` on each request.
+Simulates cross-origin fetch() or iframe navigation. Only use when the request
+origin differs from the target (e.g. `widget.com` calling `api.other.com`).
+For same-origin requests, skip embed mode and pass Sec-Fetch headers per-request.
+
+```python
+session = wafer.AsyncSession(
+    embed="xhr",                          # or "iframe"
+    embed_origin="https://widget.com",
+    embed_referers=["https://widget.com/page1", "https://widget.com/page2"],
+)
+resp = await session.post("https://api.other.com/data", json=body)
+```
+
+`Sec-Fetch-Site` is computed automatically (`same-origin`, `same-site`, or
+`cross-site`) from `embed_origin` vs request URL. Random Referer picked per
+request from `embed_referers`.
 
 ### XHR mode (`embed="xhr"`)
-- Sets: `Sec-Fetch-Site: cross-site`, `Sec-Fetch-Mode: cors`, `Sec-Fetch-Dest: empty`
-- Sets: `Origin` from embed_origin, `Accept: */*`
-- Sets: random `Referer` from embed_referers list
-- Removes: `Upgrade-Insecure-Requests`, `Cache-Control`
-- Does NOT set `X-Requested-With` (fetch() never sets it)
+- `Sec-Fetch-Mode: cors`, `Sec-Fetch-Dest: empty`, `Accept: */*`
+- Sets `Origin` from embed_origin
+- Strips navigation headers (`Upgrade-Insecure-Requests`, `Cache-Control`)
 
 ### Iframe mode (`embed="iframe"`)
-- Sets: `Sec-Fetch-Site: cross-site`, `Sec-Fetch-Mode: navigate`, `Sec-Fetch-Dest: iframe`
-- No Origin header for GET navigations
-- Sets: random `Referer` from embed_referers list
+- `Sec-Fetch-Mode: navigate`, `Sec-Fetch-Dest: iframe`
+- No `Origin` on GET navigations
 
-Per-request `headers=` override embed mode headers. If you pass
-`headers={"Sec-Fetch-Site": "same-origin"}`, it replaces the embed mode value.
+Per-request `headers=` overrides any embed header.
 
 ---
 
@@ -514,3 +538,17 @@ logging.getLogger("wafer").setLevel(logging.DEBUG)
     return a response with empty `.text`, wafer raises `EmptyResponse` after
     exhausting retries. If you want the response object back instead, use
     `.bulk()` or set `max_retries=0`.
+
+13. **Set `rate_limit` for repeated requests.** Defaults to `0.0` (disabled).
+    Without it, requests fire back-to-back. A semaphore limits concurrency,
+    not rate. Set `rate_limit=0.2`-`1.0` for any domain you hit more than a
+    few times.
+
+14. **Never `close()` or recreate sessions between requests to the same domain.**
+    Sessions accumulate cookies, TLS identity, and rate limiting state.
+    Destroying a session mid-use means the next request looks like a new
+    visitor to the WAF. One session per domain, for its entire lifetime.
+
+15. **Don't use embed mode for same-origin requests.** If the page origin and
+    API origin match (e.g. `example.com` to `example.com/api`), pass
+    Sec-Fetch headers per-request instead. Embed mode is for cross-origin.
