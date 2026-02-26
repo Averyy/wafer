@@ -75,8 +75,8 @@ def _header_fast_path(
     if headers.get("x-vercel-mitigated") == "challenge":
         return ChallengeType.VERCEL
 
-    # Kasada — x-kpsdk-ct header on 429
-    if status_code == 429:
+    # Kasada — x-kpsdk-ct/x-kpsdk-cd headers on 403/429
+    if status_code in (403, 429):
         for key in headers:
             if key.lower().startswith("x-kpsdk"):
                 return ChallengeType.KASADA
@@ -95,8 +95,8 @@ def _header_fast_path(
         if _has_cookie(set_cookie, "_px3") or _has_cookie(set_cookie, "_pxhd"):
             return ChallengeType.PERIMETERX
 
-    # Imperva — reese84 or ___utmvc cookie + 403
-    if status_code == 403:
+    # Imperva — reese84 or ___utmvc cookie + 403/429
+    if status_code in (403, 429):
         if _has_cookie(set_cookie, "reese84") or _has_cookie(set_cookie, "___utmvc"):
             return ChallengeType.IMPERVA
 
@@ -111,8 +111,9 @@ def _header_fast_path(
         if _has_cookie(set_cookie, "_abck") or _has_cookie(set_cookie, "ak_bmsc"):
             return ChallengeType.AKAMAI
 
-    # F5 Shape — _imp_apg_r_ resource path in Set-Cookie or custom headers
-    if status_code in (403, 429, 200):
+    # F5 Shape — sensor response headers on block status.
+    # Shape interstitials on 200 are caught by body markers (istlWasHere).
+    if status_code in (403, 429):
         for key in headers:
             kl = key.lower()
             # Shape's sensor headers have site-specific prefixes (x-<prefix>-a)
@@ -230,11 +231,9 @@ def detect_challenge(
 
         # Akamai body markers — bazadebezolkohpepadr is the obfuscated
         # global variable set by Akamai Bot Manager's sensor script.
-        if status_code == 403 and (
-            "akam" in body_lower
-            or "akamai" in body_lower
-            or "bazadebezolkohpepadr" in body_lower
-        ):
+        # Only match the sensor marker, not the company name (which
+        # appears on CDN docs, privacy policies, and branded error pages).
+        if status_code == 403 and "bazadebezolkohpepadr" in body_lower:
             logger.info("Challenge detected (body): akamai")
             return ChallengeType.AKAMAI
 
@@ -256,7 +255,7 @@ def detect_challenge(
             return ChallengeType.PERIMETERX
 
         # Imperva body markers
-        if status_code == 403 and (
+        if (
             "incapsula" in body_lower or "imperva" in body_lower
         ):
             logger.info("Challenge detected (body): imperva")

@@ -14,6 +14,15 @@ _SOLVE_COOKIES = ("reese84", "___utmvc")
 _CLASSIC_PREFIX = "incap_ses_"
 
 
+def _snapshot_cookies(cookies):
+    """Capture current values of solve-signal cookies."""
+    snap = {}
+    for c in cookies:
+        if c["name"] in _SOLVE_COOKIES or c["name"].startswith(_CLASSIC_PREFIX):
+            snap[c["name"]] = c["value"]
+    return snap
+
+
 def wait_for_imperva(solver, page, timeout_ms: int) -> bool:
     """Wait for Imperva challenge to resolve.
 
@@ -22,9 +31,9 @@ def wait_for_imperva(solver, page, timeout_ms: int) -> bool:
     - ``___utmvc`` — legacy Incapsula
     - ``incap_ses_*`` — classic Incapsula session (set after JS runs)
 
-    The ``_Incapsula_Resource`` script stays in the DOM even after
-    solving (used for monitoring), so we don't check for its removal.
-    The session cookie is the definitive signal.
+    Imperva may set ``reese84`` via Set-Cookie on the challenge
+    response itself (before JS runs), so we track value *changes*
+    rather than mere presence to avoid false-positive success.
     """
     state = solver._start_browse(
         page,
@@ -33,18 +42,23 @@ def wait_for_imperva(solver, page, timeout_ms: int) -> bool:
     )
     deadline = time.monotonic() + timeout_ms / 1000
 
+    # Capture initial cookie values (may already be set by the
+    # challenge page's Set-Cookie header before JS executes)
+    initial = _snapshot_cookies(page.context.cookies())
+
     while time.monotonic() < deadline:
         cookies = page.context.cookies()
+        current = _snapshot_cookies(cookies)
 
-        # Modern/legacy solve cookies
-        if any(c["name"] in _SOLVE_COOKIES for c in cookies):
-            solver._replay_browse_chunk(page, state, 1)
-            return True
-
-        # Classic Incapsula: incap_ses_* set after JS challenge
-        if any(c["name"].startswith(_CLASSIC_PREFIX) for c in cookies):
-            solver._replay_browse_chunk(page, state, 1)
-            return True
+        for name, value in current.items():
+            if name not in initial:
+                # New cookie appeared (wasn't in initial response)
+                solver._replay_browse_chunk(page, state, 1)
+                return True
+            if value != initial[name]:
+                # Existing cookie changed value (JS updated it)
+                solver._replay_browse_chunk(page, state, 1)
+                return True
 
         solver._replay_browse_chunk(page, state, 2)
 

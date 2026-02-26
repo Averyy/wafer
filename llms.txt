@@ -20,16 +20,12 @@ pip install wafer-py[browser]   # core + browser solving
 **Core** (`wafer-py`) provides the TLS client with browser-grade fingerprints,
 automatic challenge detection, retry with fingerprint rotation, cookie caching,
 rate limiting, and inline solving for challenges that don't need JavaScript
-(ACW, Amazon CAPTCHA, TMD). Many sites work with core alone - wafer's TLS
-fingerprint is enough to pass without triggering challenges.
+(ACW, Amazon CAPTCHA, TMD).
 
-**Browser** (`wafer-py[browser]`) adds everything in core plus a real Chrome
-browser solver for challenges that require JavaScript execution. Installs
-Patchright (patched Chromium), ONNX Runtime (for reCAPTCHA/GeeTest CV models),
-OpenCV, and Pillow. Use this when targeting sites with Cloudflare Turnstile,
-DataDome, PerimeterX press-and-hold, Kasada, AWS WAF, hCaptcha, reCAPTCHA,
-or other JS challenges. The `from wafer.browser import BrowserSolver` import
-is only available with this extra installed.
+**Browser** (`wafer-py[browser]`) adds a real Chrome browser solver for
+challenges that require JavaScript execution (Cloudflare Turnstile, DataDome,
+PerimeterX, Kasada, AWS WAF, hCaptcha, reCAPTCHA, etc). The
+`from wafer.browser import BrowserSolver` import requires this extra.
 
 **uv note:** wafer depends on rnet which is currently a release candidate.
 If using uv, add `prerelease = "allow"` under `[tool.uv]` in pyproject.toml,
@@ -62,9 +58,8 @@ async with AsyncSession() as session:
     resp = await session.get("https://example.com")
 ```
 
-For multiple requests, prefer a session over one-shot calls - it reuses the
-TLS identity and cookie jar across requests, which is both faster and gives
-better anti-detection behavior.
+For multiple requests, prefer a session - it reuses the TLS identity and
+cookie jar, which is faster and gives better anti-detection behavior.
 
 ---
 
@@ -194,7 +189,7 @@ session.add_cookie(raw_set_cookie: str, url: str) -> None
 
 - `headers: dict[str, str]` - merged over session headers AND embed mode headers (per-request wins over both)
 - `params: dict[str, str]` - appended to URL as query string
-- `timeout: int | float | timedelta` - per-request deadline for the entire retry loop
+- `timeout: int | float | timedelta` - per-request deadline; each attempt is clamped to the remaining budget
 - `json: dict` - JSON body (auto-sets Content-Type)
 - `form: dict` - form-encoded body
 - `body: bytes | str` - raw body
@@ -272,7 +267,7 @@ On 403 or challenge, rotations escalate in order:
 
 1. **Fresh TLS session** (rotation 1) - rebuilds the rnet client (new TLS session, empty cookie jar) with the same Chrome fingerprint. Also clears that domain's disk cookie cache (if `cache_dir` is set) so stale cookies aren't rehydrated. Often sufficient when the 403 is from a stale TLS session or tainted cookies, not a fingerprint block.
 2. **Safari profile switch** (rotation 2) - switches to a completely different TLS fingerprint (Safari instead of Chrome). Much more effective against fingerprint-based blocks.
-3. **Chrome version rotation** (rotation 3+) - if already on Safari, rotates Chrome emulation versions.
+3. **Chrome version rotation** (rotation 3+) - switches back from Safari to a different Chrome version, then cycles through Chrome versions on subsequent rotations.
 
 With the default `max_rotations=2`, wafer tries fresh session then Safari before giving up. Set `max_rotations=3` or higher if you need Chrome version rotation as well.
 
@@ -293,35 +288,27 @@ call creates and tears down its own independent SyncSession.
 
 **Cookie cache** (`cache_dir`) is off by default (`None`). When set, only solver
 cookies (browser-solved WAF challenges, inline solvers) are persisted to disk.
-Normal response `Set-Cookie` headers live only in the in-memory cookie jar and
-are lost on session rebuild. This prevents stale cookies from poisoning fresh TLS
-sessions (WAFs bind cookies to TLS fingerprints). Recommended for `BrowserSolver`
-users - browser solve cookies are expensive to obtain and worth persisting across
-restarts. Uses file locking, so multiple sessions can share the same path safely.
+Normal `Set-Cookie` headers stay in-memory and are lost on session rebuild (WAFs
+bind cookies to TLS fingerprints). Recommended for `BrowserSolver` users. Uses
+file locking, so multiple sessions can share the same path safely.
 
 ---
 
 ## Session Lifecycle
 
-Sessions have no `close()` or `aclose()` method. Cleanup options:
+Sessions have no `close()` or `aclose()` method. Use context managers:
 
 ```python
-# Preferred: context manager
 with SyncSession(browser_solver=solver) as session:
     ...  # solver.close() called on exit
 
 async with AsyncSession(browser_solver=solver) as session:
     ...  # solver.close() called on exit
-
-# Without context manager: call __exit__ / __aexit__ directly
-session.__exit__(None, None, None)
-# or for async:
-await session.__aexit__(None, None, None)
 ```
 
 **Without a browser solver, sessions have no resources to clean up.** Letting
-them go out of scope or setting to `None` is fine. The context manager only
-matters when a `browser_solver` is attached.
+them go out of scope is fine. The context manager only matters when a
+`browser_solver` is attached.
 
 **Shared BrowserSolver warning:** `__exit__` / `__aexit__` calls
 `browser_solver.close()`. If you share one BrowserSolver across multiple
@@ -366,7 +353,7 @@ capabilities and trade-offs.
 
 These are all automatic. Do not write code to handle these yourself:
 
-- **Redirects** - 3xx followed automatically (POST -> GET on 301/302/303). 304 Not Modified passes through untouched.
+- **Redirects** - 3xx followed automatically (POST -> GET on 301/302/303). 304 passes through. Auth stripped on cross-origin redirects. Body headers stripped on method change.
 - **Referer headers** - set automatically from the last URL visited per domain
 - **Cookies** - managed in-memory and optionally persisted to disk; no manual cookie jar needed
 - **WAF challenges** - detected, browser-solved if configured, retried with Safari fallback (different TLS fingerprint)
@@ -552,3 +539,8 @@ logging.getLogger("wafer").setLevel(logging.DEBUG)
 15. **Don't use embed mode for same-origin requests.** If the page origin and
     API origin match (e.g. `example.com` to `example.com/api`), pass
     Sec-Fetch headers per-request instead. Embed mode is for cross-origin.
+
+16. **Authorization is stripped on cross-origin redirects.** If you pass
+    `headers={"Authorization": "Bearer ..."}` and the server 302s to a
+    different host, the token is dropped (Fetch spec). Make two explicit
+    requests if you need to send auth to both origins.

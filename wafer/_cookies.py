@@ -111,7 +111,11 @@ class CookieCache:
         valid = []
         for e in entries:
             expires = e.get("expires", 0)
-            if expires == 0 or expires > now:
+            if expires == 0:
+                # Session cookie (no max-age/expires) - skip, these
+                # should not survive across process restarts.
+                continue
+            if expires > now:
                 e["last_used"] = now
                 valid.append(e)
         expired = len(entries) - len(valid)
@@ -151,11 +155,11 @@ class CookieCache:
 
         merged = list(by_name.values())
 
-        # TTL compaction
+        # TTL compaction - drop session cookies (expires=0) and expired
         merged = [
             e
             for e in merged
-            if e.get("expires", 0) == 0 or e.get("expires", 0) > now
+            if e.get("expires", 0) > now
         ]
 
         # LRU eviction
@@ -233,8 +237,7 @@ class CookieCache:
                     path.unlink(missing_ok=True)
                     continue
                 has_valid = any(
-                    e.get("expires", 0) == 0
-                    or e.get("expires", 0) > now
+                    e.get("expires", 0) > now
                     for e in entries
                 )
                 if not has_valid:

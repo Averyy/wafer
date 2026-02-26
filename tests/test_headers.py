@@ -532,6 +532,19 @@ class TestIframeEmbedMode:
         assert "Upgrade-Insecure-Requests" not in delta
 
     @patch("time.sleep")
+    def test_iframe_post_sends_origin(self, mock_sleep):
+        """Iframe POST navigations should send Origin (Fetch spec)."""
+        session, mock = make_sync_session(
+            [MockResponse(200, body="ok")],
+            embed="iframe",
+            embed_origin="https://seaway-greatlakes.com",
+        )
+        session.post("https://www.marinetraffic.com/submit")
+
+        headers = mock.last_kwargs.get("headers", {})
+        assert headers.get("Origin") == "https://seaway-greatlakes.com"
+
+    @patch("time.sleep")
     def test_iframe_no_x_requested_with(self, mock_sleep):
         """Iframe embed mode should NOT set X-Requested-With."""
         session, mock = make_sync_session(

@@ -39,6 +39,11 @@ See `docs/site-list.md` for WAF test sites and maintenance rules.
 
 Wraps rnet **3.0.0rc21+** (the `Emulation` API). NOT the stable 2.x series. See `docs/ref-rnet.md` for TlsOptions gotchas and HTTP/2 header duplication rules.
 
+**When upgrading rnet**, check for new Chrome Emulation profiles (e.g. Chrome146). If found:
+1. Update `DEFAULT_EMULATION` in `wafer/_base.py` to the newest Chrome profile.
+2. Add the new version's real build number to `_CHROME_BUILDS` in `wafer/_fingerprint.py`. Get it from `versionhistory.googleapis.com/v1/chrome/platforms/mac/channels/stable/versions`.
+3. Update `test_profiles_discovered` count and `test_newest_first` version in `tests/test_fingerprint.py`.
+
 ## Conventions
 
 - Python package manager: `uv` (never pip)

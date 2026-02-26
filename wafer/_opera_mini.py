@@ -209,6 +209,20 @@ _LOCALES = [
     "pl",                        # Polish
 ]
 
+# Accept-Language with region codes to avoid duplicate bare tags.
+# e.g. "fr-FR,fr;q=0.9,en;q=0.5" not "fr,fr;q=0.9,en;q=0.5".
+_LOCALE_ACCEPT_LANG = {
+    "en": "en-US,en;q=0.9",
+    "id": "id-ID,id;q=0.9,en;q=0.5",
+    "ru": "ru-RU,ru;q=0.9,en;q=0.5",
+    "vi": "vi-VN,vi;q=0.9,en;q=0.5",
+    "fr": "fr-FR,fr;q=0.9,en;q=0.5",
+    "tr": "tr-TR,tr;q=0.9,en;q=0.5",
+    "uk": "uk-UA,uk;q=0.9,en;q=0.5",
+    "th": "th-TH,th;q=0.9,en;q=0.5",
+    "pl": "pl-PL,pl;q=0.9,en;q=0.5",
+}
+
 
 class OperaMiniIdentity:
     """A bound Opera Mini device identity for a session.
@@ -225,6 +239,7 @@ class OperaMiniIdentity:
         self.stock_ua = _stock_chrome_ua(model, android_ver, lag)
         self.features = random.choice(_FEATURE_SETS)
         self._locale = random.choice(_LOCALES)
+        self._accept_lang = _LOCALE_ACCEPT_LANG[self._locale]
 
         # ~40% of real UAs include "Android {ver}", rest just "Android"
         if random.random() < 0.4:
@@ -264,13 +279,6 @@ class OperaMiniIdentity:
 
     def headers(self) -> dict[str, str]:
         """Return the full Opera Mini header set for this identity."""
-        # Accept-Language matches the locale in the UA string
-        locale = self._locale
-        if locale == "en":
-            accept_lang = "en-US,en;q=0.9"
-        else:
-            accept_lang = f"{locale},{locale.split('-')[0]};q=0.9,en;q=0.5"
-
         return {
             "User-Agent": self._build_ua(),
             "Accept": (
@@ -278,7 +286,7 @@ class OperaMiniIdentity:
                 "image/png, image/webp, image/jpeg, image/gif, "
                 "image/x-xbitmap, */*;q=0.1"
             ),
-            "Accept-Language": accept_lang,
+            "Accept-Language": self._accept_lang,
             "Accept-Encoding": "deflate, gzip, x-gzip, identity, *;q=0",
             "Connection": "Keep-Alive",
             "X-OperaMini-Features": self.features,
@@ -325,7 +333,16 @@ class OperaMiniIdentity:
 
             raise ConnectionFailed(url, str(e.reason)) from e
 
-        raw = resp.read()
+        try:
+            raw = resp.read()
+        except socket.timeout as e:
+            from wafer._errors import WaferTimeout
+
+            raise WaferTimeout(url, timeout) from e
+        except OSError as e:
+            from wafer._errors import ConnectionFailed
+
+            raise ConnectionFailed(url, str(e)) from e
         encoding = resp.headers.get("Content-Encoding", "")
         if encoding in ("gzip", "x-gzip"):
             try:

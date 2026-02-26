@@ -3,6 +3,7 @@
 import math
 import os
 import shutil
+import time
 from unittest.mock import MagicMock, PropertyMock, patch
 
 import pytest
@@ -517,7 +518,7 @@ class TestSyncBrowserSolveIntegration:
                     "value": "disk_cached",
                     "domain": ".example.com",
                     "path": "/",
-                    "expires": -1,
+                    "expires": time.time() + 1800,  # 30min TTL
                     "secure": True,
                     "httpOnly": True,
                 }
@@ -2129,20 +2130,58 @@ class TestWaitForDataDome:
 class TestWaitForImperva:
     @patch("time.sleep")
     @patch("time.monotonic")
-    def test_returns_true_when_reese84_cookie(
+    def test_returns_true_when_reese84_cookie_appears(
         self, mock_mono, mock_sleep
     ):
         from wafer.browser._imperva import wait_for_imperva
         page = MagicMock()
         solver = MagicMock()
-        # No cookie first, then reese84 appears
+        # Initial snapshot: no cookies. Then reese84 appears.
         page.context.cookies.side_effect = [
-            [],
-            [{"name": "reese84", "value": "abc123"}],
+            [],  # initial snapshot
+            [],  # first poll
+            [{"name": "reese84", "value": "abc123"}],  # second poll
         ]
-        mock_mono.side_effect = [0.0, 1.0, 3.0]
+        mock_mono.side_effect = [0.0, 1.0, 2.0, 3.0]
 
         assert wait_for_imperva(solver, page, 10000) is True
+
+    @patch("time.sleep")
+    @patch("time.monotonic")
+    def test_returns_true_when_reese84_value_changes(
+        self, mock_mono, mock_sleep
+    ):
+        """reese84 set by challenge response, then updated by JS."""
+        from wafer.browser._imperva import wait_for_imperva
+        page = MagicMock()
+        solver = MagicMock()
+        page.context.cookies.side_effect = [
+            [{"name": "reese84", "value": "server-set"}],  # initial
+            [{"name": "reese84", "value": "server-set"}],  # unchanged
+            [{"name": "reese84", "value": "js-updated"}],  # changed
+        ]
+        mock_mono.side_effect = [0.0, 1.0, 2.0, 3.0]
+
+        assert wait_for_imperva(solver, page, 10000) is True
+
+    @patch("time.sleep")
+    @patch("time.monotonic")
+    def test_no_false_positive_on_preexisting_cookie(
+        self, mock_mono, mock_sleep
+    ):
+        """reese84 present from challenge response must not trigger
+        immediate success - value must change."""
+        from wafer.browser._imperva import wait_for_imperva
+        page = MagicMock()
+        solver = MagicMock()
+        page.context.cookies.side_effect = [
+            [{"name": "reese84", "value": "stale"}],  # initial
+            [{"name": "reese84", "value": "stale"}],  # still same
+            [{"name": "reese84", "value": "stale"}],  # still same
+        ]
+        mock_mono.side_effect = [0.0, 1.0, 5.0, 15.0]
+
+        assert wait_for_imperva(solver, page, 10000) is False
 
     @patch("time.sleep")
     @patch("time.monotonic")
@@ -2152,11 +2191,13 @@ class TestWaitForImperva:
         from wafer.browser._imperva import wait_for_imperva
         page = MagicMock()
         solver = MagicMock()
+        # Initial snapshot: no cookies. Then ___utmvc appears.
         page.context.cookies.side_effect = [
-            [],
-            [{"name": "___utmvc", "value": "xyz789"}],
+            [],  # initial snapshot
+            [],  # first poll
+            [{"name": "___utmvc", "value": "xyz789"}],  # appears
         ]
-        mock_mono.side_effect = [0.0, 1.0, 3.0]
+        mock_mono.side_effect = [0.0, 1.0, 2.0, 3.0]
 
         assert wait_for_imperva(solver, page, 10000) is True
 
@@ -2169,14 +2210,16 @@ class TestWaitForImperva:
         from wafer.browser._imperva import wait_for_imperva
         page = MagicMock()
         solver = MagicMock()
+        # Initial snapshot: no cookies. Then incap_ses appears.
         page.context.cookies.side_effect = [
-            [],
+            [],  # initial snapshot
+            [],  # first poll
             [
                 {"name": "visid_incap_123", "value": "x"},
                 {"name": "incap_ses_456_123", "value": "y"},
             ],
         ]
-        mock_mono.side_effect = [0.0, 1.0, 3.0]
+        mock_mono.side_effect = [0.0, 1.0, 2.0, 3.0]
 
         assert wait_for_imperva(solver, page, 10000) is True
 
@@ -2224,8 +2267,10 @@ class TestDispatchChallenge:
     def test_dispatches_imperva(self, mock_mono, mock_sleep):
         solver = self._make_solver_with_mock_browser()
         page = MagicMock()
-        page.context.cookies.return_value = [
-            {"name": "reese84", "value": "solved"}
+        # Initial snapshot has server-set value, then JS updates it
+        page.context.cookies.side_effect = [
+            [{"name": "reese84", "value": "server"}],  # initial
+            [{"name": "reese84", "value": "solved"}],  # changed
         ]
         mock_mono.side_effect = [
             float(i) * 0.1 for i in range(50)

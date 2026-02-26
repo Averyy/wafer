@@ -4,12 +4,16 @@ Wafer wraps rnet **3.0.0rc21+** (the `Emulation` API). NOT the stable 2.x series
 
 ## TlsOptions Silent Failure
 
-**`TlsOptions(**kwargs)` silently accepts ANY kwargs -including typos and wrong names.** There is no validation, no `.pyi` stub, and no error. A kwarg being "accepted" means nothing. Only wire verification proves it works.
+**`TlsOptions(**kwargs)` and `Http2Options(**kwargs)` silently accept ANY kwargs -including typos and wrong names.** There is no validation and no error. A kwarg being "accepted" means nothing. Only wire verification proves it works. Authoritative kwarg names are in the `.pyi` stubs' `Params` TypedDicts.
 
-**When a TlsOptions feature doesn't appear on the wire, the kwarg name is almost certainly wrong.** Do NOT conclude the feature is missing from the binary/build. Known corrections:
+**When a TlsOptions/Http2Options feature doesn't appear on the wire, the kwarg name is almost certainly wrong.** Do NOT conclude the feature is missing from the binary/build. Known corrections:
 - ~~`ocsp_stapling`~~ → `enable_ocsp_stapling`
 - ~~`cert_compression_algorithm`~~ → `certificate_compression_algorithms`
 - ~~`curves`~~ → `curves_list`
+- ~~`alpn_protos`~~ → `alpn_protocols`
+- ~~`extensions`~~ → `extension_permutation`
+- ~~`key_shares`~~ (list) → `key_shares_limit` (int count)
+- ~~`pseudo_order`~~ → `headers_pseudo_order` (Http2Options)
 - SCT: `enable_signed_cert_timestamps`
 
 **Diagnosis order when something doesn't appear on wire:**

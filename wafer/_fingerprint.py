@@ -102,17 +102,17 @@ def _detect_platform_version() -> str:
     """Detect OS version for Sec-CH-UA-Platform-Version."""
     system = platform.system()
     if system == "Darwin":
-        ver = platform.mac_ver()[0]  # e.g. "26.2"
-        # Chrome reports macOS kernel version, not marketing version.
-        # macOS 15.x → kernel 24.x, 14.x → 23.x, etc.
-        # platform.mac_ver() returns the marketing version on modern Python,
-        # but Chrome reports kernel. Use uname for accuracy.
-        try:
-            uname_ver = platform.release()  # e.g. "25.2.0"
-            parts = uname_ver.split(".")
-            return f'"{parts[0]}.{parts[1] if len(parts) > 1 else "0"}.0"'
-        except Exception:
-            return f'"{ver}"' if ver else '"15.0.0"'
+        # Chrome uses NSProcessInfo.processInfo.operatingSystemVersion,
+        # which returns the macOS marketing version (e.g. "26.2.0"),
+        # NOT the Darwin kernel version (platform.release()).
+        ver = platform.mac_ver()[0]  # e.g. "26.2" or "15.2.1"
+        if not ver:
+            return '"15.0.0"'
+        parts = ver.split(".")
+        major = parts[0]
+        minor = parts[1] if len(parts) > 1 else "0"
+        patch = parts[2] if len(parts) > 2 else "0"
+        return f'"{major}.{minor}.{patch}"'
     if system == "Linux":
         try:
             release = platform.release()  # e.g. "6.5.0-44-generic"
@@ -130,14 +130,37 @@ def _detect_platform_version() -> str:
 
 
 # Chrome full version format: MAJOR.0.BUILD.PATCH
-# Build numbers increment ~65 per major version from a known anchor.
-_FULL_VERSION_ANCHOR = (130, 6723, 91)  # Chrome 130.0.6723.91
+# Real build numbers from versionhistory.googleapis.com (first stable release).
+_CHROME_BUILDS: dict[int, tuple[int, int]] = {
+    130: (6723, 58),
+    131: (6778, 69),
+    132: (6834, 83),
+    133: (6943, 33),
+    134: (6998, 35),
+    135: (7049, 42),
+    136: (7103, 49),
+    137: (7151, 37),
+    138: (7204, 46),
+    139: (7258, 42),
+    140: (7339, 34),
+    141: (7390, 47),
+    142: (7444, 48),
+    143: (7499, 52),
+    144: (7559, 46),
+    145: (7632, 46),
+}
+
+# Fallback for versions outside the lookup table.
+_FULL_VERSION_ANCHOR = (130, 6723, 58)
 
 
 def _full_version(major: int) -> str:
-    """Generate a plausible Chrome full version string."""
+    """Return a real Chrome full version string, or a plausible approximation."""
+    if major in _CHROME_BUILDS:
+        build, patch = _CHROME_BUILDS[major]
+        return f"{major}.0.{build}.{patch}"
     anchor_major, anchor_build, anchor_patch = _FULL_VERSION_ANCHOR
-    build = anchor_build + (major - anchor_major) * 65
+    build = anchor_build + (major - anchor_major) * 61
     return f"{major}.0.{build}.{anchor_patch}"
 
 

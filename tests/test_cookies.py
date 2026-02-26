@@ -10,6 +10,9 @@ from wafer._cookies import (
     extract_domain,
 )
 
+# Far-future expiry for tests that don't care about TTL behavior.
+_FUTURE = time.time() + 86400
+
 # ---------------------------------------------------------------------------
 # extract_domain
 # ---------------------------------------------------------------------------
@@ -118,7 +121,7 @@ class TestCookieCacheReadWrite:
                 "name": "sess",
                 "raw": "sess=abc",
                 "url": "https://example.com",
-                "expires": 0,
+                "expires": _FUTURE,
             },
         ]
         cache.save("example.com", cookies)
@@ -138,13 +141,13 @@ class TestCookieCacheReadWrite:
                 "name": "a",
                 "raw": "a=1",
                 "url": "https://e.com",
-                "expires": 0,
+                "expires": _FUTURE,
             },
             {
                 "name": "b",
                 "raw": "b=2",
                 "url": "https://e.com",
-                "expires": 0,
+                "expires": _FUTURE,
             },
         ]
         cache.save("e.com", cookies)
@@ -180,19 +183,35 @@ class TestCookieCacheTTL:
                 "url": "https://e.com",
                 "expires": now + 3600,
             },
-            {
-                "name": "session",
-                "raw": "session=x",
-                "url": "https://e.com",
-                "expires": 0,
-            },
         ]
         cache.save("e.com", cookies)
         loaded = cache.load("e.com")
         names = [c["name"] for c in loaded]
         assert "expired" not in names
         assert "valid" in names
-        assert "session" in names
+
+    def test_session_cookies_not_persisted(self, tmp_path):
+        """Session cookies (expires=0) should not survive disk round-trip."""
+        cache = CookieCache(cache_dir=str(tmp_path))
+        cookies = [
+            {
+                "name": "session",
+                "raw": "session=x",
+                "url": "https://e.com",
+                "expires": 0,
+            },
+            {
+                "name": "persistent",
+                "raw": "persistent=x",
+                "url": "https://e.com",
+                "expires": time.time() + 3600,
+            },
+        ]
+        cache.save("e.com", cookies)
+        loaded = cache.load("e.com")
+        names = [c["name"] for c in loaded]
+        assert "session" not in names
+        assert "persistent" in names
 
     def test_all_expired_returns_empty(self, tmp_path):
         cache = CookieCache(cache_dir=str(tmp_path))
@@ -232,7 +251,7 @@ class TestCookieCacheTTL:
                     "name": "new",
                     "raw": "new=x",
                     "url": "https://e.com",
-                    "expires": 0,
+                    "expires": _FUTURE,
                 },
             ],
         )
@@ -258,7 +277,7 @@ class TestCookieCacheLRU:
                 "name": f"c{i}",
                 "raw": f"c{i}=v",
                 "url": "https://e.com",
-                "expires": 0,
+                "expires": _FUTURE,
                 "last_used": now - (10 - i),
             }
             for i in range(5)
@@ -279,7 +298,7 @@ class TestCookieCacheLRU:
                 "name": f"c{i}",
                 "raw": f"c{i}=v",
                 "url": "https://e.com",
-                "expires": 0,
+                "expires": _FUTURE,
             }
             for i in range(5)
         ]
@@ -294,7 +313,7 @@ class TestCookieCacheLRU:
                 "name": f"c{i}",
                 "raw": f"c{i}=v",
                 "url": "https://e.com",
-                "expires": 0,
+                "expires": _FUTURE,
             }
             for i in range(3)
         ]
@@ -318,7 +337,7 @@ class TestCookieCacheMerge:
                     "name": "a",
                     "raw": "a=old",
                     "url": "https://e.com",
-                    "expires": 0,
+                    "expires": _FUTURE,
                 },
             ],
         )
@@ -329,7 +348,7 @@ class TestCookieCacheMerge:
                     "name": "a",
                     "raw": "a=new",
                     "url": "https://e.com",
-                    "expires": 0,
+                    "expires": _FUTURE,
                 },
             ],
         )
@@ -346,7 +365,7 @@ class TestCookieCacheMerge:
                     "name": "a",
                     "raw": "a=1",
                     "url": "https://e.com",
-                    "expires": 0,
+                    "expires": _FUTURE,
                 },
             ],
         )
@@ -357,7 +376,7 @@ class TestCookieCacheMerge:
                     "name": "b",
                     "raw": "b=2",
                     "url": "https://e.com",
-                    "expires": 0,
+                    "expires": _FUTURE,
                 },
             ],
         )
@@ -416,7 +435,7 @@ class TestCookieCacheClearAndList:
                     "name": "a",
                     "raw": "a=v",
                     "url": "https://e.com",
-                    "expires": 0,
+                    "expires": _FUTURE,
                 },
             ],
         )
@@ -437,7 +456,7 @@ class TestCookieCacheClearAndList:
                     "name": "x",
                     "raw": "x=1",
                     "url": "https://a.com",
-                    "expires": 0,
+                    "expires": _FUTURE,
                 },
             ],
         )
@@ -448,7 +467,7 @@ class TestCookieCacheClearAndList:
                     "name": "y",
                     "raw": "y=2",
                     "url": "https://b.com",
-                    "expires": 0,
+                    "expires": _FUTURE,
                 },
             ],
         )
@@ -469,8 +488,8 @@ class TestSaveFromHeaders:
     def test_bytes_values(self, tmp_path):
         cache = CookieCache(cache_dir=str(tmp_path))
         raw_values = [
-            b"cf_clearance=abc123; Path=/; Secure; HttpOnly",
-            b"session=xyz; Path=/",
+            b"cf_clearance=abc123; Max-Age=1800; Path=/; Secure; HttpOnly",
+            b"token=xyz; Max-Age=3600; Path=/",
         ]
         cache.save_from_headers(
             "example.com", raw_values, "https://example.com/page"
@@ -479,11 +498,11 @@ class TestSaveFromHeaders:
         assert len(loaded) == 2
         names = {c["name"] for c in loaded}
         assert "cf_clearance" in names
-        assert "session" in names
+        assert "token" in names
 
     def test_preserves_raw_value(self, tmp_path):
         cache = CookieCache(cache_dir=str(tmp_path))
-        raw = b"token=abc123; Path=/; Domain=.example.com; Secure"
+        raw = b"token=abc123; Max-Age=3600; Path=/; Domain=.example.com; Secure"
         cache.save_from_headers(
             "example.com", [raw], "https://example.com"
         )
@@ -494,7 +513,7 @@ class TestSaveFromHeaders:
         cache = CookieCache(cache_dir=str(tmp_path))
         cache.save_from_headers(
             "e.com",
-            [b"a=1; Path=/"],
+            [b"a=1; Max-Age=3600; Path=/"],
             "https://e.com/path?q=1",
         )
         loaded = cache.load("e.com")
@@ -520,7 +539,7 @@ class TestSaveFromHeaders:
         cache = CookieCache(cache_dir=str(tmp_path))
         cache.save_from_headers(
             "e.com",
-            [b"=noname; Path=/", b"valid=yes; Path=/"],
+            [b"=noname; Path=/", b"valid=yes; Max-Age=3600; Path=/"],
             "https://e.com",
         )
         loaded = cache.load("e.com")
@@ -545,7 +564,7 @@ class TestCookieCacheAtomic:
                     "name": "a",
                     "raw": "a=v",
                     "url": "https://e.com",
-                    "expires": 0,
+                    "expires": _FUTURE,
                 },
             ],
         )
@@ -560,7 +579,7 @@ class TestCookieCacheAtomic:
                     "name": "a",
                     "raw": "a=v",
                     "url": "https://e.com",
-                    "expires": 0,
+                    "expires": _FUTURE,
                 },
             ],
         )
@@ -579,7 +598,7 @@ class TestCookieCacheAtomic:
                     "name": "a",
                     "raw": "a=v",
                     "url": "https://e.com",
-                    "expires": 0,
+                    "expires": _FUTURE,
                 },
             ],
         )
@@ -603,7 +622,7 @@ class TestCookieCacheLastUsed:
                     "name": "a",
                     "raw": "a=v",
                     "url": "https://e.com",
-                    "expires": 0,
+                    "expires": _FUTURE,
                     "last_used": old_time,
                 },
             ],
@@ -621,7 +640,7 @@ class TestCookieCacheLastUsed:
                     "name": "a",
                     "raw": "a=v",
                     "url": "https://e.com",
-                    "expires": 0,
+                    "expires": _FUTURE,
                 },
             ],
         )

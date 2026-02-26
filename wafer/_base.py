@@ -249,6 +249,10 @@ class BaseSession:
             self.headers = self._safari_identity.client_headers()
         else:
             self.headers = dict(DEFAULT_HEADERS)
+        # Save Chrome-mode headers for restoration after Safari rotation
+        self._chrome_headers = (
+            dict(self.headers) if self._safari_identity is None else None
+        )
         self.connect_timeout = (
             _normalize_timeout(connect_timeout)
             if connect_timeout is not None
@@ -265,7 +269,9 @@ class BaseSession:
         self.max_redirects = max_redirects
         self.max_failures = max_failures
 
-        if profile is Profile.SAFARI:
+        if profile in (Profile.SAFARI, Profile.OPERA_MINI):
+            # Safari uses TlsOptions (not Emulation). Opera Mini
+            # bypasses rnet entirely. Neither needs FingerprintManager.
             self._fingerprint = None
         else:
             self._fingerprint = FingerprintManager(
@@ -283,9 +289,10 @@ class BaseSession:
 
         # Session health: consecutive failure count per domain
         self._domain_failures: dict[str, int] = {}
+        self._tried_safari = profile is Profile.SAFARI
 
         # Cookie cache (disk persistence)
-        if cache_dir is not None:
+        if cache_dir is not None and profile is not Profile.OPERA_MINI:
             self._cookie_cache: CookieCache | None = CookieCache(
                 cache_dir
             )
@@ -320,9 +327,10 @@ class BaseSession:
         # Cache client-level headers for fast delta in _build_headers
         self._client_headers = self._compute_client_headers()
 
-        if profile is Profile.SAFARI:
+        if self._fingerprint is None:
             logger.debug(
-                "Session created with Safari profile, timeout=%s",
+                "Session created with %s profile, timeout=%s",
+                profile.name if profile else "custom",
                 self.timeout,
             )
         elif embed_origin:
@@ -388,6 +396,13 @@ class BaseSession:
         """Compute Sec-Fetch-Site based on embed_origin vs request URL.
 
         Returns "same-origin", "same-site", or "cross-site" per the spec.
+
+        Limitation: same-site uses a naive TLD+1 heuristic (last two
+        hostname labels) instead of a Public Suffix List lookup. This
+        gives wrong results for multi-label TLDs like .co.uk, .com.au,
+        and .github.io - two unrelated .co.uk domains would incorrectly
+        be classified as same-site. Override per-request if needed:
+        ``headers={"Sec-Fetch-Site": "cross-site"}``.
         """
         if not self._embed_origin:
             return "cross-site"
@@ -427,6 +442,7 @@ class BaseSession:
 
     def _build_headers(
         self, url: str, extra: dict[str, str] | None = None,
+        method: str = "GET",
     ) -> dict[str, str]:
         """Build per-request headers as a delta over client-level headers.
 
@@ -476,7 +492,10 @@ class BaseSession:
             merged["Sec-Fetch-Site"] = self._compute_sec_fetch_site(url)
             merged["Sec-Fetch-Mode"] = "navigate"
             merged["Sec-Fetch-Dest"] = "iframe"
-            # No Origin for GET navigations
+            # POST/PUT/PATCH/DELETE navigations send Origin (Fetch spec);
+            # GET/HEAD navigations do not.
+            if method.upper() not in ("GET", "HEAD"):
+                merged["Origin"] = self._embed_origin or ""
             if self._embed_referers:
                 merged["Referer"] = random.choice(self._embed_referers)
             logger.debug(
@@ -557,8 +576,28 @@ class BaseSession:
         """
         self._safari_identity = SafariIdentity(locale=self._safari_locale)
         self._fingerprint = None
+        self._tried_safari = True
         self.headers = self._safari_identity.client_headers()
         logger.info("Rotation fallback: switched to Safari profile")
+
+    def _switch_to_chrome(self) -> None:
+        """Switch back from Safari to Chrome with a rotated version.
+
+        Called during rotation escalation when Safari didn't help either.
+        Restores Chrome TLS identity with a different version than default.
+        """
+        self._safari_identity = None
+        self._fingerprint = FingerprintManager(DEFAULT_EMULATION)
+        self._fingerprint.rotate()
+        self.headers = (
+            dict(self._chrome_headers)
+            if self._chrome_headers
+            else dict(DEFAULT_HEADERS)
+        )
+        logger.info(
+            "Rotation: switched to Chrome %s",
+            self._fingerprint.current,
+        )
 
     def _rotation_delay(self) -> float:
         """Delay before a rotation retry: rate limiter interval + 1s.
@@ -580,6 +619,45 @@ class BaseSession:
             return url
         sep = "&" if "?" in url else "?"
         return url + sep + urlencode(params)
+
+    @staticmethod
+    def _is_cross_origin(old_url: str, new_url: str) -> bool:
+        """True if redirect crosses origin (different host)."""
+        old_host = urlparse(old_url).hostname or ""
+        new_host = urlparse(new_url).hostname or ""
+        return old_host != new_host
+
+    @staticmethod
+    def _strip_sensitive_headers(
+        extra_headers: dict[str, str] | None,
+        cross_origin: bool,
+        method_changed: bool,
+    ) -> dict[str, str] | None:
+        """Strip headers that should not survive a redirect hop.
+
+        Per the Fetch spec and consistent with requests/httpx/curl:
+        - Authorization is stripped on cross-origin redirects
+        - Content-Type is stripped when method changes (POST → GET)
+        """
+        if extra_headers is None:
+            return None
+        drop = set()
+        if cross_origin:
+            drop.add("authorization")
+        if method_changed:
+            drop.update(("content-type", "content-length"))
+        if not drop:
+            return extra_headers
+        filtered = {
+            k: v for k, v in extra_headers.items()
+            if k.lower() not in drop
+        }
+        if len(filtered) != len(extra_headers):
+            logger.debug(
+                "Redirect: stripped headers %s",
+                drop & {k.lower() for k in extra_headers},
+            )
+        return filtered or None
 
     @staticmethod
     def _resolve_redirect_url(base_url: str, location: str) -> str:
@@ -631,11 +709,14 @@ class BaseSession:
         self._client_headers = self._compute_client_headers()
 
         if self._safari_identity is not None:
-            # Safari: custom TLS + H2, no Emulation
+            # Safari: custom TLS + H2, no Emulation.
+            # Use _client_headers (not self.headers) so embed mode
+            # stripping of Sec-Fetch-* is reflected at client level,
+            # matching what _build_headers uses for delta computation.
             kwargs = {
                 "tls_options": self._safari_identity.tls_options(),
                 "http2_options": self._safari_identity.http2_options(),
-                "headers": dict(self.headers),
+                "headers": dict(self._client_headers),
                 "connect_timeout": self.connect_timeout,
                 "timeout": self.timeout,
                 "cookie_store": True,

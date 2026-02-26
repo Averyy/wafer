@@ -75,7 +75,7 @@ class SafariIdentity:
             ),
             min_tls_version=TlsVersion.TLS_1_2,
             max_tls_version=TlsVersion.TLS_1_3,
-            alpn_protos=[AlpnProtocol.HTTP2, AlpnProtocol.HTTP1],
+            alpn_protocols=[AlpnProtocol.HTTP2, AlpnProtocol.HTTP1],
             certificate_compression_algorithms=[
                 CertificateCompressionAlgorithm.ZLIB,
             ],
@@ -84,8 +84,8 @@ class SafariIdentity:
             grease_enabled=True,
             permute_extensions=True,
             curves_list="X25519MLKEM768:X25519:P-256:P-384",
-            key_shares=[4588, 29],
-            extensions=[
+            key_shares_limit=2,
+            extension_permutation=[
                 ExtensionType.SIGNATURE_ALGORITHMS,
                 ExtensionType.EXTENDED_MASTER_SECRET,
                 ExtensionType.KEY_SHARE,
@@ -124,7 +124,7 @@ class SafariIdentity:
             initial_connection_window_size=8355840,  # 8290305 + 65535
             no_rfc7540_priorities=True,
             settings_order=so,
-            pseudo_order=po,
+            headers_pseudo_order=po,
         )
 
     def client_headers(self) -> dict[str, str]:

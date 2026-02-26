@@ -3,6 +3,7 @@
 import re
 
 from wafer._opera_mini import (
+    _LOCALE_ACCEPT_LANG,
     _LOCALES,
     _OM_VERSIONS,
     _SERVER_VERSIONS,
@@ -199,11 +200,15 @@ class TestOperaMiniIdentity:
         """Accept-Language should reflect the locale in the UA."""
         identity = OperaMiniIdentity()
         h = identity.headers()
-        locale = identity._locale
-        if locale == "en":
-            assert h["Accept-Language"].startswith("en-US")
-        else:
-            assert h["Accept-Language"].startswith(locale)
+        assert h["Accept-Language"] == _LOCALE_ACCEPT_LANG[identity._locale]
+
+    def test_accept_language_no_duplicate_tags(self):
+        """Accept-Language must not repeat the same tag at different q-values."""
+        for locale, al in _LOCALE_ACCEPT_LANG.items():
+            tags = [t.split(";")[0].strip() for t in al.split(",")]
+            assert len(tags) == len(set(tags)), (
+                f"Duplicate tags for {locale}: {al}"
+            )
 
     def test_ua_full_format_regex(self):
         """UA matches the documented Opera Mini format."""

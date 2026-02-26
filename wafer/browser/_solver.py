@@ -203,10 +203,10 @@ class BrowserSolver:
         self._browser_ua: str | None = None
         self._extension_dir: str | None = None
         # Recording caches (lazy-loaded on first PX encounter)
-        self._idle_recordings: list[list[dict[str, float]]] | None = None
+        self._idle_recordings: list[dict] | None = None
         self._path_recordings: list[dict] | None = None
-        self._hold_recordings: list[list[dict[str, float]]] | None = None
-        self._drag_recordings: list[list[dict[str, float]]] | None = None
+        self._hold_recordings: list[dict] | None = None
+        self._drag_recordings: list[dict] | None = None
         self._slide_recordings: list[dict] | None = None
         self._browse_recordings: list[dict] | None = None
         self._grid_recordings: list[dict] | None = None
@@ -321,12 +321,16 @@ class BrowserSolver:
                 f"--disable-extensions-except={ext_dir}"
             )
 
-        self._playwright = sync_playwright().start()
-        self._browser = self._playwright.chromium.launch(
-            channel="chrome",
-            headless=self._headless,
-            args=launch_args,
-        )
+        try:
+            self._playwright = sync_playwright().start()
+            self._browser = self._playwright.chromium.launch(
+                channel="chrome",
+                headless=self._headless,
+                args=launch_args,
+            )
+        except Exception:
+            self._close_browser()
+            raise
         self._last_used = now
         logger.info("Browser launched (headless=%s)", self._headless)
 
@@ -411,7 +415,7 @@ class BrowserSolver:
                         {"rows": rows, "name": name}
                     )
         except Exception:
-            pass
+            logger.debug("Failed to load idle recordings", exc_info=True)
 
         # --- paths ---
         try:
@@ -433,7 +437,7 @@ class BrowserSolver:
                         }
                     )
         except Exception:
-            pass
+            logger.debug("Failed to load path recordings", exc_info=True)
 
         # --- holds ---
         try:
@@ -448,7 +452,7 @@ class BrowserSolver:
                         {"rows": rows, "name": name}
                     )
         except Exception:
-            pass
+            logger.debug("Failed to load hold recordings", exc_info=True)
 
         # --- drags ---
         try:
@@ -464,7 +468,7 @@ class BrowserSolver:
                         {"rows": rows, "meta": meta, "name": name}
                     )
         except Exception:
-            pass
+            logger.debug("Failed to load drag recordings", exc_info=True)
 
         # --- slide_drags (full-width "slide to verify" drags) ---
         try:
@@ -480,7 +484,7 @@ class BrowserSolver:
                         {"rows": rows, "meta": meta, "name": name}
                     )
         except Exception:
-            pass
+            logger.debug("Failed to load slide recordings", exc_info=True)
 
         # --- browses ---
         try:
@@ -505,7 +509,7 @@ class BrowserSolver:
                         "name": name,
                     })
         except Exception:
-            pass
+            logger.debug("Failed to load browse recordings", exc_info=True)
 
         # --- grids (short-hop paths for tile clicking) ---
         try:
@@ -527,7 +531,7 @@ class BrowserSolver:
                         }
                     )
         except Exception:
-            pass
+            logger.debug("Failed to load grid recordings", exc_info=True)
 
         logger.info(
             "Loaded %d idle + %d path + %d hold + %d drag"
@@ -750,8 +754,7 @@ class BrowserSolver:
             return None
 
         rec = random.choice(self._browse_recordings)
-        max_scroll = rec.get("max_scroll", 0)
-        scroll_scale = 1.0 if max_scroll <= 0 else 1.0
+        scroll_scale = 1.0
         time_scale = random.uniform(0.85, 1.15)
 
         logger.debug(
@@ -933,13 +936,6 @@ class BrowserSolver:
                     page, challenge_type, timeout_ms
                 )
 
-                # Wait for page to fully settle before extracting
-                try:
-                    page.wait_for_load_state(
-                        "networkidle", timeout=5000
-                    )
-                except Exception:
-                    pass
 
                 cookies = context.cookies()
 
@@ -1209,7 +1205,10 @@ class BrowserSolver:
                 target_cookies = [
                     c
                     for c in all_cookies
-                    if target_domain in (c.get("domain", ""))
+                    if (
+                        c.get("domain", "").lstrip(".") == target_domain
+                        or c.get("domain", "").endswith("." + target_domain)
+                    )
                 ]
 
                 self._last_used = time.monotonic()

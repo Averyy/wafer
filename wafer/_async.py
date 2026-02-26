@@ -1,6 +1,7 @@
 """AsyncSession -- async HTTP client wrapping rnet.Client."""
 
 import asyncio
+import datetime
 import logging
 import time
 
@@ -102,7 +103,19 @@ class AsyncSession(BaseSession):
             )
 
     def _rebuild_client(self) -> None:
-        """Rebuild the rnet client (after fingerprint rotation)."""
+        """Rebuild the rnet client with a fresh TLS session and cookie jar.
+
+        Creates a new rnet.Client, discarding the old client's connection
+        pool, TLS session tickets, and in-memory cookie jar. Only cookies
+        persisted to disk cache (via _cache_response_cookies or browser
+        solve) survive the rebuild; normal HTTP response cookies that were
+        only in the in-memory jar are intentionally lost.
+
+        This is correct for rotation/retirement: cookies are bound to the
+        TLS fingerprint that earned them, and replaying them on a different
+        fingerprint can trigger WAF flags. For rotate_every (unlinkable
+        request sequences), cookie loss is the desired isolation property.
+        """
         self._client = rnet.Client(**self._build_client_kwargs())
         self._hydrate_jar_from_cache()
         logger.debug(
@@ -111,6 +124,12 @@ class AsyncSession(BaseSession):
 
     async def _retire_session(self, domain: str) -> None:
         """Full identity reset: new fingerprint, empty jar, clear cache."""
+        # Restore Chrome if rotated to Safari (not explicit Safari profile)
+        if (
+            self._safari_identity is not None
+            and self._profile is not Profile.SAFARI
+        ):
+            self._switch_to_chrome()
         if self._fingerprint is not None:
             self._fingerprint.reset()
         if self._cookie_cache:
@@ -281,8 +300,12 @@ class AsyncSession(BaseSession):
                 self._client.cookie_jar.add(
                     format_cookie_str(cookie), url
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(
+                    "Failed to inject cookie %s: %s",
+                    cookie.get("name", "?"),
+                    e,
+                )
 
         # Passthrough: browser got real content without solving
         if result.response is not None:
@@ -390,6 +413,8 @@ class AsyncSession(BaseSession):
                     url, headers=extra_headers, timeout=timeout,
                 ),
             )
+            if self._rate_limiter:
+                self._rate_limiter.record(domain)
             return WaferResponse(
                 status_code=status,
                 content=text.encode("utf-8"),
@@ -430,8 +455,18 @@ class AsyncSession(BaseSession):
 
             # Rebuild merged headers each iteration (fingerprint may rotate)
             kwargs["headers"] = self._build_headers(
-                current_url, extra_headers
+                current_url, extra_headers, method=method
             )
+
+            # Clamp per-attempt timeout to remaining deadline so a
+            # single slow response can't overshoot the user's budget.
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise WaferTimeout(url, timeout_secs)
+                kwargs["timeout"] = datetime.timedelta(
+                    seconds=min(timeout_secs, remaining)
+                )
 
             # Make the request
             try:
@@ -484,16 +519,28 @@ class AsyncSession(BaseSession):
                     )
                     # Track referer from pre-redirect URL
                     self._record_url(current_url)
+                    cross_origin = self._is_cross_origin(
+                        current_url, new_url
+                    )
                     current_url = new_url
                     domain = (
                         extract_domain(current_url) or current_url
                     )
                     # POST redirects (301, 302, 303) → GET per RFC
+                    method_changed = False
                     if status in (301, 302, 303) and m != Method.GET:
                         m = Method.GET
+                        method = "GET"
                         kwargs.pop("body", None)
                         kwargs.pop("form", None)
                         kwargs.pop("json", None)
+                        method_changed = True
+                    # Strip sensitive headers on cross-origin or
+                    # body headers on method change (Fetch spec)
+                    if cross_origin or method_changed:
+                        extra_headers = self._strip_sensitive_headers(
+                            extra_headers, cross_origin, method_changed
+                        )
                     continue
 
             # Decode headers eagerly for all remaining paths
@@ -609,18 +656,25 @@ class AsyncSession(BaseSession):
                 )
                 await asyncio.sleep(delay)
                 if not retired:
+                    # Clear domain cookies on every rotation - stale
+                    # cookies from a different TLS identity cause WAF
+                    # re-challenges (cf_clearance, _abck are TLS-bound).
+                    if self._cookie_cache:
+                        await asyncio.to_thread(
+                            self._cookie_cache.clear, domain
+                        )
                     if state.rotation_retries == 1:
-                        # First rotation: fresh TLS session + clear
-                        # domain cookies (tainted by old fingerprint).
-                        if self._cookie_cache:
-                            await asyncio.to_thread(
-                                self._cookie_cache.clear, domain
-                            )
+                        pass  # first rotation: just fresh TLS + cleared cookies
                     elif (
                         self._fingerprint is not None
-                        and self._safari_identity is None
+                        and not self._tried_safari
                     ):
                         self._switch_to_safari()
+                    elif (
+                        self._safari_identity is not None
+                        and self._profile is not Profile.SAFARI
+                    ):
+                        self._switch_to_chrome()
                     elif self._fingerprint is not None:
                         self._fingerprint.rotate()
                     self._rebuild_client()
@@ -760,18 +814,25 @@ class AsyncSession(BaseSession):
                 if should_retire:
                     await self._retire_session(domain)
                 else:
+                    # Clear domain cookies on every rotation - stale
+                    # cookies from a different TLS identity cause WAF
+                    # re-challenges (cf_clearance, _abck are TLS-bound).
+                    if self._cookie_cache:
+                        await asyncio.to_thread(
+                            self._cookie_cache.clear, domain
+                        )
                     if state.rotation_retries == 1:
-                        # First rotation: fresh TLS session + clear
-                        # domain cookies (tainted by old fingerprint).
-                        if self._cookie_cache:
-                            await asyncio.to_thread(
-                                self._cookie_cache.clear, domain
-                            )
+                        pass  # first rotation: just fresh TLS + cleared cookies
                     elif (
                         self._fingerprint is not None
-                        and self._safari_identity is None
+                        and not self._tried_safari
                     ):
                         self._switch_to_safari()
+                    elif (
+                        self._safari_identity is not None
+                        and self._profile is not Profile.SAFARI
+                    ):
+                        self._switch_to_chrome()
                     elif self._fingerprint is not None:
                         self._fingerprint.rotate()
                     self._rebuild_client()
@@ -869,4 +930,7 @@ class AsyncSession(BaseSession):
 
     async def __aexit__(self, *args):
         if self._browser_solver is not None:
-            self._browser_solver.close()
+            try:
+                self._browser_solver.close()
+            except Exception:
+                logger.debug("BrowserSolver.close() failed", exc_info=True)

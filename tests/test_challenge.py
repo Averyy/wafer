@@ -87,13 +87,15 @@ class TestAkamai:
         body = "x" * 50_000
         assert detect_challenge(200, headers, body) is None
 
-    def test_akamai_body_marker_403(self):
+    def test_akamai_branded_403_not_challenge(self):
+        """403 page mentioning 'Akamai' by name is not a solvable challenge."""
         body = '<html><body>Akamai Bot Manager</body></html>'
-        assert detect_challenge(403, {}, body) == ChallengeType.AKAMAI
+        assert detect_challenge(403, {}, body) is None
 
-    def test_akam_body_marker_403(self):
+    def test_akam_reference_403_not_challenge(self):
+        """403 page with 'akam' reference ID is not a solvable challenge."""
         body = '<html><body>Reference: akam-12345</body></html>'
-        assert detect_challenge(403, {}, body) == ChallengeType.AKAMAI
+        assert detect_challenge(403, {}, body) is None
 
     def test_bazadebezolkohpepadr_is_akamai_not_shape(self):
         """bazadebezolkohpepadr is Akamai Bot Manager, not F5 Shape."""
@@ -131,6 +133,31 @@ class TestShape:
         """Normal 200 page is not Shape."""
         body = "<html><body>Welcome to our store</body></html>"
         assert detect_challenge(200, {}, body) is None
+
+    def test_shape_sensor_header_403(self):
+        """Shape sensor response header on 403."""
+        headers = {"x-nordstrom-a": "2"}
+        assert detect_challenge(403, headers, "") == ChallengeType.SHAPE
+
+    def test_shape_sensor_header_429(self):
+        """Shape sensor response header on 429."""
+        headers = {"x-site-a": "98765432109876543210987654321098765678901"}
+        assert detect_challenge(429, headers, "") == ChallengeType.SHAPE
+
+    def test_shape_sensor_header_200_not_detected(self):
+        """Shape header heuristic must NOT fire on 200 (too broad)."""
+        headers = {"x-data-a": "12345"}
+        assert detect_challenge(200, headers, "") is None
+
+    def test_shape_header_long_key_not_detected(self):
+        """Headers longer than 20 chars don't match Shape heuristic."""
+        headers = {"x-very-long-header-name-a": "12345"}
+        assert detect_challenge(403, headers, "") is None
+
+    def test_shape_header_non_numeric_short_value_not_detected(self):
+        """Shape header with non-numeric short value doesn't match."""
+        headers = {"x-test-a": "hello"}
+        assert detect_challenge(403, headers, "") is None
 
 
 # ---------------------------------------------------------------------------
@@ -250,6 +277,26 @@ class TestImperva:
         )
         assert detect_challenge(200, {}, body) == ChallengeType.IMPERVA
 
+    def test_reese84_cookie_429(self):
+        """reese84 cookie on 429 identifies Imperva."""
+        headers = _h(set_cookie="reese84=abc; Path=/")
+        assert detect_challenge(429, headers, "") == ChallengeType.IMPERVA
+
+    def test_utmvc_cookie_429(self):
+        """___utmvc cookie on 429 identifies Imperva."""
+        headers = _h(set_cookie="___utmvc=abc; Path=/")
+        assert detect_challenge(429, headers, "") == ChallengeType.IMPERVA
+
+    def test_incapsula_body_marker_429(self):
+        """Incapsula body marker on 429 identifies Imperva."""
+        body = '<html><body>Incapsula incident ID: 12345</body></html>'
+        assert detect_challenge(429, {}, body) == ChallengeType.IMPERVA
+
+    def test_imperva_body_marker_429(self):
+        """Imperva body marker on 429 identifies Imperva."""
+        body = '<html><body>Powered by Imperva</body></html>'
+        assert detect_challenge(429, {}, body) == ChallengeType.IMPERVA
+
     def test_x_cdn_incapsula_429(self):
         """x-cdn: Incapsula header on 429 identifies Imperva."""
         headers = {"x-cdn": "Incapsula"}
@@ -301,15 +348,25 @@ class TestKasada:
         headers = {"x-kpsdk-cd": "some-value"}
         assert detect_challenge(429, headers, "") == ChallengeType.KASADA
 
-    def test_kpsdk_header_403_not_kasada(self):
-        """Kasada detection only on 429, not 403."""
+    def test_kpsdk_header_403(self):
+        """Kasada header detection on 403."""
         headers = {"x-kpsdk-ct": "some-value"}
-        assert detect_challenge(403, headers, "") != ChallengeType.KASADA
+        assert detect_challenge(403, headers, "") == ChallengeType.KASADA
+
+    def test_kpsdk_header_200_not_kasada(self):
+        """Kasada header detection only on 403/429, not 200."""
+        headers = {"x-kpsdk-ct": "some-value"}
+        assert detect_challenge(200, headers, "") is None
 
     def test_kasada_body_ips_js(self):
         """Body with ips.js on 429 detects Kasada."""
         body = '<script src="/ips.js"></script>'
         assert detect_challenge(429, {}, body) == ChallengeType.KASADA
+
+    def test_kasada_body_ips_js_403(self):
+        """Body with ips.js on 403 detects Kasada."""
+        body = '<script src="/ips.js"></script>'
+        assert detect_challenge(403, {}, body) == ChallengeType.KASADA
 
     def test_kasada_body_kpsdk(self):
         """Body with kpsdk marker on 429 detects Kasada."""
