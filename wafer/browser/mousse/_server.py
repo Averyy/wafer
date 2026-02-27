@@ -2,12 +2,38 @@
 
 import json
 import re
+import shutil
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 _STATIC_DIR = Path(__file__).resolve().parent / "_static"
 _RECORDINGS_DIR = Path(__file__).resolve().parent.parent / "_recordings"
 _CATEGORIES = ("idles", "paths", "holds", "drags", "slide_drags", "grids", "browses")
+
+_COLLECTED_DET_DIR: Path | None = None
+_COLLECTED_CLS_DIR: Path | None = None
+_REVIEWED_CLS_DIR: Path | None = None
+
+# Map reCAPTCHA keywords to CLS class names (Title Case, matching 57k dataset).
+# Covers English keywords only since that's what metadata.jsonl stores.
+_KEYWORD_TO_CLASSNAME: dict[str, str] = {
+    "bicycles": "Bicycle", "a bicycle": "Bicycle",
+    "bridges": "Bridge", "a bridge": "Bridge",
+    "buses": "Bus", "a bus": "Bus",
+    "school buses": "Bus", "a school bus": "Bus",
+    "cars": "Car", "a car": "Car", "taxis": "Car", "a taxi": "Car",
+    "chimneys": "Chimney", "a chimney": "Chimney",
+    "crosswalks": "Crosswalk", "a crosswalk": "Crosswalk",
+    "fire hydrants": "Hydrant", "a fire hydrant": "Hydrant",
+    "motorcycles": "Motorcycle", "a motorcycle": "Motorcycle",
+    "mountains": "Mountain", "mountains or hills": "Mountain",
+    "palm trees": "Palm",
+    "stairs": "Stair", "a staircase": "Stair",
+    "tractors": "Tractor", "a tractor": "Tractor",
+    "traffic lights": "Traffic Light", "a traffic light": "Traffic Light",
+    "boats": "Boat", "a boat": "Boat",
+    "parking meters": "Parking Meter", "a parking meter": "Parking Meter",
+}
 
 _CONTENT_TYPES = {
     ".html": "text/html; charset=utf-8",
@@ -36,6 +62,20 @@ _PATH_TARGETS = {
 def _safe_filename(name: str) -> bool:
     """Reject path traversal or weird filenames."""
     return bool(re.fullmatch(r"[a-zA-Z0-9_.\-]+", name))
+
+
+def _safe_resolve(base: Path, user_path: str) -> Path | None:
+    """Resolve user_path under base and verify it doesn't escape.
+
+    Returns the resolved Path if safe, None if traversal detected.
+    """
+    try:
+        resolved = (base / user_path).resolve()
+        if not resolved.is_relative_to(base.resolve()):
+            return None
+        return resolved
+    except (ValueError, OSError):
+        return None
 
 
 def _list_recordings(category: str) -> list[str]:
@@ -91,6 +131,108 @@ def _path_direction_counts() -> dict[str, int]:
             direction = m.group(1)
             counts[direction] = counts.get(direction, 0) + 1
     return counts
+
+
+def _read_jsonl(filepath: Path) -> list[dict]:
+    """Read a JSONL file, returning list of dicts."""
+    if not filepath.is_file():
+        return []
+    entries = []
+    with open(filepath) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                entries.append(json.loads(line))
+    return entries
+
+
+def _load_cls_tiles() -> dict:
+    """Load collected CLS tiles with metadata and review status."""
+    if not _COLLECTED_CLS_DIR or not _COLLECTED_CLS_DIR.is_dir():
+        return {"tiles": [], "total": 0, "reviewed": 0, "has_tiles": False}
+
+    metadata = _read_jsonl(_COLLECTED_CLS_DIR / "metadata.jsonl")
+
+    # Build set of already-reviewed files
+    reviewed_files: set[str] = set()
+    if _REVIEWED_CLS_DIR and _REVIEWED_CLS_DIR.is_dir():
+        for cls_dir in _REVIEWED_CLS_DIR.iterdir():
+            if cls_dir.is_dir():
+                for f in cls_dir.iterdir():
+                    if f.suffix == ".jpg":
+                        reviewed_files.add(f.name)
+
+    tiles = []
+    for entry in metadata:
+        filepath = entry.get("file", "")
+        filename = filepath.rsplit("/", 1)[-1] if "/" in filepath else filepath
+        # Check if file still exists in collected dir
+        full_path = _COLLECTED_CLS_DIR / filepath
+        is_reviewed = filename in reviewed_files
+        exists = full_path.is_file()
+        if not exists and not is_reviewed:
+            continue
+        tiles.append({
+            **entry,
+            "reviewed": is_reviewed,
+            "exists": exists,
+        })
+
+    reviewed_count = sum(1 for t in tiles if t["reviewed"])
+    return {
+        "tiles": tiles,
+        "total": len(tiles),
+        "reviewed": reviewed_count,
+        "has_tiles": len(tiles) > 0,
+    }
+
+
+def _load_det_grids() -> dict:
+    """Load collected DET grids with metadata and annotation status."""
+    if not _COLLECTED_DET_DIR or not _COLLECTED_DET_DIR.is_dir():
+        return {"grids": [], "total": 0, "annotated": 0, "has_grids": False}
+
+    metadata = _read_jsonl(_COLLECTED_DET_DIR / "metadata.jsonl")
+    annotations = _read_jsonl(_COLLECTED_DET_DIR / "annotations.jsonl")
+
+    # Map bare filename (uuid.jpg) to annotation
+    ann_map: dict[str, dict] = {}
+    for ann in annotations:
+        bare = ann.get("file", "").rsplit("/", 1)[-1]
+        ann_map[bare] = ann
+
+    grids = []
+    for entry in metadata:
+        orig_file = entry.get("file")
+        if not orig_file:
+            continue  # Skip entries without images
+        bare = orig_file.rsplit("/", 1)[-1]
+        ann = ann_map.get(bare)
+
+        # Resolve current file location
+        if ann:
+            kw_folder = ann.get("keyword_folder", "")
+            current_file = f"{kw_folder}/{bare}" if kw_folder else orig_file
+        else:
+            current_file = orig_file
+
+        if not (_COLLECTED_DET_DIR / current_file).is_file():
+            continue
+
+        grids.append({
+            **entry,
+            "file": current_file,
+            "annotated": ann is not None,
+            "ground_truth": ann.get("ground_truth", []) if ann else [],
+        })
+
+    annotated_count = sum(1 for g in grids if g["annotated"])
+    return {
+        "grids": grids,
+        "total": len(grids),
+        "annotated": annotated_count,
+        "has_grids": len(grids) > 0,
+    }
 
 
 class MousseHandler(BaseHTTPRequestHandler):
@@ -153,6 +295,47 @@ class MousseHandler(BaseHTTPRequestHandler):
             self._send_json(result)
             return
 
+        # /api/det/grids - list collected DET grids with metadata
+        if path == "/api/det/grids":
+            self._send_json(_load_det_grids())
+            return
+
+        # /api/det/image/{subfolder}/{filename}
+        m = re.match(r"^/api/det/image/(.+)/(.+)$", path)
+        if m:
+            if not _COLLECTED_DET_DIR:
+                self._send_error(404, "DET dir not configured")
+                return
+            user_path = f"{m.group(1)}/{m.group(2)}"
+            filepath = _safe_resolve(_COLLECTED_DET_DIR, user_path)
+            if not filepath or not filepath.is_file():
+                self._send_error(404, "Not found")
+                return
+            self._send_file(filepath, "image/jpeg")
+            return
+
+        # /api/cls/tiles - list collected tiles with metadata
+        if path == "/api/cls/tiles":
+            self._send_json(_load_cls_tiles())
+            return
+
+        # /api/cls/image/{subfolder}/{filename}
+        m = re.match(r"^/api/cls/image/(.+)/(.+)$", path)
+        if m:
+            if not _COLLECTED_CLS_DIR:
+                self._send_error(404, "Collected dir not configured")
+                return
+            user_path = f"{m.group(1)}/{m.group(2)}"
+            filepath = _safe_resolve(_COLLECTED_CLS_DIR, user_path)
+            if (not filepath or not filepath.is_file()) and _REVIEWED_CLS_DIR:
+                # Check reviewed dir (for history thumbnails)
+                filepath = _safe_resolve(_REVIEWED_CLS_DIR, user_path)
+            if not filepath or not filepath.is_file():
+                self._send_error(404, "Not found")
+                return
+            self._send_file(filepath, "image/jpeg")
+            return
+
         # /api/preview/{category}/{filename}
         m = re.match(r"^/api/preview/(\w+)/(.+)$", path)
         if m:
@@ -171,6 +354,131 @@ class MousseHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         path = self.path.split("?")[0]
+
+        if path == "/api/det/annotate":
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length))
+            if not _COLLECTED_DET_DIR:
+                self._send_error(400, "DET dir not configured")
+                return
+            file_path = body.get("file", "")
+            keyword = body.get("keyword", "")
+            if not file_path:
+                self._send_error(400, "Missing file")
+                return
+
+            # Map keyword to CLS class name (Title Case)
+            kw_lower = keyword.lower().strip()
+            class_name = _KEYWORD_TO_CLASSNAME.get(kw_lower)
+            if not class_name:
+                # Fallback: title-case the keyword
+                class_name = keyword.strip().title()
+
+            # Validate paths before any filesystem operations
+            src = _safe_resolve(_COLLECTED_DET_DIR, file_path)
+            if not src or not src.is_file():
+                self._send_error(404, "Source file not found")
+                return
+            bare = src.name
+            dest_dir = _safe_resolve(_COLLECTED_DET_DIR, class_name)
+            if not dest_dir:
+                self._send_error(400, "Invalid class name")
+                return
+
+            # Move from current location to class-named folder
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(src), str(dest_dir / bare))
+
+            # Also copy full grid image to reviewed/ for CLS training
+            det_copy = dest_dir / bare
+            if det_copy.is_file() and _REVIEWED_CLS_DIR:
+                cls_dir = _safe_resolve(_REVIEWED_CLS_DIR, class_name)
+                if cls_dir:
+                    cls_dir.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(str(det_copy), str(cls_dir / bare))
+
+            annotation = {
+                "file": bare,
+                "keyword_folder": class_name,
+                "keyword": keyword,
+                "grid_type": body.get("grid_type", ""),
+                "ground_truth": body.get("ground_truth", []),
+            }
+            ann_path = _COLLECTED_DET_DIR / "annotations.jsonl"
+            with open(ann_path, "a") as f:
+                f.write(json.dumps(annotation) + "\n")
+            self._send_json({
+                "ok": True,
+                "dest": f"{class_name}/{bare}",
+            })
+            return
+
+        if path == "/api/cls/label":
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length))
+            file_path = body.get("file", "")
+            label = body.get("label", "")
+            if not file_path or not label:
+                self._send_error(400, "Missing file or label")
+                return
+            if not _COLLECTED_CLS_DIR or not _REVIEWED_CLS_DIR:
+                self._send_error(400, "Dirs not configured")
+                return
+            src = _safe_resolve(_COLLECTED_CLS_DIR, file_path)
+            if not src or not src.is_file():
+                self._send_error(404, "Tile not found")
+                return
+            dest_dir = _safe_resolve(_REVIEWED_CLS_DIR, label)
+            if not dest_dir:
+                self._send_error(400, "Invalid label")
+                return
+            filename = src.name
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(src), str(dest_dir / filename))
+            self._send_json({"ok": True, "dest": f"{label}/{filename}"})
+            return
+
+        if path == "/api/cls/undo":
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length))
+            reviewed_path = body.get("reviewed_path", "")  # e.g. "Stair/uuid.jpg"
+            original_path = body.get("original_path", "")  # e.g. "_unlabeled/uuid.jpg"
+            if not reviewed_path or not original_path:
+                self._send_error(400, "Missing paths")
+                return
+            if not _COLLECTED_CLS_DIR or not _REVIEWED_CLS_DIR:
+                self._send_error(400, "Dirs not configured")
+                return
+            src = _safe_resolve(_REVIEWED_CLS_DIR, reviewed_path)
+            if not src or not src.is_file():
+                self._send_error(404, "Reviewed file not found")
+                return
+            dest = _safe_resolve(_COLLECTED_CLS_DIR, original_path)
+            if not dest:
+                self._send_error(400, "Invalid path")
+                return
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(src), str(dest))
+            self._send_json({"ok": True})
+            return
+
+        if path == "/api/cls/skip":
+            # Just acknowledge - tile stays in collected/
+            self._send_json({"ok": True})
+            return
+
+        if path == "/api/cls/delete":
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length))
+            file_path = body.get("file", "")
+            if not file_path or not _COLLECTED_CLS_DIR:
+                self._send_error(400, "Missing file or dir not configured")
+                return
+            src = _safe_resolve(_COLLECTED_CLS_DIR, file_path)
+            if src and src.is_file():
+                src.unlink()
+            self._send_json({"ok": True})
+            return
 
         if path == "/api/save":
             length = int(self.headers.get("Content-Length", 0))
@@ -255,7 +563,16 @@ class MousseHandler(BaseHTTPRequestHandler):
         self._send_error(404, "Not found")
 
 
-def run_server(port: int = 8377) -> None:
+def run_server(
+    port: int = 8377,
+    collected_det: Path | None = None,
+    collected_cls: Path | None = None,
+) -> None:
+    global _COLLECTED_DET_DIR, _COLLECTED_CLS_DIR, _REVIEWED_CLS_DIR  # noqa: PLW0603
+    _COLLECTED_DET_DIR = collected_det
+    _COLLECTED_CLS_DIR = collected_cls
+    if collected_cls:
+        _REVIEWED_CLS_DIR = collected_cls.parent / "reviewed"
     server = HTTPServer(("127.0.0.1", port), MousseHandler)
     print(f"Mousse server running on http://localhost:{port}")
     try:

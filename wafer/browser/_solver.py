@@ -16,7 +16,7 @@ WAF-specific logic lives in dedicated modules:
 - ``_drag`` — GeeTest / Alibaba drag/slider puzzle
 - ``_hcaptcha`` — hCaptcha checkbox
 - ``_recaptcha`` — reCAPTCHA v2 checkbox
-- ``_recaptcha_grid`` — reCAPTCHA v2 image grid (YOLO)
+- ``_recaptcha_grid`` — reCAPTCHA v2 image grid (EfficientNet + D-FINE)
 """
 
 import csv

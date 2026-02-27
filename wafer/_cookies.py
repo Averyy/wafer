@@ -1,11 +1,11 @@
 """Cookie cache: JSON disk persistence with TTL and LRU eviction."""
 
 import email.utils
-import fcntl
 import json
 import logging
 import os
 import tempfile
+import threading
 import time
 from pathlib import Path
 from urllib.parse import urlparse
@@ -60,7 +60,8 @@ class CookieCache:
     """JSON-file-per-domain cookie cache with TTL and LRU eviction.
 
     Each domain gets a JSON file: {cache_dir}/{domain}.json
-    Writes are atomic (temp file + rename) and locked (fcntl.flock).
+    Writes are atomic (temp file + rename) with per-domain threading
+    locks to prevent lost-update races on concurrent save().
     """
 
     def __init__(
@@ -71,6 +72,9 @@ class CookieCache:
         self._cache_dir = Path(cache_dir)
         self._max_entries = max_entries
         self._sweep_counter = 0
+        self._sweep_lock = threading.Lock()
+        self._domain_locks: dict[str, threading.Lock] = {}
+        self._lock_lock = threading.Lock()
 
     def _domain_path(self, domain: str) -> Path:
         safe = (
@@ -87,11 +91,7 @@ class CookieCache:
             return []
         try:
             with open(path) as f:
-                fcntl.flock(f, fcntl.LOCK_SH)
-                try:
-                    data = json.load(f)
-                finally:
-                    fcntl.flock(f, fcntl.LOCK_UN)
+                data = json.load(f)
             if not isinstance(data, list):
                 logger.warning(
                     "Corrupt cookie file for %s, ignoring", domain
@@ -118,14 +118,16 @@ class CookieCache:
             if expires > now:
                 e["last_used"] = now
                 valid.append(e)
-        expired = len(entries) - len(valid)
-        if expired > 0:
-            if valid:
-                # Rewrite file without expired entries
-                self._write_atomic(domain, valid)
-            else:
-                self.clear(domain)
+        # Don't rewrite here to prune expired entries - that would race
+        # with save() which holds the domain lock.  Expired entries are
+        # cleaned up by save()'s TTL compaction and _sweep_expired().
         return valid
+
+    def _get_domain_lock(self, domain: str) -> threading.Lock:
+        with self._lock_lock:
+            if domain not in self._domain_locks:
+                self._domain_locks[domain] = threading.Lock()
+            return self._domain_locks[domain]
 
     def save(self, domain: str, cookies: list[dict]) -> None:
         """Save cookies with merge, TTL compaction, and LRU eviction."""
@@ -135,43 +137,49 @@ class CookieCache:
         now = time.time()
 
         # Sweep stale domain files every ~10 saves
-        self._sweep_counter += 1
-        if self._sweep_counter >= 10:
-            self._sweep_counter = 0
+        do_sweep = False
+        with self._sweep_lock:
+            self._sweep_counter += 1
+            if self._sweep_counter >= 10:
+                self._sweep_counter = 0
+                do_sweep = True
+        if do_sweep:
             self._sweep_expired(now)
-        existing = self._load_raw(domain)
 
-        by_name: dict[str, dict] = {}
-        for e in existing:
-            name = e.get("name", "")
-            if name:
-                by_name[name] = e
+        with self._get_domain_lock(domain):
+            existing = self._load_raw(domain)
 
-        for c in cookies:
-            c.setdefault("last_used", now)
-            name = c.get("name", "")
-            if name:
-                by_name[name] = c
+            by_name: dict[str, dict] = {}
+            for e in existing:
+                name = e.get("name", "")
+                if name:
+                    by_name[name] = e
 
-        merged = list(by_name.values())
+            for c in cookies:
+                c.setdefault("last_used", now)
+                name = c.get("name", "")
+                if name:
+                    by_name[name] = c
 
-        # TTL compaction - drop session cookies (expires=0) and expired
-        merged = [
-            e
-            for e in merged
-            if e.get("expires", 0) > now
-        ]
+            merged = list(by_name.values())
 
-        # LRU eviction
-        if len(merged) > self._max_entries:
-            merged.sort(key=lambda c: c.get("last_used", 0))
-            evicted = len(merged) - self._max_entries
-            merged = merged[evicted:]
-            logger.warning(
-                "LRU evicted %d cookies for %s", evicted, domain
-            )
+            # TTL compaction - drop session cookies (expires=0) and expired
+            merged = [
+                e
+                for e in merged
+                if e.get("expires", 0) > now
+            ]
 
-        self._write_atomic(domain, merged)
+            # LRU eviction
+            if len(merged) > self._max_entries:
+                merged.sort(key=lambda c: c.get("last_used", 0))
+                evicted = len(merged) - self._max_entries
+                merged = merged[evicted:]
+                logger.warning(
+                    "LRU evicted %d cookies for %s", evicted, domain
+                )
+
+            self._write_atomic(domain, merged)
 
     def save_from_headers(
         self, domain: str, raw_values: list, url: str
@@ -250,7 +258,7 @@ class CookieCache:
                 pass
 
     def _write_atomic(self, domain: str, entries: list[dict]) -> None:
-        """Atomic write: temp file + flock + rename."""
+        """Atomic write: temp file + rename (same filesystem = atomic on POSIX)."""
         self._cache_dir.mkdir(parents=True, exist_ok=True)
         path = self._domain_path(domain)
         fd, tmp_path = tempfile.mkstemp(
@@ -258,7 +266,6 @@ class CookieCache:
         )
         try:
             with os.fdopen(fd, "w") as f:
-                fcntl.flock(f, fcntl.LOCK_EX)
                 json.dump(entries, f, indent=2)
             os.rename(tmp_path, path)
         except Exception:

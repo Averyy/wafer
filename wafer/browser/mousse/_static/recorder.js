@@ -1,7 +1,7 @@
 /* Mousse — mouse movement recorder */
 
 // ── State ──────────────────────────────────────────────────────────────
-let mode = "idle"; // idle | path | hold | drag | slide_drag | grid | browse
+let mode = "idle"; // idle | path | hold | drag | slide_drag | grid | browse | det | cls
 let state = "ready"; // ready | countdown | recording | preview
 let points = []; // raw captured points [{t, x, y}]
 let startTime = 0;
@@ -9,6 +9,35 @@ let holdStartPos = null;
 let countdownTimer = null;
 let recordingTimer = null;
 let animFrameId = null;
+
+// ── DET mode state (grid annotation) ──────────────────────────────────
+let detEntries = [];          // all unannotated grid entries
+let detIndex = 0;             // current entry index
+let detImage = null;          // loaded Image object
+let detGridSize = 0;          // 3 or 4
+let detModelPicks = [];       // model's selected cells
+let detUserPicks = new Set(); // user's clicked cells (togglable)
+let detAnnotatedCount = 0;    // total annotated so far
+let detTotalCount = 0;        // total failure entries (annotated + unannotated)
+let detHasEntries = false;    // whether any failure entries exist at all
+
+// ── CLS mode state (tile labeling) ───────────────────────────────────
+let clsTiles = [];             // all tiles from metadata
+let clsIndex = 0;             // current tile index (into filtered list)
+let clsFiltered = [];         // filtered subset being reviewed
+let clsImage = null;          // loaded Image object
+let clsSelectedLabel = null;  // currently selected class label
+let clsReviewedCount = 0;     // total reviewed
+let clsTotalCount = 0;        // total tiles
+let clsHasTiles = false;      // whether any tiles exist
+let clsFilter = "unreviewed"; // "all" | "unreviewed" | "low_confidence"
+let clsHistory = [];          // recent labels [{tile, label, imgSrc}]
+const CLS_NAMES = [
+  "Bicycle", "Bridge", "Bus", "Car", "Chimney", "Crosswalk",
+  "Hydrant", "Motorcycle", "Mountain", "Other", "Palm",
+  "Stair", "Tractor", "Traffic Light", "Boat", "Parking Meter", "None",
+];
+// No keyboard shortcuts for class buttons - click only
 
 // ── DOM refs ───────────────────────────────────────────────────────────
 const canvas = document.getElementById("canvas");
@@ -29,16 +58,44 @@ const modalCtx = modalCanvas.getContext("2d");
 const modalTitle = document.getElementById("modal-title");
 const modalClose = document.getElementById("modal-close");
 
+// ── Tool panel DOM refs (DET/CLS) ─────────────────────────────────────
+const detPanel = document.getElementById("det-panel");
+const detOutcomeEl = document.getElementById("det-outcome");
+const detInstructionEl = document.getElementById("det-instruction");
+const detGridEl = document.getElementById("det-grid");
+const detProgressEl = document.getElementById("det-progress");
+const clsPanel = document.getElementById("cls-panel");
+const clsTileImg = document.getElementById("cls-tile-img");
+const clsKeywordEl = document.getElementById("cls-keyword-text");
+const clsConfWrap = document.getElementById("cls-confidence-wrap");
+const clsButtonsWrap = document.getElementById("cls-buttons-wrap");
+const clsProgressEl = document.getElementById("cls-progress");
+const clsHistoryEl = document.getElementById("cls-history");
+const controlsRight = document.querySelector(".controls-right");
+const recordingsPanel = document.querySelector(".recordings-panel");
+
 // ── Viewport ───────────────────────────────────────────────────────────
 function getViewport() {
   const v = viewportSelect.value.split("x");
   return { w: parseInt(v[0]), h: parseInt(v[1]) };
 }
 
+// Track whether canvas is in HiDPI mode so coordinate mapping stays correct
+let canvasDPR = 1;
+
+function setCanvasSize(w, h, hidpi = false) {
+  const dpr = hidpi ? (window.devicePixelRatio || 1) : 1;
+  canvasDPR = dpr;
+  canvas.width = w * dpr;
+  canvas.height = h * dpr;
+  canvas.style.width = w + "px";
+  canvas.style.height = h + "px";
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+
 function resizeCanvas() {
   const vp = getViewport();
-  canvas.width = vp.w;
-  canvas.height = vp.h;
+  setCanvasSize(vp.w, vp.h, false);
   drawGuides();
 }
 
@@ -517,6 +574,7 @@ function drawGuides() {
   } else if (mode === "browse") {
     drawBrowsePage();
   }
+  // DET and CLS modes use DOM panels, not canvas
 }
 
 // ── Drag puzzle rendering ─────────────────────────────────────────────
@@ -726,17 +784,486 @@ function drawBrowsePage() {
   }
 }
 
+// ── Fail mode rendering ─────────────────────────────────────────────────
+// Google reCAPTCHA grid layout (from live CSS inspection):
+//   3x3: table 390x390, td 130x130, 2px td padding, img 378x378 (from 450 natural)
+//   4x4: table 388x388, td  97x97,  1px td padding, img 380x380 (from 450 natural)
+// Backgrounds are transparent; the iframe's white bg bleeds through the padding gaps.
+// We replicate this by drawing each tile individually with white gaps between them.
+const FAIL_GRID_SPECS = {
+  3: { tableSize: 390, tdSize: 130, padding: 2, imgSize: 378 },
+  4: { tableSize: 388, tdSize:  97, padding: 1, imgSize: 380 },
+};
+
+// ── DET DOM rendering ──────────────────────────────────────────────────
+
+function renderDetPanel() {
+  const entry = detEntries[detIndex];
+  if (!entry) {
+    detGridEl.innerHTML = "";
+    detOutcomeEl.textContent = "";
+    detInstructionEl.textContent = "";
+    detProgressEl.textContent = detTotalCount > 0
+      ? `All ${detTotalCount} grids annotated!`
+      : "No grids to annotate";
+    return;
+  }
+
+  // Outcome
+  const outcome = entry.outcome || "";
+  detOutcomeEl.textContent = outcome;
+  detOutcomeEl.className = "det-outcome " +
+    (outcome.startsWith("solved") ? "solved" : "failed");
+
+  // Instruction
+  detInstructionEl.textContent =
+    `Select all squares with ${entry.keyword || "?"}`;
+
+  // Build grid cells
+  const gs = detGridSize;
+  const spec = FAIL_GRID_SPECS[gs];
+  const contentSize = spec.tdSize - 2 * spec.padding;
+  const imgUrl = `/api/det/image/${entry.file}`;
+
+  detGridEl.innerHTML = "";
+  detGridEl.style.gridTemplateColumns = `repeat(${gs}, ${contentSize}px)`;
+  detGridEl.style.gap = `${spec.padding * 2}px`;
+  detGridEl.style.padding = `${spec.padding}px`;
+
+  for (let i = 0; i < gs * gs; i++) {
+    const row = Math.floor(i / gs);
+    const col = i % gs;
+    const cell = document.createElement("div");
+    cell.className = "det-cell";
+    cell.dataset.idx = i;
+    cell.style.width = `${contentSize}px`;
+    cell.style.height = `${contentSize}px`;
+    cell.style.backgroundImage = `url(${imgUrl})`;
+    cell.style.backgroundSize =
+      `${contentSize * gs}px ${contentSize * gs}px`;
+    cell.style.backgroundPosition =
+      `-${col * contentSize}px -${row * contentSize}px`;
+
+    const overlay = document.createElement("div");
+    overlay.className = "det-cell-overlay";
+    cell.appendChild(overlay);
+
+    cell.addEventListener("click", () => {
+      if (detUserPicks.has(i)) detUserPicks.delete(i);
+      else detUserPicks.add(i);
+      updateDetCellStates();
+    });
+    detGridEl.appendChild(cell);
+  }
+
+  updateDetCellStates();
+
+  // Progress
+  const remaining = detEntries.length - detIndex;
+  detProgressEl.textContent =
+    `${detAnnotatedCount}/${detTotalCount} annotated \u00b7 ${remaining} remaining`;
+}
+
+function updateDetCellStates() {
+  const cells = detGridEl.querySelectorAll(".det-cell");
+  cells.forEach(cell => {
+    const idx = parseInt(cell.dataset.idx);
+    const isModel = detModelPicks.includes(idx);
+    const isUser = detUserPicks.has(idx);
+    cell.classList.toggle("model-pick", isModel);
+    cell.classList.toggle("user-pick", isUser);
+    const overlay = cell.querySelector(".det-cell-overlay");
+    if (isUser && isModel) {
+      overlay.innerHTML =
+        '<span class="check">\u2713</span><span class="badge">M+U</span>';
+    } else if (isModel) {
+      overlay.innerHTML = '<span class="badge">M</span>';
+    } else if (isUser) {
+      overlay.innerHTML = '<span class="check">\u2713</span>';
+    } else {
+      overlay.innerHTML = "";
+    }
+  });
+}
+
+function loadDetEntry() {
+  const entry = detEntries[detIndex];
+  if (!entry) {
+    renderDetPanel();
+    return;
+  }
+
+  detGridSize = entry.grid_type === "4x4" ? 4 : 3;
+  detModelPicks = entry.cells_selected || [];
+  detUserPicks = new Set();
+  renderDetPanel();
+}
+
+function updateDetStat() {
+  const el = document.getElementById("stat-det");
+  const done = detAnnotatedCount >= detTotalCount && detTotalCount > 0;
+  const valueEl = el.querySelector(".stat-value");
+  if (valueEl) valueEl.textContent = `${detAnnotatedCount}/${detTotalCount}`;
+  const iconEl = el.querySelector(".stat-icon");
+  if (iconEl) iconEl.textContent = done ? "\u2705" : "\uD83D\uDD0D";
+  const isActive = el.classList.contains("active-tab");
+  el.className = "stat " + (done ? "complete" : "incomplete")
+    + (isActive ? " active-tab" : "")
+    + (!detHasEntries ? " disabled" : "");
+}
+
+async function loadDetEntries() {
+  const resp = await fetch("/api/det/grids");
+  const data = await resp.json();
+  const unannotated = [];
+  let annotated = 0;
+
+  for (const grid of data.grids || []) {
+    if (grid.annotated) { annotated++; continue; }
+    unannotated.push(grid);
+  }
+
+  detEntries = unannotated;
+  detAnnotatedCount = annotated;
+  detTotalCount = data.total || 0;
+  detIndex = 0;
+  detHasEntries = detTotalCount > 0;
+
+  // Enable/disable det tab and stat
+  const detTab = document.querySelector('.tab[data-mode="det"]');
+  if (detHasEntries) {
+    detTab.disabled = false;
+    detTab.classList.remove("disabled");
+  } else {
+    detTab.disabled = true;
+    detTab.classList.add("disabled");
+  }
+  updateDetStat();
+
+  if (mode === "det") {
+    loadDetEntry();
+  }
+}
+
+async function detAccept() {
+  const entry = detEntries[detIndex];
+  if (!entry) return;
+  if (detUserPicks.size === 0) {
+    if (!confirm("No cells selected. Save as 'no matching objects'?")) return;
+  }
+  const resp = await fetch("/api/det/annotate", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      file: entry.file,
+      keyword: entry.keyword,
+      grid_type: entry.grid_type,
+      ground_truth: [...detUserPicks].sort((a, b) => a - b),
+    }),
+  });
+  if (!resp.ok) {
+    showStatus("Annotation failed", "error");
+    return;
+  }
+  detAnnotatedCount++;
+  showStatus(`Annotated ${entry.file}`, "success");
+  detAdvance();
+}
+
+function detSkip() {
+  detAdvance();
+}
+
+function detAdvance() {
+  detIndex++;
+  updateDetStat();
+  if (detIndex >= detEntries.length) {
+    renderDetPanel();
+    return;
+  }
+  loadDetEntry();
+}
+
+// ── CLS DOM rendering ──────────────────────────────────────────────────
+
+function renderClsPanel() {
+  const tile = clsFiltered[clsIndex];
+  if (!tile) {
+    clsTileImg.parentElement.style.display = "none";
+    clsKeywordEl.textContent = "";
+    clsConfWrap.innerHTML = "";
+    clsButtonsWrap.innerHTML = "";
+    clsProgressEl.textContent = clsTotalCount > 0
+      ? `All ${clsTotalCount} tiles reviewed!`
+      : "No tiles to review";
+    return;
+  }
+
+  // Tile image
+  clsTileImg.parentElement.style.display = "";
+  clsTileImg.src = `/api/cls/image/${tile.file || ""}`;
+  clsTileImg.onerror = () => clsAdvance();
+
+  // Model info: keyword, predicted class, selected status
+  const parts = [];
+  if (tile.keyword) parts.push(`keyword: "${tile.keyword}"`);
+  const targetName = tile.target_class != null ? CLS_NAMES[tile.target_class] || `#${tile.target_class}` : "?";
+  parts.push(`target: ${targetName}`);
+  parts.push(`predicted: ${tile.predicted_class || "?"}`);
+  parts.push(tile.is_selected ? "selected: YES" : "selected: no");
+  clsKeywordEl.textContent = parts.join("  \u00b7  ");
+
+  // Confidence bars (all top3)
+  const top3 = tile.top3 || [];
+  clsConfWrap.innerHTML = "";
+  for (let i = 0; i < top3.length; i++) {
+    const [name, score] = top3[i];
+    const row = document.createElement("div");
+    row.className = "cls-conf-row";
+    const pct = (score * 100).toFixed(1);
+    row.innerHTML =
+      `<span class="cls-conf-label${i === 0 ? " top" : ""}">${name}</span>` +
+      `<div class="cls-conf-bar"><div class="cls-conf-fill${i === 0 ? " top" : ""}" style="width:${pct}%"></div></div>` +
+      `<span class="cls-conf-score">${pct}%</span>`;
+    clsConfWrap.appendChild(row);
+  }
+
+  // Class buttons
+  clsButtonsWrap.innerHTML = "";
+  for (let i = 0; i < CLS_NAMES.length; i++) {
+    const btn = document.createElement("button");
+    const isPredicted = tile.predicted_class === CLS_NAMES[i];
+    const isSelected = clsSelectedLabel === CLS_NAMES[i];
+    btn.className = "cls-btn" +
+      (isPredicted ? " predicted" : "") +
+      (isSelected ? " selected" : "");
+    btn.textContent = CLS_NAMES[i];
+    btn.addEventListener("click", () => {
+      clsSelectedLabel = CLS_NAMES[i];
+      updateClsButtonStates();
+    });
+    clsButtonsWrap.appendChild(btn);
+  }
+
+  // Progress
+  const remaining = clsFiltered.length - clsIndex;
+  clsProgressEl.textContent =
+    `${clsReviewedCount}/${clsTotalCount} reviewed \u00b7 ${remaining} remaining`;
+}
+
+function updateClsButtonStates() {
+  const tile = clsFiltered[clsIndex];
+  if (!tile) return;
+  const btns = clsButtonsWrap.querySelectorAll(".cls-btn");
+  btns.forEach((btn, i) => {
+    const isPredicted = tile.predicted_class === CLS_NAMES[i];
+    const isSelected = clsSelectedLabel === CLS_NAMES[i];
+    btn.className = "cls-btn" +
+      (isPredicted ? " predicted" : "") +
+      (isSelected ? " selected" : "");
+  });
+}
+
+function loadClsTile() {
+  const tile = clsFiltered[clsIndex];
+  if (!tile) {
+    clsSelectedLabel = null;
+    renderClsPanel();
+    return;
+  }
+
+  clsSelectedLabel = tile.predicted_class;
+  renderClsPanel();
+}
+
+function updateClsStat() {
+  const el = document.getElementById("stat-cls");
+  const done = clsReviewedCount >= clsTotalCount && clsTotalCount > 0;
+  const valueEl = el.querySelector(".stat-value");
+  if (valueEl) valueEl.textContent = `${clsReviewedCount}/${clsTotalCount}`;
+  const iconEl = el.querySelector(".stat-icon");
+  if (iconEl) iconEl.textContent = done ? "\u2705" : "\uD83C\uDFF7\uFE0F";
+  const isActive = el.classList.contains("active-tab");
+  el.className = "stat " + (done ? "complete" : "incomplete")
+    + (isActive ? " active-tab" : "")
+    + (!clsHasTiles ? " disabled" : "");
+}
+
+function clsApplyFilter() {
+  if (clsFilter === "all") {
+    clsFiltered = clsTiles.filter(t => !t.reviewed && t.exists);
+  } else if (clsFilter === "low_confidence") {
+    clsFiltered = clsTiles.filter(t => !t.reviewed && t.exists && t.confidence < 0.5);
+  } else {
+    // "unreviewed" (default)
+    clsFiltered = clsTiles.filter(t => !t.reviewed && t.exists);
+  }
+}
+
+async function loadClsTiles() {
+  const resp = await fetch("/api/cls/tiles");
+  const data = await resp.json();
+
+  clsTiles = data.tiles || [];
+  clsReviewedCount = data.reviewed || 0;
+  clsTotalCount = data.total || 0;
+  clsHasTiles = data.has_tiles || false;
+
+  clsApplyFilter();
+  clsIndex = 0;
+
+  // Enable/disable CLS tab
+  const clsTab = document.querySelector('.tab[data-mode="cls"]');
+  if (clsHasTiles) {
+    clsTab.disabled = false;
+    clsTab.classList.remove("disabled");
+  } else {
+    clsTab.disabled = true;
+    clsTab.classList.add("disabled");
+  }
+  updateClsStat();
+
+  if (mode === "cls") {
+    loadClsTile();
+  }
+}
+
+async function clsAccept() {
+  const tile = clsFiltered[clsIndex];
+  if (!tile || !clsSelectedLabel) return;
+  const label = clsSelectedLabel;
+  const filename = tile.file.split("/").pop();
+  const resp = await fetch("/api/cls/label", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ file: tile.file, label }),
+  });
+  if (!resp.ok) return;
+  tile.reviewed = true;
+  clsReviewedCount++;
+  const reviewedPath = `${label}/${filename}`;
+  clsHistory.unshift({
+    tile,
+    label,
+    imgSrc: `/api/cls/image/${reviewedPath}`,
+    reviewedPath,
+    originalPath: tile.file,
+  });
+  if (clsHistory.length > 20) clsHistory.pop();
+  renderClsHistory();
+  showStatus(`Labeled ${label}`, "success");
+  clsAdvance();
+}
+
+async function clsUndo(entry) {
+  const resp = await fetch("/api/cls/undo", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      reviewed_path: entry.reviewedPath,
+      original_path: entry.originalPath,
+    }),
+  });
+  if (!resp.ok) {
+    showStatus("Undo failed", "error");
+    return;
+  }
+  entry.tile.reviewed = false;
+  clsReviewedCount--;
+  clsHistory = clsHistory.filter(h => h !== entry);
+  renderClsHistory();
+  // Jump back to this tile
+  const idx = clsFiltered.indexOf(entry.tile);
+  if (idx >= 0) {
+    clsIndex = idx;
+    clsSelectedLabel = entry.tile.predicted_class;
+    renderClsPanel();
+  }
+  updateClsStat();
+  showStatus("Undone - relabel this tile", "success");
+}
+
+function renderClsHistory() {
+  if (!clsHistoryEl) return;
+  clsHistoryEl.innerHTML = "";
+  for (const entry of clsHistory) {
+    const item = document.createElement("div");
+    item.className = "cls-history-item";
+    item.title = `${entry.label} - click to undo`;
+    item.innerHTML =
+      `<img src="${entry.imgSrc}" alt="${entry.label}" />` +
+      `<div class="cls-history-label">${entry.label}</div>`;
+    item.addEventListener("click", () => clsUndo(entry));
+    clsHistoryEl.appendChild(item);
+  }
+}
+
+async function clsSkip() {
+  clsAdvance();
+}
+
+async function clsDelete() {
+  const tile = clsFiltered[clsIndex];
+  if (!tile) return;
+  await fetch("/api/cls/delete", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ file: tile.file }),
+  });
+  tile.exists = false;
+  showStatus("Deleted tile", "success");
+  clsAdvance();
+}
+
+function clsAdvance() {
+  clsIndex++;
+  updateClsStat();
+  if (clsIndex >= clsFiltered.length) {
+    renderClsPanel();
+    return;
+  }
+  loadClsTile();
+}
+
 // ── Mode tabs ──────────────────────────────────────────────────────────
 function switchMode(newMode) {
   if (state !== "ready") return;
+  // Block switching to fail if no entries
+  if (newMode === "det" && !detHasEntries) return;
+  if (newMode === "cls" && !clsHasTiles) return;
   mode = newMode;
   location.hash = mode;
   tabs.forEach(t => t.classList.toggle("active", t.dataset.mode === mode));
   directionSelect.classList.toggle("hidden", mode !== "path");
   directionInfo.classList.toggle("hidden", mode !== "path");
+  viewportSelect.classList.toggle("hidden", mode === "det" || mode === "cls");
   if (mode === "path") updateDirectionInfo();
   syncActiveTab();
-  resizeCanvas();
+  // Toggle canvas vs tool panels
+  const isToolMode = mode === "det" || mode === "cls";
+  canvas.classList.toggle("hidden", isToolMode);
+  detPanel.classList.toggle("hidden", mode !== "det");
+  clsPanel.classList.toggle("hidden", mode !== "cls");
+  controlsRight.classList.toggle("hidden", isToolMode);
+  recordingsPanel.classList.toggle("hidden", isToolMode);
+
+  if (mode === "det") {
+    if (detTotalCount > 0) {
+      detIndex = 0;
+      loadDetEntry();
+    } else {
+      loadDetEntries();
+    }
+  } else if (mode === "cls") {
+    if (clsTotalCount > 0) {
+      clsIndex = 0;
+      loadClsTile();
+    } else {
+      loadClsTiles();
+    }
+  } else {
+    resizeCanvas();
+  }
 }
 
 tabs.forEach(tab => {
@@ -812,7 +1339,7 @@ function updateStats(data) {
 }
 
 function syncActiveTab() {
-  const modeToStat = { idle: "stat-idles", path: "stat-paths", hold: "stat-holds", drag: "stat-drags", slide_drag: "stat-slide_drags", grid: "stat-grids", browse: "stat-browses" };
+  const modeToStat = { idle: "stat-idles", path: "stat-paths", hold: "stat-holds", drag: "stat-drags", slide_drag: "stat-slide_drags", grid: "stat-grids", browse: "stat-browses", det: "stat-det", cls: "stat-cls" };
   for (const [m, id] of Object.entries(modeToStat)) {
     document.getElementById(id).classList.toggle("active-tab", m === mode);
   }
@@ -1952,15 +2479,24 @@ function resetState() {
 
 // ── Button state ───────────────────────────────────────────────────────
 function updateButtons() {
+  const isToolMode = mode === "det" || mode === "cls";
   const isReady = state === "ready";
   const isPreview = state === "preview";
   const isRecording = state === "recording" || state === "countdown";
 
-  btnStart.classList.toggle("hidden", !isReady);
+  btnStart.classList.toggle("hidden", isToolMode || !isReady);
   btnAccept.classList.toggle("hidden", !isPreview);
   btnDiscard.classList.toggle("hidden", !isPreview && !isRecording);
 
-  tabs.forEach(t => t.disabled = !isReady);
+  tabs.forEach(t => {
+    if (t.dataset.mode === "det") {
+      t.disabled = !detHasEntries;
+    } else if (t.dataset.mode === "cls") {
+      t.disabled = !clsHasTiles;
+    } else {
+      t.disabled = !isReady;
+    }
+  });
   viewportSelect.disabled = !isReady;
   directionSelect.disabled = !isReady;
 }
@@ -1976,18 +2512,34 @@ document.addEventListener("keydown", (e) => {
 
   if (e.code === "Space") {
     e.preventDefault();
-    if (state === "ready") startRecording();
+    if (mode !== "det" && mode !== "cls" && state === "ready") startRecording();
   } else if (e.code === "Enter") {
     e.preventDefault();
-    if (state === "preview") acceptRecording();
+    if (mode === "det") detAccept();
+    else if (mode === "cls") clsAccept();
+    else if (state === "preview") acceptRecording();
   } else if (e.code === "Escape") {
     e.preventDefault();
     if (!managePopover.classList.contains("hidden")) {
       managePopover.classList.add("hidden");
     } else if (!modal.classList.contains("hidden")) {
       closePreview();
+    } else if (mode === "det") {
+      detSkip();
+    } else if (mode === "cls") {
+      clsSkip();
     } else if (state === "preview" || state === "recording" || state === "countdown") {
       discardRecording();
+    }
+  } else if (mode === "cls") {
+    // CLS keyboard shortcuts: 1-9,0,a-d for class selection, D for delete, S for skip
+    const key = e.key.toLowerCase();
+    if (key === "d" && !e.ctrlKey && !e.metaKey) {
+      e.preventDefault();
+      clsDelete();
+    } else if (key === "s") {
+      e.preventDefault();
+      clsSkip();
     }
   }
 });
@@ -2062,10 +2614,21 @@ btnDeleteAll.addEventListener("click", async () => {
 
 // ── Init ───────────────────────────────────────────────────────────────
 // Restore mode from URL hash
-const validModes = ["idle", "path", "hold", "drag", "slide_drag", "grid", "browse"];
+const validModes = ["idle", "path", "hold", "drag", "slide_drag", "grid", "browse", "det", "cls"];
 const hashMode = location.hash.slice(1);
-if (hashMode && validModes.includes(hashMode)) {
+if (hashMode && validModes.includes(hashMode) && hashMode !== "det" && hashMode !== "cls") {
   switchMode(hashMode);
 }
 resizeCanvas();
 refreshRecordings();
+// Load DET grids and CLS tiles, then switch if hash matches
+loadDetEntries().then(() => {
+  if (hashMode === "det" && detHasEntries) {
+    switchMode("det");
+  }
+});
+loadClsTiles().then(() => {
+  if (hashMode === "cls" && clsHasTiles) {
+    switchMode("cls");
+  }
+});

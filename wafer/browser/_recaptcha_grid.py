@@ -1,14 +1,13 @@
-"""reCAPTCHA v2 image grid solver (YOLO classification + detection).
+"""reCAPTCHA v2 image grid solver (classification + D-FINE detection).
 
-Uses two ONNX models:
-- Classification (recaptcha_cls.onnx): 14-class tile classifier for 3x3 grids
-- Detection (coco_det.onnx): COCO object detector for 4x4 grids
+Uses two ONNX models hosted on HuggingFace (Averyyyyyy/wafer-models):
+- Classification (wafer_cls_{s,x}.onnx): 14-class tile classifier for 3x3 grids
+- Detection (wafer_det_{s,x}.onnx): D-FINE COCO detector for 4x4 grids
 
-Models are lazy-loaded on first encounter. If absent, returns False and
-the escalation chain continues to the next step.
+Models are lazy-loaded on first encounter via huggingface_hub.
+If unavailable, returns False and the escalation chain continues.
 """
 
-import importlib.resources
 import io
 import json
 import logging
@@ -16,59 +15,246 @@ import os
 import random
 import threading
 import time
+import uuid
 from pathlib import Path
 from urllib.parse import urlparse
 
 logger = logging.getLogger("wafer")
 
 # ---------------------------------------------------------------------------
-# Failure logging for training data collection
+# Grid collection for training data (DET grids - full images with outcomes)
 # ---------------------------------------------------------------------------
 
-_FAILURE_LOG_DIR = os.environ.get("WAFER_GRID_FAILURE_DIR")
+_COLLECT_DET_DIR: str | None = os.environ.get("WAFER_COLLECT_DET") or None
+
+# ---------------------------------------------------------------------------
+# Tile collection for training data (CLS grids only)
+# ---------------------------------------------------------------------------
+
+# 16 class names - indices 0-13 match current CLS model output,
+# indices 14-15 are collection-only until the model is retrained.
+_CLS_NAMES = [
+    "Bicycle", "Bridge", "Bus", "Car", "Chimney", "Crosswalk",
+    "Hydrant", "Motorcycle", "Mountain", "Other", "Palm",
+    "Stair", "Tractor", "Traffic Light", "Boat", "Parking Meter",
+]
+
+_COLLECT_CLS_DIR: str | None = os.environ.get("WAFER_COLLECT_CLS") or None
+
+_seen_hashes: set[int] = set()
+_seen_hashes_loaded = False
+_seen_hashes_lock = threading.Lock()  # guards one-time hash loading (I/O)
+_collect_lock = threading.Lock()  # guards metadata writes and hash set updates
 
 
-def _log_failure(
+def _dhash(img, hash_size: int = 8) -> int:
+    """64-bit perceptual difference hash for dedup."""
+    small = img.convert("L").resize((hash_size + 1, hash_size), 1)  # LANCZOS=1
+    pixels = list(small.getdata())
+    w = hash_size + 1
+    bits = 0
+    for row in range(hash_size):
+        for col in range(hash_size):
+            bits = (bits << 1) | (pixels[row * w + col] < pixels[row * w + col + 1])
+    return bits
+
+
+def _collect_tiles(
+    image_bytes: bytes,
+    probs,  # numpy (9, 14)
+    target_class: int | None,
     keyword: str,
     grid_type: str,
-    reason: str,
+    cells: list[int] | None,
+):
+    """Split a 3x3 grid into tiles and save each with metadata."""
+    if not _COLLECT_CLS_DIR:
+        return
+    try:
+        from PIL import Image
+
+        img = Image.open(io.BytesIO(image_bytes))
+        w, h = img.size
+        tw, th = w // 3, h // 3
+
+        for idx in range(9):
+            tile = img.crop((
+                (idx % 3) * tw, (idx // 3) * th,
+                (idx % 3 + 1) * tw, (idx // 3 + 1) * th,
+            ))
+            _collect_single_tile(
+                tile, probs[idx] if probs is not None else None,
+                target_class,
+                cells is not None and idx in cells,
+                keyword,
+                source_grid=grid_type,
+            )
+    except Exception:
+        pass  # Never break the solver
+
+
+def _collect_single_tile(
+    tile_img,
+    probs,  # numpy (14,) or None
+    target_class: int | None,
+    is_match: bool,
+    keyword: str,
+    source_grid: str = "dynamic_3x3",
+):
+    """Save a single tile with metadata.
+
+    Used for both grid splits and dynamic replacements.
+    """
+    if not _COLLECT_CLS_DIR:
+        return
+    try:
+        import hashlib
+
+        import numpy as np
+
+        # Normalize to 100x100 RGB first - used for both saving and hashing
+        tile_100 = tile_img.convert("RGB").resize((100, 100), 1)
+
+        # Cross-session dedup via dHash
+        h = _dhash(tile_100)
+        _load_seen_hashes()
+        with _collect_lock:
+            if h in _seen_hashes:
+                return
+            _seen_hashes.add(h)
+
+        # Pixel-level hash for reliable dedup against training data
+        pixhash = hashlib.sha256(tile_100.tobytes()).hexdigest()
+
+        # Determine folder: predicted class for selected tiles, _unlabeled for rest
+        if probs is not None:
+            argmax = int(np.argmax(probs))
+            confidence = float(probs[argmax])
+            top3_idx = np.argsort(probs)[::-1][:3]
+            top3 = [(int(i), float(probs[i])) for i in top3_idx]
+            predicted_class = _CLS_NAMES[argmax]
+        else:
+            argmax = -1
+            confidence = 0.0
+            top3 = []
+            predicted_class = None
+
+        if is_match and predicted_class:
+            subfolder = predicted_class
+        else:
+            subfolder = "_unlabeled"
+
+        out_dir = Path(_COLLECT_CLS_DIR) / subfolder
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        filename = f"{uuid.uuid4()}.jpg"
+        tile_100.save(out_dir / filename, "JPEG", quality=90)
+
+        entry = {
+            "file": f"{subfolder}/{filename}",
+            "predicted_class": predicted_class,
+            "predicted_index": argmax,
+            "confidence": round(confidence, 4),
+            "top3": [[_CLS_NAMES[i], round(s, 4)] for i, s in top3],
+            "keyword": keyword,
+            "target_class": target_class,
+            "is_selected": bool(is_match),
+            "source_grid": source_grid,
+            "dhash": h,
+            "pixhash": pixhash,
+        }
+
+        meta_path = Path(_COLLECT_CLS_DIR) / "metadata.jsonl"
+        meta_path.parent.mkdir(parents=True, exist_ok=True)
+        with _collect_lock:
+            with open(meta_path, "a") as f:
+                f.write(json.dumps(entry) + "\n")
+    except Exception:
+        pass  # Never break the solver
+
+
+def _load_seen_hashes() -> None:
+    """Seed _seen_hashes from existing metadata.jsonl (once per process).
+
+    Uses its own lock so the file I/O doesn't block _collect_lock.
+    """
+    global _seen_hashes_loaded  # noqa: PLW0603
+    if _seen_hashes_loaded:
+        return
+    with _seen_hashes_lock:
+        if _seen_hashes_loaded:
+            return
+        _seen_hashes_loaded = True
+        for dir_path in (_COLLECT_DET_DIR, _COLLECT_CLS_DIR):
+            if not dir_path:
+                continue
+            meta = Path(dir_path) / "metadata.jsonl"
+            if not meta.is_file():
+                continue
+            try:
+                with open(meta) as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        entry = json.loads(line)
+                        h = entry.get("dhash")
+                        if h is not None:
+                            _seen_hashes.add(h)
+            except Exception:
+                pass
+
+
+def _collect_det_grid(
+    keyword: str,
+    grid_type: str,
+    outcome: str,
     image_bytes: bytes | None = None,
     extra: dict | None = None,
 ):
-    """Log a grid solve failure for training data collection.
+    """Save a full grid image with metadata for DET review.
 
-    Only active when WAFER_GRID_FAILURE_DIR env var is set.
-    Saves image + metadata JSONL to the specified directory.
+    Logs both successes and failures to a single collection directory.
     """
-    if not _FAILURE_LOG_DIR:
+    if not _COLLECT_DET_DIR:
         return
-
     try:
-        out_dir = Path(_FAILURE_LOG_DIR)
-        out_dir.mkdir(parents=True, exist_ok=True)
-
-        ts = time.strftime("%Y%m%d_%H%M%S") + f"_{random.randint(0, 999):03d}"
-        slug = "".join(c if c.isalnum() else "_" for c in keyword.lower())[:30]
+        unlabeled = Path(_COLLECT_DET_DIR) / "_unlabeled"
+        unlabeled.mkdir(parents=True, exist_ok=True)
 
         img_name = None
+        h = None
         if image_bytes:
-            img_name = f"{ts}_{slug}.jpg"
-            (out_dir / img_name).write_bytes(image_bytes)
+            from PIL import Image
+
+            img = Image.open(io.BytesIO(image_bytes))
+            h = _dhash(img)
+            _load_seen_hashes()
+            with _collect_lock:
+                if h in _seen_hashes:
+                    return
+                _seen_hashes.add(h)
+            img_name = f"{uuid.uuid4()}.jpg"
+            (unlabeled / img_name).write_bytes(image_bytes)
 
         entry = {
-            "timestamp": ts,
+            "file": f"_unlabeled/{img_name}" if img_name else None,
             "keyword": keyword,
             "grid_type": grid_type,
-            "reason": reason,
-            "image": img_name,
+            "outcome": outcome,
         }
         if extra:
             entry.update(extra)
+        if h is not None:
+            entry["dhash"] = h
 
-        with open(out_dir / "failures.jsonl", "a") as f:
-            f.write(json.dumps(entry) + "\n")
+        meta_path = Path(_COLLECT_DET_DIR) / "metadata.jsonl"
+        with _collect_lock:
+            with open(meta_path, "a") as f:
+                f.write(json.dumps(entry) + "\n")
     except Exception:
-        pass  # Never let logging break the solver
+        pass  # Never break the solver
+
 
 # ---------------------------------------------------------------------------
 # ONNX model loading (lazy, thread-safe)
@@ -78,26 +264,31 @@ _cls_session = None
 _det_session = None
 _models_unavailable = False
 _model_lock = threading.Lock()
+_inference_lock = threading.Lock()
 _warmup_done = threading.Event()
 
 
-def _ensure_models():
-    """Load ONNX models from wafer/browser/models/. Thread-safe, lazy.
+_HF_REPO = "Averyyyyyy/wafer-models"
 
-    Returns (cls_session, det_session) or (None, None) if unavailable.
+
+def _ensure_models():
+    """Download + load ONNX models from HuggingFace. Thread-safe, lazy.
+
+    Returns (cls_session, det_session). Either may be None if unavailable.
+    Detection and classification are independent - one can work without the other.
     """
     global _cls_session, _det_session, _models_unavailable
 
-    if _cls_session is not None and _det_session is not None:
-        return _cls_session, _det_session
     if _models_unavailable:
-        return None, None
+        return _cls_session, _det_session
+    if _cls_session is not None or _det_session is not None:
+        return _cls_session, _det_session
 
     with _model_lock:
-        if _cls_session is not None and _det_session is not None:
-            return _cls_session, _det_session
         if _models_unavailable:
-            return None, None
+            return _cls_session, _det_session
+        if _cls_session is not None or _det_session is not None:
+            return _cls_session, _det_session
 
         try:
             import onnxruntime as ort
@@ -107,79 +298,86 @@ def _ensure_models():
             return None, None
 
         try:
-            models_dir = importlib.resources.files("wafer.browser") / "models"
-            # Prefer larger models (x > m > s > n) if available
-            cls_path = None
-            for suffix in ("_x", "_m", "_s", "_n", ""):
-                p = models_dir / f"recaptcha_cls{suffix}.onnx"
-                if p.is_file():
-                    cls_path = str(p)
-                    break
-            det_path = None
-            for suffix in ("_x", "_m", "_s", "_n", ""):
-                p = models_dir / f"coco_det{suffix}.onnx"
-                if p.is_file():
-                    det_path = str(p)
-                    break
-            if not cls_path or not det_path:
-                logger.debug("ONNX model files not found in %s", models_dir)
-                _models_unavailable = True
-                return None, None
-        except Exception:
-            logger.debug("Could not locate model directory")
+            from huggingface_hub import hf_hub_download
+        except ImportError:
+            logger.debug("huggingface_hub not installed, image grid solver unavailable")
             _models_unavailable = True
             return None, None
 
+        opts = ort.SessionOptions()
+        opts.inter_op_num_threads = 1
+        opts.intra_op_num_threads = 2
+
+        # cls: only download "s" - "x" exists on HF as backup but is 40%
+        # larger with <1% accuracy gain (92.1% vs 92.5%).
+        cls = None
         try:
-            opts = ort.SessionOptions()
-            opts.inter_op_num_threads = 1
-            opts.intra_op_num_threads = 2
+            p = hf_hub_download(_HF_REPO, "wafer_cls_s.onnx")
             cls = ort.InferenceSession(
-                cls_path, opts, providers=["CPUExecutionProvider"]
-            )
-            det = ort.InferenceSession(
-                det_path, opts, providers=["CPUExecutionProvider"]
+                p, opts, providers=["CPUExecutionProvider"]
             )
         except Exception:
-            logger.debug("Failed to load ONNX models", exc_info=True)
+            pass
+
+        # det: only download "s" - "x" exists on HF as backup (248 MB vs 42 MB)
+        # but hasn't been benchmarked against reCAPTCHA grids.
+        det = None
+        try:
+            p = hf_hub_download(_HF_REPO, "wafer_det_s.onnx")
+            det = ort.InferenceSession(
+                p, opts, providers=["CPUExecutionProvider"]
+            )
+        except Exception:
+            pass
+
+        if cls is None and det is None:
+            logger.debug("Could not download any ONNX models from %s", _HF_REPO)
             _models_unavailable = True
             return None, None
 
-        # Assign atomically after both succeed
         _cls_session = cls
         _det_session = det
+        _models_unavailable = True  # Don't retry on next call
 
-        # Background warmup (dummy inference to pre-warm runtime)
+        # Background warmup
         def _warmup():
             import numpy as np
             try:
-                _cls_session.run(
-                    None,
-                    {_cls_session.get_inputs()[0].name: np.zeros(
-                        (1, 3, 224, 224), dtype=np.float32
-                    )},
-                )
-                _det_session.run(
-                    None,
-                    {_det_session.get_inputs()[0].name: np.zeros(
-                        (1, 3, 640, 640), dtype=np.float32
-                    )},
-                )
+                if _cls_session is not None:
+                    _cls_session.run(
+                        None,
+                        {_cls_session.get_inputs()[0].name: np.zeros(
+                            (1, 3, 224, 224), dtype=np.float32
+                        )},
+                    )
+                if _det_session is not None:
+                    _det_session.run(
+                        None,
+                        {
+                            "images": np.zeros(
+                                (1, 3, 640, 640), dtype=np.float32
+                            ),
+                            "orig_target_sizes": np.array(
+                                [[640, 640]], dtype=np.int64
+                            ),
+                        },
+                    )
             except Exception:
                 pass
             _warmup_done.set()
 
         threading.Thread(target=_warmup, daemon=True).start()
-        cls_name = cls_path.rsplit("/", 1)[-1]
-        det_name = det_path.rsplit("/", 1)[-1]
-        logger.info(
-            "ONNX models loaded: %s + %s", cls_name, det_name,
-        )
+        loaded = []
+        if cls:
+            loaded.append("cls")
+        if det:
+            loaded.append("det")
+        logger.info("ONNX models loaded: %s", " + ".join(loaded))
         return _cls_session, _det_session
 
 
 # ---------------------------------------------------------------------------
-# Keyword -> class index mapping (9 languages, 14 classes)
+# Keyword -> class index mapping (9 languages, 16 classes)
 # ---------------------------------------------------------------------------
 
 # fmt: off
@@ -187,7 +385,7 @@ KEYWORD_TO_CLASS: dict[str, int] = {
     # English
     "bicycles": 0, "a bicycle": 0,
     "bridges": 1, "a bridge": 1,
-    "buses": 2, "a bus": 2,
+    "buses": 2, "a bus": 2, "school buses": 2, "a school bus": 2,
     "cars": 3, "taxis": 3, "a taxi": 3, "a car": 3,
     "chimneys": 4, "a chimney": 4,
     "crosswalks": 5, "a crosswalk": 5,
@@ -198,6 +396,8 @@ KEYWORD_TO_CLASS: dict[str, int] = {
     "stairs": 11, "a staircase": 11,
     "tractors": 12, "a tractor": 12,
     "traffic lights": 13, "a traffic light": 13,
+    # "boats" (14) and "parking meters" (15) are collection-only — the CLS
+    # model has 14 outputs (0-13).  They live in EXTRA_COCO for detection.
     # Spanish (shared words with PT: bicicletas, hidrantes,
     # motocicletas, semáforos - only listed once)
     "bicicletas": 0, "una bicicleta": 0,
@@ -326,14 +526,14 @@ KEYWORD_TO_CLASS: dict[str, int] = {
 }
 # fmt: on
 
-# Extra COCO-only classes for 4x4 grids (not in classification model)
+# Extra COCO keywords for 4x4 grids - looked up by raw keyword string
+# before falling back to CLASS_TO_COCO index lookup.
 EXTRA_COCO: dict[str, int] = {
     "boats": 8, "a boat": 8,
     "parking meters": 12, "a parking meter": 12,
 }
 
-# Classifier class → COCO80 class mapping for 4x4 grid detection.
-# Only objects that exist in both the 14-class classifier and COCO80.
+# Classifier class index → COCO80 class mapping for 4x4 grid detection.
 CLASS_TO_COCO: dict[int, int] = {
     0: 1,   # bicycle
     2: 5,   # bus
@@ -341,6 +541,8 @@ CLASS_TO_COCO: dict[int, int] = {
     6: 10,  # fire hydrant
     7: 3,   # motorcycle
     13: 9,  # traffic light
+    14: 8,  # boat
+    15: 12,  # parking meter
 }
 
 
@@ -377,9 +579,10 @@ def _classify_tiles_batch(session, tile_images, size: int = 224):
         blobs.append(arr / 255.0)
     batch = np.stack(blobs).transpose(0, 3, 1, 2)  # (N, 3, H, W)
 
-    logits = session.run(
-        None, {session.get_inputs()[0].name: batch}
-    )[0]  # (N, 14)
+    with _inference_lock:
+        logits = session.run(
+            None, {session.get_inputs()[0].name: batch}
+        )[0]  # (N, 14)
 
     # Softmax per row
     e = np.exp(logits - logits.max(axis=1, keepdims=True))
@@ -389,8 +592,14 @@ def _classify_tiles_batch(session, tile_images, size: int = 224):
 def _detect_in_grid(
     session, full_image, target_coco_class: int,
     grid_cols: int = 4, conf_thresh: float = 0.25, size: int = 640,
+    min_cell_coverage: float = 0.15,
 ):
-    """Run COCO detection on full 4x4 image, return occupied cell indices (0-based)."""
+    """Run COCO detection on full 4x4 image, return occupied cell indices (0-based).
+
+    min_cell_coverage: minimum fraction of a cell's area that must be covered
+    by a detection box for that cell to be selected. Prevents marking cells
+    where a box barely clips the corner. 0.15 = 15% of the cell area.
+    """
     import numpy as np
 
     orig_w, orig_h = full_image.size
@@ -409,15 +618,21 @@ def _detect_in_grid(
         np.array(padded, dtype=np.float32) / 255.0
     ).transpose(2, 0, 1)[np.newaxis, ...]  # (1, 3, 640, 640)
 
-    dets = session.run(
-        None, {session.get_inputs()[0].name: blob}
-    )[0][0]  # (300, 6): x1, y1, x2, y2, score, class_id
+    # D-FINE: 2 inputs (images + orig_target_sizes), 3 outputs (labels, boxes, scores)
+    with _inference_lock:
+        labels, boxes_raw, scores = session.run(
+            None,
+            {
+                "images": blob,
+                "orig_target_sizes": np.array([[size, size]], dtype=np.int64),
+            },
+        )
+    labels = labels[0]      # (300,)
+    boxes_raw = boxes_raw[0]  # (300, 4) - x1,y1,x2,y2 in input-size coords
+    scores = scores[0]      # (300,)
 
-    mask = (
-        (dets[:, 5].astype(int) == target_coco_class)
-        & (dets[:, 4] > conf_thresh)
-    )
-    boxes = dets[mask, :4]
+    mask = (labels.astype(int) == target_coco_class) & (scores > conf_thresh)
+    boxes = boxes_raw[mask]
     if len(boxes) == 0:
         return []
 
@@ -426,9 +641,11 @@ def _detect_in_grid(
     boxes[:, [1, 3]] = (boxes[:, [1, 3]] - pad_h) / scale
     boxes = np.clip(boxes, 0, [orig_w, orig_h, orig_w, orig_h])
 
-    # Map boxes to grid cells
+    # Map boxes to grid cells, requiring minimum coverage of each cell
     cell_w, cell_h = orig_w / grid_cols, orig_h / grid_cols
-    cells = set()
+    cell_area = cell_w * cell_h
+    # Track max coverage per cell across all detection boxes
+    coverage = {}
     for bx1, by1, bx2, by2 in boxes:
         for r in range(
             max(0, int(by1 // cell_h)),
@@ -438,7 +655,18 @@ def _detect_in_grid(
                 max(0, int(bx1 // cell_w)),
                 min(grid_cols, int(bx2 // cell_w) + 1),
             ):
-                cells.add(r * grid_cols + c)
+                # Intersection of box with this cell
+                cx1, cy1 = c * cell_w, r * cell_h
+                cx2, cy2 = cx1 + cell_w, cy1 + cell_h
+                ix1 = max(bx1, cx1)
+                iy1 = max(by1, cy1)
+                ix2 = min(bx2, cx2)
+                iy2 = min(by2, cy2)
+                inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+                frac = inter / cell_area
+                idx = r * grid_cols + c
+                coverage[idx] = max(coverage.get(idx, 0), frac)
+    cells = [idx for idx, frac in coverage.items() if frac >= min_cell_coverage]
     return sorted(cells)
 
 
@@ -653,6 +881,7 @@ def _click_reload(solver, page, bframe, cur_x, cur_y):
 def _handle_dynamic_replacements(
     solver, page, bframe, clicked_cells, target_class,
     cls_session, grid_size, cur_x, cur_y, deadline,
+    keyword: str = "",
 ):
     """Poll for replacement tiles and re-classify them.
 
@@ -752,6 +981,11 @@ def _handle_dynamic_replacements(
                     probs.argmax(axis=1)[0],
                     "MATCH" if is_target else "skip",
                 )
+                # Collect replacement tile for training
+                _collect_single_tile(
+                    tile_img, probs[0], target_class,
+                    is_target, keyword, source_grid="dynamic_3x3",
+                )
                 if is_target:
                     new_matches.append(cell)
             except Exception:
@@ -834,6 +1068,7 @@ def _detect_grid_type(bframe):
 def solve_image_grid(
     solver, page, bframe, state, deadline,
     payload: bytes | None = None,
+    max_attempts: int = 12,
 ) -> bool:
     """Solve reCAPTCHA image grid challenge.
 
@@ -846,10 +1081,11 @@ def solve_image_grid(
         state: _BrowseState for current mouse position tracking.
         deadline: time.monotonic() deadline for the entire solve.
         payload: Pre-intercepted payload image bytes (from checkbox phase).
+        max_attempts: Maximum number of solve attempts (default 12).
     """
     cls_session, det_session = _ensure_models()
-    if cls_session is None or det_session is None:
-        logger.debug("ONNX models not available, skipping image grid solver")
+    if cls_session is None and det_session is None:
+        logger.debug("No ONNX models available, skipping image grid solver")
         return False
 
     # Wait for warmup if still running (respect solve deadline)
@@ -861,8 +1097,6 @@ def solve_image_grid(
 
     cur_x = state.current_x if state else random.uniform(400, 700)
     cur_y = state.current_y if state else random.uniform(300, 500)
-
-    max_attempts = 12
     for attempt in range(max_attempts):
         if time.monotonic() > deadline:
             logger.debug("Image grid solver deadline exceeded")
@@ -889,10 +1123,33 @@ def solve_image_grid(
         coco_direct = EXTRA_COCO.get(keyword_lower)
 
         if target_class is None and coco_direct is None:
-            logger.debug(
-                "Unknown reCAPTCHA keyword: %r, reloading", keyword_lower,
+            logger.warning(
+                "Unknown reCAPTCHA keyword: %r — collecting image for review",
+                keyword_lower,
             )
-            _log_failure(keyword_lower, grid_type, "unknown_keyword")
+            # Still fetch the image before reloading so we can annotate it
+            try:
+                tile_class = (
+                    "rc-image-tile-44" if grid_type == "4x4"
+                    else "rc-image-tile-33"
+                )
+                img_src = bframe.locator(
+                    f"img.{tile_class}"
+                ).first.get_attribute("src", timeout=3000)
+                if img_src and (
+                    _is_recaptcha_url(img_src)
+                    or img_src.startswith("data:")
+                ):
+                    resp = page.request.get(img_src)
+                    if resp.status == 200:
+                        body = resp.body()
+                        if body and len(body) <= _MAX_PAYLOAD_BYTES:
+                            _collect_det_grid(
+                                keyword_lower, grid_type, "unknown_keyword",
+                                body,
+                            )
+            except Exception:
+                _collect_det_grid(keyword_lower, grid_type, "unknown_keyword")
             cur_x, cur_y = _click_reload(
                 solver, page, bframe, cur_x, cur_y,
             )
@@ -947,6 +1204,13 @@ def solve_image_grid(
         grid_image = Image.open(io.BytesIO(image_bytes))
 
         if grid_type == "4x4":
+            if det_session is None:
+                logger.debug("4x4 grid but no detection model, reloading")
+                cur_x, cur_y = _click_reload(
+                    solver, page, bframe, cur_x, cur_y,
+                )
+                continue
+
             # 4x4 grids: COCO object detection on full image.
             # Resolve COCO class from keyword.
             coco_class = EXTRA_COCO.get(keyword_lower)
@@ -959,7 +1223,7 @@ def solve_image_grid(
                     "4x4 grid, no COCO class for %r, reloading",
                     keyword_lower,
                 )
-                _log_failure(
+                _collect_det_grid(
                     keyword_lower, grid_type, "no_coco_class", image_bytes,
                 )
                 cur_x, cur_y = _click_reload(
@@ -987,9 +1251,13 @@ def solve_image_grid(
                         "reCAPTCHA image grid solved (skip) on attempt %d",
                         attempt + 1,
                     )
+                    _collect_det_grid(
+                        keyword_lower, grid_type, "solved_skip", image_bytes,
+                        {"coco_class": coco_class},
+                    )
                     return True
                 # Skip was wrong - object was present but detection missed it
-                _log_failure(
+                _collect_det_grid(
                     keyword_lower, grid_type, "skip_wrong", image_bytes,
                     {"coco_class": coco_class},
                 )
@@ -1001,6 +1269,10 @@ def solve_image_grid(
             )
         else:
             # 3x3 grids: tile-by-tile classification
+            if cls_session is None:
+                logger.debug("3x3 grid but no classification model, skipping")
+                break
+
             grid_size = 3
             tiles = _split_grid(image_bytes, grid_size=3)
             probs = _classify_tiles_batch(cls_session, tiles)
@@ -1010,16 +1282,18 @@ def solve_image_grid(
             else:
                 # COCO-only keywords (boats, parking meters) on 3x3
                 coco_class = coco_direct
-                if coco_class is None:
+                if coco_class is None or det_session is None:
                     logger.debug(
-                        "No class mapping for keyword %r, reloading",
+                        "No class/det mapping for keyword %r, reloading",
                         keyword_lower,
                     )
                     cur_x, cur_y = _click_reload(
                         solver, page, bframe, cur_x, cur_y,
                     )
                     continue
-                cells = _detect_in_grid(det_session, grid_image, coco_class)
+                cells = _detect_in_grid(
+                    det_session, grid_image, coco_class, grid_cols=3,
+                )
 
             # Debug: log per-tile probabilities for the target class
             if target_class is not None:
@@ -1033,9 +1307,15 @@ def solve_image_grid(
                     target_class, " ".join(tile_scores),
                 )
 
+            # Collect tiles for training data
+            _collect_tiles(
+                image_bytes, probs, target_class,
+                keyword_lower, grid_type, cells,
+            )
+
             if not cells:
                 logger.info("No tiles selected, reloading")
-                _log_failure(
+                _collect_det_grid(
                     keyword_lower, grid_type, "no_tiles_selected", image_bytes,
                 )
                 cur_x, cur_y = _click_reload(
@@ -1062,21 +1342,44 @@ def solve_image_grid(
             cur_x, cur_y = _handle_dynamic_replacements(
                 solver, page, bframe, cells, target_class,
                 cls_session, grid_size, cur_x, cur_y, deadline,
+                keyword=keyword_lower,
             )
 
-        # Click verify
+        # Detect if this is an intermediate "Next" or final "Verify"
+        is_next = False
+        try:
+            btn_text = bframe.locator(
+                "#recaptcha-verify-button"
+            ).text_content(timeout=2000)
+            is_next = btn_text and "next" in btn_text.strip().lower()
+        except Exception:
+            pass
+
+        # Click verify/next
         time.sleep(random.uniform(0.3, 0.7))
         cur_x, cur_y = _click_verify(
             solver, page, bframe, cur_x, cur_y,
         )
 
-        # Check for token
+        if is_next:
+            # Intermediate round in 4x4 sequence - not a pass/fail yet
+            logger.info(
+                "4x4 sequence: clicked Next on attempt %d", attempt + 1,
+            )
+            time.sleep(random.uniform(0.5, 1.0))
+            continue
+
+        # Final round - check for token
         time.sleep(random.uniform(0.5, 1.0))
         from wafer.browser._recaptcha import _check_token
 
         if _check_token(page):
             logger.info(
                 "reCAPTCHA image grid solved on attempt %d", attempt + 1,
+            )
+            _collect_det_grid(
+                keyword_lower, grid_type, "solved", image_bytes,
+                {"cells_selected": sorted(cells)},
             )
             return True
 
@@ -1088,7 +1391,7 @@ def solve_image_grid(
             ).first.is_visible(timeout=500)
             if has_error:
                 logger.info("Need more tiles, reloading")
-                _log_failure(
+                _collect_det_grid(
                     keyword_lower, grid_type, "need_more_tiles", image_bytes,
                     {"cells_selected": sorted(cells)},
                 )
@@ -1099,9 +1402,24 @@ def solve_image_grid(
         except Exception:
             pass
 
-        # Wrong answer - new challenge served, loop continues
-        logger.info("Wrong answer on attempt %d, retrying", attempt + 1)
-        _log_failure(
+        # Check if IP is blocked by clicking audio button and reading message
+        try:
+            audio_btn = bframe.locator("#recaptcha-audio-button")
+            if audio_btn.is_visible(timeout=500):
+                audio_btn.click()
+                time.sleep(0.5)
+                body_text = bframe.locator("body").text_content(timeout=2000)
+                if body_text and "automated queries" in body_text.lower():
+                    logger.warning(
+                        "IP blocked by reCAPTCHA - aborting (not a real failure)"
+                    )
+                    return False
+        except Exception:
+            pass
+
+        # Wrong answer after Verify - genuine failure
+        logger.info("Wrong answer on attempt %d", attempt + 1)
+        _collect_det_grid(
             keyword_lower, grid_type, "wrong_answer", image_bytes,
             {"cells_selected": sorted(cells)},
         )

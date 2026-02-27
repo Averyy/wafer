@@ -1,6 +1,6 @@
 # Mousse -Mouse Movement Recorder
 
-Dev tool for recording human mouse movements used by wafer's browser solver. Records idles, paths, holds, drags, slide_drags, grids, and browses as CSV files consumed at runtime by `_solver.py`.
+Dev tool for recording human mouse movements and labeling reCAPTCHA training data. Records idles, paths, holds, drags, slide_drags, grids, and browses as CSV files consumed at runtime by `_solver.py`. Also provides DET (detection) and CLS (classification) annotation modes for labeling collected reCAPTCHA grid images and tiles.
 
 ## Usage
 
@@ -9,7 +9,10 @@ uv run python -m wafer.browser.mousse
 # Opens http://localhost:8377 in your browser
 ```
 
-Optional: `--port 9000` to use a different port.
+Optional flags:
+- `--port 9000` to use a different port
+- `--collected-det PATH` to set the DET grids directory (default: `training/recaptcha/collected_det`)
+- `--collected-cls PATH` to set the CLS tiles directory (default: `training/recaptcha/collected_cls`)
 
 ## Recording Modes
 
@@ -69,6 +72,35 @@ Targets are randomized each session (never all in the same row or column) so rec
 ### Browse (20 needed)
 Simulate exploring a page -move mouse around naturally AND scroll up/down. Press Space, then move and scroll for 8 seconds. The fake page has randomized content length (3-12 sections) per recording to capture different scroll behaviors for short vs long pages. Section count is saved in metadata for page-length matching during replay. Captures both mouse movement and scroll wheel events. Stored as `t,dx,dy,scroll_y` where `scroll_y` is the wheel deltaY (0 for mouse-only events, positive for scroll-down, negative for scroll-up).
 
+## Labeling Modes
+
+### DET (Detection Grid Annotation)
+
+Annotate 4x4 (and 3x3) reCAPTCHA grid images collected during live solves. The solver saves full grid images with metadata (keyword, outcome, model picks) to `collected_det/`. DET mode shows each grid with the model's cell selections overlaid, and you click cells to mark the ground truth.
+
+- Green cells = your picks, red cells = model-only picks, amber = both agree
+- Enter = save annotation, Esc = skip
+- On annotation:
+  1. Grid moved to `collected_det/{ClassName}/` (Title Case, e.g. `Bicycle/`, `Traffic Light/`)
+  2. Ground truth saved to `annotations.jsonl`
+  3. Full grid image auto-copied to `reviewed/{ClassName}/` for CLS retraining
+- Unknown keywords from Google are auto-collected with images for future annotation
+
+Tab is disabled when no grids are available. Populate by running the collector (`uv run python training/collect.py`) or the reCAPTCHA solver with collection enabled (`WAFER_COLLECT_DET` env var or default path).
+
+### CLS (Classification Tile Labeling)
+
+Label individual 3x3 reCAPTCHA tiles collected during live solves. The solver splits each 3x3 grid into 9 tiles and saves them with model predictions (keyword, top-3 confidence, predicted class) to `collected_cls/`. CLS mode shows each tile with confidence bars and 17 class buttons (16 object classes + None for distractors).
+
+The bulk collector (`training/collect.py`) auto-splits 3x3 grids into individual tiles on save, so collected tiles are ready for CLS annotation immediately.
+
+- Click a class button to select, Enter to confirm
+- S = skip tile, D = delete tile
+- History panel at bottom shows recent labels as thumbnails; click to undo (moves file back)
+- Labeled tiles are moved to `reviewed/{ClassName}/` for training data
+
+Tab is disabled when no tiles are available.
+
 ## Output
 
 CSV files saved to `wafer/browser/_recordings/{idles,paths,holds,drags,slide_drags,grids,browses}/`.
@@ -98,8 +130,10 @@ t,dx,dy,scroll_y
 | Key | Action |
 |-----|--------|
 | Space | Start recording |
-| Enter | Accept recording |
-| Escape | Discard / close modal |
+| Enter | Accept recording / save DET annotation / confirm CLS label |
+| Escape | Discard / close modal / skip DET grid |
+| S | Skip CLS tile |
+| D | Delete CLS tile |
 
 Gear icon (⚙) in the header opens bulk delete controls.
 

@@ -241,7 +241,7 @@ session = SyncSession(cache_dir=None)
 ```
 
 Features:
-- Per-domain JSON files with file locking for thread safety
+- Per-domain JSON files with thread-safe atomic writes
 - TTL-based expiration (respects `Expires` / `Max-Age`)
 - LRU eviction (max 50 entries per domain by default)
 - Cookies from browser solving are automatically cached
@@ -359,7 +359,7 @@ if result:
 
 Uses [Patchright](https://github.com/Kaliiiiiiiiii-Vinyzu/patchright-python) (patched Playwright) with real system Chrome for maximum stealth. Persistent browser instance with idle timeout. Thread-safe.
 
-Supports: Cloudflare (managed + Turnstile), Akamai, DataDome (VM PoW + puzzle slider), PerimeterX (including press-and-hold), Imperva, Kasada, F5 Shape, AWS WAF, GeeTest v4 (slide puzzle), Alibaba Baxia (slider), hCaptcha (checkbox), reCAPTCHA v2 (checkbox + image grid via YOLO), and generic JS challenges.
+Supports: Cloudflare (managed + Turnstile), Akamai, DataDome (VM PoW + puzzle slider), PerimeterX (including press-and-hold), Imperva, Kasada, F5 Shape, AWS WAF, GeeTest v4 (slide puzzle), Alibaba Baxia (slider), hCaptcha (checkbox), reCAPTCHA v2 (checkbox + image grid via EfficientNet + D-FINE), and generic JS challenges.
 
 ## Iframe Intercept
 
@@ -392,7 +392,7 @@ How it works:
 
 ## Mouse Recorder (Mousse)
 
-Dev tool for recording human mouse movements used by the browser solver. Recordings drive PerimeterX press-and-hold, drag/slide puzzle solvers (GeeTest, Baxia/AliExpress), reCAPTCHA grid tile clicking, and browse replay (background mouse/scroll activity during all solver wait loops). Seven recording modes: idle, path, hold, drag (puzzle), slide (full-width "slide to verify"), grid (short tile-to-tile hops for reCAPTCHA 3x3 grids), and browse. See [`wafer/browser/mousse/README.md`](wafer/browser/mousse/README.md) for full documentation.
+Dev tool for recording human mouse movements and labeling reCAPTCHA training data. Recordings drive PerimeterX press-and-hold, drag/slide puzzle solvers (GeeTest, Baxia/AliExpress), reCAPTCHA grid tile clicking, and browse replay (background mouse/scroll activity during all solver wait loops). Seven recording modes: idle, path, hold, drag (puzzle), slide (full-width "slide to verify"), grid (short tile-to-tile hops for reCAPTCHA 3x3 grids), and browse. Two labeling modes: DET (annotate 4x4 detection grids with ground truth cells, auto-copies to CLS training data) and CLS (label individual 3x3 classification tiles into 16 object classes). See [`wafer/browser/mousse/README.md`](wafer/browser/mousse/README.md) for full documentation.
 
 ```bash
 uv run python -m wafer.browser.mousse
@@ -408,7 +408,6 @@ from wafer import (
     WaferTimeout,        # request exceeded timeout (also a TimeoutError)
     ChallengeDetected,   # WAF challenge unsolvable
     RateLimited,         # HTTP 429
-    SessionBlocked,      # too many consecutive failures
     ConnectionFailed,    # network error
     EmptyResponse,       # 200 with empty body
     TooManyRedirects,    # redirect loop
@@ -473,7 +472,7 @@ wafer/
     _awswaf.py      # AWS WAF challenge solver
     _hcaptcha.py    # hCaptcha checkbox solver
     _recaptcha.py   # reCAPTCHA v2 checkbox + image grid dispatch
-    _recaptcha_grid.py  # reCAPTCHA v2 image grid solver (YOLO)
+    _recaptcha_grid.py  # reCAPTCHA v2 image grid solver (EfficientNet + D-FINE)
     _drag.py        # GeeTest / Baxia drag/slider puzzle solver
     _cv.py          # CV notch detection for drag/slider puzzles
 ```

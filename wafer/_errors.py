@@ -29,18 +29,6 @@ class RateLimited(WaferError):
         super().__init__(msg)
 
 
-class SessionBlocked(WaferError):
-    """Session has been blocked after repeated failures."""
-
-    def __init__(self, url: str, consecutive_failures: int):
-        self.url = url
-        self.consecutive_failures = consecutive_failures
-        super().__init__(
-            f"Session blocked at {url} after "
-            f"{consecutive_failures} consecutive failures"
-        )
-
-
 class ConnectionFailed(WaferError):
     """Failed to establish a connection."""
 

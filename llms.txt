@@ -81,7 +81,6 @@ from wafer import (
     ConnectionFailed,  # network/TLS error after all retries
     EmptyResponse,     # 200 with empty body after all retries
     TooManyRedirects,  # redirect loop exceeded max_redirects
-    SessionBlocked,    # exported but not raised internally; for caller use
 )
 
 # Module-level convenience (each creates a one-shot SyncSession with defaults).
@@ -236,12 +235,10 @@ WaferError (base)
   +- TooManyRedirects     .url: str, .max_redirects: int
   +- WaferTimeout         .url: str, .timeout_secs: float  (also inherits TimeoutError)
   +- WaferHTTPError       .status_code: int, .url: str  (raised by raise_for_status())
-  +- SessionBlocked       .url: str, .consecutive_failures: int  (not raised internally)
 ```
 
 `except WaferError` catches everything including WaferTimeout.
 
-`SessionBlocked` is exported for caller use but wafer itself does not raise it.
 When `max_failures` consecutive failures occur on a domain, wafer silently resets
 the session identity (new TLS fingerprint, cleared cookies for that domain, new
 cookie jar) and continues retrying. It does not raise.
@@ -289,8 +286,10 @@ call creates and tears down its own independent SyncSession.
 **Cookie cache** (`cache_dir`) is off by default (`None`). When set, only solver
 cookies (browser-solved WAF challenges, inline solvers) are persisted to disk.
 Normal `Set-Cookie` headers stay in-memory and are lost on session rebuild (WAFs
-bind cookies to TLS fingerprints). Recommended for `BrowserSolver` users. Uses
-file locking, so multiple sessions can share the same path safely.
+bind cookies to TLS fingerprints). Recommended for `BrowserSolver` users.
+Thread-safe (per-domain locks, atomic writes via temp file + rename). Multiple
+threads can share the same `cache_dir` path safely. Multiple processes sharing
+the same path may lose updates under concurrent writes to the same domain.
 
 ---
 
@@ -436,7 +435,21 @@ solver.close()
 The solver is thread-safe and reuses a single browser instance with idle timeout.
 Supports: Cloudflare, Akamai, DataDome, PerimeterX (press-and-hold), Imperva,
 Kasada, F5 Shape, AWS WAF, GeeTest v4 (slide), Baxia (slider), hCaptcha,
-reCAPTCHA v2 (checkbox + image grid via YOLO+ONNX), generic JS.
+reCAPTCHA v2 (checkbox + image grid via local ONNX models), generic JS.
+
+### reCAPTCHA v2 Image Grid Solver
+
+Requires `[browser]` extra. Uses two ONNX models downloaded from HuggingFace
+on first encounter (~63 MB total, cached locally). If models or dependencies
+(`onnxruntime`, `huggingface_hub`) are unavailable, falls back gracefully
+(returns False, challenge escalation continues).
+
+- **3x3 grids** (static + dynamic): EfficientNet-B0 classifier, 14 object classes
+- **4x4 grids** (multi-round): D-FINE COCO detector, bbox-to-cell mapping
+- Grid type auto-detected via DOM class inspection
+- Keyword matching in 9 languages (English, Spanish, French, German, Italian,
+  Portuguese, Dutch, Russian, Chinese)
+- First inference has ~2-3s warmup delay (background warmup thread runs on load)
 
 ---
 

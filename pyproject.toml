@@ -27,7 +27,7 @@ Issues = "https://github.com/Averyy/wafer/issues"
 Changelog = "https://github.com/Averyy/wafer/releases"
 
 [project.optional-dependencies]
-browser = ["patchright", "opencv-python-headless", "onnxruntime", "Pillow"]
+browser = ["patchright", "opencv-python-headless", "onnxruntime", "Pillow", "huggingface_hub"]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",

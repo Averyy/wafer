@@ -1,6 +1,7 @@
 """Tests for cookie cache."""
 
 import json
+import threading
 import time
 
 from wafer._cookies import (
@@ -674,3 +675,42 @@ class TestSessionCookieCacheDisabled:
 
         bs = BaseSession(cache_dir="./data/wafer/cookies")
         assert bs._cookie_cache is not None
+
+
+# ---------------------------------------------------------------------------
+# CookieCache: concurrent writers
+# ---------------------------------------------------------------------------
+
+
+class TestCookieCacheConcurrency:
+    def test_concurrent_saves_no_lost_updates(self, tmp_path):
+        """Two threads writing distinct cookie names must both survive."""
+        cache = CookieCache(cache_dir=str(tmp_path), max_entries=500)
+        per_thread = 200
+        barrier = threading.Barrier(2)
+
+        def writer(prefix):
+            barrier.wait()
+            for i in range(per_thread):
+                cache.save(
+                    "e.com",
+                    [
+                        {
+                            "name": f"{prefix}{i}",
+                            "raw": f"{prefix}{i}=v",
+                            "url": "https://e.com",
+                            "expires": _FUTURE,
+                        },
+                    ],
+                )
+
+        t1 = threading.Thread(target=writer, args=("a",))
+        t2 = threading.Thread(target=writer, args=("b",))
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+
+        loaded = cache.load("e.com")
+        names = {c["name"] for c in loaded}
+        assert len(names) == per_thread * 2

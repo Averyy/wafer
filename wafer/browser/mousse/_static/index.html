@@ -54,6 +54,16 @@
         <span class="stat-label">Browse</span>
         <span class="stat-value">0/20</span>
       </div>
+      <div class="stat incomplete disabled" id="stat-det" data-mode="det">
+        <span class="stat-icon">🔍</span>
+        <span class="stat-label">DET</span>
+        <span class="stat-value">0/0</span>
+      </div>
+      <div class="stat incomplete disabled" id="stat-cls" data-mode="cls">
+        <span class="stat-icon">🏷️</span>
+        <span class="stat-label">CLS</span>
+        <span class="stat-value">0/0</span>
+      </div>
     </div>
     <button class="btn manage-btn" id="btn-manage" title="Manage recordings">
       <span>&#9881;</span>
@@ -80,6 +90,8 @@
         <button class="tab" data-mode="slide_drag">Slide</button>
         <button class="tab" data-mode="grid">Grid</button>
         <button class="tab" data-mode="browse">Browse</button>
+        <button class="tab disabled" data-mode="det" disabled>DET</button>
+        <button class="tab disabled" data-mode="cls" disabled>CLS</button>
       </div>
 
       <div class="separator"></div>
@@ -123,6 +135,35 @@
   <!-- Canvas -->
   <div class="canvas-wrap">
     <canvas id="canvas" width="1280" height="720"></canvas>
+
+    <!-- DET annotation panel -->
+    <div class="tool-panel hidden" id="det-panel">
+      <div class="det-status">
+        <div class="det-outcome" id="det-outcome"></div>
+        <div class="det-instruction" id="det-instruction"></div>
+      </div>
+      <div class="det-grid" id="det-grid"></div>
+      <div class="tool-footer">
+        <div class="tool-progress" id="det-progress"></div>
+        <div class="tool-help">Click cells = ground truth (green) · Enter = save · Esc = skip</div>
+      </div>
+    </div>
+
+    <!-- CLS labeling panel -->
+    <div class="tool-panel hidden" id="cls-panel">
+      <div class="cls-tile-wrap">
+        <img id="cls-tile-img" alt="" />
+      </div>
+      <div class="cls-keyword" id="cls-keyword-text"></div>
+      <div class="cls-conf-wrap" id="cls-confidence-wrap"></div>
+      <div class="cls-buttons" id="cls-buttons-wrap"></div>
+      <div class="tool-footer">
+        <div class="tool-progress" id="cls-progress"></div>
+        <div class="tool-help">Enter = confirm · S = skip · D = delete</div>
+      </div>
+      <div class="cls-history-header">Recent</div>
+      <div class="cls-history" id="cls-history"></div>
+    </div>
   </div>
 
   <!-- Recordings panel -->
