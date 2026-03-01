@@ -35,9 +35,3 @@ inprogress.md
 # Playwright MCP
 .playwright-mcp/
 
-# Training data (large, binary)
-training/recaptcha/collected_*/
-training/recaptcha/reviewed/
-training/recaptcha/datasets/
-training/recaptcha/runs/
-training/recaptcha/dedup_index.pkl

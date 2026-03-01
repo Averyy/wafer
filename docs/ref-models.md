@@ -84,7 +84,7 @@ All training scripts live in `training/recaptcha/`. Separate venv from wafer (`t
 
 Both CLS models are trained, exported, uploaded to HuggingFace, and live in production.
 
-**Base dataset**: `DannyLuna/recaptcha-classification-57k` (57k tiles, 14 classes, MIT license). Downloaded via `download_dataset.py` to `datasets/dataset_cls_full_57k/`.
+**Base dataset**: `wafer_cls_classic/` - 46,753 deduplicated tiles from `DannyLuna/recaptcha-classification-57k` (MIT license), 14 classes. Originally 57k images but ~11k were byte-identical duplicates within the dataset.
 
 **Training script**: `train_mps.py` - EfficientNet on Apple Silicon MPS GPU.
 
@@ -105,7 +105,7 @@ python export.py --cls-model runs/cls_s/weights/best.pth.tar --size s
 python export.py --cls-model runs/cls_x/weights/best.pth.tar --size x --deliver
 ```
 
-To retrain with new data, merge reviewed tiles into the base dataset (see Offline Dedup & Merge below) and re-run `train_mps.py` with `--data datasets/dataset_cls_merged`.
+To retrain with new data, dedup labeled tiles against the base dataset (see Offline Dedup below), then train with both data sources.
 
 ### DET Models (off-the-shelf)
 
@@ -121,7 +121,7 @@ D-FINE models are used as-is from the D-FINE project (pretrained on Objects365+C
 uv run python training/collect.py --workers 3
 ```
 
-3x3 grids split into 9 individual 100x100 tiles on save, written to `collected_cls/_unlabeled/`. 4x4 grids saved as full images to `collected_det/_unlabeled/`.
+3x3 grids split into 9 individual 100x100 tiles on save, written to `collected_cls/`. 4x4 grids saved as full images to `collected_det/`.
 
 ### Hot Path Collection
 
@@ -146,31 +146,31 @@ The solver also collects training data during live reCAPTCHA solves (zero overhe
 
 **DET mode**: Shows full grid images with model cell selections overlaid. Click cells to mark ground truth. On annotation:
 1. Grid moved to `collected_det/{ClassName}/` (Title Case, e.g. `Bicycle/`, `Traffic Light/`)
-2. Ground truth saved to `annotations.jsonl`
-3. Full grid image copied to `reviewed/{ClassName}/` for CLS retraining (450x450 scene photo = valid CLS training data)
+2. Grid copied to `datasets/wafer_det/{ClassName}/`, ground truth saved to `datasets/wafer_det/annotations.jsonl`
+3. Grid also copied to `datasets/wafer_cls/{ClassName}/` for CLS retraining (450x450 scene photo = valid CLS training data)
 
-**CLS mode**: Shows individual tiles with model predictions and top-3 confidence bars. Click one of 17 class buttons (16 classes + None for distractors) to label. Labeled tiles moved to `reviewed/{ClassName}/`.
+**CLS mode**: Shows individual tiles with model predictions and top-3 confidence bars. Click one of 17 class buttons (16 classes + None for distractors) to label. Labeled tiles moved to `datasets/wafer_cls/{ClassName}/`.
 
-### Offline Dedup & Merge
+### Offline Dedup
 
-`training/recaptcha/dedup.py` handles dedup against the base 57k dataset:
+`training/recaptcha/dedup.py` checks our labeled tiles against the classic dataset:
 
 ```bash
-python dedup.py build-index                    # pixel SHA256 + dHash of 57k tiles
-python dedup.py dedup --threshold 4            # remove matches from reviewed/
-python dedup.py merge --output datasets/dataset_cls_merged  # base + reviewed -> train/
+python dedup.py build-index                    # pixel SHA256 + dHash of classic tiles
+python dedup.py dedup --threshold 4            # remove matches from datasets/wafer_cls/
 ```
 
-Two-tier dedup: exact pixel hash match, then perceptual dHash with hamming distance <= 4.
+Two-tier dedup: exact pixel hash match, then perceptual dHash with hamming distance <= 4. Run before training to avoid duplicates between the classic dataset and our collected tiles.
 
 ## Data Directories
 
 | Directory | Contents |
 |-----------|----------|
-| `training/recaptcha/collected_cls/` | CLS tiles - individual 100x100 tiles from hot path and collector |
-| `training/recaptcha/collected_det/` | DET grid images (`_unlabeled/` + annotated class folders) |
-| `training/recaptcha/reviewed/` | Labeled images ready for training merge (all classes) |
-| `training/recaptcha/datasets/dataset_cls_full_57k/` | 57k base tiles (train + val splits) |
+| `training/recaptcha/collected_cls/` | Raw unlabeled CLS tiles (flat queue, images + metadata.jsonl) |
+| `training/recaptcha/collected_det/` | Raw unlabeled DET grids (flat queue, images + metadata.jsonl) |
+| `training/recaptcha/datasets/wafer_cls_classic/` | Deduplicated base tiles (46,753 from DannyLuna 57k, MIT) |
+| `training/recaptcha/datasets/wafer_cls/` | Our labeled CLS tiles (Mousse output, training-ready) |
+| `training/recaptcha/datasets/wafer_det/` | Our labeled DET grids + annotations.jsonl (Mousse output) |
 
 ## Known DET Issues
 
@@ -185,5 +185,5 @@ Two-tier dedup: exact pixel hash match, then perceptual dHash with hamming dista
 |---------|---------|----------|
 | [D-FINE](https://github.com/Peterande/D-FINE) | Apache 2.0 | COCO detection (det models) |
 | [timm](https://github.com/huggingface/pytorch-image-models) | Apache 2.0 | EfficientNet training (cls models) |
-| [DannyLuna/recaptcha-classification-57k](https://huggingface.co/DannyLuna/recaptcha-classification-57k) | MIT | Base CLS dataset |
+| [DannyLuna/recaptcha-classification-57k](https://huggingface.co/DannyLuna/recaptcha-classification-57k) | MIT | Base CLS dataset (deduplicated as wafer_cls_classic) |
 | [Breaking reCAPTCHAv2](https://github.com/aplesner/Breaking-reCAPTCHAv2) | Academic | Mouse curves, 4x4 strategy |

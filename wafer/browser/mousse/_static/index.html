@@ -141,12 +141,14 @@
       <div class="det-status">
         <div class="det-outcome" id="det-outcome"></div>
         <div class="det-instruction" id="det-instruction"></div>
+        <select id="det-class-override" title="Override class if keyword is wrong"></select>
       </div>
       <div class="det-grid" id="det-grid"></div>
       <div class="tool-footer">
         <div class="tool-progress" id="det-progress"></div>
         <div class="tool-help">Click cells = ground truth (green) · Enter = save · Esc = skip</div>
       </div>
+      <div class="label-stats" id="det-stats"></div>
     </div>
 
     <!-- CLS labeling panel -->
@@ -163,6 +165,8 @@
       </div>
       <div class="cls-history-header">Recent</div>
       <div class="cls-history" id="cls-history"></div>
+      <button class="cls-flush-btn hidden" id="cls-flush-btn"></button>
+      <div class="label-stats" id="cls-stats"></div>
     </div>
   </div>
 

@@ -696,13 +696,8 @@ canvas#canvas {
 
 /* ── CLS Mode ────────────────────────────────────────────────────────── */
 
-.cls-panel {
-  display: none;
-  flex-direction: column;
-  align-items: center;
-  gap: 12px;
-  padding: 16px;
-  width: 100%;
+#cls-panel {
+  max-width: 920px;
 }
 
 .cls-panel.active {
@@ -752,7 +747,7 @@ canvas#canvas {
   flex-wrap: wrap;
   gap: 4px;
   justify-content: center;
-  max-width: 520px;
+  max-width: 600px;
 }
 
 .cls-buttons .cls-btn {
@@ -774,9 +769,10 @@ canvas#canvas {
   background: var(--bg-surface);
 }
 
-.cls-buttons .cls-btn.predicted {
+.cls-buttons .cls-btn.suggested {
+  background: rgba(0, 200, 120, 0.35);
   border-color: var(--green);
-  box-shadow: 0 0 6px var(--green-glow);
+  color: var(--text);
 }
 
 .cls-buttons .cls-btn.selected {
@@ -816,8 +812,8 @@ canvas#canvas {
 
 .cls-keyword {
   font-family: var(--font-mono);
-  font-size: 11px;
-  color: var(--text-muted);
+  font-size: 15px;
+  color: var(--text);
 }
 
 /* ── CLS History ──────────────────────────────────────────────────── */
@@ -843,6 +839,15 @@ canvas#canvas {
 
 .cls-history-item:hover {
   border-color: var(--green);
+}
+
+.cls-history-item.pending {
+  border-color: var(--yellow, #f0c040);
+  opacity: 0.85;
+}
+
+.cls-history-item.pending:hover {
+  border-color: var(--red, #e05050);
 }
 
 .cls-history-item img {
@@ -875,6 +880,77 @@ canvas#canvas {
   width: 100%;
   text-align: center;
   padding-bottom: 4px;
+}
+
+.cls-flush-btn {
+  margin-top: 12px;
+  padding: 8px 24px;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  border: 1px solid var(--green);
+  border-radius: var(--radius-sm);
+  background: var(--bg-raised);
+  color: var(--text);
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.cls-flush-btn:hover {
+  background: var(--green);
+  color: var(--bg-deep);
+}
+
+.label-stats {
+  width: 100%;
+  max-width: 400px;
+  margin-top: 16px;
+}
+
+.stats-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.stats-table th,
+.stats-table td {
+  padding: 3px 8px;
+  text-align: left;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.stats-table th {
+  color: var(--text-muted);
+  font-weight: 600;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.stats-table td:nth-child(2),
+.stats-table td:nth-child(3),
+.stats-table th:nth-child(2),
+.stats-table th:nth-child(3) {
+  text-align: right;
+}
+
+.stats-table tfoot td {
+  border-top: 1px solid rgba(255, 255, 255, 0.15);
+  border-bottom: none;
+}
+
+.stats-table tr.stat-good td {
+  color: var(--green, #00c878);
+}
+
+.stats-table tr.stat-warn td {
+  color: var(--yellow, #f0c040);
+}
+
+.stats-table tr.stat-low td {
+  color: #e05050;
 }
 
 /* ── Tool Panels (DET/CLS) ─────────────────────────────────────────── */
@@ -912,6 +988,17 @@ canvas#canvas {
   color: var(--text);
 }
 
+#det-class-override {
+  font-family: var(--font-mono);
+  font-size: 16px;
+  padding: 8px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-raised);
+  color: var(--text);
+  cursor: pointer;
+}
+
 .tool-footer {
   display: flex;
   flex-direction: column;
@@ -944,6 +1031,8 @@ canvas#canvas {
   position: relative;
   cursor: pointer;
   transition: opacity 0.1s;
+  user-select: none;
+  -webkit-user-select: none;
 }
 
 .det-cell:hover {

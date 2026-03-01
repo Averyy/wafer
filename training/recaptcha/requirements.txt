@@ -1,0 +1,5 @@
+timm>=1.0.0
+torch>=2.0
+huggingface_hub
+onnx
+onnxruntime

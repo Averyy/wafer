@@ -5,7 +5,6 @@ Usage:
 """
 
 import argparse
-import webbrowser
 from pathlib import Path
 
 from wafer.browser.mousse._server import run_server
@@ -28,9 +27,6 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    url = f"http://localhost:{args.port}"
-    print(f"Starting Mousse at {url}")
-    webbrowser.open(url)
     run_server(
         args.port,
         collected_det=args.collected_det,

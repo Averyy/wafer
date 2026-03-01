@@ -17,6 +17,10 @@ let detImage = null;          // loaded Image object
 let detGridSize = 0;          // 3 or 4
 let detModelPicks = [];       // model's selected cells
 let detUserPicks = new Set(); // user's clicked cells (togglable)
+let detClassOverride = null;  // user-corrected class name (null = use keyword)
+let detDragging = false;      // mouse held down over grid
+let detDragSelecting = true;  // true = drag selects, false = drag deselects
+let detDragVisited = new Set(); // cells visited during this drag
 let detAnnotatedCount = 0;    // total annotated so far
 let detTotalCount = 0;        // total failure entries (annotated + unannotated)
 let detHasEntries = false;    // whether any failure entries exist at all
@@ -31,13 +35,41 @@ let clsReviewedCount = 0;     // total reviewed
 let clsTotalCount = 0;        // total tiles
 let clsHasTiles = false;      // whether any tiles exist
 let clsFilter = "unreviewed"; // "all" | "unreviewed" | "low_confidence"
-let clsHistory = [];          // recent labels [{tile, label, imgSrc}]
+let clsHistory = [];          // recent labels [{tile, label, imgSrc, pending}]
+let clsPending = [];          // pending transfers (subset of clsHistory where pending=true)
 const CLS_NAMES = [
   "Bicycle", "Bridge", "Bus", "Car", "Chimney", "Crosswalk",
   "Hydrant", "Motorcycle", "Mountain", "Other", "Palm",
-  "Stair", "Tractor", "Traffic Light", "Boat", "Parking Meter", "None",
+  "Stair", "Tractor", "Traffic Light", "Boat", "Parking Meter",
 ];
-// No keyboard shortcuts for class buttons - click only
+const CLS_EMOJI = {
+  "Bicycle": "🚲", "Bridge": "🌉", "Bus": "🚌",
+  "Car": "🚗", "Chimney": "🏭", "Crosswalk": "🚶",
+  "Hydrant": "🧯", "Motorcycle": "🏍️",
+  "Mountain": "⛰️", "Other": "❓", "Palm": "🌴",
+  "Stair": "🪜", "Tractor": "🚜",
+  "Traffic Light": "🚦", "Boat": "🚢",
+  "Parking Meter": "🅿️",
+};
+const CLS_PENDING_BUFFER = 3; // labels to keep pending before transferring
+const KEYWORD_TO_CLASS = {
+  "bicycles": "Bicycle", "a bicycle": "Bicycle",
+  "bridges": "Bridge", "a bridge": "Bridge",
+  "buses": "Bus", "a bus": "Bus",
+  "school buses": "Bus", "a school bus": "Bus",
+  "cars": "Car", "a car": "Car", "taxis": "Car", "a taxi": "Car",
+  "chimneys": "Chimney", "a chimney": "Chimney",
+  "crosswalks": "Crosswalk", "a crosswalk": "Crosswalk",
+  "fire hydrants": "Hydrant", "a fire hydrant": "Hydrant",
+  "motorcycles": "Motorcycle", "a motorcycle": "Motorcycle",
+  "mountains": "Mountain", "mountains or hills": "Mountain",
+  "palm trees": "Palm",
+  "stairs": "Stair", "a staircase": "Stair",
+  "tractors": "Tractor", "a tractor": "Tractor",
+  "traffic lights": "Traffic Light", "a traffic light": "Traffic Light",
+  "boats": "Boat", "a boat": "Boat",
+  "parking meters": "Parking Meter", "a parking meter": "Parking Meter",
+};
 
 // ── DOM refs ───────────────────────────────────────────────────────────
 const canvas = document.getElementById("canvas");
@@ -64,6 +96,7 @@ const detOutcomeEl = document.getElementById("det-outcome");
 const detInstructionEl = document.getElementById("det-instruction");
 const detGridEl = document.getElementById("det-grid");
 const detProgressEl = document.getElementById("det-progress");
+const detClassSelect = document.getElementById("det-class-override");
 const clsPanel = document.getElementById("cls-panel");
 const clsTileImg = document.getElementById("cls-tile-img");
 const clsKeywordEl = document.getElementById("cls-keyword-text");
@@ -71,6 +104,7 @@ const clsConfWrap = document.getElementById("cls-confidence-wrap");
 const clsButtonsWrap = document.getElementById("cls-buttons-wrap");
 const clsProgressEl = document.getElementById("cls-progress");
 const clsHistoryEl = document.getElementById("cls-history");
+const clsFlushBtn = document.getElementById("cls-flush-btn");
 const controlsRight = document.querySelector(".controls-right");
 const recordingsPanel = document.querySelector(".recordings-panel");
 
@@ -815,9 +849,28 @@ function renderDetPanel() {
   detOutcomeEl.className = "det-outcome " +
     (outcome.startsWith("solved") ? "solved" : "failed");
 
-  // Instruction
-  detInstructionEl.textContent =
-    `Select all squares with ${entry.keyword || "?"}`;
+  // Instruction + class override dropdown
+  const kw = (entry.keyword || "").toLowerCase();
+  const detectedClass = KEYWORD_TO_CLASS[kw] || null;
+  const classLabel = detectedClass
+    ? `${CLS_EMOJI[detectedClass] || ""} ${detectedClass}`
+    : entry.keyword || "?";
+  detInstructionEl.textContent = `Select all squares with ${classLabel}`;
+  detClassOverride = null;
+  detClassSelect.innerHTML = "";
+  const btnOrder = CLS_NAMES.filter(n => n !== "Other");
+  for (const name of btnOrder) {
+    const opt = document.createElement("option");
+    opt.value = name;
+    const emoji = CLS_EMOJI[name] || "";
+    opt.textContent = `${emoji} ${name}`;
+    if (name === detectedClass) opt.selected = true;
+    detClassSelect.appendChild(opt);
+  }
+  detClassOverride = detClassSelect.value || null;
+  detClassSelect.onchange = () => {
+    detClassOverride = detClassSelect.value || null;
+  };
 
   // Build grid cells
   const gs = detGridSize;
@@ -848,9 +901,22 @@ function renderDetPanel() {
     overlay.className = "det-cell-overlay";
     cell.appendChild(overlay);
 
-    cell.addEventListener("click", () => {
-      if (detUserPicks.has(i)) detUserPicks.delete(i);
-      else detUserPicks.add(i);
+    cell.addEventListener("mousedown", (e) => {
+      e.preventDefault();
+      detDragging = true;
+      // Drag mode: if cell is selected, drag deselects; otherwise selects
+      detDragSelecting = !detUserPicks.has(i);
+      if (detDragSelecting) detUserPicks.add(i);
+      else detUserPicks.delete(i);
+      detDragVisited.clear();
+      detDragVisited.add(i);
+      updateDetCellStates();
+    });
+    cell.addEventListener("mouseenter", () => {
+      if (!detDragging || detDragVisited.has(i)) return;
+      detDragVisited.add(i);
+      if (detDragSelecting) detUserPicks.add(i);
+      else detUserPicks.delete(i);
       updateDetCellStates();
     });
     detGridEl.appendChild(cell);
@@ -903,7 +969,7 @@ function updateDetStat() {
   const el = document.getElementById("stat-det");
   const done = detAnnotatedCount >= detTotalCount && detTotalCount > 0;
   const valueEl = el.querySelector(".stat-value");
-  if (valueEl) valueEl.textContent = `${detAnnotatedCount}/${detTotalCount}`;
+  if (valueEl) valueEl.textContent = `${detTotalCount - detAnnotatedCount}`;
   const iconEl = el.querySelector(".stat-icon");
   if (iconEl) iconEl.textContent = done ? "\u2705" : "\uD83D\uDD0D";
   const isActive = el.classList.contains("active-tab");
@@ -951,12 +1017,13 @@ async function detAccept() {
   if (detUserPicks.size === 0) {
     if (!confirm("No cells selected. Save as 'no matching objects'?")) return;
   }
+  const keyword = detClassOverride || entry.keyword;
   const resp = await fetch("/api/det/annotate", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       file: entry.file,
-      keyword: entry.keyword,
+      keyword,
       grid_type: entry.grid_type,
       ground_truth: [...detUserPicks].sort((a, b) => a - b),
     }),
@@ -1028,19 +1095,21 @@ function renderClsPanel() {
     clsConfWrap.appendChild(row);
   }
 
-  // Class buttons
+  // Class buttons (Other rendered last)
   clsButtonsWrap.innerHTML = "";
-  for (let i = 0; i < CLS_NAMES.length; i++) {
+  const btnOrder = CLS_NAMES.filter(n => n !== "Other").concat("Other");
+  const autoSuggested = clsSelectedLabel === tile.predicted_class;
+  for (const name of btnOrder) {
     const btn = document.createElement("button");
-    const isPredicted = tile.predicted_class === CLS_NAMES[i];
-    const isSelected = clsSelectedLabel === CLS_NAMES[i];
+    const isSelected = clsSelectedLabel === name;
     btn.className = "cls-btn" +
-      (isPredicted ? " predicted" : "") +
-      (isSelected ? " selected" : "");
-    btn.textContent = CLS_NAMES[i];
+      (isSelected && autoSuggested ? " suggested" : "") +
+      (isSelected && !autoSuggested ? " selected" : "");
+    const emoji = CLS_EMOJI[name] || "";
+    btn.textContent = `${emoji} ${name}`;
     btn.addEventListener("click", () => {
-      clsSelectedLabel = CLS_NAMES[i];
-      updateClsButtonStates();
+      clsSelectedLabel = name;
+      clsAccept();
     });
     clsButtonsWrap.appendChild(btn);
   }
@@ -1054,13 +1123,15 @@ function renderClsPanel() {
 function updateClsButtonStates() {
   const tile = clsFiltered[clsIndex];
   if (!tile) return;
+  const order = CLS_NAMES.filter(n => n !== "Other").concat("Other");
+  const autoSuggested = clsSelectedLabel === tile.predicted_class;
   const btns = clsButtonsWrap.querySelectorAll(".cls-btn");
   btns.forEach((btn, i) => {
-    const isPredicted = tile.predicted_class === CLS_NAMES[i];
-    const isSelected = clsSelectedLabel === CLS_NAMES[i];
+    const name = order[i];
+    const isSelected = clsSelectedLabel === name;
     btn.className = "cls-btn" +
-      (isPredicted ? " predicted" : "") +
-      (isSelected ? " selected" : "");
+      (isSelected && autoSuggested ? " suggested" : "") +
+      (isSelected && !autoSuggested ? " selected" : "");
   });
 }
 
@@ -1080,7 +1151,7 @@ function updateClsStat() {
   const el = document.getElementById("stat-cls");
   const done = clsReviewedCount >= clsTotalCount && clsTotalCount > 0;
   const valueEl = el.querySelector(".stat-value");
-  if (valueEl) valueEl.textContent = `${clsReviewedCount}/${clsTotalCount}`;
+  if (valueEl) valueEl.textContent = `${clsTotalCount - clsReviewedCount}`;
   const iconEl = el.querySelector(".stat-icon");
   if (iconEl) iconEl.textContent = done ? "\u2705" : "\uD83C\uDFF7\uFE0F";
   const isActive = el.classList.contains("active-tab");
@@ -1133,45 +1204,92 @@ async function clsAccept() {
   if (!tile || !clsSelectedLabel) return;
   const label = clsSelectedLabel;
   const filename = tile.file.split("/").pop();
-  const resp = await fetch("/api/cls/label", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ file: tile.file, label }),
-  });
-  if (!resp.ok) return;
   tile.reviewed = true;
   clsReviewedCount++;
-  const reviewedPath = `${label}/${filename}`;
-  clsHistory.unshift({
+  const entry = {
     tile,
     label,
-    imgSrc: `/api/cls/image/${reviewedPath}`,
-    reviewedPath,
+    imgSrc: `/api/cls/image/${tile.file}`,  // still in collected dir
+    reviewedPath: `${label}/${filename}`,
     originalPath: tile.file,
-  });
+    pending: true,
+  };
+  clsHistory.unshift(entry);
+  clsPending.push(entry);
   if (clsHistory.length > 20) clsHistory.pop();
+  // Flush oldest pending if buffer exceeded
+  while (clsPending.length > CLS_PENDING_BUFFER) {
+    await clsFlushOne();
+  }
   renderClsHistory();
+  updateFlushBtn();
   showStatus(`Labeled ${label}`, "success");
   clsAdvance();
 }
 
-async function clsUndo(entry) {
-  const resp = await fetch("/api/cls/undo", {
+async function clsFlushOne() {
+  if (clsPending.length === 0) return;
+  const entry = clsPending.shift();
+  if (!entry.pending) return;  // already flushed (shouldn't happen)
+  const resp = await fetch("/api/cls/label", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      reviewed_path: entry.reviewedPath,
-      original_path: entry.originalPath,
-    }),
+    body: JSON.stringify({ file: entry.originalPath, label: entry.label }),
   });
-  if (!resp.ok) {
-    showStatus("Undo failed", "error");
-    return;
+  if (resp.ok) {
+    entry.pending = false;
+    entry.imgSrc = `/api/cls/image/${entry.reviewedPath}`;
+  }
+}
+
+async function clsFlushAll() {
+  while (clsPending.length > 0) {
+    await clsFlushOne();
+  }
+  renderClsHistory();
+  updateFlushBtn();
+}
+
+function updateFlushBtn() {
+  const n = clsPending.length;
+  if (n === 0) {
+    clsFlushBtn.classList.add("hidden");
+  } else {
+    clsFlushBtn.classList.remove("hidden");
+    clsFlushBtn.textContent = `Save ${n} pending`;
+  }
+}
+
+clsFlushBtn.addEventListener("click", async () => {
+  await clsFlushAll();
+  updateFlushBtn();
+  showStatus("All pending labels saved", "success");
+});
+
+async function clsUndo(entry) {
+  if (entry.pending) {
+    // Still in pending buffer - just remove, no API call needed
+    clsPending = clsPending.filter(p => p !== entry);
+  } else {
+    // Already transferred - call undo API
+    const resp = await fetch("/api/cls/undo", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        reviewed_path: entry.reviewedPath,
+        original_path: entry.originalPath,
+      }),
+    });
+    if (!resp.ok) {
+      showStatus("Undo failed", "error");
+      return;
+    }
   }
   entry.tile.reviewed = false;
   clsReviewedCount--;
   clsHistory = clsHistory.filter(h => h !== entry);
   renderClsHistory();
+  updateFlushBtn();
   // Jump back to this tile
   const idx = clsFiltered.indexOf(entry.tile);
   if (idx >= 0) {
@@ -1188,11 +1306,14 @@ function renderClsHistory() {
   clsHistoryEl.innerHTML = "";
   for (const entry of clsHistory) {
     const item = document.createElement("div");
-    item.className = "cls-history-item";
-    item.title = `${entry.label} - click to undo`;
+    item.className = "cls-history-item" + (entry.pending ? " pending" : "");
+    item.title = entry.pending
+      ? `${entry.label} (pending) - click to undo`
+      : `${entry.label} - click to undo`;
+    const emoji = CLS_EMOJI[entry.label] || "";
     item.innerHTML =
       `<img src="${entry.imgSrc}" alt="${entry.label}" />` +
-      `<div class="cls-history-label">${entry.label}</div>`;
+      `<div class="cls-history-label">${emoji} ${entry.label}</div>`;
     item.addEventListener("click", () => clsUndo(entry));
     clsHistoryEl.appendChild(item);
   }
@@ -1231,6 +1352,8 @@ function switchMode(newMode) {
   // Block switching to fail if no entries
   if (newMode === "det" && !detHasEntries) return;
   if (newMode === "cls" && !clsHasTiles) return;
+  // Flush pending CLS labels when leaving CLS mode
+  if (mode === "cls" && newMode !== "cls") clsFlushAll();
   mode = newMode;
   location.hash = mode;
   tabs.forEach(t => t.classList.toggle("active", t.dataset.mode === mode));
@@ -1241,6 +1364,7 @@ function switchMode(newMode) {
   syncActiveTab();
   // Toggle canvas vs tool panels
   const isToolMode = mode === "det" || mode === "cls";
+  document.body.style.overflow = isToolMode ? "auto" : "hidden";
   canvas.classList.toggle("hidden", isToolMode);
   detPanel.classList.toggle("hidden", mode !== "det");
   clsPanel.classList.toggle("hidden", mode !== "cls");
@@ -1264,6 +1388,7 @@ function switchMode(newMode) {
   } else {
     resizeCanvas();
   }
+  if (mode === "det" || mode === "cls") refreshLabelStats();
 }
 
 tabs.forEach(tab => {
@@ -2505,14 +2630,65 @@ btnStart.addEventListener("click", startRecording);
 btnAccept.addEventListener("click", acceptRecording);
 btnDiscard.addEventListener("click", discardRecording);
 
+// ── Label stats table ──────────────────────────────────────────────────
+const clsStatsEl = document.getElementById("cls-stats");
+const detStatsEl = document.getElementById("det-stats");
+
+async function refreshLabelStats() {
+  try {
+    const resp = await fetch("/api/label-stats");
+    const data = await resp.json();
+    renderLabelStats(clsStatsEl, data.cls, "CLS");
+    renderLabelStats(detStatsEl, data.det, "DET");
+  } catch (_) { /* ignore */ }
+}
+
+function renderLabelStats(el, stats, label) {
+  if (!el) return;
+  const labeled = stats.labeled || {};
+  const pending = stats.pending || {};
+  const allClasses = new Set([...Object.keys(labeled), ...Object.keys(pending)]);
+  if (allClasses.size === 0) {
+    el.innerHTML = "";
+    return;
+  }
+  // Sort by labeled count ascending
+  const sorted = [...allClasses]
+    .filter(c => c !== "None")
+    .sort((a, b) => (labeled[a] || 0) - (labeled[b] || 0));
+
+  // Green >= target, yellow >= 50% of target, red < 50%
+  const target = label === "CLS" ? 100 : 50;
+  let html = `<table class="stats-table"><thead><tr><th>Class</th><th>Labeled</th><th>Pending</th></tr></thead><tbody>`;
+  let totalLabeled = 0, totalPending = 0;
+  for (const cls of sorted) {
+    const l = labeled[cls] || 0;
+    const p = pending[cls] || 0;
+    totalLabeled += l;
+    totalPending += p;
+    const emoji = CLS_EMOJI[cls] || "";
+    const level = l >= target ? "stat-good" : l >= target * 0.5 ? "stat-warn" : "stat-low";
+    html += `<tr class="${level}"><td>${emoji} ${cls}</td><td>${l}</td><td>${p}</td></tr>`;
+  }
+  html += `</tbody><tfoot><tr><td><strong>Total</strong></td><td><strong>${totalLabeled}</strong></td><td><strong>${totalPending}</strong></td></tr></tfoot></table>`;
+  el.innerHTML = html;
+}
+
+// Refresh stats on mode switch and periodically
+setInterval(refreshLabelStats, 30000);
+
 // ── Keyboard shortcuts ─────────────────────────────────────────────────
+document.addEventListener("mouseup", () => { detDragging = false; });
+
 document.addEventListener("keydown", (e) => {
   // Don't handle if typing in an input
   if (e.target.tagName === "INPUT" || e.target.tagName === "SELECT") return;
 
   if (e.code === "Space") {
     e.preventDefault();
-    if (mode !== "det" && mode !== "cls" && state === "ready") startRecording();
+    if (mode === "det") detAccept();
+    else if (mode === "cls") clsAccept();
+    else if (state === "ready") startRecording();
   } else if (e.code === "Enter") {
     e.preventDefault();
     if (mode === "det") detAccept();
@@ -2610,6 +2786,22 @@ btnDeleteAll.addEventListener("click", async () => {
   showStatus("Deleted everything", "success");
   await refreshRecordings();
   populateManage();
+});
+
+// Flush pending CLS labels on page unload
+window.addEventListener("beforeunload", () => {
+  if (clsPending.length === 0) return;
+  for (const entry of clsPending) {
+    navigator.sendBeacon(
+      "/api/cls/label",
+      new Blob(
+        [JSON.stringify({ file: entry.originalPath, label: entry.label })],
+        { type: "application/json" },
+      ),
+    );
+    entry.pending = false;
+  }
+  clsPending = [];
 });
 
 // ── Init ───────────────────────────────────────────────────────────────

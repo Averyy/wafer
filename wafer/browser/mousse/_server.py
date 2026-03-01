@@ -12,9 +12,10 @@ _CATEGORIES = ("idles", "paths", "holds", "drags", "slide_drags", "grids", "brow
 
 _COLLECTED_DET_DIR: Path | None = None
 _COLLECTED_CLS_DIR: Path | None = None
-_REVIEWED_CLS_DIR: Path | None = None
+_WAFER_CLS_DIR: Path | None = None
+_WAFER_DET_DIR: Path | None = None
 
-# Map reCAPTCHA keywords to CLS class names (Title Case, matching 57k dataset).
+# Map reCAPTCHA keywords to CLS class names (Title Case, matching CLS dataset).
 # Covers English keywords only since that's what metadata.jsonl stores.
 _KEYWORD_TO_CLASSNAME: dict[str, str] = {
     "bicycles": "Bicycle", "a bicycle": "Bicycle",
@@ -146,6 +147,18 @@ def _read_jsonl(filepath: Path) -> list[dict]:
     return entries
 
 
+def _count_labeled(dataset_dir: Path | None) -> dict[str, int]:
+    """Count labeled images per class in a dataset directory."""
+    counts: dict[str, int] = {}
+    if not dataset_dir or not dataset_dir.is_dir():
+        return counts
+    for cls_dir in dataset_dir.iterdir():
+        if cls_dir.is_dir():
+            n = sum(1 for f in cls_dir.iterdir() if f.suffix in (".jpg", ".png"))
+            counts[cls_dir.name] = n
+    return counts
+
+
 def _load_cls_tiles() -> dict:
     """Load collected CLS tiles with metadata and review status."""
     if not _COLLECTED_CLS_DIR or not _COLLECTED_CLS_DIR.is_dir():
@@ -153,14 +166,17 @@ def _load_cls_tiles() -> dict:
 
     metadata = _read_jsonl(_COLLECTED_CLS_DIR / "metadata.jsonl")
 
-    # Build set of already-reviewed files
+    # Build set of already-labeled files
     reviewed_files: set[str] = set()
-    if _REVIEWED_CLS_DIR and _REVIEWED_CLS_DIR.is_dir():
-        for cls_dir in _REVIEWED_CLS_DIR.iterdir():
+    if _WAFER_CLS_DIR and _WAFER_CLS_DIR.is_dir():
+        for cls_dir in _WAFER_CLS_DIR.iterdir():
             if cls_dir.is_dir():
                 for f in cls_dir.iterdir():
                     if f.suffix == ".jpg":
                         reviewed_files.add(f.name)
+
+    # Count labeled per class for priority sorting
+    cls_counts = _count_labeled(_WAFER_CLS_DIR)
 
     tiles = []
     for entry in metadata:
@@ -178,6 +194,16 @@ def _load_cls_tiles() -> dict:
             "exists": exists,
         })
 
+    # Sort unreviewed tiles: lowest labeled class count first
+    def _cls_sort_key(tile):
+        if tile["reviewed"]:
+            return (1, 0)  # reviewed tiles last
+        cls_name = tile.get("predicted_class", "Other")
+        count = cls_counts.get(cls_name, 0)
+        return (0, count)
+
+    tiles.sort(key=_cls_sort_key)
+
     reviewed_count = sum(1 for t in tiles if t["reviewed"])
     return {
         "tiles": tiles,
@@ -188,49 +214,36 @@ def _load_cls_tiles() -> dict:
 
 
 def _load_det_grids() -> dict:
-    """Load collected DET grids with metadata and annotation status."""
+    """Load unannotated DET grids from collected_det/."""
     if not _COLLECTED_DET_DIR or not _COLLECTED_DET_DIR.is_dir():
-        return {"grids": [], "total": 0, "annotated": 0, "has_grids": False}
+        return {"grids": [], "total": 0, "has_grids": False}
 
     metadata = _read_jsonl(_COLLECTED_DET_DIR / "metadata.jsonl")
-    annotations = _read_jsonl(_COLLECTED_DET_DIR / "annotations.jsonl")
 
-    # Map bare filename (uuid.jpg) to annotation
-    ann_map: dict[str, dict] = {}
-    for ann in annotations:
-        bare = ann.get("file", "").rsplit("/", 1)[-1]
-        ann_map[bare] = ann
+    # Count labeled per class for priority sorting
+    det_counts = _count_labeled(_WAFER_DET_DIR)
 
     grids = []
     for entry in metadata:
-        orig_file = entry.get("file")
-        if not orig_file:
-            continue  # Skip entries without images
-        bare = orig_file.rsplit("/", 1)[-1]
-        ann = ann_map.get(bare)
-
-        # Resolve current file location
-        if ann:
-            kw_folder = ann.get("keyword_folder", "")
-            current_file = f"{kw_folder}/{bare}" if kw_folder else orig_file
-        else:
-            current_file = orig_file
-
-        if not (_COLLECTED_DET_DIR / current_file).is_file():
+        filename = entry.get("file")
+        if not filename:
             continue
+        # Flat structure: file is just "uuid.jpg"
+        if not (_COLLECTED_DET_DIR / filename).is_file():
+            continue
+        grids.append(entry)
 
-        grids.append({
-            **entry,
-            "file": current_file,
-            "annotated": ann is not None,
-            "ground_truth": ann.get("ground_truth", []) if ann else [],
-        })
+    # Sort: lowest labeled class count first
+    def _det_sort_key(grid):
+        kw = (grid.get("keyword") or "").lower()
+        cls_name = _KEYWORD_TO_CLASSNAME.get(kw, "Other")
+        return det_counts.get(cls_name, 0)
 
-    annotated_count = sum(1 for g in grids if g["annotated"])
+    grids.sort(key=_det_sort_key)
+
     return {
         "grids": grids,
         "total": len(grids),
-        "annotated": annotated_count,
         "has_grids": len(grids) > 0,
     }
 
@@ -279,6 +292,41 @@ class MousseHandler(BaseHTTPRequestHandler):
             self._send_file(filepath, ct)
             return
 
+        if path == "/api/label-stats":
+            cls_counts = _count_labeled(_WAFER_CLS_DIR)
+            det_counts = _count_labeled(_WAFER_DET_DIR)
+            # Build set of already-labeled CLS filenames
+            cls_reviewed: set[str] = set()
+            if _WAFER_CLS_DIR and _WAFER_CLS_DIR.is_dir():
+                for d in _WAFER_CLS_DIR.iterdir():
+                    if d.is_dir():
+                        for f in d.iterdir():
+                            cls_reviewed.add(f.name)
+            # Count unlabeled CLS per predicted class
+            cls_pending: dict[str, int] = {}
+            if _COLLECTED_CLS_DIR and (_COLLECTED_CLS_DIR / "metadata.jsonl").is_file():
+                for entry in _read_jsonl(_COLLECTED_CLS_DIR / "metadata.jsonl"):
+                    fp = entry.get("file", "")
+                    fn = fp.rsplit("/", 1)[-1] if "/" in fp else fp
+                    if fn not in cls_reviewed:
+                        cls_name = entry.get("predicted_class", "Other")
+                        cls_pending[cls_name] = cls_pending.get(cls_name, 0) + 1
+            # Count unlabeled DET per keyword class
+            det_pending: dict[str, int] = {}
+            if _COLLECTED_DET_DIR and (_COLLECTED_DET_DIR / "metadata.jsonl").is_file():
+                for entry in _read_jsonl(_COLLECTED_DET_DIR / "metadata.jsonl"):
+                    kw = (entry.get("keyword") or "").lower()
+                    cls_name = _KEYWORD_TO_CLASSNAME.get(kw, "Other")
+                    det_pending[cls_name] = det_pending.get(cls_name, 0) + 1
+                for k, v in det_counts.items():
+                    if k in det_pending:
+                        det_pending[k] = max(0, det_pending[k] - v)
+            self._send_json({
+                "cls": {"labeled": cls_counts, "pending": cls_pending},
+                "det": {"labeled": det_counts, "pending": det_pending},
+            })
+            return
+
         if path == "/api/recordings":
             result = {}
             for cat in _CATEGORIES:
@@ -300,13 +348,12 @@ class MousseHandler(BaseHTTPRequestHandler):
             self._send_json(_load_det_grids())
             return
 
-        # /api/det/image/{subfolder}/{filename}
-        m = re.match(r"^/api/det/image/(.+)/(.+)$", path)
-        if m:
+        # /api/det/image/{filename} or /api/det/image/{sub}/{filename}
+        if path.startswith("/api/det/image/"):
             if not _COLLECTED_DET_DIR:
                 self._send_error(404, "DET dir not configured")
                 return
-            user_path = f"{m.group(1)}/{m.group(2)}"
+            user_path = path[len("/api/det/image/"):]
             filepath = _safe_resolve(_COLLECTED_DET_DIR, user_path)
             if not filepath or not filepath.is_file():
                 self._send_error(404, "Not found")
@@ -319,17 +366,16 @@ class MousseHandler(BaseHTTPRequestHandler):
             self._send_json(_load_cls_tiles())
             return
 
-        # /api/cls/image/{subfolder}/{filename}
-        m = re.match(r"^/api/cls/image/(.+)/(.+)$", path)
-        if m:
+        # /api/cls/image/{filename} or /api/cls/image/{sub}/{filename}
+        if path.startswith("/api/cls/image/"):
             if not _COLLECTED_CLS_DIR:
                 self._send_error(404, "Collected dir not configured")
                 return
-            user_path = f"{m.group(1)}/{m.group(2)}"
+            user_path = path[len("/api/cls/image/"):]
             filepath = _safe_resolve(_COLLECTED_CLS_DIR, user_path)
-            if (not filepath or not filepath.is_file()) and _REVIEWED_CLS_DIR:
-                # Check reviewed dir (for history thumbnails)
-                filepath = _safe_resolve(_REVIEWED_CLS_DIR, user_path)
+            if (not filepath or not filepath.is_file()) and _WAFER_CLS_DIR:
+                # Check wafer_cls dir (for history thumbnails)
+                filepath = _safe_resolve(_WAFER_CLS_DIR, user_path)
             if not filepath or not filepath.is_file():
                 self._send_error(404, "Not found")
                 return
@@ -374,29 +420,32 @@ class MousseHandler(BaseHTTPRequestHandler):
                 # Fallback: title-case the keyword
                 class_name = keyword.strip().title()
 
-            # Validate paths before any filesystem operations
+            # Validate source file
             src = _safe_resolve(_COLLECTED_DET_DIR, file_path)
             if not src or not src.is_file():
                 self._send_error(404, "Source file not found")
                 return
             bare = src.name
-            dest_dir = _safe_resolve(_COLLECTED_DET_DIR, class_name)
-            if not dest_dir:
-                self._send_error(400, "Invalid class name")
-                return
 
-            # Move from current location to class-named folder
-            dest_dir.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(src), str(dest_dir / bare))
+            # Copy to datasets/wafer_det/ (DET training data)
+            if _WAFER_DET_DIR:
+                det_out = _safe_resolve(
+                    _WAFER_DET_DIR, class_name,
+                )
+                if det_out:
+                    det_out.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(str(src), str(det_out / bare))
 
-            # Also copy full grid image to reviewed/ for CLS training
-            det_copy = dest_dir / bare
-            if det_copy.is_file() and _REVIEWED_CLS_DIR:
-                cls_dir = _safe_resolve(_REVIEWED_CLS_DIR, class_name)
+            # Copy to datasets/wafer_cls/ (valid CLS data)
+            if _WAFER_CLS_DIR:
+                cls_dir = _safe_resolve(
+                    _WAFER_CLS_DIR, class_name,
+                )
                 if cls_dir:
                     cls_dir.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(str(det_copy), str(cls_dir / bare))
+                    shutil.copy2(str(src), str(cls_dir / bare))
 
+            # Write annotation to wafer_det/
             annotation = {
                 "file": bare,
                 "keyword_folder": class_name,
@@ -404,9 +453,16 @@ class MousseHandler(BaseHTTPRequestHandler):
                 "grid_type": body.get("grid_type", ""),
                 "ground_truth": body.get("ground_truth", []),
             }
-            ann_path = _COLLECTED_DET_DIR / "annotations.jsonl"
+            if _WAFER_DET_DIR:
+                ann_path = _WAFER_DET_DIR / "annotations.jsonl"
+            else:
+                ann_path = _COLLECTED_DET_DIR / "annotations.jsonl"
+            ann_path.parent.mkdir(parents=True, exist_ok=True)
             with open(ann_path, "a") as f:
                 f.write(json.dumps(annotation) + "\n")
+
+            # Remove from collected queue
+            src.unlink()
             self._send_json({
                 "ok": True,
                 "dest": f"{class_name}/{bare}",
@@ -421,14 +477,14 @@ class MousseHandler(BaseHTTPRequestHandler):
             if not file_path or not label:
                 self._send_error(400, "Missing file or label")
                 return
-            if not _COLLECTED_CLS_DIR or not _REVIEWED_CLS_DIR:
+            if not _COLLECTED_CLS_DIR or not _WAFER_CLS_DIR:
                 self._send_error(400, "Dirs not configured")
                 return
             src = _safe_resolve(_COLLECTED_CLS_DIR, file_path)
             if not src or not src.is_file():
                 self._send_error(404, "Tile not found")
                 return
-            dest_dir = _safe_resolve(_REVIEWED_CLS_DIR, label)
+            dest_dir = _safe_resolve(_WAFER_CLS_DIR, label)
             if not dest_dir:
                 self._send_error(400, "Invalid label")
                 return
@@ -442,14 +498,14 @@ class MousseHandler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length))
             reviewed_path = body.get("reviewed_path", "")  # e.g. "Stair/uuid.jpg"
-            original_path = body.get("original_path", "")  # e.g. "_unlabeled/uuid.jpg"
+            original_path = body.get("original_path", "")  # e.g. "uuid.jpg"
             if not reviewed_path or not original_path:
                 self._send_error(400, "Missing paths")
                 return
-            if not _COLLECTED_CLS_DIR or not _REVIEWED_CLS_DIR:
+            if not _COLLECTED_CLS_DIR or not _WAFER_CLS_DIR:
                 self._send_error(400, "Dirs not configured")
                 return
-            src = _safe_resolve(_REVIEWED_CLS_DIR, reviewed_path)
+            src = _safe_resolve(_WAFER_CLS_DIR, reviewed_path)
             if not src or not src.is_file():
                 self._send_error(404, "Reviewed file not found")
                 return
@@ -568,13 +624,18 @@ def run_server(
     collected_det: Path | None = None,
     collected_cls: Path | None = None,
 ) -> None:
-    global _COLLECTED_DET_DIR, _COLLECTED_CLS_DIR, _REVIEWED_CLS_DIR  # noqa: PLW0603
+    global _COLLECTED_DET_DIR, _COLLECTED_CLS_DIR, _WAFER_CLS_DIR, _WAFER_DET_DIR  # noqa: PLW0603
     _COLLECTED_DET_DIR = collected_det
     _COLLECTED_CLS_DIR = collected_cls
     if collected_cls:
-        _REVIEWED_CLS_DIR = collected_cls.parent / "reviewed"
+        _WAFER_CLS_DIR = collected_cls.parent / "datasets" / "wafer_cls"
+    if collected_det:
+        _WAFER_DET_DIR = collected_det.parent / "datasets" / "wafer_det"
     server = HTTPServer(("127.0.0.1", port), MousseHandler)
-    print(f"Mousse server running on http://localhost:{port}")
+    url = f"http://localhost:{port}"
+    print(f"Mousse server running on {url}")
+    import webbrowser
+    webbrowser.open(url)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

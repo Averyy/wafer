@@ -126,7 +126,7 @@ def _collect_single_tile(
         # Pixel-level hash for reliable dedup against training data
         pixhash = hashlib.sha256(tile_100.tobytes()).hexdigest()
 
-        # Determine folder: predicted class for selected tiles, _unlabeled for rest
+        # Classify tile for metadata (prediction stored, not used for folder)
         if probs is not None:
             argmax = int(np.argmax(probs))
             confidence = float(probs[argmax])
@@ -139,19 +139,14 @@ def _collect_single_tile(
             top3 = []
             predicted_class = None
 
-        if is_match and predicted_class:
-            subfolder = predicted_class
-        else:
-            subfolder = "_unlabeled"
-
-        out_dir = Path(_COLLECT_CLS_DIR) / subfolder
+        out_dir = Path(_COLLECT_CLS_DIR)
         out_dir.mkdir(parents=True, exist_ok=True)
 
         filename = f"{uuid.uuid4()}.jpg"
         tile_100.save(out_dir / filename, "JPEG", quality=90)
 
         entry = {
-            "file": f"{subfolder}/{filename}",
+            "file": filename,
             "predicted_class": predicted_class,
             "predicted_index": argmax,
             "confidence": round(confidence, 4),
@@ -219,8 +214,8 @@ def _collect_det_grid(
     if not _COLLECT_DET_DIR:
         return
     try:
-        unlabeled = Path(_COLLECT_DET_DIR) / "_unlabeled"
-        unlabeled.mkdir(parents=True, exist_ok=True)
+        out_dir = Path(_COLLECT_DET_DIR)
+        out_dir.mkdir(parents=True, exist_ok=True)
 
         img_name = None
         h = None
@@ -235,10 +230,10 @@ def _collect_det_grid(
                     return
                 _seen_hashes.add(h)
             img_name = f"{uuid.uuid4()}.jpg"
-            (unlabeled / img_name).write_bytes(image_bytes)
+            (out_dir / img_name).write_bytes(image_bytes)
 
         entry = {
-            "file": f"_unlabeled/{img_name}" if img_name else None,
+            "file": img_name,
             "keyword": keyword,
             "grid_type": grid_type,
             "outcome": outcome,

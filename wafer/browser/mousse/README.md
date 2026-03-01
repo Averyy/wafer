@@ -76,28 +76,36 @@ Simulate exploring a page -move mouse around naturally AND scroll up/down. Press
 
 ### DET (Detection Grid Annotation)
 
-Annotate 4x4 (and 3x3) reCAPTCHA grid images collected during live solves. The solver saves full grid images with metadata (keyword, outcome, model picks) to `collected_det/`. DET mode shows each grid with the model's cell selections overlaid, and you click cells to mark the ground truth.
+Annotate 4x4 (and 3x3) reCAPTCHA grid images collected during live solves or the bulk collector. DET mode shows each grid with the original keyword, and you click cells to mark the ground truth.
 
+- Click cells to toggle, or click+drag across multiple cells
 - Green cells = your picks, red cells = model-only picks, amber = both agree
+- Class override dropdown lets you correct the keyword if Google's label is wrong (e.g. image shows a bicycle but keyword says "motorcycles")
 - Enter = save annotation, Esc = skip
 - On annotation:
-  1. Grid moved to `collected_det/{ClassName}/` (Title Case, e.g. `Bicycle/`, `Traffic Light/`)
-  2. Ground truth saved to `annotations.jsonl`
-  3. Full grid image auto-copied to `reviewed/{ClassName}/` for CLS retraining
-- Unknown keywords from Google are auto-collected with images for future annotation
+  1. Grid copied to `datasets/wafer_det/{ClassName}/`, ground truth saved to `datasets/wafer_det/annotations.jsonl`
+  2. Grid also copied to `datasets/wafer_cls/{ClassName}/` for CLS retraining
+  3. Grid removed from `collected_det/` queue
+
+- **Priority ordering**: grids are sorted by labeled class count (ascending) so underrepresented classes appear first
+- **Stats table** at the bottom shows per-class labeled/pending counts with color coding (green/yellow/red)
 
 Tab is disabled when no grids are available. Populate by running the collector (`uv run python training/collect.py`) or the reCAPTCHA solver with collection enabled (`WAFER_COLLECT_DET` env var or default path).
 
 ### CLS (Classification Tile Labeling)
 
-Label individual 3x3 reCAPTCHA tiles collected during live solves. The solver splits each 3x3 grid into 9 tiles and saves them with model predictions (keyword, top-3 confidence, predicted class) to `collected_cls/`. CLS mode shows each tile with confidence bars and 17 class buttons (16 object classes + None for distractors).
+Label individual 3x3 reCAPTCHA tiles collected during live solves or the bulk collector. CLS mode shows each tile with confidence bars and 16 emoji-labeled class buttons (Other is last, for tiles that don't match any category).
 
-The bulk collector (`training/collect.py`) auto-splits 3x3 grids into individual tiles on save, so collected tiles are ready for CLS annotation immediately.
+The bulk collector (`training/collect.py`) auto-splits 3x3 grids into individual tiles on save, so collected tiles are ready for CLS annotation immediately. Run `predict_cls.py` after collecting to add model predictions.
 
-- Click a class button to select, Enter to confirm
+- **Auto-suggest**: model's predicted class is pre-selected (half-opacity green). Press Enter/Space to approve, or click a different button to override (full green, accepts immediately).
 - S = skip tile, D = delete tile
-- History panel at bottom shows recent labels as thumbnails; click to undo (moves file back)
-- Labeled tiles are moved to `reviewed/{ClassName}/` for training data
+- 3-item pending buffer: the last 3 labels stay pending (yellow border in history) before being transferred. Click a pending item to undo instantly without an API call. Already-transferred items can still be undone (calls the undo API).
+- "Save N pending" button appears below history when items are buffered, hidden when empty
+- Pending labels also flush automatically on tab switch or page close
+- Labeled tiles are moved to `datasets/wafer_cls/{ClassName}/`
+- **Priority ordering**: tiles are sorted by labeled class count (ascending) so underrepresented classes appear first
+- **Stats table** at the bottom shows per-class labeled/pending counts with color coding (green/yellow/red)
 
 Tab is disabled when no tiles are available.
 
@@ -129,9 +137,9 @@ t,dx,dy,scroll_y
 
 | Key | Action |
 |-----|--------|
-| Space | Start recording |
-| Enter | Accept recording / save DET annotation / confirm CLS label |
-| Escape | Discard / close modal / skip DET grid |
+| Space | Start recording / confirm CLS label / save DET annotation |
+| Enter | Accept recording / confirm CLS label / save DET annotation |
+| Escape | Discard / close modal / skip DET grid / skip CLS tile |
 | S | Skip CLS tile |
 | D | Delete CLS tile |
 
