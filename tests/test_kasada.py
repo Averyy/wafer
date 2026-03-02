@@ -19,14 +19,37 @@ from wafer.browser import SolveResult
 
 
 class TestGenerateCD:
-    def test_returns_valid_json(self):
+    def test_returns_valid_json_with_correct_fields(self):
         cd = generate_cd(1707644948142)
         data = json.loads(cd)
+        assert "workTime" in data
+        assert "id" in data
         assert "answers" in data
         assert "duration" in data
         assert "d" in data
         assert "st" in data
         assert "rst" in data
+
+    def test_id_is_32_char_hex(self):
+        cd = generate_cd(1707644948142)
+        data = json.loads(cd)
+        assert len(data["id"]) == 32
+        int(data["id"], 16)  # should not raise
+
+    def test_d_in_range(self):
+        cd = generate_cd(1707644948142)
+        data = json.loads(cd)
+        assert 1400 <= data["d"] <= 2700
+
+    def test_duration_is_float(self):
+        cd = generate_cd(1707644948142)
+        data = json.loads(cd)
+        assert isinstance(data["duration"], float)
+
+    def test_rst_equals_st_plus_d(self):
+        cd = generate_cd(1707644948142)
+        data = json.loads(cd)
+        assert data["rst"] == data["st"] + data["d"]
 
     def test_answers_are_positive_ints(self):
         cd = generate_cd(1707644948142)
@@ -36,28 +59,37 @@ class TestGenerateCD:
             assert isinstance(answer, int)
             assert answer > 0
 
-    def test_answers_satisfy_difficulty(self):
+    def test_hash_chaining_satisfies_difficulty(self):
+        """Verify the chained hash algorithm matches the spec."""
         st = 1707644948142
         difficulty = 10
         subchallenges = 2
-        threshold = (2**52 * subchallenges) // difficulty
+        target = difficulty / subchallenges
 
         cd = generate_cd(st, difficulty=difficulty, subchallenges=subchallenges)
         data = json.loads(cd)
 
+        # Replay the hash chain to verify answers
+        challenge_id = data["id"]
+        hash_val = hashlib.sha256(
+            f"tp-v2-input, {st}, {challenge_id}".encode()
+        ).hexdigest()
+
         for answer in data["answers"]:
-            input_str = f"tp-v2-input, {st}, {answer}"
-            h = hashlib.sha256(input_str.encode()).hexdigest()
-            value = int(h[:13], 16)
-            assert value <= threshold
+            h = hashlib.sha256(
+                f"{answer}, {hash_val}".encode()
+            ).hexdigest()
+            score = 0x10000000000000 / (int(h[:13], 16) + 1)
+            assert score >= target
+            hash_val = h  # chain
 
     def test_different_each_call(self):
         cd1 = generate_cd(1707644948142)
         cd2 = generate_cd(1707644948142)
         data1 = json.loads(cd1)
         data2 = json.loads(cd2)
-        # Answers should differ (astronomically unlikely to match)
-        assert data1["answers"] != data2["answers"]
+        # Different challenge_id each time
+        assert data1["id"] != data2["id"]
 
     def test_st_preserved(self):
         st = 1707644948142
@@ -68,25 +100,9 @@ class TestGenerateCD:
     def test_custom_difficulty(self):
         cd = generate_cd(12345, difficulty=5, subchallenges=3)
         data = json.loads(cd)
-        assert data["d"] == 5
         assert len(data["answers"]) == 3
-
-    def test_hash_difficulty_known_values(self):
-        """Verify difficulty formula: 2^52 / (hash_value + 1) >= d/sc."""
-        st = 1707644948142
-        difficulty = 10
-        subchallenges = 2
-        target_ratio = difficulty / subchallenges
-
-        cd = generate_cd(st, difficulty=difficulty, subchallenges=subchallenges)
-        data = json.loads(cd)
-
-        for answer in data["answers"]:
-            input_str = f"tp-v2-input, {st}, {answer}"
-            h = hashlib.sha256(input_str.encode()).hexdigest()
-            value = int(h[:13], 16)
-            score = 2**52 / (value + 1)
-            assert score >= target_ratio
+        # d is the random offset, not the difficulty param
+        assert 1400 <= data["d"] <= 2700
 
 
 # ---------------------------------------------------------------------------
@@ -162,8 +178,12 @@ class TestKasadaRetryIntegration:
         _sessions.clear()
 
     @patch("time.sleep")
-    def test_kasada_browser_solve_then_cd_attached(self, mock_sleep):
-        """Full flow: 429 + kasada → browser solve → retry with CT+CD."""
+    def test_kasada_browser_solve_then_retry(self, mock_sleep):
+        """Full flow: 429 + kasada → browser solve → retry with cookies only.
+
+        CT+CD headers are NOT injected because x-kpsdk-h HMAC is
+        unavailable. Sending CT+CD without H causes server rejection.
+        """
         mock_browser = MockBrowserSolver(
             result=SolveResult(
                 cookies=[
@@ -203,16 +223,10 @@ class TestKasadaRetryIntegration:
             "kasada",
         )
 
-        # Verify CT+CD headers were attached on retry
+        # CT+CD NOT injected (no H HMAC available)
         retry_headers = mock_client.request_log[1][2]["headers"]
-        assert "x-kpsdk-ct" in retry_headers
-        assert retry_headers["x-kpsdk-ct"] == "test-ct-token"
-        assert "x-kpsdk-cd" in retry_headers
-
-        # Verify CD is valid JSON with correct ST
-        cd_data = json.loads(retry_headers["x-kpsdk-cd"])
-        assert cd_data["st"] == 1707644948142
-        assert len(cd_data["answers"]) == 2
+        assert "x-kpsdk-ct" not in retry_headers
+        assert "x-kpsdk-cd" not in retry_headers
 
     @patch("time.sleep")
     def test_kasada_429_not_treated_as_rate_limit(self, mock_sleep):
@@ -288,8 +302,8 @@ class TestKasadaRetryIntegration:
         assert mock_browser.solve_calls[0][1] == "kasada"
 
     @patch("time.sleep")
-    def test_subsequent_requests_reuse_cached_ct(self, mock_sleep):
-        """After solve, subsequent requests use cached CT + fresh CD."""
+    def test_subsequent_requests_no_ct_cd_without_hmac(self, mock_sleep):
+        """Cached session does NOT inject CT+CD (no H HMAC available)."""
         _sessions.clear()
         store_session("example.com", "cached-ct", 1707644948142, [])
 
@@ -301,10 +315,10 @@ class TestKasadaRetryIntegration:
         resp = session.request("GET", "https://example.com/page")
         assert resp.status_code == 200
 
-        # First request should have CT+CD from cache
+        # CT+CD NOT injected (would need x-kpsdk-h HMAC)
         req_headers = mock_client.request_log[0][2]["headers"]
-        assert req_headers["x-kpsdk-ct"] == "cached-ct"
-        assert "x-kpsdk-cd" in req_headers
+        assert "x-kpsdk-ct" not in req_headers
+        assert "x-kpsdk-cd" not in req_headers
 
     @patch("time.sleep")
     def test_no_kasada_headers_without_session(self, mock_sleep):

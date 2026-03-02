@@ -1,6 +1,6 @@
 """DataDome challenge solver.
 
-Handles three DataDome interstitial types:
+Handles four DataDome interstitial types:
 
 1. **Auto-resolve** — DD's WASM PoW runs in the background and sets
    the ``datadome`` cookie automatically.  No interaction needed.
@@ -10,6 +10,9 @@ Handles three DataDome interstitial types:
    inside ``#ddv1-captcha-container``.  CV detects the notch offset in
    the background canvas, then drags the handle to the correct position
    using mousse recordings.
+4. **Slide-right** — A "slide right to secure your access" slider
+   (Dec 2025+).  No canvas/puzzle - just drag the handle to the right
+   end of the track.
 """
 
 import base64
@@ -122,6 +125,17 @@ def _get_slider_dims(dd_frame) -> dict | None:
         return None
 
 
+def _get_track_width(dd_frame) -> float | None:
+    """Get the sliderContainer track width in CSS pixels."""
+    try:
+        return dd_frame.evaluate("""() => {
+            const track = document.querySelector('.sliderContainer');
+            return track ? track.offsetWidth : null;
+        }""")
+    except Exception:
+        return None
+
+
 def _check_slider_result(dd_frame) -> bool | None:
     """Check DD slider result.  True=solved, False=failed, None=pending."""
     try:
@@ -137,19 +151,85 @@ def _check_slider_result(dd_frame) -> bool | None:
         return None
 
 
+def _drag_to_target(solver, page, dd_frame, state, box, end_x, end_y):
+    """Move to handle center and drag to (end_x, end_y)."""
+    handle_cx = box["x"] + box["width"] / 2
+    handle_cy = box["y"] + box["height"] / 2
+
+    try:
+        solver._replay_path(
+            page,
+            state.current_x
+            if state
+            else random.uniform(400, 800),
+            state.current_y
+            if state
+            else random.uniform(200, 400),
+            handle_cx,
+            handle_cy,
+        )
+    except Exception:
+        page.mouse.move(handle_cx, handle_cy)
+
+    time.sleep(random.uniform(0.1, 0.3))
+    solver._replay_drag(page, handle_cx, handle_cy, end_x, end_y)
+
+    # Check result (sliderContainer_success / _fail classes)
+    for _ in range(10):
+        time.sleep(0.3)
+        result = _check_slider_result(dd_frame)
+        if result is True:
+            return True
+        if result is False:
+            return False
+
+    # No clear result - let the cookie check in the main loop decide
+    return True
+
+
+def _try_slide_right(solver, page, dd_frame, state, box) -> bool:
+    """Slide-right challenge: drag handle to right end of track."""
+    track_width = _get_track_width(dd_frame)
+    if not track_width:
+        logger.debug("DD slide-right: could not read track width")
+        return False
+
+    handle_w = box["width"]
+    # Drag to the end of the track (tiny random variance)
+    travel = track_width - handle_w - random.uniform(0, 1)
+    if travel <= 0:
+        return False
+
+    handle_cx = box["x"] + handle_w / 2
+    handle_cy = box["y"] + box["height"] / 2
+    end_x = handle_cx + travel
+    end_y = handle_cy
+
+    logger.info(
+        "DD slide-right: track=%d handle=%d travel=%.1fpx "
+        "(%.0f,%.0f)->(%.0f,%.0f)",
+        track_width, handle_w, travel,
+        handle_cx, handle_cy, end_x, end_y,
+    )
+
+    ok = _drag_to_target(solver, page, dd_frame, state, box, end_x, end_y)
+    if ok:
+        logger.info("DD slide-right solved!")
+    else:
+        logger.info("DD slide-right rejected")
+    return ok
+
+
 def _try_drag_slider(solver, page, dd_frame, state) -> bool:
-    """Solve DataDome puzzle slider using CV + mousse drag replay.
+    """Solve DataDome slider challenge.
 
-    The slider is a jigsaw puzzle based on ArgoZhang/SliderCaptcha.
-    The handle (``.slider`` inside ``.sliderContainer``) drags a
-    puzzle piece canvas to match a notch in the background canvas.
+    Handles two slider variants:
 
-    Block-to-handle mapping (from ArgoZhang source)::
-
-        blockLeft = (w - 60) / (w - 40) * moveX
-
-    where ``w`` is the widget width and ``moveX`` is handle travel.
-    Verification passes when ``|blockLeft - target_x| < 5px``.
+    1. **Jigsaw puzzle** (ArgoZhang/SliderCaptcha) - two canvases inside
+       ``#ddv1-captcha-container``.  CV detects the notch offset, then
+       drags the handle to the matching position.
+    2. **Slide-right** - no canvases, just drag the handle to the right
+       end of the track.
     """
     try:
         handle = dd_frame.locator(".sliderContainer .slider")
@@ -165,10 +245,15 @@ def _try_drag_slider(solver, page, dd_frame, state) -> bool:
 
         # Extract puzzle images from canvas elements
         bg_png, piece_png = _extract_puzzle_images(dd_frame)
-        if not bg_png or not piece_png:
-            logger.debug("DD: No puzzle images extracted")
-            return False
 
+        # No canvases -> slide-right variant
+        if not bg_png or not piece_png:
+            logger.debug("DD: No puzzle canvases, trying slide-right")
+            return _try_slide_right(
+                solver, page, dd_frame, state, box
+            )
+
+        # Jigsaw puzzle path
         logger.debug(
             "DD puzzle images: bg=%d bytes, piece=%d bytes",
             len(bg_png), len(piece_png),
@@ -223,41 +308,14 @@ def _try_drag_slider(solver, page, dd_frame, state) -> bool:
             handle_travel, handle_cx, handle_cy, end_x, end_y,
         )
 
-        # Mouse replay: path to handle, then drag with mousse recordings
-        try:
-            solver._replay_path(
-                page,
-                state.current_x
-                if state
-                else random.uniform(400, 800),
-                state.current_y
-                if state
-                else random.uniform(200, 400),
-                handle_cx,
-                handle_cy,
-            )
-        except Exception:
-            page.mouse.move(handle_cx, handle_cy)
-
-        time.sleep(random.uniform(0.1, 0.3))
-        solver._replay_drag(
-            page, handle_cx, handle_cy, end_x, end_y
+        ok = _drag_to_target(
+            solver, page, dd_frame, state, box, end_x, end_y
         )
-
-        # Check result (sliderContainer_success / _fail classes)
-        for _ in range(10):
-            time.sleep(0.3)
-            result = _check_slider_result(dd_frame)
-            if result is True:
-                logger.info("DD puzzle slider solved!")
-                return True
-            if result is False:
-                logger.info("DD puzzle slider rejected (wrong pos)")
-                return False
-
-        # No clear result — let the cookie check in the main loop decide
-        logger.debug("DD puzzle slider: no class result after 3s")
-        return True
+        if ok:
+            logger.info("DD puzzle slider solved!")
+        else:
+            logger.info("DD puzzle slider rejected (wrong pos)")
+        return ok
     except Exception:
         logger.debug("DD slider drag failed", exc_info=True)
         return False

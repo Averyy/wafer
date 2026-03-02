@@ -60,35 +60,55 @@ def get_session(domain: str) -> KasadaSession | None:
     return session
 
 
+def _hash_difficulty(h: str) -> float:
+    """Compute hash difficulty: 2^52 / (parseInt(h[0:13], 16) + 1)."""
+    return 0x10000000000000 / (int(h[:13], 16) + 1)
+
+
 def generate_cd(
     st: int, difficulty: int = 10, subchallenges: int = 2
 ) -> str:
     """Generate a Kasada CD (proof-of-work) token.
 
-    Pure SHA-256 hash grinding with "tp-v2-input" platform string.
-    Returns a JSON string suitable for the x-kpsdk-cd header.
+    Pure SHA-256 hash grinding with "tp-v2-input" platform string and
+    hash chaining between subchallenges. Returns a JSON string suitable
+    for the x-kpsdk-cd header.
+
+    Algorithm (from Fweak gist / tramodule Kasada-Solver):
+    1. Generate random 32-hex challenge_id
+    2. Initial hash = SHA256("tp-v2-input, {st}, {challenge_id}")
+    3. Per subchallenge: iterate nonces from 1, hash "{nonce}, {hash_val}",
+       chain hash_val = h when difficulty met
     """
-    start = time.monotonic()
-    threshold = (2**52 * subchallenges) // difficulty
+    challenge_id = random.randbytes(16).hex()
+    hash_val = hashlib.sha256(
+        f"tp-v2-input, {st}, {challenge_id}".encode()
+    ).hexdigest()
+
+    target = difficulty / subchallenges
     answers = []
 
     for _ in range(subchallenges):
+        nonce = 1
         while True:
-            nonce = random.randint(1, 2**31)
-            input_str = f"tp-v2-input, {st}, {nonce}"
-            h = hashlib.sha256(input_str.encode()).hexdigest()
-            value = int(h[:13], 16)
-            if value <= threshold:
+            h = hashlib.sha256(
+                f"{nonce}, {hash_val}".encode()
+            ).hexdigest()
+            if _hash_difficulty(h) >= target:
                 answers.append(nonce)
+                hash_val = h  # chain for next subchallenge
                 break
+            nonce += 1
 
-    work_time = int((time.monotonic() - start) * 1000)
+    d = random.randint(1400, 2700)
 
     payload = {
+        "workTime": int(time.time() * 1000) - d,
+        "id": challenge_id,
         "answers": answers,
-        "duration": work_time,
-        "d": difficulty,
+        "duration": round(random.uniform(2.0, 8.0), 1),
+        "d": d,
         "st": st,
-        "rst": int(time.time() * 1000),
+        "rst": st + d,
     }
     return json.dumps(payload, separators=(",", ":"))

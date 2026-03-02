@@ -983,6 +983,37 @@ class BrowserSolver:
                             len(cookies),
                         )
 
+                # Kasada passthrough: after solving, the page
+                # auto-reloads to real content. Capture it since
+                # cookie replay from rnet fails (TLS-bound _abck).
+                if (
+                    solved
+                    and captured is None
+                    and challenge_type == "kasada"
+                ):
+                    try:
+                        html = page.content()
+                        if len(html) > 1024 and "kpsdk" not in html[:500].lower():
+                            body = html.encode("utf-8")
+                            captured = CapturedResponse(
+                                url=page.url,
+                                status=200,
+                                headers={"content-type": "text/html; charset=utf-8"},
+                                body=body,
+                            )
+                            logger.info(
+                                "Kasada passthrough at %s "
+                                "(%d bytes, %d cookies)",
+                                page.url,
+                                len(body),
+                                len(cookies),
+                            )
+                    except Exception:
+                        logger.debug(
+                            "Kasada passthrough capture failed",
+                            exc_info=True,
+                        )
+
                 if solved:
                     logger.info(
                         "Browser solved %s challenge at %s "

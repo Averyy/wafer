@@ -199,12 +199,12 @@ Requires browser solver for initial solve, then TLS client replays cached cookie
 
 ### Kasada
 
-Kasada solver: browser solve extracts CT token from ips.js/p.js response, cookies provide session auth. CD (proof-of-work) requires ST from /tl endpoint -not all deployments provide it.
-
-**Validation gap**: No site found that returns `x-kpsdk-st`. The CT+CD per-request header injection path (`generate_cd()`) is unit-tested but has zero live validation. Both confirmed sites use cookie-only auth (no ST). Looking for a Kasada deployment with ST to validate the full flow -see `ref-kasada.md` "Open: ST/CD Flow Validation".
+Kasada solver: browser solve extracts CT token from ips.js/p.js response, cookies provide session auth. CD (proof-of-work) requires ST from /tl endpoint -not all deployments provide it. Sites with dual Akamai+Kasada (e.g. Chewy) use Kasada passthrough (browser captures page content after solve) because Akamai _abck cookies are TLS-bound and can't be replayed.
 
 | URL | Challenge Type | Status | Notes |
 |---|---|---|---|
+| `chewy.com` | Kasada + Akamai | browser-solve | 2026-03-02: Browser-solve verified. 429→browser→kasada passthrough→200 2.1MB. Dual-WAF: Akamai behavioral on outer layer, Kasada underneath. Full CT+CD+ST flow (ST returned from /tl). Cookie replay fails (_abck TLS-bound), uses Kasada passthrough. |
+| `chewy.com/nummy-tum-tum-pure-organic-pumpkin/dp/35533` | Kasada + Akamai | browser-solve | 2026-03-02: Browser-solve verified. Akamai behavioral→Kasada→passthrough→200 2.7MB. Product page hits Akamai first, then Kasada. Dual browser solve works via per-challenge-type tracking. |
 | `realestate.com.au` | Kasada (server-side) | browser-solve | 2026-02-21: Browser-solve verified. 429→browser→CT+cookies→200 626KB. CT from ips.js (no ST), cookie auth. |
 | `hyatt.com` | Kasada (server-side) | browser-solve | 2026-02-21: Browser-solve verified. 429→browser→CT+cookies→200 41KB. CT from ips.js (no ST), 43 cookies. |
 | `scheels.com` | Kasada (client-side) | pass | 2026-02-21: 200 804KB via TLS. Kasada is client-side only |
@@ -338,7 +338,7 @@ Wafer has **no Arkose Labs solver**. Arkose presents 3D puzzle CAPTCHAs (rotate,
 | **PerimeterX** (press-and-hold) | Yes | 21 | Browser solve with recorded mouse input. **SOLVED** on wayfair. |
 | **AWS WAF** | Yes | 6 | Browser solve for JS challenge. |
 | **Imperva** | Yes | 6 | Browser solve + cookie replay. Handles modern reese84, legacy ___utmvc, and classic incap_ses. |
-| **Kasada** | Yes | 7 | Browser solve extracts CT from ips.js/p.js. Cookie-based auth confirmed on realestate.com.au. CD (PoW) needs ST from /tl. |
+| **Kasada** | Yes | 9 | Browser solve extracts CT from ips.js/p.js. Cookie auth for simple deployments. Passthrough for dual-WAF (Chewy: Akamai+Kasada). CD PoW rewritten to match spec (hash chaining). |
 | **F5 Shape** | Yes | 3 | Browser solve -passive wait for istlWasHere interstitial to clear. |
 | **GeeTest v4** (slide) | Yes | 4 | Browser solve with CV notch detection + recorded mouse replay. **SOLVED** 12/12+ on demo. bilibili NOT GeeTest; aerlingus is GeeTest v3. |
 | **hCaptcha** (checkbox) | Yes | 1 | Browser solve -checkbox click + token poll. Image escalation detected, not solved. |

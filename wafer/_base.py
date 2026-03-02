@@ -11,8 +11,7 @@ from rnet import CertStore, Emulation, Method
 
 from wafer._cookies import CookieCache
 from wafer._fingerprint import FingerprintManager
-from wafer._kasada import generate_cd
-from wafer._kasada import get_session as get_kasada_session
+from wafer._kasada import get_session as get_kasada_session  # noqa: F401
 from wafer._opera_mini import OperaMiniIdentity
 from wafer._profiles import Profile
 from wafer._ratelimit import RateLimiter
@@ -511,14 +510,15 @@ class BaseSession:
                     "Auto-Referer: %s", self._last_url[domain]
                 )
 
-        # Kasada: inject CT + CD if domain has active session with
-        # valid ST. Sending CT without CD is worse than neither —
-        # Kasada rejects unaccompanied tokens. Cookie-based auth
-        # (without CT/CD headers) works for some deployments.
-        kasada = get_kasada_session(domain)
-        if kasada and kasada.st:
-            merged["x-kpsdk-ct"] = kasada.ct
-            merged["x-kpsdk-cd"] = generate_cd(kasada.st)
+        # Kasada: CT+CD headers require x-kpsdk-h HMAC to be valid.
+        # Without H, sending CT+CD causes server rejection (worse
+        # than cookies alone). Cookie-only auth works for most
+        # deployments; passthrough handles the rest. CT/ST are
+        # still captured and cached for future H generation.
+        # kasada = get_kasada_session(domain)
+        # if kasada and kasada.st:
+        #     merged["x-kpsdk-ct"] = kasada.ct
+        #     merged["x-kpsdk-cd"] = generate_cd(kasada.st)
 
         # Per-request overrides (last to win)
         if extra:

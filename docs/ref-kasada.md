@@ -6,7 +6,7 @@
 
 **Browser solve (CT extraction)**: Done. Patchright navigates to protected URL, response listener intercepts `x-kpsdk-ct` from ips.js/p.js response. 10-second post-CT settle time ensures cookies are fully set.
 
-**CD generation (per-request PoW)**: Done. Pure Python SHA-256 (~30 LOC in `wafer/_kasada.py`). Generates fresh `x-kpsdk-cd` per request in ~1ms.
+**CD generation (per-request PoW)**: Done. Pure Python SHA-256 with hash chaining (`wafer/_kasada.py`). Generates fresh `x-kpsdk-cd` per request in ~1ms. Algorithm matches Fweak gist / tramodule spec (initial hash from challenge_id, sequential nonces, hash chaining between subchallenges).
 
 **Integration**: Done. Session cache with 30-min TTL, CT+CD header injection in `_build_headers()`, cookie-only fallback when ST=0.
 
@@ -18,11 +18,11 @@
 - CDP console detection mitigation -resolved by Patchright (removes `Runtime.enable` + `Console.enable`) and Chrome V8 engine patch (Chrome 137+, May 2025). Solver works without any mitigation code.
 - Full VM reimplementation -not justified. Browser-for-CT + Python-CD architecture is excellent. VM engine is achievable but browser API mocks (~460 LOC) require ongoing monthly maintenance as Kasada adds fingerprint checks. No public working implementation exists.
 
-## Open: ST/CD Flow Validation
+## ST/CD Flow Validation
 
-**The CT+CD per-request header injection path has never been validated against a real Kasada deployment.** Both confirmed server-side sites (realestate.com.au, hyatt.com) return CT but no ST from ips.js. Without ST, `generate_cd()` is never called and only cookie-based auth is used.
+**CD algorithm rewritten (Mar 2026)** to match the Fweak gist / tramodule Kasada-Solver spec exactly: initial hash from random challenge_id, sequential nonces starting from 1, hash chaining between subchallenges, correct output format (`workTime`, `id`, `answers`, `duration`, `d`, `st`, `rst`). The previous implementation used a different (incorrect) algorithm with random large nonces and no hash chaining.
 
-The CD code is unit-tested (`tests/test_kasada.py::TestGenerateCD`) and the algorithm matches the public spec (Fweak gist, Feb 2024), but end-to-end proof against a real WAF is missing.
+Unit-tested (`tests/test_kasada.py::TestGenerateCD`) with hash chain replay verification.
 
 ### 2026-02-23 Investigation: Twitch Integrity
 

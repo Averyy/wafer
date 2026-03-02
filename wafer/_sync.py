@@ -256,7 +256,9 @@ class SyncSession(BaseSession):
                         "raw": raw,
                         "url": url,
                         "expires": (
-                            0.0 if expires < 0 else float(expires)
+                            time.time() + 86400
+                            if expires <= 0
+                            else float(expires)
                         ),
                         "last_used": time.time(),
                     }
@@ -417,7 +419,7 @@ class SyncSession(BaseSession):
         domain = extract_domain(url) or url
         current_url = url
 
-        browser_attempted = False
+        browser_attempted_type: str | None = None
         redirects_followed = 0
 
         logger.debug("%s %s", method, url)
@@ -526,7 +528,7 @@ class SyncSession(BaseSession):
             was_retried = (
                 state.normal_retries > 0
                 or state.rotation_retries > 0
-                or browser_attempted
+                or browser_attempted_type is not None
             )
 
             # Read body: bytes for binary content, text for text
@@ -695,11 +697,12 @@ class SyncSession(BaseSession):
                 # Early browser solve for JS-only challenges (rotation
                 # can't help — these require JS execution)
                 if (
-                    not browser_attempted
-                    and self._browser_solver is not None
+                    challenge is not None
                     and challenge in JS_ONLY_CHALLENGES
+                    and browser_attempted_type != challenge.value
+                    and self._browser_solver is not None
                 ):
-                    browser_attempted = True
+                    browser_attempted_type = challenge.value
                     browser_result = self._try_browser_solve(
                         challenge, current_url
                     )
@@ -737,13 +740,13 @@ class SyncSession(BaseSession):
 
                 # Fallback: rotate fingerprint
                 if not state.can_rotate:
-                    # Last resort: browser solve (once per request)
+                    # Last resort: browser solve (once per challenge type)
                     if (
-                        not browser_attempted
+                        challenge is not None
+                        and browser_attempted_type != challenge.value
                         and self._browser_solver is not None
-                        and challenge is not None
                     ):
-                        browser_attempted = True
+                        browser_attempted_type = challenge.value
                         browser_result = self._try_browser_solve(
                             challenge, current_url
                         )
