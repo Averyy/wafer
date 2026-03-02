@@ -331,6 +331,22 @@ class BrowserSolver:
         except Exception:
             self._close_browser()
             raise
+
+        # Headless Chrome exposes "HeadlessChrome" in the UA string,
+        # which WAF fingerprinting (Kasada, DataDome, etc.) detects
+        # instantly.  Probe the real UA and patch it so every context
+        # we create uses the corrected value.
+        if self._headless:
+            probe = self._browser.new_page()
+            raw_ua = probe.evaluate("navigator.userAgent")
+            probe.close()
+            if "HeadlessChrome" in raw_ua:
+                self._browser_ua = raw_ua.replace(
+                    "HeadlessChrome", "Chrome"
+                )
+            else:
+                self._browser_ua = raw_ua
+
         self._last_used = now
         logger.info("Browser launched (headless=%s)", self._headless)
 
@@ -362,10 +378,15 @@ class BrowserSolver:
         # macOS Retina displays are always DPR 2.  Non-Retina Macs
         # are extinct.  Linux/Windows default to 1.
         dpr = 2 if sys.platform == "darwin" else 1
-        return self._browser.new_context(
-            viewport={"width": viewport[0], "height": viewport[1]},
-            device_scale_factor=dpr,
-        )
+        kwargs = {
+            "viewport": {"width": viewport[0], "height": viewport[1]},
+            "device_scale_factor": dpr,
+        }
+        # Inject corrected UA so headless contexts don't leak
+        # "HeadlessChrome" to WAF fingerprinters.
+        if self._browser_ua:
+            kwargs["user_agent"] = self._browser_ua
+        return self._browser.new_context(**kwargs)
 
     # ------------------------------------------------------------------
     # Recording loader
