@@ -132,7 +132,7 @@ session.request("PATCH", url, **kwargs)
 # ... all standard HTTP methods (GET, POST, PUT, DELETE, HEAD, OPTIONS, PATCH, TRACE)
 ```
 
-All `**kwargs` are passed through to rnet (headers, params, json, form, data, timeout, etc.).
+Per-request kwargs: `headers`, `params`, `json`, `form`, `body`, `timeout`, `multipart`.
 
 ## TLS Fingerprinting
 
@@ -191,7 +191,7 @@ Safari is particularly effective against DataDome, which heavily fingerprints th
 
 ## Challenge Detection
 
-Wafer detects 16 WAF challenge types from response status, headers, and body:
+Wafer detects 17 WAF challenge types from response status, headers, and body:
 
 | WAF | Detection |
 |-----|-----------|
@@ -207,6 +207,7 @@ Wafer detects 16 WAF challenge types from response status, headers, and body:
 | TMD | TMD session validation pattern |
 | Amazon | CAPTCHA page with `amzn` markers |
 | Arkose / FunCaptcha | `arkoselabs.com` or `funcaptcha` markers |
+| GeeTest v4 | `initGeetest4`, `gcaptcha4.geetest.com`, `gt4.js` |
 | hCaptcha | `hcaptcha.com` script, `h-captcha` div |
 | reCAPTCHA | `google.com/recaptcha` script, `g-recaptcha` div |
 | Vercel | Vercel bot protection challenge |
@@ -264,7 +265,7 @@ Both sync and async sessions block/await until the rate limit allows the next re
 Wafer uses separate counters for different failure modes:
 
 - **Retries** (`max_retries=3`): For 5xx server errors and connection failures. Exponential backoff.
-- **Rotations** (`max_rotations=1`): For 403/challenge responses. On the first failure, wafer switches from Chrome to Safari (fundamentally different TLS/H2 fingerprint) and retries.
+- **Rotations** (`max_rotations=2`): For 403/challenge responses. First rotation rebuilds the TLS session; second switches from Chrome to Safari (fundamentally different TLS/H2 fingerprint).
 
 After `max_failures` consecutive failures on a domain, the session is retired (full identity reset). Set to `None` to disable.
 
@@ -359,7 +360,7 @@ if result:
 
 Uses [Patchright](https://github.com/Kaliiiiiiiiii-Vinyzu/patchright-python) (patched Playwright) with real system Chrome for maximum stealth. Persistent browser instance with idle timeout. Thread-safe.
 
-Supports: Cloudflare (managed + Turnstile), Akamai, DataDome (VM PoW + puzzle slider), PerimeterX (including press-and-hold), Imperva, Kasada, F5 Shape, AWS WAF, GeeTest v4 (slide puzzle), Alibaba Baxia (slider), hCaptcha (checkbox), reCAPTCHA v2 (checkbox + image grid via EfficientNet + D-FINE), and generic JS challenges.
+Supports: Cloudflare (managed + Turnstile), Akamai, DataDome (VM PoW + puzzle slider + slide-right), PerimeterX (including press-and-hold), Imperva, Kasada, F5 Shape, AWS WAF, GeeTest v4 (slide puzzle), Alibaba Baxia (slider), hCaptcha (checkbox), reCAPTCHA v2 (checkbox + image grid via EfficientNet + D-FINE), and generic JS challenges.
 
 ## Iframe Intercept
 

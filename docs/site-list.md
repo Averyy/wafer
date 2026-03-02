@@ -211,7 +211,7 @@ Kasada solver: browser solve extracts CT token from ips.js/p.js response, cookie
 | `vividseats.com` | Kasada (client-side) | pass | 2026-02-21: 200 343KB via TLS. No server-side enforcement |
 | `footlocker.co.uk` | Kasada (client-side) | pass | 2026-02-21: 200 593KB via TLS. Kasada SDK in page but no server-side enforcement |
 | `wizzair.com` | Kasada (unverified) | pass | 2026-02-21: 200 1.9MB via TLS (302→/en-gb→200). No Kasada markers found |
-| `gql.twitch.tv/integrity` | Kasada (API, full CT+CD) | untested | 2026-02-23: Confirmed full Kasada flow (p.js from k.twitchcdn.net, /tl returns both CT+ST). Commercial solvers confirm CD required. API-style POST, not page-navigate. Needs browser solver extension to capture ST from /tl response. |
+| `gql.twitch.tv/integrity` | Kasada (API, full CT+CD) | untested | 2026-02-23: Confirmed full Kasada flow (p.js from k.twitchcdn.net, /tl returns both CT+ST). Commercial solvers confirm CD required. API-style POST, not page-navigate. Listener captures CT+ST; blocked on x-kpsdk-h HMAC generation. |
 
 ### F5 Shape
 
@@ -249,7 +249,7 @@ Requires browser solver with human-like mouse input.
 
 ### DataDome (slider + VM PoW)
 
-DataDome shifted to VM fingerprint (`plv3`) + WASM PoW in Jan 2026, which auto-resolve in a real browser. A jigsaw puzzle slider (ArgoZhang/SliderCaptcha) may still appear on some deployments. Solver handles both: auto-resolve (no interaction) and puzzle slider (CV notch detection + mousse drag).
+DataDome shifted to VM fingerprint (`plv3`) + WASM PoW in Jan 2026, which auto-resolve in a real browser. Two slider variants may appear: a jigsaw puzzle slider (ArgoZhang/SliderCaptcha, CV notch detection + mousse drag) and a slide-right slider (Dec 2025+, drag handle to end of track). Solver handles all three: auto-resolve, puzzle slider, and slide-right.
 
 | URL | Challenge Type | Status | Notes |
 |---|---|---|---|
@@ -334,7 +334,7 @@ Wafer has **no Arkose Labs solver**. Arkose presents 3D puzzle CAPTCHAs (rotate,
 |---|---|---|---|
 | **Cloudflare** (JS + Turnstile) | Yes | 15 | Browser solve + cookie replay. 30 min TTL. |
 | **Akamai** | Yes | 18 | Browser solve. Cookie replay difficult (_abck continuously validated). |
-| **DataDome** | Yes | 17 | Browser solve + cookie replay. Match OS. VM+PoW auto-resolves in browser. Puzzle slider solver ready (CV + mousse drag) if DD escalates. |
+| **DataDome** | Yes | 17 | Browser solve + cookie replay. Match OS. VM+PoW auto-resolves in browser. Puzzle slider + slide-right solvers ready if DD escalates. |
 | **PerimeterX** (press-and-hold) | Yes | 21 | Browser solve with recorded mouse input. **SOLVED** on wayfair. |
 | **AWS WAF** | Yes | 6 | Browser solve for JS challenge. |
 | **Imperva** | Yes | 6 | Browser solve + cookie replay. Handles modern reese84, legacy ___utmvc, and classic incap_ses. |

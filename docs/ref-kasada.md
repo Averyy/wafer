@@ -4,15 +4,16 @@
 
 **Detection**: Done. Header-based (`x-kpsdk-*` on 429) and body-based (`ips.js`, `kpsdk`, `/p.js` markers).
 
-**Browser solve (CT extraction)**: Done. Patchright navigates to protected URL, response listener intercepts `x-kpsdk-ct` from ips.js/p.js response. 10-second post-CT settle time ensures cookies are fully set.
+**Browser solve (CT+ST extraction)**: Done. Patchright navigates to protected URL, response listener intercepts `x-kpsdk-ct` and `x-kpsdk-st` from ips.js/p.js/tl responses. 10-second post-CT settle time ensures cookies are fully set.
 
 **CD generation (per-request PoW)**: Done. Pure Python SHA-256 with hash chaining (`wafer/_kasada.py`). Generates fresh `x-kpsdk-cd` per request in ~1ms. Algorithm matches Fweak gist / tramodule spec (initial hash from challenge_id, sequential nonces, hash chaining between subchallenges).
 
-**Integration**: Done. Session cache with 30-min TTL, CT+CD header injection in `_build_headers()`, cookie-only fallback when ST=0.
+**Integration**: Done. Session cache with 30-min TTL, cookie-based auth for simple deployments. Passthrough mode for dual-WAF sites (browser captures post-solve page content when cookie replay fails due to TLS-bound tokens). CT+CD header injection disabled pending x-kpsdk-h HMAC generation.
 
-**Validated against real sites (Feb 2026)**:
-- `realestate.com.au` -server-side 429, browser-solve PASS, cookie auth 5/5 durability
-- `hyatt.com` -server-side 429 (also Akamai CDN), browser-solve PASS, cookie auth 5/5, 43 cookies
+**Validated against real sites**:
+- `realestate.com.au` -server-side 429, browser-solve PASS, cookie auth 5/5 durability (Feb 2026)
+- `hyatt.com` -server-side 429 (also Akamai CDN), browser-solve PASS, cookie auth 5/5, 43 cookies (Feb 2026)
+- `chewy.com` -dual-WAF (Akamai + Kasada), browser-solve PASS, passthrough 2.1MB. Full CT+CD+ST flow (ST returned from /tl). Cookie replay fails (_abck TLS-bound), uses passthrough. (Mar 2026)
 
 **Skipped items** (resolved or not worth pursuing):
 - CDP console detection mitigation -resolved by Patchright (removes `Runtime.enable` + `Console.enable`) and Chrome V8 engine patch (Chrome 137+, May 2025). Solver works without any mitigation code.
@@ -36,14 +37,9 @@ Unit-tested (`tests/test_kasada.py::TestGenerateCD`) with hash chain replay veri
 
 This is confirmed by multiple commercial Kasada solver APIs (EzCaptcha, Hyper Solutions, MeshPrivacy) which all document the Twitch flow as requiring `x-kpsdk-cd` generated from the `x-kpsdk-st` value.
 
-**Key difference from realestate.com.au/hyatt.com**: Twitch is an API-style Kasada deployment (POST to `/integrity`, not a page-navigate flow). The Kasada script patches `window.fetch` to automatically inject headers -our current browser solver intercepts the `/tl` response but doesn't capture the patched fetch's headers.
+**Key difference from realestate.com.au/hyatt.com**: Twitch is an API-style Kasada deployment (POST to `/integrity`, not a page-navigate flow). The Kasada script patches `window.fetch` to automatically inject headers.
 
-**Next step**: To validate `generate_cd()` end-to-end, the browser solver needs to:
-1. Intercept the `/tl` response to capture both `x-kpsdk-ct` and `x-kpsdk-st`
-2. Use `generate_cd(st)` to produce `x-kpsdk-cd` for subsequent requests
-3. POST to `/integrity` with CT+CD headers via rnet
-
-This requires extending `setup_kasada_listener` in `_kasada.py` to also capture ST from the `/tl` response headers. The current listener only captures CT.
+**Status**: Steps 1-2 are done - `setup_kasada_listener` captures both CT and ST, and `generate_cd(st)` produces valid CD tokens. The remaining blocker is **x-kpsdk-h** (HMAC binding CT to CD) - without H, sending CT+CD causes server rejection. H generation requires reverse-engineering the HMAC key derivation from ips.js VM state.
 
 **Other candidates**:
 - `draftkings.com` -2026-02-21: TLS passes Cloudflare on homepage. Kasada presence unverified on deeper pages.
@@ -168,6 +164,7 @@ Does NOT need:
 
 | Site | Status | Notes |
 |------|--------|-------|
+| `chewy.com` | **Validated** | 2026-03-02: dual-WAF (Akamai+Kasada), browser-solve PASS, passthrough 2.1MB. Full ST from /tl. Cookie replay fails (_abck TLS-bound). |
 | `realestate.com.au` | **Validated** | 2026-02-21: server-side 429, browser-solve PASS, cookie auth 5/5, no ST |
 | `hyatt.com` | **Validated** | 2026-02-21: server-side 429, browser-solve PASS, cookie auth 5/5, 43 cookies, no ST |
 | `scheels.com` | tls-pass | 2026-02-21: Chrome145 TLS passes. Cloudflare CDN blocks naked. Kasada client-side only. |

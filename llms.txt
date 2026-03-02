@@ -415,8 +415,8 @@ resp = session.get("https://protected-site.com")  # auto-solves challenges
 result: SolveResult | None = solver.solve(url, challenge_type)
 # result.cookies: list[dict] - browser cookies
 # result.user_agent: str - browser's real User-Agent
-# result.extras: dict | None - WAF-specific data (e.g. Kasada CT/ST)
-# result.response: CapturedResponse | None - passthrough content if no challenge
+# result.extras: dict | None - WAF-specific data
+# result.response: CapturedResponse | None - passthrough content (see below)
 
 # Iframe intercept (for embedded widgets):
 result: InterceptResult | None = solver.intercept_iframe(
@@ -433,23 +433,18 @@ solver.close()
 ```
 
 The solver is thread-safe and reuses a single browser instance with idle timeout.
-Supports: Cloudflare, Akamai, DataDome, PerimeterX (press-and-hold), Imperva,
-Kasada, F5 Shape, AWS WAF, GeeTest v4 (slide), Baxia (slider), hCaptcha,
-reCAPTCHA v2 (checkbox + image grid via local ONNX models), generic JS.
+Supports: Cloudflare, Akamai, DataDome (puzzle + slide-right), PerimeterX
+(press-and-hold), Imperva, Kasada, F5 Shape, AWS WAF, GeeTest v4 (slide),
+Baxia (slider), hCaptcha, reCAPTCHA v2 (checkbox + image grid via local ONNX
+models), generic JS.
 
-### reCAPTCHA v2 Image Grid Solver
+### Passthrough mode
 
-Requires `[browser]` extra. Uses two ONNX models downloaded from HuggingFace
-on first encounter (~63 MB total, cached locally). If models or dependencies
-(`onnxruntime`, `huggingface_hub`) are unavailable, falls back gracefully
-(returns False, challenge escalation continues).
-
-- **3x3 grids** (static + dynamic): EfficientNet-B0 classifier, 14 object classes
-- **4x4 grids** (multi-round): D-FINE COCO detector, bbox-to-cell mapping
-- Grid type auto-detected via DOM class inspection
-- Keyword matching in 9 languages (English, Spanish, French, German, Italian,
-  Portuguese, Dutch, Russian, Chinese)
-- First inference has ~2-3s warmup delay (background warmup thread runs on load)
+Some WAFs bind cookies to the TLS session, making cookie replay from rnet
+impossible after a browser solve. In these cases the solver captures the page
+content directly and returns it as the response. This is transparent -
+`session.get()` returns a normal `WaferResponse`. No special handling needed.
+Currently applies to Kasada on dual-WAF sites (e.g. Akamai + Kasada).
 
 ---
 
