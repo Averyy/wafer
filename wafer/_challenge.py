@@ -39,9 +39,14 @@ class ChallengeType(enum.Enum):
 
 # Challenge types that require JS execution to solve. Fingerprint
 # rotation alone cannot help — browser solver should be tried early.
+# DataDome is included because its cookie is TLS+IP bound: when the
+# TLS client gets 403, rotation to a different fingerprint from the
+# same IP rarely helps, and each failed attempt poisons the IP for
+# the subsequent browser solve.
 JS_ONLY_CHALLENGES = frozenset({
     ChallengeType.AWSWAF,
     ChallengeType.CLOUDFLARE,
+    ChallengeType.DATADOME,
     ChallengeType.KASADA,
     ChallengeType.VERCEL,
     ChallengeType.HCAPTCHA,

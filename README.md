@@ -360,7 +360,7 @@ if result:
 
 Uses [Patchright](https://github.com/Kaliiiiiiiiii-Vinyzu/patchright-python) (patched Playwright) with real system Chrome for maximum stealth. Persistent browser instance with idle timeout. Thread-safe.
 
-Supports: Cloudflare (managed + Turnstile), Akamai, DataDome (VM PoW + puzzle slider + slide-right), PerimeterX (including press-and-hold), Imperva, Kasada, F5 Shape, AWS WAF, GeeTest v4 (slide puzzle), Alibaba Baxia (slider), hCaptcha (checkbox), reCAPTCHA v2 (checkbox + image grid via EfficientNet + D-FINE), and generic JS challenges.
+Supports: Cloudflare (managed + Turnstile), Akamai, DataDome (VM PoW + puzzle slider + slide-right + audio captcha), PerimeterX (including press-and-hold), Imperva, Kasada, F5 Shape, AWS WAF, GeeTest v4 (slide puzzle), Alibaba Baxia (slider), hCaptcha (checkbox), reCAPTCHA v2 (checkbox + image grid via EfficientNet + D-FINE), and generic JS challenges.
 
 ## Iframe Intercept
 

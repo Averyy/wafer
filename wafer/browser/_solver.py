@@ -24,11 +24,8 @@ import importlib.resources
 import io
 import logging
 import math
-import os
 import random
-import shutil
 import sys
-import tempfile
 import threading
 import time
 from dataclasses import dataclass
@@ -55,6 +52,126 @@ logger = logging.getLogger("wafer")
 # CDP ``Page.addScriptToEvaluateOnNewDocument`` (requires
 # ``Page.enable`` first, do NOT detach the session).
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Headless fingerprint patch (macOS)
+#
+# Headless Chrome on macOS leaks 6 properties that WAFs detect from
+# cross-origin iframes (e.g. DataDome's geo.captcha-delivery.com):
+#   colorDepth/pixelDepth: 24 (should be 30 on Retina)
+#   outerWidth: == innerWidth (should be +2 for window chrome)
+#   outerHeight: == innerHeight (should be +80 for title/tab/toolbar)
+#   screenY/screenTop: ~22 (should be ~56 with menu bar)
+#
+# Normally CDP Page.addScriptToEvaluateOnNewDocument only reaches the
+# main frame (OOPIFs are separate targets).  We disable site isolation
+# to force all frames into the same process, so the script reaches
+# cross-origin iframes too.
+#
+# The JS guard (isMac && outerWidth === innerWidth) is intentional:
+# outerWidth === innerWidth is the headless signature on macOS.  The
+# script is registered on all platforms but only activates on macOS
+# headless.  If a future Chrome changes headless outerWidth, the
+# Python-side self._headless gate still prevents headed-mode injection.
+# ---------------------------------------------------------------------------
+_HEADLESS_FIX_SCRIPT = r"""(function () {
+  var isMac = navigator.platform === 'MacIntel' ||
+    navigator.userAgent.indexOf('Mac OS X') !== -1;
+  // In headed mode outerWidth > innerWidth (window chrome adds ~2px).
+  // In headless, outerWidth === innerWidth OR 0 (early document load
+  // during cross-origin navigation).  Skip only when > innerWidth.
+  if (!isMac || window.outerWidth > window.innerWidth) return;
+  var _ts = Function.prototype.toString;
+  var _m = new Map();
+  var _nts = function () {
+    return _m.has(this) ? _m.get(this) : _ts.call(this);
+  };
+  Object.defineProperty(_nts, 'name', {value: 'toString'});
+  Object.defineProperty(_nts, 'length', {value: 0});
+  Function.prototype.toString = _nts;
+  _m.set(_nts, 'function toString() { [native code] }');
+  function patch(obj, prop, val) {
+    var orig = Object.getOwnPropertyDescriptor(obj, prop);
+    if (!orig || !orig.get) return;
+    var g = typeof val === 'function' ? val : function () { return val; };
+    Object.defineProperty(g, 'name', {value: orig.get.name});
+    var desc = {get: g, enumerable: orig.enumerable, configurable: true};
+    if (orig.set) desc.set = orig.set;
+    Object.defineProperty(obj, prop, desc);
+    _m.set(g, _ts.call(orig.get));
+  }
+  // screen.colorDepth/pixelDepth: headless reports 24 (8-bit), real
+  // macOS is 30 (10-bit).  Safe to patch because --force-color-profile=
+  // scrgb-linear makes the CSS media queries match (color:10 = true,
+  // dynamic-range:high = true), so there's no cross-check inconsistency.
+  patch(Screen.prototype, 'colorDepth', 30);
+  patch(Screen.prototype, 'pixelDepth', 30);
+  patch(window, 'outerWidth', function () { return window.innerWidth + 2; });
+  patch(window, 'outerHeight', function () { return window.innerHeight + 80; });
+  patch(window, 'screenY', function () { return 56; });
+  patch(window, 'screenTop', function () { return 56; });
+  // Screen dimensions: headless reports viewport == screen which is
+  // impossible on a real display.  Pick a plausible macOS resolution
+  // (CSS pixels at default "looks like" scaling) that fits the viewport.
+  var displays = [
+    [1440, 900],  [1512, 982],  [1710, 1107],
+    [1728, 1117], [2560, 1440]
+  ];
+  var vw = window.innerWidth, vh = window.innerHeight;
+  var sw = 2560, sh = 1440;
+  for (var i = 0; i < displays.length; i++) {
+    if (displays[i][0] > vw && displays[i][1] > vh + 120) {
+      sw = displays[i][0]; sh = displays[i][1]; break;
+    }
+  }
+  var menuBar = 37;
+  patch(Screen.prototype, 'width', sw);
+  patch(Screen.prototype, 'height', sh);
+  patch(Screen.prototype, 'availWidth', sw);
+  patch(Screen.prototype, 'availHeight', sh - menuBar);
+  patch(Screen.prototype, 'availTop', menuBar);
+  patch(Screen.prototype, 'availLeft', 0);
+})();"""
+
+
+# ---------------------------------------------------------------------------
+# screenX/screenY fix for CDP Input.dispatchMouseEvent
+#
+# Chromium bug #40280325: CDP mouse events set screenX=clientX and
+# screenY=clientY instead of adding the window position offset.
+# WAFs (esp. DataDome) compare screenX/Y vs clientX/Y to detect
+# CDP-dispatched events.  This script patches the getters so they
+# add the window position when the bug is detected (val == clientXY).
+#
+# Previously shipped as an MV3 extension, but extensions don't load
+# in Playwright's new_context() (incognito-like).  Now injected via
+# CDP Page.addScriptToEvaluateOnNewDocument (which reaches all frames
+# including cross-origin iframes because site isolation is disabled).
+# ---------------------------------------------------------------------------
+_SCREENXY_FIX_SCRIPT = r"""(function () {
+  var origSX = Object.getOwnPropertyDescriptor(MouseEvent.prototype, 'screenX');
+  var origSY = Object.getOwnPropertyDescriptor(MouseEvent.prototype, 'screenY');
+  if (!origSX || !origSY) return;
+  [MouseEvent, PointerEvent].forEach(function (cls) {
+    Object.defineProperty(cls.prototype, 'screenX', {
+      get: function () {
+        var val = origSX.get.call(this);
+        if (val === this.clientX) return val + (window.screenX || 0);
+        return val;
+      }
+    });
+    Object.defineProperty(cls.prototype, 'screenY', {
+      get: function () {
+        var val = origSY.get.call(this);
+        if (val === this.clientY)
+          return val + (window.screenY || 0)
+            + (window.outerHeight - window.innerHeight);
+        return val;
+      }
+    });
+  });
+})();"""
 
 
 # ---------------------------------------------------------------------------
@@ -201,7 +318,7 @@ class BrowserSolver:
         self._lock = threading.Lock()
         self._last_used: float = 0.0
         self._browser_ua: str | None = None
-        self._extension_dir: str | None = None
+        self._browser_version: str | None = None
         # Recording caches (lazy-loaded on first PX encounter)
         self._idle_recordings: list[dict] | None = None
         self._path_recordings: list[dict] | None = None
@@ -241,37 +358,6 @@ class BrowserSolver:
         logger.debug("patchright browsers ready")
         BrowserSolver._browser_installed = True
 
-    def _ensure_extension(self) -> str | None:
-        """Extract the screenX/screenY fix extension to a temp dir.
-
-        Returns the path to the unpacked extension directory, or None if
-        the extension files aren't available.
-        """
-        if self._extension_dir and os.path.isdir(self._extension_dir):
-            return self._extension_dir
-
-        try:
-            ext_pkg = (
-                importlib.resources.files("wafer.browser")
-                / "_extensions"
-                / "screenxy"
-            )
-            manifest = (ext_pkg / "manifest.json").read_text()
-            content_js = (ext_pkg / "content.js").read_text()
-        except Exception:
-            logger.debug("screenXY extension not found in package")
-            return None
-
-        tmp = tempfile.mkdtemp(prefix="wafer_ext_")
-        with open(os.path.join(tmp, "manifest.json"), "w") as f:
-            f.write(manifest)
-        with open(os.path.join(tmp, "content.js"), "w") as f:
-            f.write(content_js)
-
-        self._extension_dir = tmp
-        logger.debug("Extracted screenXY extension to %s", tmp)
-        return tmp
-
     def _ensure_browser(self) -> None:
         """Launch browser if not running or if idle too long."""
         now = time.monotonic()
@@ -305,21 +391,48 @@ class BrowserSolver:
         launch_args = [
             "--disable-blink-features=AutomationControlled",
             # Force real GPU instead of SwiftShader.  Without this,
-            # WebGL exposes "SwiftShader" as the renderer — a dead
+            # WebGL exposes "SwiftShader" as the renderer - a dead
             # giveaway for automated browsers.  Metal on macOS,
             # ANGLE+GL on Linux/Windows.
             "--enable-gpu",
             "--use-gl=angle",
+            # Disable site isolation so CDP scripts (screenXY fix,
+            # headless patches) reach cross-origin iframes (e.g.
+            # DataDome's captcha-delivery iframe).
+            "--disable-site-isolation-trials",
+            "--disable-features=IsolateOrigins,site-per-process",
         ]
         if sys.platform == "darwin":
             launch_args.append("--use-angle=metal")
 
-        ext_dir = self._ensure_extension()
-        if ext_dir:
-            launch_args.append(f"--load-extension={ext_dir}")
-            launch_args.append(
-                f"--disable-extensions-except={ext_dir}"
-            )
+        ignored = [
+            # --enable-automation: sets internal automation state,
+            # removes chrome.runtime from window.chrome.
+            "--enable-automation",
+            # --force-color-profile=srgb: alters canvas fingerprint
+            # (real Chrome uses system profile).
+            "--force-color-profile=srgb",
+        ]
+
+        if self._headless:
+            # Use --headless=new (Chrome 112+) instead of the old
+            # --headless mode.  The new mode uses Chrome's real
+            # compositor pipeline, which gives full performance.now
+            # timer resolution (old mode clamps to 100us - a known
+            # timing-based detection signal).
+            launch_args.append("--headless=new")
+            ignored.append("--headless")
+
+            if sys.platform == "darwin":
+                # Force scRGB-linear color profile so the rendering
+                # pipeline reports 10-bit color (color: 10) and HDR
+                # (dynamic-range: high).  Without this, headless
+                # Chrome on macOS reports 8-bit sRGB, and WAFs like
+                # Kasada cross-check CSS computed styles against
+                # screen.colorDepth to detect headless.
+                launch_args.append(
+                    "--force-color-profile=scrgb-linear"
+                )
 
         try:
             self._playwright = sync_playwright().start()
@@ -327,10 +440,16 @@ class BrowserSolver:
                 channel="chrome",
                 headless=self._headless,
                 args=launch_args,
+                ignore_default_args=ignored,
             )
         except Exception:
             self._close_browser()
             raise
+
+        # Capture the real Chrome full version (e.g. "145.0.7632.117")
+        # for CDP metadata.  The UA string is reduced to MAJOR.0.0.0
+        # so we can't extract the full version from there.
+        self._browser_version = self._browser.version
 
         # Headless Chrome exposes "HeadlessChrome" in the UA string,
         # which WAF fingerprinting (Kasada, DataDome, etc.) detects
@@ -365,28 +484,134 @@ class BrowserSolver:
                 pass
             self._playwright = None
         self._browser_ua = None
-        if self._extension_dir:
-            try:
-                shutil.rmtree(self._extension_dir)
-            except Exception:
-                pass
-            self._extension_dir = None
+        self._browser_version = None
 
     def _create_context(self):
         """Create a new browser context with realistic settings."""
-        viewport = random.choice(_VIEWPORTS)
-        # macOS Retina displays are always DPR 2.  Non-Retina Macs
-        # are extinct.  Linux/Windows default to 1.
-        dpr = 2 if sys.platform == "darwin" else 1
-        kwargs = {
-            "viewport": {"width": viewport[0], "height": viewport[1]},
-            "device_scale_factor": dpr,
-        }
+        kwargs: dict = {}
+        if self._headless:
+            # Headless has no real window, so we must set a viewport
+            # and DPR explicitly.
+            viewport = random.choice(_VIEWPORTS)
+            kwargs["viewport"] = {
+                "width": viewport[0], "height": viewport[1],
+            }
+            # macOS Retina displays are always DPR 2.  Non-Retina
+            # Macs are extinct.  Linux/Windows default to 1.
+            dpr = 2 if sys.platform == "darwin" else 1
+            kwargs["device_scale_factor"] = dpr
+        else:
+            # Headed: let the browser use its natural window size.
+            # Forcing a viewport larger than the screen causes
+            # innerHeight > outerHeight, which is impossible in a
+            # real browser and detected by DataDome.  The real
+            # display's DPR is already correct.
+            kwargs["no_viewport"] = True
         # Inject corrected UA so headless contexts don't leak
         # "HeadlessChrome" to WAF fingerprinters.
         if self._browser_ua:
             kwargs["user_agent"] = self._browser_ua
         return self._browser.new_context(**kwargs)
+
+    def _setup_headless_patches(
+        self, page, *, challenge_type: str | None = None,
+    ) -> None:
+        """Register fingerprint patches via CDP.
+
+        Must be called after page creation but before navigation.
+
+        **All modes** (headed + headless):
+        - Fixes ``navigator.languages`` to ``["en-US", "en"]`` via
+          CDP ``Emulation.setUserAgentOverride`` with ``acceptLanguage``.
+        - Injects screenX/screenY fix for CDP mouse event bug
+          (Chromium #40280325) via ``Page.addScriptToEvaluateOnNewDocument``.
+
+        **Headless only** (additional):
+        - Injects headless fingerprint fix script (colorDepth, outerWidth,
+          outerHeight, screenY patches for macOS).  Skipped for Kasada
+          because the Function.prototype.toString wrapper is detected
+          by ips.js; scrgb-linear alone suffices for Kasada.
+        - Fixes ``navigator.userAgentData`` via CDP ``userAgentMetadata``
+          so the JS ``NavigatorUAData`` API matches the corrected UA.
+        """
+        # Guard against double registration (each call creates a new
+        # CDP session and re-registers the init script).
+        if getattr(page, "_wafer_headless_patched", False):
+            return
+        page._wafer_headless_patched = True  # type: ignore[attr-defined]
+        cdp = page.context.new_cdp_session(page)
+        cdp.send("Page.enable")
+
+        # screenXY fix: runs in both headed and headless modes.
+        # Must fire before any page JS to intercept mouse events.
+        cdp.send("Page.addScriptToEvaluateOnNewDocument", {
+            "source": _SCREENXY_FIX_SCRIPT,
+        })
+
+        if self._headless:
+            # Kasada's ips.js detects the Function.prototype.toString
+            # wrapper in _HEADLESS_FIX_SCRIPT and withholds x-kpsdk-r.
+            # scrgb-linear alone handles Kasada's CSS cross-checks.
+            if challenge_type != "kasada":
+                cdp.send("Page.addScriptToEvaluateOnNewDocument", {
+                    "source": _HEADLESS_FIX_SCRIPT,
+                })
+
+            # On macOS, --force-color-profile=scrgb-linear already
+            # makes (color: 10), (dynamic-range: high), and
+            # (color-gamut: p3) match headed Chrome.  The only
+            # remaining gap is color-gamut on non-macOS headless,
+            # which CDP Emulation.setEmulatedMedia can patch.
+            if sys.platform == "darwin":
+                cdp.send("Emulation.setEmulatedMedia", {
+                    "features": [
+                        {"name": "color-gamut", "value": "p3"},
+                    ],
+                })
+
+            # Fix navigator.userAgentData + languages.
+            ua = self._browser_ua or ""
+            if ua:
+                self._apply_ua_metadata(
+                    cdp, ua, self._browser_version,
+                )
+        else:
+            # Headed: fix navigator.languages AND provide
+            # userAgentMetadata.  Without metadata, the CDP
+            # setUserAgentOverride call strips sec-ch-ua HTTP
+            # headers entirely — a strong WAF detection signal.
+            ua = self._browser_ua or page.evaluate(
+                "navigator.userAgent"
+            )
+            self._apply_ua_metadata(
+                cdp, ua, self._browser_version,
+            )
+
+        # Do NOT detach the CDP session - that removes registered
+        # scripts.  GC-safe: Playwright's channel registry keeps it
+        # alive for the page's lifetime.
+
+    @staticmethod
+    def _apply_ua_metadata(
+        cdp, ua: str, browser_version: str | None = None,
+    ) -> None:
+        """Set CDP userAgentMetadata so navigator.userAgentData matches.
+
+        Delegates to ``wafer._fingerprint.cdp_ua_metadata`` which
+        reuses the same arch, bitness, platform version, and brand
+        algorithms used for HTTP sec-ch-ua headers.  Also sets
+        ``acceptLanguage`` so ``navigator.languages`` returns
+        ``["en-US", "en"]`` instead of the default ``["en-US"]``.
+
+        *browser_version* is the real full version from ``browser.version``
+        (e.g. ``"145.0.7632.117"``).  The UA string is reduced to
+        ``MAJOR.0.0.0`` so the full version can't be extracted from it.
+        """
+        from wafer._fingerprint import cdp_ua_metadata
+
+        params = cdp_ua_metadata(ua, browser_version=browser_version)
+        params["acceptLanguage"] = "en-US,en"
+        cdp.send("Emulation.setUserAgentOverride", params)
 
     # ------------------------------------------------------------------
     # Recording loader
@@ -913,6 +1138,9 @@ class BrowserSolver:
             try:
                 context = self._create_context()
                 page = context.new_page()
+                self._setup_headless_patches(
+                    page, challenge_type=challenge_type,
+                )
 
                 if self._browser_ua is None:
                     self._browser_ua = page.evaluate(
@@ -982,6 +1210,16 @@ class BrowserSolver:
                         body = nav_response.body()
                     except Exception:
                         body = b""
+                    # nav_response body may be empty after a
+                    # client-side redirect/reload.  Fall back to
+                    # page.content() which reflects the final DOM.
+                    if len(body) <= 1024:
+                        try:
+                            html = page.content()
+                            if len(html) > 1024:
+                                body = html.encode("utf-8")
+                        except Exception:
+                            pass
                     if len(body) > 1024:
                         nav_headers = {}
                         try:
@@ -1004,36 +1242,91 @@ class BrowserSolver:
                             len(cookies),
                         )
 
-                # Kasada passthrough: after solving, the page
-                # auto-reloads to real content. Capture it since
-                # cookie replay from rnet fails (TLS-bound _abck).
-                if (
-                    solved
-                    and captured is None
-                    and challenge_type == "kasada"
-                ):
+                # Auto-resolve passthrough: WAF served a challenge
+                # (nav 403) but the browser resolved it in the
+                # background (WASM PoW, auto-cookie).  The page may
+                # have redirected to real content by now.
+                if not solved and captured is None:
                     try:
                         html = page.content()
-                        if len(html) > 1024 and "kpsdk" not in html[:500].lower():
+                    except Exception:
+                        html = ""
+                    if len(html) > 1024:
+                        head = html[:5000].lower()
+                        is_challenge = (
+                            "captcha-delivery" in head
+                            or "kpsdk" in head
+                            or "px-captcha" in head
+                            or "reese84" in head
+                        )
+                        if not is_challenge:
                             body = html.encode("utf-8")
+                            cookies = context.cookies()
                             captured = CapturedResponse(
                                 url=page.url,
                                 status=200,
-                                headers={"content-type": "text/html; charset=utf-8"},
+                                headers={
+                                    "content-type": (
+                                        "text/html; charset=utf-8"
+                                    )
+                                },
                                 body=body,
                             )
                             logger.info(
-                                "Kasada passthrough at %s "
-                                "(%d bytes, %d cookies)",
+                                "Browser auto-resolve passthrough "
+                                "for %s at %s (%d bytes, %d cookies)",
+                                challenge_type or "unknown",
                                 page.url,
                                 len(body),
                                 len(cookies),
                             )
-                    except Exception:
-                        logger.debug(
-                            "Kasada passthrough capture failed",
-                            exc_info=True,
+
+                # Post-solve passthrough: after solving, the page
+                # may auto-reload to real content.  Capture it
+                # when cookie replay is unreliable (TLS-bound).
+                # The browser needs time to redirect after cookie
+                # update, so retry up to 5s for real content.
+                if solved and captured is None:
+                    passthrough_deadline = time.monotonic() + 5
+                    while time.monotonic() < passthrough_deadline:
+                        try:
+                            html = page.content()
+                        except Exception:
+                            html = ""
+                        head = html[:5000].lower()
+                        is_challenge = (
+                            "kpsdk" in head
+                            or "captcha-delivery" in head
+                            or ("akamai" in head and "_abck" in head)
+                            or "perimeterx" in head
+                            or "px-captcha" in head
+                            or "reese84" in head
                         )
+                        if len(html) > 1024 and not is_challenge:
+                            body = html.encode("utf-8")
+                            # Re-read cookies after redirect —
+                            # new page may have set more.
+                            cookies = context.cookies()
+                            captured = CapturedResponse(
+                                url=page.url,
+                                status=200,
+                                headers={
+                                    "content-type": (
+                                        "text/html; charset=utf-8"
+                                    )
+                                },
+                                body=body,
+                            )
+                            logger.info(
+                                "%s passthrough at %s "
+                                "(%d bytes, %d cookies)",
+                                challenge_type or "unknown",
+                                page.url,
+                                len(body),
+                                len(cookies),
+                            )
+                            break
+                        time.sleep(1)
 
                 if solved:
                     logger.info(
@@ -1178,6 +1471,7 @@ class BrowserSolver:
             try:
                 context = self._create_context()
                 page = context.new_page()
+                self._setup_headless_patches(page)
 
                 if self._browser_ua is None:
                     self._browser_ua = page.evaluate(

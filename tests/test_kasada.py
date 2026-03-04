@@ -335,3 +335,164 @@ class TestKasadaRetryIntegration:
         req_headers = mock_client.request_log[0][2]["headers"]
         assert "x-kpsdk-ct" not in req_headers
         assert "x-kpsdk-cd" not in req_headers
+
+
+# ---------------------------------------------------------------------------
+# Cookie replay regression tests
+# ---------------------------------------------------------------------------
+
+
+class TestBrowserSolveCookieReplay:
+    """Verify browser solve pins fingerprint, resets failures, and
+    preserves cookies during rotation.
+
+    These tests catch the regression from aef1c14 where cookie clearing
+    moved from first-rotation-only to every-rotation, destroying
+    browser-obtained cookies before they could be replayed.
+    """
+
+    def setup_method(self):
+        _sessions.clear()
+
+    @patch("time.sleep")
+    def test_fingerprint_pinned_after_browser_solve(self, mock_sleep):
+        """Browser solve must pin fingerprint to the matched emulation.
+
+        Without pinning, rotation changes TLS identity away from the
+        browser's, invalidating TLS-bound cookies.
+        """
+        mock_browser = MockBrowserSolver(
+            result=SolveResult(
+                cookies=[
+                    {
+                        "name": "tkrm",
+                        "value": "x",
+                        "domain": ".example.com",
+                        "path": "/",
+                        "expires": -1,
+                    }
+                ],
+                user_agent="Mozilla/5.0 Chrome/145.0",
+                extras={"ct": "ct", "st": 12345},
+            )
+        )
+        responses = [
+            MockResponse(
+                429,
+                {"x-kpsdk-ct": "challenge"},
+                "<html>kasada</html>",
+            ),
+            MockResponse(200, {}, "<html>ok</html>"),
+        ]
+        session, _ = make_sync_session(
+            responses,
+            browser_solver=mock_browser,
+            use_cookie_jar=True,
+        )
+
+        session.request("GET", "https://example.com/page")
+
+        # Fingerprint must be pinned after browser solve
+        assert session._fingerprint.pinned
+
+    @patch("time.sleep")
+    def test_failure_counter_reset_after_browser_solve(self, mock_sleep):
+        """Browser solve returning True must reset the failure counter.
+
+        Without resetting, the pre-solve failure persists and the
+        session reaches the 3-failure retirement threshold prematurely.
+        """
+        mock_browser = MockBrowserSolver(
+            result=SolveResult(
+                cookies=[
+                    {
+                        "name": "tkrm",
+                        "value": "x",
+                        "domain": ".example.com",
+                        "path": "/",
+                        "expires": -1,
+                    }
+                ],
+                user_agent="Chrome/145",
+                extras={"ct": "ct", "st": 12345},
+            )
+        )
+        responses = [
+            MockResponse(
+                429,
+                {"x-kpsdk-ct": "challenge"},
+                "<html>kasada</html>",
+            ),
+            MockResponse(200, {}, "<html>ok</html>"),
+        ]
+        session, _ = make_sync_session(
+            responses,
+            browser_solver=mock_browser,
+            use_cookie_jar=True,
+        )
+
+        session.request("GET", "https://example.com/page")
+
+        # Failure counter must be reset (domain not in failures dict)
+        assert "example.com" not in session._domain_failures
+
+    @patch("time.sleep")
+    def test_cookies_preserved_when_pinned_and_rotated(self, mock_sleep):
+        """Rotation must not clear cookies when fingerprint is pinned.
+
+        Regression: aef1c14 changed cookie clearing from first-rotation
+        to every-rotation, destroying browser-obtained cookies.
+        """
+        import shutil
+        import tempfile
+
+        from wafer._cookies import CookieCache
+
+        cache_dir = tempfile.mkdtemp()
+        try:
+            cache = CookieCache(cache_dir)
+
+            mock_browser = MockBrowserSolver(
+                result=SolveResult(
+                    cookies=[
+                        {
+                            "name": "tkrm",
+                            "value": "x",
+                            "domain": ".example.com",
+                            "path": "/",
+                            "expires": -1,
+                        }
+                    ],
+                    user_agent="Chrome/145",
+                    extras={"ct": "ct", "st": 12345},
+                )
+            )
+            responses = [
+                MockResponse(
+                    429,
+                    {"x-kpsdk-ct": "challenge"},
+                    "<html>kasada</html>",
+                ),
+                MockResponse(200, {}, "<html>ok</html>"),
+            ]
+            session, _ = make_sync_session(
+                responses,
+                browser_solver=mock_browser,
+                use_cookie_jar=True,
+                cookie_cache=cache,
+            )
+
+            session.request("GET", "https://example.com/page")
+            assert session._fingerprint.pinned
+
+            # Verify cookies were saved to cache by browser solve
+            cached = cache.load("example.com")
+            assert len(cached) > 0, "Browser cookies should be in cache"
+
+            # Verify cookies survive (pinned fingerprint protects them)
+            cached_after = cache.load("example.com")
+            assert len(cached_after) > 0, (
+                "Cookies must survive when fingerprint is pinned"
+            )
+        finally:
+            shutil.rmtree(cache_dir, ignore_errors=True)

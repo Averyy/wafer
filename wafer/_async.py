@@ -284,7 +284,9 @@ class AsyncSession(BaseSession):
                 cookies=target_cookies,
             )
 
-        # Match emulation to browser's Chrome version.
+        # Match emulation to browser's Chrome version and pin it.
+        # Cookies are TLS-bound — rotation away from the matched
+        # fingerprint would invalidate them.
         # Skip for Safari — keep Safari TLS identity after browser solve.
         if self._fingerprint is not None:
             chrome_ver = chrome_version_from_ua(result.user_agent)
@@ -292,6 +294,7 @@ class AsyncSession(BaseSession):
                 em = emulation_for_version(chrome_ver)
                 if em:
                     self._fingerprint.reset(em)
+                    self._fingerprint.pin()
 
         # Rebuild client (rehydrates cookies from cache)
         self._rebuild_client()
@@ -658,14 +661,21 @@ class AsyncSession(BaseSession):
                 )
                 await asyncio.sleep(delay)
                 if not retired:
-                    # Clear domain cookies on every rotation - stale
-                    # cookies from a different TLS identity cause WAF
-                    # re-challenges (cf_clearance, _abck are TLS-bound).
-                    if self._cookie_cache:
+                    # Clear domain cookies on rotation unless the
+                    # fingerprint is pinned (browser-solve matched the
+                    # emulation to the browser's TLS identity, so the
+                    # cookies belong to THIS fingerprint).
+                    pinned = (
+                        self._fingerprint is not None
+                        and self._fingerprint.pinned
+                    )
+                    if self._cookie_cache and not pinned:
                         await asyncio.to_thread(
                             self._cookie_cache.clear, domain
                         )
-                    if state.rotation_retries == 1:
+                    if pinned:
+                        pass  # keep TLS identity that cookies are bound to
+                    elif state.rotation_retries == 1:
                         pass  # first rotation: just fresh TLS + cleared cookies
                     elif (
                         self._fingerprint is not None
@@ -738,6 +748,9 @@ class AsyncSession(BaseSession):
                         )
                         return browser_result
                     if browser_result:
+                        # Browser solved and injected cookies — reset
+                        # failure counter so the retry starts clean.
+                        self._record_success(domain)
                         continue
 
                 # No browser solver — rotation can't help JS-only challenges
@@ -784,6 +797,7 @@ class AsyncSession(BaseSession):
                             )
                             return browser_result
                         if browser_result:
+                            self._record_success(domain)
                             continue
                     if challenge:
                         if self.max_rotations == 0:
@@ -817,14 +831,20 @@ class AsyncSession(BaseSession):
                 if should_retire:
                     await self._retire_session(domain)
                 else:
-                    # Clear domain cookies on every rotation - stale
-                    # cookies from a different TLS identity cause WAF
-                    # re-challenges (cf_clearance, _abck are TLS-bound).
-                    if self._cookie_cache:
+                    # Clear domain cookies on rotation unless the
+                    # fingerprint is pinned (browser-solve matched the
+                    # emulation, so cookies belong to THIS fingerprint).
+                    pinned = (
+                        self._fingerprint is not None
+                        and self._fingerprint.pinned
+                    )
+                    if self._cookie_cache and not pinned:
                         await asyncio.to_thread(
                             self._cookie_cache.clear, domain
                         )
-                    if state.rotation_retries == 1:
+                    if pinned:
+                        pass  # keep TLS identity that cookies are bound to
+                    elif state.rotation_retries == 1:
                         pass  # first rotation: just fresh TLS + cleared cookies
                     elif (
                         self._fingerprint is not None

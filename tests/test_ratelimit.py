@@ -315,14 +315,17 @@ class TestSyncSessionRetirement:
 
         When max_rotations is hit on a real challenge, ChallengeDetected is
         raised. Retirement should not fire on the final iteration.
+
+        Uses Akamai (not JS_ONLY) so the rotation loop actually runs.
+        DataDome is JS_ONLY and goes to browser immediately.
         """
-        dd_resp = MockResponse(
+        ak_resp = MockResponse(
             403,
-            headers={"Set-Cookie": "datadome=abc123; Path=/"},
-            body="<html>datadome challenge</html>",
+            headers={"Set-Cookie": "_abck=abc123; Path=/"},
+            body="<html>akamai challenge</html>",
         )
         session, mock = make_sync_session(
-            [dd_resp] * 10,
+            [ak_resp] * 10,
             max_rotations=2,
             max_failures=5,  # high threshold so retirement doesn't
         )                        # interfere with the budget test

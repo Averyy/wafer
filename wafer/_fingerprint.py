@@ -152,6 +152,7 @@ _CHROME_BUILDS: dict[int, tuple[int, int]] = {
 
 # Fallback for versions outside the lookup table.
 _FULL_VERSION_ANCHOR = (130, 6723, 58)
+_CHROME_BUILDS_DEFAULT_MAJOR = max(_CHROME_BUILDS)
 
 
 def _full_version(major: int) -> str:
@@ -165,11 +166,19 @@ def _full_version(major: int) -> str:
 
 
 def generate_sec_ch_ua_full_version_list(
-    major_version: int, brand: str = "Google Chrome"
+    major_version: int,
+    brand: str = "Google Chrome",
+    full_version_override: str | None = None,
 ) -> str:
-    """Generate Sec-CH-UA-Full-Version-List with full version numbers."""
+    """Generate Sec-CH-UA-Full-Version-List with full version numbers.
+
+    When *full_version_override* is given (e.g. ``"145.0.7632.117"``),
+    it is used verbatim for the Chrome and Chromium brand versions
+    instead of the static build-number table.  This keeps the header
+    consistent with the actual browser binary.
+    """
     seed = major_version
-    full_ver = _full_version(major_version)
+    full_ver = full_version_override or _full_version(major_version)
 
     char1 = _GREASY_CHARS[seed % 11]
     char2 = _GREASY_CHARS[(seed + 1) % 11]
@@ -194,6 +203,77 @@ def generate_sec_ch_ua_full_version_list(
 _HOST_ARCH = _detect_arch()
 _HOST_BITNESS = _detect_bitness()
 _HOST_PLATFORM_VERSION = _detect_platform_version()
+
+# navigator.platform values per OS (for CDP Emulation.setUserAgentOverride).
+_NAVIGATOR_PLATFORM: dict[str, str] = {
+    "Darwin": "MacIntel",
+    "Windows": "Win32",
+    "Linux": "Linux x86_64",
+}
+
+
+def _parse_header_brands(header_str: str) -> list[dict[str, str]]:
+    """Parse a ``sec-ch-ua`` style header into ``[{"brand": ..., "version": ...}]``.
+
+    Expected format: ``'"BrandA";v="VerA", "BrandB";v="VerB"'``.
+    """
+    brands: list[dict[str, str]] = []
+    for entry in header_str.split(", "):
+        parts = entry.split(";v=", 1)
+        if len(parts) != 2:
+            continue
+        brands.append({
+            "brand": parts[0].strip('"'),
+            "version": parts[1].strip('"'),
+        })
+    return brands
+
+
+def cdp_ua_metadata(
+    ua: str, browser_version: str | None = None,
+) -> dict:
+    """Build the ``Emulation.setUserAgentOverride`` params for CDP.
+
+    Returns a dict ready to pass to ``cdp.send("Emulation.setUserAgentOverride", ...)``.
+
+    *browser_version* is the real full Chrome version from
+    ``browser.version`` (e.g. ``"145.0.7632.117"``).  Chrome's UA
+    string uses the reduced format (``MAJOR.0.0.0``), so the full
+    version can't be extracted from it.  When provided, it's used for
+    ``fullVersionList`` and ``fullVersion`` so ``getHighEntropyValues()``
+    returns values consistent with the actual browser binary.
+    """
+    major = chrome_version_from_ua(ua)
+    if major is None:
+        major = _CHROME_BUILDS_DEFAULT_MAJOR
+
+    # Use real browser version for fullVersionList (high-entropy).
+    # Falls back to our build-number table when browser_version
+    # isn't available (e.g. TLS-only usage).
+    real_full = browser_version or _full_version(major)
+    full_version_list = generate_sec_ch_ua_full_version_list(
+        major, full_version_override=real_full,
+    )
+
+    system = platform.system()
+    nav_platform = _NAVIGATOR_PLATFORM.get(system, "Linux x86_64")
+
+    return {
+        "userAgent": ua,
+        "platform": nav_platform,
+        "userAgentMetadata": {
+            "brands": _parse_header_brands(generate_sec_ch_ua(major)),
+            "fullVersionList": _parse_header_brands(full_version_list),
+            "fullVersion": real_full,
+            "platform": _HOST_PLATFORM.strip('"'),
+            "platformVersion": _HOST_PLATFORM_VERSION.strip('"'),
+            "architecture": _HOST_ARCH.strip('"'),
+            "bitness": _HOST_BITNESS.strip('"'),
+            "model": "",
+            "mobile": False,
+            "wow64": False,
+        },
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -236,12 +316,19 @@ def emulation_for_version(version: int) -> Emulation | None:
 
 
 _UA_CHROME_RE = re.compile(r"Chrome/(\d+)")
+_UA_CHROME_FULL_RE = re.compile(r"Chrome/(\d+\.\d+\.\d+\.\d+)")
 
 
 def chrome_version_from_ua(user_agent: str) -> int | None:
     """Extract Chrome major version from a User-Agent string."""
     m = _UA_CHROME_RE.search(user_agent)
     return int(m.group(1)) if m else None
+
+
+def chrome_full_version_from_ua(user_agent: str) -> str | None:
+    """Extract the full Chrome version (e.g. ``145.0.7632.117``) from a UA."""
+    m = _UA_CHROME_FULL_RE.search(user_agent)
+    return m.group(1) if m else None
 
 
 # ---------------------------------------------------------------------------

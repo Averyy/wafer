@@ -433,7 +433,7 @@ solver.close()
 ```
 
 The solver is thread-safe and reuses a single browser instance with idle timeout.
-Supports: Cloudflare, Akamai, DataDome (puzzle + slide-right), PerimeterX
+Supports: Cloudflare, Akamai, DataDome (puzzle + slide-right + audio), PerimeterX
 (press-and-hold), Imperva, Kasada, F5 Shape, AWS WAF, GeeTest v4 (slide),
 Baxia (slider), hCaptcha, reCAPTCHA v2 (checkbox + image grid via local ONNX
 models), generic JS.
@@ -444,7 +444,8 @@ Some WAFs bind cookies to the TLS session, making cookie replay from rnet
 impossible after a browser solve. In these cases the solver captures the page
 content directly and returns it as the response. This is transparent -
 `session.get()` returns a normal `WaferResponse`. No special handling needed.
-Currently applies to Kasada on dual-WAF sites (e.g. Akamai + Kasada).
+Applies to Kasada, AWS WAF, and any challenge where the browser lands on the
+real page after solving.
 
 ---
 

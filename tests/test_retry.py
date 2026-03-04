@@ -269,12 +269,12 @@ class TestSyncRetryLoop:
             session.get("https://example.com")
 
     def test_challenge_detected_rotates(self, mock_sleep):
-        """Non-JS-only challenge (DataDome) rotates fingerprint."""
+        """Non-JS-only challenge (Akamai) rotates fingerprint."""
         session, mock = make_sync_session([
             MockResponse(
                 403,
-                headers={"Set-Cookie": "datadome=abc123; Path=/"},
-                body="<html>datadome challenge</html>",
+                headers={"Set-Cookie": "_abck=abc123; Path=/"},
+                body="<html>akamai challenge</html>",
             ),
             MockResponse(200, body="OK"),
         ])
@@ -337,7 +337,8 @@ class TestSyncRetryLoop:
         resp = session.get("https://example.com")
         assert resp.status_code == 200
 
-    def test_datadome_cookie_challenge(self, mock_sleep):
+    def test_datadome_cookie_challenge_js_only(self, mock_sleep):
+        """DataDome is JS_ONLY: raises immediately without browser solver."""
         session, mock = make_sync_session([
             MockResponse(
                 403,
@@ -346,16 +347,18 @@ class TestSyncRetryLoop:
             ),
             MockResponse(200, body="OK"),
         ])
-        resp = session.get("https://example.com")
-        assert resp.status_code == 200
+        with pytest.raises(ChallengeDetected) as exc_info:
+            session.get("https://example.com")
+        assert exc_info.value.challenge_type == "datadome"
+        assert mock.request_count == 1
 
     def test_multi_set_cookie_challenge_detected(self, mock_sleep):
         """Challenge detected when WAF cookie is in second Set-Cookie header."""
         resp403 = MockResponse(403, body="")
-        # Simulate two Set-Cookie headers: one benign, one datadome
+        # Simulate two Set-Cookie headers: one benign, one akamai
         resp403.headers._raw[b"set-cookie"] = [
             b"session_id=abc; Path=/",
-            b"datadome=xyz; Path=/",
+            b"_abck=xyz; Path=/",
         ]
         session, mock = make_sync_session([
             resp403,

@@ -1,8 +1,6 @@
 """Tests for browser-based challenge solving and iframe interception."""
 
 import math
-import os
-import shutil
 import time
 from unittest.mock import MagicMock, PropertyMock, patch
 
@@ -2075,7 +2073,11 @@ class TestWaitForDataDome:
         page.frames = []
         # deadline(0.0) + grace(0.5) + while(1.0) + grace_check(1.5)
         # + while(2.0) — second iteration finds solved cookie
-        mock_mono.side_effect = [0.0, 0.5, 1.0, 1.5, 2.0]
+        # + redirect_deadline(2.5) + redirect_while(3.0) — no DD frame,
+        #   returns True
+        mock_mono.side_effect = [
+            0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0,
+        ]
 
         assert wait_for_datadome(solver, page, 10000) is True
 
@@ -2297,40 +2299,15 @@ class TestDispatchChallenge:
         assert result is True
 
 
-class TestScreenXYExtension:
-    def test_extension_extracted(self):
-        solver = BrowserSolver()
-        ext_dir = solver._ensure_extension()
+class TestScreenXYFixScript:
+    def test_screenxy_fix_script_exists(self):
+        """The screenXY fix script constant is defined and non-empty."""
+        from wafer.browser._solver import _SCREENXY_FIX_SCRIPT
 
-        assert ext_dir is not None
-        assert os.path.isfile(
-            os.path.join(ext_dir, "manifest.json")
-        )
-        assert os.path.isfile(
-            os.path.join(ext_dir, "content.js")
-        )
-
-        # Cleanup
-        shutil.rmtree(ext_dir)
-        solver._extension_dir = None
-
-    def test_extension_cached(self):
-        solver = BrowserSolver()
-        dir1 = solver._ensure_extension()
-        dir2 = solver._ensure_extension()
-        assert dir1 == dir2
-
-        shutil.rmtree(dir1)
-        solver._extension_dir = None
-
-    def test_close_browser_cleans_up(self):
-        solver = BrowserSolver()
-        ext_dir = solver._ensure_extension()
-        assert os.path.isdir(ext_dir)
-
-        solver._close_browser()
-        assert not os.path.isdir(ext_dir)
-        assert solver._extension_dir is None
+        assert _SCREENXY_FIX_SCRIPT
+        assert "screenX" in _SCREENXY_FIX_SCRIPT
+        assert "screenY" in _SCREENXY_FIX_SCRIPT
+        assert "MouseEvent" in _SCREENXY_FIX_SCRIPT
 
 
 # ---------------------------------------------------------------------------

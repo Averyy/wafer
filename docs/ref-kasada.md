@@ -13,7 +13,7 @@
 **Validated against real sites**:
 - `realestate.com.au` -server-side 429, browser-solve PASS, cookie auth 5/5 durability (Feb 2026)
 - `hyatt.com` -server-side 429 (also Akamai CDN), browser-solve PASS, cookie auth 5/5, 43 cookies (Feb 2026)
-- `chewy.com` -dual-WAF (Akamai + Kasada), browser-solve PASS, passthrough 2.1MB. Full CT+CD+ST flow (ST returned from /tl). Cookie replay fails (_abck TLS-bound), uses passthrough. (Mar 2026)
+- `chewy.com` -dual-WAF (Akamai + Kasada), browser-solve PASS, passthrough 2.0MB. Full CT+CD+ST flow (ST returned from /tl). Cookie replay fails (_abck TLS-bound), uses passthrough. Requires `--force-color-profile=scrgb-linear` + skipping `_HEADLESS_FIX_SCRIPT` (ips.js detects Function.prototype.toString wrapper). (Mar 2026)
 
 **Skipped items** (resolved or not worth pursuing):
 - CDP console detection mitigation -resolved by Patchright (removes `Runtime.enable` + `Console.enable`) and Chrome V8 engine patch (Chrome 137+, May 2025). Solver works without any mitigation code.
@@ -44,6 +44,28 @@ This is confirmed by multiple commercial Kasada solver APIs (EzCaptcha, Hyper So
 **Other candidates**:
 - `draftkings.com` -2026-02-21: TLS passes Cloudflare on homepage. Kasada presence unverified on deeper pages.
 - Any Kasada site that rejects cookie-only auth with a 429
+
+## Headless Detection
+
+Kasada's ips.js detects headless Chrome via two independent mechanisms:
+
+### 1. CSS computed style cross-check (rendering pipeline)
+
+ips.js creates DOM elements with `@media (color: 10)` CSS rules and reads `getComputedStyle()`. On headed macOS Chrome, the Display P3 pipeline reports 10-bit color. Headless Chrome defaults to 8-bit sRGB. This cannot be faked via JS or CDP `Emulation.setEmulatedMedia` - the CSS query result comes from the actual rendering pipeline.
+
+**Fix:** `--force-color-profile=scrgb-linear` launch flag makes the rendering pipeline report 10-bit color, matching headed Chrome. All three CSS signals now match:
+
+| Signal | Headed | Headless (default) | Headless (scrgb-linear) |
+|---|---|---|---|
+| `@media (color: 10)` | true | false | true |
+| `@media (color: 8)` | false | true | false |
+| `@media (dynamic-range: high)` | true | false | true |
+
+### 2. Function.prototype.toString wrapper detection
+
+ips.js detects the `Function.prototype.toString` override used by `_HEADLESS_FIX_SCRIPT` to make patched getters appear native. The exact detection mechanism is unknown (possibly checks for closure references, Map backing, or toString identity).
+
+**Fix:** Skip `_HEADLESS_FIX_SCRIPT` entirely for Kasada challenges. The scrgb-linear flag handles the CSS signals, and Kasada accepts `colorDepth=24` when the rendering pipeline reports 10-bit color. The getter patches for `outerWidth`/`outerHeight`/`screenY` are only needed for DataDome, not Kasada.
 
 ## How Kasada Works
 
@@ -164,7 +186,7 @@ Does NOT need:
 
 | Site | Status | Notes |
 |------|--------|-------|
-| `chewy.com` | **Validated** | 2026-03-02: dual-WAF (Akamai+Kasada), browser-solve PASS, passthrough 2.1MB. Full ST from /tl. Cookie replay fails (_abck TLS-bound). |
+| `chewy.com` | **Validated** | 2026-03-03: dual-WAF (Akamai+Kasada), browser-solve PASS headless, passthrough 2.0MB, 36 cookies. Requires scrgb-linear color profile + no getter patches (ips.js detects Function.prototype.toString wrapper). Cookie replay fails (_abck TLS-bound). |
 | `realestate.com.au` | **Validated** | 2026-02-21: server-side 429, browser-solve PASS, cookie auth 5/5, no ST |
 | `hyatt.com` | **Validated** | 2026-02-21: server-side 429, browser-solve PASS, cookie auth 5/5, 43 cookies, no ST |
 | `scheels.com` | tls-pass | 2026-02-21: Chrome145 TLS passes. Cloudflare CDN blocks naked. Kasada client-side only. |
