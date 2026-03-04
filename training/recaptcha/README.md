@@ -23,13 +23,13 @@ Collect reCAPTCHA grid images from Google's demo page:
 
 ```bash
 # Single worker (recommended - Google rate-limits after ~30-60 min)
-uv run python training/collect.py
+uv run python training/recaptcha/collect.py
 
 # Headful if headless stops getting challenges
-uv run python training/collect.py --headful
+uv run python training/recaptcha/collect.py --headful
 ```
 
-3x3 grids are auto-split into 9 individual 100x100 tiles on save (`collected_cls/`). 4x4 grids go to `collected_det/` as full images. 3-6s delay between grid reloads, 10-16s between rounds. Auto-backoff on rate limiting (8h, 12h).
+3x3 grids are auto-split into 9 individual 100x100 tiles on save (`collected_cls/`). 4x4 grids go to `collected_det/` as full images. 3-6s delay between grid reloads, 10-16s between rounds. Auto-backoff on rate limiting (12h, 16h).
 
 After collecting, add model predictions for faster CLS labeling:
 

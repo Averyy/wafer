@@ -12,9 +12,9 @@ hits from the same IP (empty challenge frames). Use --headful if
 headless stops getting challenges.
 
 Usage:
-    uv run python training/collect.py
-    uv run python training/collect.py --workers 3
-    uv run python training/collect.py --workers 3 --headful
+    uv run python training/recaptcha/collect.py
+    uv run python training/recaptcha/collect.py --workers 3
+    uv run python training/recaptcha/collect.py --workers 3 --headful
 """
 
 import argparse
@@ -29,6 +29,9 @@ import time
 import uuid
 from pathlib import Path
 from urllib.parse import urlparse
+
+import numpy as np
+from scipy.fftpack import dct  # type: ignore[import-not-found]
 
 # Set collection env vars before importing wafer modules
 os.environ.setdefault("WAFER_COLLECT_DET", "training/recaptcha/collected_det")
@@ -94,12 +97,16 @@ def _print_stats():
 
 
 # ---------------------------------------------------------------------------
-# Dedup (dHash, same as _recaptcha_grid.py)
+# Dedup - dual hash (dHash + pHash) with pixel MAD verification
 # ---------------------------------------------------------------------------
 
-_seen_hashes: set[int] = set()
-_seen_loaded = False
-_hash_lock = threading.Lock()
+_DH_THRESHOLD = 12    # hamming distance for dHash64 candidates
+_PH_THRESHOLD = 12    # hamming distance for pHash64 candidates
+_MAD_THRESHOLD = 20.0  # max mean absolute pixel diff to confirm dupe
+_NORM_SIZE = (100, 100)
+_POPCOUNT_LUT = np.array(
+    [bin(i).count("1") for i in range(256)], dtype=np.uint8,
+)
 
 
 def _dhash(img, hash_size: int = 8) -> int:
@@ -110,101 +117,242 @@ def _dhash(img, hash_size: int = 8) -> int:
     bits = 0
     for row in range(hash_size):
         for col in range(hash_size):
-            bits = (bits << 1) | (pixels[row * w + col] < pixels[row * w + col + 1])
+            bits = (bits << 1) | int(
+                pixels[row * w + col] < pixels[row * w + col + 1]
+            )
     return bits
 
 
-def _dhash_file(path: Path) -> int | None:
-    """Compute dHash of an image file on disk."""
-    try:
+def _phash(img, hash_size: int = 8, highfreq_factor: int = 4) -> int:
+    img_size = hash_size * highfreq_factor
+    small = img.convert("L").resize((img_size, img_size), 1)
+    pixels = np.array(small, dtype=np.float64)
+    dct_result = dct(dct(pixels, axis=0), axis=1)
+    dct_low = dct_result[:hash_size, :hash_size]
+    med = np.median(dct_low)
+    bits = 0
+    for val in dct_low.flatten():
+        bits = (bits << 1) | int(val > med)
+    return bits
+
+
+def _to_pixels(img) -> np.ndarray:
+    return np.array(
+        img.convert("RGB").resize(_NORM_SIZE, 1), dtype=np.float32,
+    )
+
+
+def _hamming_batch(hashes: np.ndarray, query: int, count: int):
+    xored = np.bitwise_xor(hashes[:count], np.uint64(query))
+    return _POPCOUNT_LUT[xored.view(np.uint8).reshape(-1, 8)].sum(
+        axis=1,
+    )
+
+
+class DedupIndex:
+    """Per-type dedup index with dual-hash + pixel MAD verification."""
+
+    def __init__(self, name: str):
+        self.name = name
+        self._cap = 100_000
+        self._dh = np.zeros(self._cap, dtype=np.uint64)
+        self._ph = np.zeros(self._cap, dtype=np.uint64)
+        self._paths: list[str] = []
+        self._size = 0
+        self._exact: set[int] = set()
+        self._loaded = threading.Event()
+        self._lock = threading.Lock()
+
+    def _grow(self):
+        new_cap = self._cap * 2
+        new_dh = np.zeros(new_cap, dtype=np.uint64)
+        new_ph = np.zeros(new_cap, dtype=np.uint64)
+        new_dh[: self._cap] = self._dh
+        new_ph[: self._cap] = self._ph
+        self._dh = new_dh
+        self._ph = new_ph
+        self._cap = new_cap
+
+    def add(self, dh: int, ph: int, path: str):
+        if self._size >= self._cap:
+            self._grow()
+        self._dh[self._size] = np.uint64(dh)
+        self._ph[self._size] = np.uint64(ph)
+        self._paths.append(path)
+        self._exact.add(dh)
+        self._size += 1
+
+    def _load_collected(self, collect_dir: str):
+        """Load previously collected images from metadata.jsonl."""
         from PIL import Image
-        img = Image.open(path)
-        return _dhash(img)
-    except Exception:
-        return None
-
-
-def _load_seen():
-    global _seen_loaded
-    if _seen_loaded:
-        return
-    with _hash_lock:
-        if _seen_loaded:
+        meta = Path(collect_dir) / "metadata.jsonl"
+        if not meta.is_file():
             return
-        _seen_loaded = True
-        # Load hashes from collected metadata.jsonl files
-        for envvar in ("WAFER_COLLECT_DET", "WAFER_COLLECT_CLS"):
-            d = os.environ.get(envvar)
-            if not d:
-                continue
-            meta = Path(d) / "metadata.jsonl"
-            if not meta.is_file():
+        count = 0
+        try:
+            with open(meta) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+                    fname = entry.get("file")
+                    dh = entry.get("dhash")
+                    if dh is None or not fname:
+                        continue
+                    img_path = Path(collect_dir) / fname
+                    if not img_path.is_file():
+                        self._exact.add(dh)
+                        continue
+                    try:
+                        img = Image.open(img_path)
+                        ph = _phash(img)
+                        self.add(dh, ph, str(img_path))
+                        count += 1
+                    except Exception:
+                        self._exact.add(dh)
+        except Exception:
+            pass
+        if count:
+            logger.info(
+                "[%s] Loaded %d from %s", self.name, count,
+                collect_dir,
+            )
+
+    def _load_dataset(self, ds_dir: Path):
+        """Load a dataset directory into the index."""
+        from PIL import Image
+        if not ds_dir.is_dir():
+            return
+        count = 0
+        name = ds_dir.name
+        for img_path in ds_dir.rglob("*"):
+            if img_path.suffix.lower() not in (".jpg", ".jpeg", ".png"):
                 continue
             try:
-                with open(meta) as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        h = json.loads(line).get("dhash")
-                        if h is not None:
-                            _seen_hashes.add(h)
+                img = Image.open(img_path)
+                dh = _dhash(img)
+                ph = _phash(img)
+                self.add(dh, ph, str(img_path))
+                count += 1
+                if count % 10000 == 0:
+                    logger.info(
+                        "[%s] Indexed %d from %s...",
+                        self.name, count, name,
+                    )
             except Exception:
                 pass
-        # Load 57k base dataset index (built by dedup.py build-index)
-        cls_dir = os.environ.get("WAFER_COLLECT_CLS", "")
-        if cls_dir:
-            index_path = Path(cls_dir).parent / "dedup_index.pkl"
-            if index_path.is_file():
+        if count:
+            logger.info(
+                "[%s] Loaded %d from %s", self.name, count, name,
+            )
+
+    def is_dupe(self, img) -> tuple[bool, int, int]:
+        """Check if img is a duplicate. Returns (is_dupe, dHash, pHash).
+
+        Tier 1: Exact dHash match (O(1) set lookup).
+        Tier 2: Both dHash64 AND pHash64 within hamming threshold,
+                confirmed by mean absolute pixel difference < 20.
+
+        Does NOT modify the index - caller must call add() on non-dupes.
+        """
+        self._ensure_loaded()
+        norm = img.convert("RGB").resize(_NORM_SIZE, 1)
+        dh = _dhash(norm)
+        ph = _phash(norm)
+
+        # Tier 1: exact dHash
+        with self._lock:
+            if dh in self._exact:
+                return True, dh, ph
+
+        # Tier 2: find candidate indices under lock, do I/O outside
+        candidate_paths: list[str] = []
+        with self._lock:
+            if self._size > 0:
+                dh_d = _hamming_batch(self._dh, dh, self._size)
+                ph_d = _hamming_batch(self._ph, ph, self._size)
+                idxs = np.where(
+                    (dh_d <= _DH_THRESHOLD)
+                    & (ph_d <= _PH_THRESHOLD)
+                )[0]
+                candidate_paths = [self._paths[i] for i in idxs]
+
+        if candidate_paths:
+            from PIL import Image as _Img
+            pix = _to_pixels(norm)
+            for cpath in candidate_paths:
                 try:
-                    import pickle
-                    with open(index_path, "rb") as f:
-                        index = pickle.load(f)
-                    for h in index.get("dhashes", []):
-                        _seen_hashes.add(h)
-                    logger.info(
-                        "Loaded %d hashes from classic dedup index",
-                        len(index.get("dhashes", [])),
-                    )
-                except Exception as e:
-                    logger.warning("Failed to load dedup index: %s", e)
-            else:
-                logger.warning(
-                    "No dedup_index.pkl found - run "
-                    "'python dedup.py build-index' to dedup against classic dataset",
-                )
-        # Load hashes from already-labeled images in datasets/wafer_*
-        datasets_dirs_seen: set[str] = set()
-        for envvar in ("WAFER_COLLECT_DET", "WAFER_COLLECT_CLS"):
-            d = os.environ.get(envvar)
-            if not d:
-                continue
-            datasets_dir = Path(d).parent / "datasets"
-            ds_key = str(datasets_dir.resolve())
-            if ds_key in datasets_dirs_seen or not datasets_dir.is_dir():
-                continue
-            datasets_dirs_seen.add(ds_key)
-            count = 0
-            for img_path in datasets_dir.rglob("*.jpg"):
-                if "wafer_cls_classic" in str(img_path):
+                    cpix = _to_pixels(_Img.open(cpath))
+                    mad = float(np.abs(pix - cpix).mean())
+                    if mad < _MAD_THRESHOLD:
+                        return True, dh, ph
+                except Exception:
                     continue
-                h = _dhash_file(img_path)
-                if h is not None:
-                    _seen_hashes.add(h)
-                    count += 1
-            if count:
-                logger.info("Loaded %d hashes from datasets/", count)
-    logger.info("Total dedup hashes: %d", len(_seen_hashes))
+
+        # Optimistically reserve this hash so concurrent threads skip it.
+        # Caller must call add() after saving, or remove from _exact on failure.
+        with self._lock:
+            self._exact.add(dh)
+
+        return False, dh, ph
+
+    def _ensure_loaded(self):
+        raise NotImplementedError
 
 
-def _is_dupe(img) -> bool:
-    _load_seen()
-    h = _dhash(img)
-    with _hash_lock:
-        if h in _seen_hashes:
-            return True
-        _seen_hashes.add(h)
-    return False
+class _ClsDedup(DedupIndex):
+    """CLS: collected_cls + datasets/wafer_cls + datasets/wafer_cls_classic."""
+
+    def _ensure_loaded(self):
+        if self._loaded.is_set():
+            return
+        with self._lock:
+            if self._loaded.is_set():
+                return
+
+            d = os.environ.get("WAFER_COLLECT_CLS", "")
+            if d:
+                self._load_collected(d)
+                ds = Path(d).parent / "datasets"
+                self._load_dataset(ds / "wafer_cls_classic")
+                self._load_dataset(ds / "wafer_cls")
+
+            logger.info(
+                "[cls] Dedup index: %d full, %d exact",
+                self._size, len(self._exact),
+            )
+            self._loaded.set()
+
+
+class _DetDedup(DedupIndex):
+    """DET: collected_det + datasets/wafer_det."""
+
+    def _ensure_loaded(self):
+        if self._loaded.is_set():
+            return
+        with self._lock:
+            if self._loaded.is_set():
+                return
+
+            d = os.environ.get("WAFER_COLLECT_DET", "")
+            if d:
+                self._load_collected(d)
+                ds = Path(d).parent / "datasets"
+                self._load_dataset(ds / "wafer_det")
+
+            logger.info(
+                "[det] Dedup index: %d full, %d exact",
+                self._size, len(self._exact),
+            )
+            self._loaded.set()
+
+
+_cls_dedup = _ClsDedup("cls")
+_det_dedup = _DetDedup("det")
 
 
 # ---------------------------------------------------------------------------
@@ -220,26 +368,31 @@ def _save_det(keyword: str, grid_type: str, image_bytes: bytes):
         from PIL import Image
 
         img = Image.open(io.BytesIO(image_bytes))
-        if _is_dupe(img):
+
+        dupe, dh, ph = _det_dedup.is_dupe(img)
+        if dupe:
             _inc(dupes_skipped=1)
             return False
 
         out = Path(d)
         out.mkdir(parents=True, exist_ok=True)
         fname = f"{uuid.uuid4()}.jpg"
-        (out / fname).write_bytes(image_bytes)
+        fpath = out / fname
+        fpath.write_bytes(image_bytes)
 
         entry = {
             "file": fname,
             "keyword": keyword,
             "grid_type": grid_type,
             "outcome": "collected",
-            "dhash": _dhash(img),
+            "dhash": dh,
+            "phash": ph,
         }
         meta = Path(d) / "metadata.jsonl"
-        with _hash_lock:
+        with _det_dedup._lock:
             with open(meta, "a") as f:
                 f.write(json.dumps(entry) + "\n")
+            _det_dedup.add(dh, ph, str(fpath))
         _inc(images_saved=1)
         return True
     except Exception as e:
@@ -272,12 +425,14 @@ def _save_cls(keyword: str, grid_type: str, image_bytes: bytes):
             ))
             tile_100 = tile.convert("RGB").resize((100, 100), 1)
 
-            if _is_dupe(tile_100):
+            dupe, dh, ph = _cls_dedup.is_dupe(tile_100)
+            if dupe:
                 _inc(dupes_skipped=1)
                 continue
 
             fname = f"{uuid.uuid4()}.jpg"
-            tile_100.save(out_dir / fname, "JPEG", quality=90)
+            fpath = out_dir / fname
+            tile_100.save(fpath, "JPEG", quality=100)
 
             entry = {
                 "file": fname,
@@ -285,11 +440,13 @@ def _save_cls(keyword: str, grid_type: str, image_bytes: bytes):
                 "grid_type": grid_type,
                 "outcome": "collected",
                 "cell_index": idx,
-                "dhash": _dhash(tile_100),
+                "dhash": dh,
+                "phash": ph,
             }
-            with _hash_lock:
+            with _cls_dedup._lock:
                 with open(meta, "a") as f:
                     f.write(json.dumps(entry) + "\n")
+                _cls_dedup.add(dh, ph, str(fpath))
             saved += 1
 
         _inc(tiles_saved=saved)
@@ -525,6 +682,8 @@ def _run_session(browser, wid: int) -> int:
                 "W%d: grid %d - %s %s %r",
                 wid, i, grid_type, status, keyword,
             )
+            if saved:
+                grids_collected += 1
         else:
             _inc(grids_3x3=1)
             tiles = _save_cls(keyword, grid_type, image_bytes)
@@ -532,8 +691,8 @@ def _run_session(browser, wid: int) -> int:
                 "W%d: grid %d - %s %d tiles %r",
                 wid, i, grid_type, tiles, keyword,
             )
-
-        grids_collected += 1
+            if tiles > 0:
+                grids_collected += 1
         _click_reload(page, bframe)
 
     return grids_collected
@@ -563,9 +722,11 @@ def main():
         _shutdown.set()
 
     signal.signal(signal.SIGINT, _sig)
+    signal.signal(signal.SIGTERM, _sig)
 
-    # Pre-load dedup hashes
-    _load_seen()
+    # Pre-load dedup indexes
+    _cls_dedup._ensure_loaded()
+    _det_dedup._ensure_loaded()
 
     logger.info(
         "Starting %d %s worker(s) against %s",

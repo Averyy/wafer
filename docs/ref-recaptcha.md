@@ -68,6 +68,6 @@ See `docs/ref-models.md` for model training, data collection pipeline, and retra
 ## Test Infrastructure
 
 - **Live test**: `google.com/recaptcha/api2/demo` (always triggers image grid)
-- **Bulk data collection**: `uv run python training/collect.py --workers 3` (headless, ~18 img/min per worker, both 3x3 and 4x4)
+- **Bulk data collection**: `uv run python training/recaptcha/collect.py --workers 3` (headless, ~18 img/min per worker, both 3x3 and 4x4)
 - **Annotation**: `uv run python -m wafer.browser.mousse` (DET and CLS labeling modes)
 - **Recordings**: 45 grid hops in `_recordings/grid_hops/`

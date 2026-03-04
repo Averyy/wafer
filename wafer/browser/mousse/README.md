@@ -90,13 +90,13 @@ Annotate 4x4 (and 3x3) reCAPTCHA grid images collected during live solves or the
 - **Priority ordering**: grids are sorted by labeled class count (ascending) so underrepresented classes appear first
 - **Stats table** at the bottom shows per-class labeled/pending counts with color coding (green/yellow/red)
 
-Tab is disabled when no grids are available. Populate by running the collector (`uv run python training/collect.py`) or the reCAPTCHA solver with collection enabled (`WAFER_COLLECT_DET` env var or default path).
+Tab is disabled when no grids are available. Populate by running the collector (`uv run python training/recaptcha/collect.py`) or the reCAPTCHA solver with collection enabled (`WAFER_COLLECT_DET` env var or default path).
 
 ### CLS (Classification Tile Labeling)
 
 Label individual 3x3 reCAPTCHA tiles collected during live solves or the bulk collector. CLS mode shows each tile with confidence bars and 16 emoji-labeled class buttons (Other is last, for tiles that don't match any category).
 
-The bulk collector (`training/collect.py`) auto-splits 3x3 grids into individual tiles on save, so collected tiles are ready for CLS annotation immediately. Run `predict_cls.py` after collecting to add model predictions.
+The bulk collector (`training/recaptcha/collect.py`) auto-splits 3x3 grids into individual tiles on save, so collected tiles are ready for CLS annotation immediately. Run `predict_cls.py` after collecting to add model predictions.
 
 - **Auto-suggest**: model's predicted class is pre-selected (half-opacity green). Press Enter/Space to approve, or click a different button to override (full green, accepts immediately).
 - S = skip tile, D = delete tile

@@ -115,10 +115,10 @@ D-FINE models are used as-is from the D-FINE project (pretrained on Objects365+C
 
 ### Bulk Collection
 
-`training/collect.py` runs headless browser workers against Google's reCAPTCHA demo page, collecting both 3x3 and 4x4 grids. No inference, no solving - just image + keyword capture. ~18 img/min per worker.
+`training/recaptcha/collect.py` runs headless browser workers against Google's reCAPTCHA demo page, collecting both 3x3 and 4x4 grids. No inference, no solving - just image + keyword capture. ~18 img/min per worker.
 
 ```bash
-uv run python training/collect.py --workers 3
+uv run python training/recaptcha/collect.py --workers 3
 ```
 
 3x3 grids split into 9 individual 100x100 tiles on save, written to `collected_cls/`. 4x4 grids saved as full images to `collected_det/`.
@@ -130,13 +130,13 @@ The solver also collects training data during live reCAPTCHA solves (zero overhe
 **CLS tiles** (`_collect_single_tile`):
 - Every 3x3 tile (both grid splits and dynamic replacements) saved as 100x100 JPEG
 - Metadata: predicted_class, confidence, top-3 predictions, keyword, target_class, is_selected, dhash, pixhash
-- Cross-session dedup via dHash (loads existing hashes from metadata.jsonl on first collection)
+- Dual-hash dedup (dHash64 + pHash64 + pixel MAD) against collected_cls, wafer_cls_classic, and wafer_cls
 - Env var: `WAFER_COLLECT_CLS` (default: `training/recaptcha/collected_cls`)
 
 **DET grids** (`_collect_det_grid`):
 - Full 4x4 grid images saved at native resolution (~400-450px) with solve outcome
 - Metadata: keyword, grid_type, outcome, cells_selected, dhash
-- Cross-session dedup via dHash (same mechanism as CLS)
+- Dual-hash dedup against collected_det and wafer_det (separate index from CLS)
 - All 10 outcome paths logged (solved, failed, no_coco_class, etc.)
 - Env var: `WAFER_COLLECT_DET` (default: `training/recaptcha/collected_det`)
 
@@ -153,14 +153,16 @@ The solver also collects training data during live reCAPTCHA solves (zero overhe
 
 ### Offline Dedup
 
-`training/recaptcha/dedup.py` checks our labeled tiles against the classic dataset:
+The collector deduplicates automatically on save. For manual cleanup of existing tiles, use `manual_dedup.py`:
 
 ```bash
-python dedup.py build-index                    # pixel SHA256 + dHash of classic tiles
-python dedup.py dedup --threshold 4            # remove matches from datasets/wafer_cls/
+cd training/recaptcha
+python manual_dedup.py              # dry run - report dupes
+python manual_dedup.py --delete     # delete confirmed dupes
+python manual_dedup.py --gallery    # save visual gallery to /tmp
 ```
 
-Two-tier dedup: exact pixel hash match, then perceptual dHash with hamming distance <= 4. Run before training to avoid duplicates between the classic dataset and our collected tiles.
+Finds intra-set dupes within collected_cls and cross-set dupes against wafer_cls_classic. Dual-hash approach: both dHash64 and pHash64 must agree on candidacy, then pixel MAD < 20 confirms. Only deletes from collected_cls, never classic.
 
 ## Data Directories
 
