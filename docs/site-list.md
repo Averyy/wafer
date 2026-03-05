@@ -247,9 +247,9 @@ Requires browser solver with human-like mouse input.
 | `bkstr.com` | PX | pass | 2026-02-21: 200 31KB via TLS |
 | `hibbett.com` | PX press-and-hold | blocked | 2026-02-21: PX challenge for TLS but browser passes without challenge → no _px3 cookie → cookie replay impossible. IP burned during testing. Sneaker retailer, aggressive PX config |
 
-### DataDome (slider + VM PoW)
+### DataDome (WASM PoW)
 
-DataDome shifted to VM fingerprint (`plv3`) + WASM PoW in Jan 2026, which auto-resolve in a real browser. Two slider variants may appear: a jigsaw puzzle slider (ArgoZhang/SliderCaptcha, CV notch detection + mousse drag) and a slide-right slider (Dec 2025+, drag handle to end of track). Solver handles all three: auto-resolve, puzzle slider, and slide-right.
+DataDome shifted to VM fingerprint (`plv3`) + WASM PoW in Jan 2026, which auto-resolve in a real browser. If DD escalates beyond PoW (audio captcha, puzzle slider, slide-right), we cannot solve it - DD's behavioral analysis detects CDP-dispatched input events and rejects even correct answers. See `docs/ref-datadome.md`.
 
 | URL | Challenge Type | Status | Notes |
 |---|---|---|---|
@@ -334,7 +334,7 @@ Wafer has **no Arkose Labs solver**. Arkose presents 3D puzzle CAPTCHAs (rotate,
 |---|---|---|---|
 | **Cloudflare** (JS + Turnstile) | Yes | 15 | Browser solve + cookie replay. 30 min TTL. |
 | **Akamai** | Yes | 18 | Browser solve. Cookie replay difficult (_abck continuously validated). |
-| **DataDome** | Yes | 17 | Browser solve + cookie replay. Match OS. VM+PoW auto-resolves in browser. Puzzle slider + slide-right solvers ready if DD escalates. |
+| **DataDome** | Partial | 17 | WASM PoW auto-resolve + confirm button + cookie replay. Match OS. Interactive challenges (slider, audio) are **unsolvable** - DD detects CDP input events. See `docs/ref-datadome.md`. |
 | **PerimeterX** (press-and-hold) | Yes | 21 | Browser solve with recorded mouse input. **SOLVED** on wayfair. |
 | **AWS WAF** | Yes | 6 | Browser solve for JS challenge. |
 | **Imperva** | Yes | 6 | Browser solve + cookie replay. Handles modern reese84, legacy ___utmvc, and classic incap_ses. |

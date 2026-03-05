@@ -88,11 +88,14 @@ def wait_for_kasada(solver, page, timeout_ms: int) -> bool:
     if captured is None:
         captured = setup_kasada_listener(page)
 
-    # After CT is captured, wait for:
-    # 1. ST to also arrive (may come on a later /tl response)
-    # 2. Kasada JS to finish setting session cookies (~10s)
-    # Returning too early results in missing cookies.
-    min_settle = 10  # seconds after CT capture
+    # After CT is captured, wait for ST to arrive (may come on a
+    # later /tl response) and a short settle for cookies.  The
+    # original 10s settle was overly conservative — CT/ST typically
+    # arrive within 2-3s, and cookies are set around the same time.
+    # For passthrough sites (where browser returns content directly),
+    # cookie timing doesn't matter at all since TLS replay requires
+    # CT+CD+H headers that we don't send.
+    min_settle = 3  # seconds after CT capture
 
     try:
         ct_time: float | None = None

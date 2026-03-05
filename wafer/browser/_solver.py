@@ -343,12 +343,26 @@ class BrowserSolver:
 
         driver = compute_driver_executable()
         env = get_driver_env()
-        result = subprocess.run(
-            [*driver, "install", "chromium"],
-            capture_output=True,
-            text=True,
-            env=env,
-        )
+        logger.debug("Running patchright install chromium...")
+        try:
+            result = subprocess.run(
+                [*driver, "install", "chromium"],
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=60,
+            )
+        except subprocess.TimeoutExpired:
+            # When using channel="chrome" (system Chrome), the
+            # downloaded Chromium binary isn't needed. Log and
+            # continue - launch() will fail later if it really
+            # was required.
+            logger.warning(
+                "patchright install chromium timed out after 60s, "
+                "continuing (system Chrome may still work)"
+            )
+            BrowserSolver._browser_installed = True
+            return
         if result.returncode != 0:
             raise RuntimeError(
                 "Failed to install patchright browser binaries. "
@@ -435,12 +449,15 @@ class BrowserSolver:
                 )
 
         try:
+            logger.debug("Starting playwright driver...")
             self._playwright = sync_playwright().start()
+            logger.debug("Launching Chrome (headless=%s)...", self._headless)
             self._browser = self._playwright.chromium.launch(
                 channel="chrome",
                 headless=self._headless,
                 args=launch_args,
                 ignore_default_args=ignored,
+                timeout=30000,
             )
         except Exception:
             self._close_browser()
@@ -549,10 +566,12 @@ class BrowserSolver:
         })
 
         if self._headless:
-            # Kasada's ips.js detects the Function.prototype.toString
-            # wrapper in _HEADLESS_FIX_SCRIPT and withholds x-kpsdk-r.
-            # scrgb-linear alone handles Kasada's CSS cross-checks.
-            if challenge_type != "kasada":
+            # Kasada's ips.js and Akamai's behavioral challenge JS
+            # detect the Function.prototype.toString wrapper in
+            # _HEADLESS_FIX_SCRIPT.  Kasada withholds x-kpsdk-r;
+            # Akamai behavioral refuses to set session cookies.
+            # scrgb-linear alone handles the CSS cross-checks.
+            if challenge_type not in ("kasada", "akamai"):
                 cdp.send("Page.addScriptToEvaluateOnNewDocument", {
                     "source": _HEADLESS_FIX_SCRIPT,
                 })
