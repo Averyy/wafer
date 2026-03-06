@@ -137,6 +137,7 @@ Requires browser solver for initial solve, then TLS client replays cached cookie
 | `capterra.com/categories` | Cloudflare | pass | 2026-02-21: 200 616KB via TLS |
 | `fiverr.com` | Cloudflare | pass | 2026-02-21: 200 1.9MB via TLS |
 | `miata.net` | Cloudflare | browser-solve | 2026-02-21: Browser-solve verified. 403→browser→cf_clearance→200 26KB |
+| `researchgate.net/publication/352299571_Additives_in_pet_food_are_they_safe` | CF managed + Turnstile | browser-solve | 2026-03-06: Browser-solve verified. 403→browser→passthrough→200 710KB. Custom CF challenge page (ResearchGate branding). Alternates between managed (auto-solve) and interactive Turnstile. Detected `--disable-site-isolation-trials` flag - required removing it for Turnstile to resolve. |
 | `glassdoor.com` | Cloudflare | pass | 2026-02-21: 200 648KB via TLS |
 | `kick.com` | Cloudflare | browser-solve | 2026-02-21: Browser-solve verified. 403→browser→cf_clearance→200 502KB. **Reclassified from Kasada to Cloudflare** |
 | `fbref.com` | Cloudflare | browser-solve | 2026-02-21: Browser-solve verified. 403→browser→cf_clearance→200 554KB. Sports reference |
@@ -204,7 +205,8 @@ Kasada solver: browser solve extracts CT token from ips.js/p.js response, cookie
 | URL | Challenge Type | Status | Notes |
 |---|---|---|---|
 | `chewy.com` | Kasada + Akamai | browser-solve | 2026-03-02: Browser-solve verified. 429→browser→kasada passthrough→200 2.1MB. Dual-WAF: Akamai behavioral on outer layer, Kasada underneath. Full CT+CD+ST flow (ST returned from /tl). Cookie replay fails (_abck TLS-bound), uses Kasada passthrough. |
-| `chewy.com/nummy-tum-tum-pure-organic-pumpkin/dp/35533` | Kasada + Akamai | browser-solve | 2026-03-02: Browser-solve verified. Akamai behavioral→Kasada→passthrough→200 2.7MB. Product page hits Akamai first, then Kasada. Dual browser solve works via per-challenge-type tracking. |
+| `chewy.com/s?query=dog+food` | Kasada + Akamai | browser-solve | 2026-03-06: Browser-solve verified. Kasada passthrough→200 6.1MB. Search redirects to /b/food-332. |
+| `chewy.com/blue-buffalo-life-protection-formula/dp/37466` | Kasada + Akamai | browser-solve | 2026-03-06: Browser-solve verified. Akamai behavioral→browser→passthrough→200 5.0MB. Product page. |
 | `realestate.com.au` | Kasada (server-side) | browser-solve | 2026-02-21: Browser-solve verified. 429→browser→CT+cookies→200 626KB. CT from ips.js (no ST), cookie auth. |
 | `hyatt.com` | Kasada (server-side) | browser-solve | 2026-02-21: Browser-solve verified. 429→browser→CT+cookies→200 41KB. CT from ips.js (no ST), 43 cookies. |
 | `scheels.com` | Kasada (client-side) | pass | 2026-02-21: 200 804KB via TLS. Kasada is client-side only |

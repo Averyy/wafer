@@ -27,6 +27,17 @@ def wait_for_shape(solver, page, timeout_ms: int) -> bool:
             content = page.content()
             if "istlwashere" not in content.lower():
                 solver._replay_browse_chunk(page, state, 1)
+                # Verify we landed on real content, not a block page.
+                # F5 Shape redirects blocked clients to a soft-block
+                # page (e.g. siteclosed.nordstrom.com/invitation.html)
+                # that also lacks istlWasHere.
+                url = page.url.lower()
+                if "invitation" in url or "siteclosed" in url:
+                    logger.warning(
+                        "Shape redirected to block page: %s",
+                        page.url,
+                    )
+                    return False
                 return True
         except Exception:
             pass

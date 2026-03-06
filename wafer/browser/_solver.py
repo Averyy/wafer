@@ -64,10 +64,10 @@ logger = logging.getLogger("wafer")
 #   outerHeight: == innerHeight (should be +80 for title/tab/toolbar)
 #   screenY/screenTop: ~22 (should be ~56 with menu bar)
 #
-# Normally CDP Page.addScriptToEvaluateOnNewDocument only reaches the
-# main frame (OOPIFs are separate targets).  We disable site isolation
-# to force all frames into the same process, so the script reaches
-# cross-origin iframes too.
+# CDP Page.addScriptToEvaluateOnNewDocument only reaches same-origin
+# frames (OOPIFs are separate targets).  Cross-origin iframes need
+# the fix injected directly via frame.evaluate() - see
+# patch_frame_headless() below.
 #
 # The JS guard (isMac && outerWidth === innerWidth) is intentional:
 # outerWidth === innerWidth is the headless signature on macOS.  The
@@ -146,8 +146,8 @@ _HEADLESS_FIX_SCRIPT = r"""(function () {
 #
 # Previously shipped as an MV3 extension, but extensions don't load
 # in Playwright's new_context() (incognito-like).  Now injected via
-# CDP Page.addScriptToEvaluateOnNewDocument (which reaches all frames
-# including cross-origin iframes because site isolation is disabled).
+# CDP Page.addScriptToEvaluateOnNewDocument for same-origin frames.
+# Cross-origin iframes need patch_frame_screenxy() called directly.
 # ---------------------------------------------------------------------------
 _SCREENXY_FIX_SCRIPT = r"""(function () {
   var origSX = Object.getOwnPropertyDescriptor(MouseEvent.prototype, 'screenX');
@@ -172,6 +172,34 @@ _SCREENXY_FIX_SCRIPT = r"""(function () {
     });
   });
 })();"""
+
+
+def patch_frame_screenxy(frame) -> None:
+    """Inject screenXY fix into a cross-origin frame.
+
+    With site isolation enabled (the default), CDP init scripts only
+    reach same-origin frames.  Cross-origin iframes (DataDome's
+    captcha-delivery, Baxia, etc.) need the fix injected directly
+    so CDP mouse events have correct screenX/screenY values.
+    """
+    try:
+        frame.evaluate(_SCREENXY_FIX_SCRIPT)
+    except Exception:
+        pass
+
+
+def patch_frame_headless(frame) -> None:
+    """Inject headless fingerprint fix into a cross-origin frame.
+
+    Same rationale as patch_frame_screenxy: CDP init scripts don't
+    reach cross-origin iframes.  WAFs that check colorDepth,
+    outerWidth, screen dimensions from inside their iframe need
+    the headless patches injected directly.
+    """
+    try:
+        frame.evaluate(_HEADLESS_FIX_SCRIPT)
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -410,11 +438,6 @@ class BrowserSolver:
             # ANGLE+GL on Linux/Windows.
             "--enable-gpu",
             "--use-gl=angle",
-            # Disable site isolation so CDP scripts (screenXY fix,
-            # headless patches) reach cross-origin iframes (e.g.
-            # DataDome's captcha-delivery iframe).
-            "--disable-site-isolation-trials",
-            "--disable-features=IsolateOrigins,site-per-process",
         ]
         if sys.platform == "darwin":
             launch_args.append("--use-angle=metal")
@@ -1271,12 +1294,16 @@ class BrowserSolver:
                     except Exception:
                         html = ""
                     if len(html) > 1024:
-                        head = html[:5000].lower()
+                        head = html[:10000].lower()
                         is_challenge = (
                             "captcha-delivery" in head
                             or "kpsdk" in head
                             or "px-captcha" in head
                             or "reese84" in head
+                            or "just a moment" in head
+                            or "cf_chl" in head
+                            or "challenge-platform" in head
+                            or "chl_page" in head
                         )
                         if not is_challenge:
                             body = html.encode("utf-8")
@@ -1312,7 +1339,7 @@ class BrowserSolver:
                             html = page.content()
                         except Exception:
                             html = ""
-                        head = html[:5000].lower()
+                        head = html[:10000].lower()
                         is_challenge = (
                             "kpsdk" in head
                             or "captcha-delivery" in head
@@ -1320,8 +1347,23 @@ class BrowserSolver:
                             or "perimeterx" in head
                             or "px-captcha" in head
                             or "reese84" in head
+                            or "just a moment" in head
+                            or "cf_chl" in head
+                            or "challenge-platform" in head
+                            or "chl_page" in head
                         )
-                        if len(html) > 1024 and not is_challenge:
+                        # Detect soft-block pages (e.g. F5 Shape
+                        # redirects to siteclosed/invitation.html).
+                        page_url = page.url.lower()
+                        is_block = (
+                            "invitation" in page_url
+                            or "siteclosed" in page_url
+                        )
+                        if (
+                            len(html) > 1024
+                            and not is_challenge
+                            and not is_block
+                        ):
                             body = html.encode("utf-8")
                             # Re-read cookies after redirect —
                             # new page may have set more.

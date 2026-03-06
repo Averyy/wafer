@@ -2350,11 +2350,14 @@ class TestCloudflareEarlyBailout:
             [],
             [{"name": "cf_clearance", "value": "solved"}],
         ]
-        # CF iframe is present
+        # CF iframe is present with checkbox
         cf_frame = MagicMock()
         cf_frame.url = "https://challenges.cloudflare.com/turnstile/v0/..."
         page.frames = [cf_frame]
-        mock_mono.side_effect = [0.0, 0.0, 1.0, 3.0]
+        # monotonic calls: deadline, grace_deadline,
+        # loop check, click throttle check, click timestamp,
+        # loop check (2nd iteration)
+        mock_mono.side_effect = [0.0, 0.0, 1.0, 1.0, 1.0, 2.0]
 
         result = wait_for_cloudflare(solver, page, 30000)
         assert result is True

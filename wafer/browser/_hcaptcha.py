@@ -56,6 +56,9 @@ def wait_for_hcaptcha(solver, page, timeout_ms: int) -> bool:
         )
         return False
 
+    from wafer.browser._solver import patch_frame_screenxy
+    patch_frame_screenxy(cb_frame)
+
     # Phase 3: Move mouse naturally to checkbox, then click.
     try:
         box = cb_frame.locator("#checkbox").bounding_box(timeout=3000)

@@ -717,6 +717,9 @@ def solve_baxia(solver, page, timeout_ms: int) -> bool:
         logger.warning("Baxia NoCaptcha slider not found")
         return False
 
+    from wafer.browser._solver import patch_frame_screenxy
+    patch_frame_screenxy(frame)
+
     # Wait for handle to be visible
     try:
         frame.wait_for_selector(

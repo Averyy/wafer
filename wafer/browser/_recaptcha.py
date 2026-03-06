@@ -108,6 +108,10 @@ def wait_for_recaptcha(solver, page, timeout_ms: int) -> bool:
                     )
                     if is_anchor:
                         iframe_seen = True
+                        from wafer.browser._solver import (
+                            patch_frame_screenxy,
+                        )
+                        patch_frame_screenxy(frame)
                         if _click_element(
                             solver, page, state, frame,
                             ".recaptcha-checkbox-border",
@@ -152,6 +156,9 @@ def wait_for_recaptcha(solver, page, timeout_ms: int) -> bool:
     if not bframe:
         _cleanup_listener()
         return False
+
+    from wafer.browser._solver import patch_frame_screenxy
+    patch_frame_screenxy(bframe)
 
     # Phase 2: Solve image grid challenge.
     logger.info("reCAPTCHA escalated to image challenge")

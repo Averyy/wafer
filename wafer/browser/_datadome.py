@@ -191,6 +191,13 @@ def wait_for_datadome(solver, page, timeout_ms: int) -> bool:
         if dd_frame:
             if not iframe_seen:
                 iframe_first_seen = time.monotonic()
+                from wafer.browser._solver import (
+                    patch_frame_headless,
+                    patch_frame_screenxy,
+                )
+                patch_frame_screenxy(dd_frame)
+                if solver._headless:
+                    patch_frame_headless(dd_frame)
             iframe_seen = True
 
             # Phase 1: click confirm button (if present)
