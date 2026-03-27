@@ -4,17 +4,9 @@ Anti-detection HTTP client for Python. Wraps rnet with opinionated defaults for 
 
 ## Web Fetching and Web Searching
 
-**For website research/browsing**: ALWAYS use fetchaller MCP tools (`mcp__fetchaller__*`) instead of WebFetch/WebSearch. No domain restrictions, bypasses bot protection.
-
 **For testing wafer functionality**: ALWAYS use wafer itself (`uv run python -c "import wafer; ..."` or test scripts). Never use fetchaller to test links, WAF challenges, solver behavior, or anything wafer is supposed to handle -that defeats the purpose.
 
 ## Debugging Rules
-
-**NEVER blame external services** (Cloudflare, Akamai, rnet, etc.) for issues. The problem is in THIS codebase. Investigate our code first, add logging, find the real cause.
-
-**NEVER dismiss issues as "pre-existing" or "known".** Every issue is an issue. If something fails during testing, investigate the root cause and fix it.
-
-**NEVER assume a dependency can't do something without reading its source.** When something "doesn't work" in rnet, Patchright, Playwright, or any other dependency, the most likely cause is wrong usage -not a missing feature. Read the actual source code to find correct APIs, field names, and calling conventions before concluding something is impossible.
 
 **NEVER blame IP blocks, rate limits, or network-level bans for failures.** If a site works in a normal browser, it must work in wafer. "IP is flagged" is not a valid excuse -the whole point of wafer is to be indistinguishable from a real browser. If a WAF blocks wafer but not a browser, the bug is in wafer's fingerprinting, solver, or request handling.
 
@@ -48,8 +40,6 @@ Wraps rnet **3.0.0rc21+** (the `Emulation` API). NOT the stable 2.x series. See 
 
 ## Conventions
 
-- Python package manager: `uv` (never pip)
-- All Python runs via `uv run`
 - No `from __future__ import annotations`
 - Logging via `logging.getLogger("wafer")`, never print()
 - rnet's `Emulation` enum is the source of truth for browser fingerprints

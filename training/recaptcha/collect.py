@@ -47,7 +47,7 @@ DEMO_URL = "https://www.google.com/recaptcha/api2/demo"
 PAGE_LOAD_TIMEOUT_MS = 15000
 PAUSE_MIN = 0.5
 PAUSE_MAX = 1.5
-BACKOFF_SCHEDULE = [43200, 57600]  # 12h, 16h
+BACKOFF_RANGE = (36000, 57600)  # 10h-16h in seconds
 MAX_AUTOPASSES = 1
 MAX_GRIDS_PER_SESSION = 8  # reload within a session, then fresh browser
 MAX_PAYLOAD_BYTES = 5 * 1024 * 1024
@@ -86,11 +86,16 @@ def _print_stats():
     mins = elapsed / 60
     total = s["images_saved"] + s["tiles_saved"]
     rate = total / mins if mins > 0 else 0
+    checked = s["grids_3x3"] * 9 + s["grids_4x4"]
+    discard_pct = (
+        s["dupes_skipped"] * 100 // checked if checked else 0
+    )
     logger.info(
-        "rounds=%d | 3x3=%d(%d tiles) 4x4=%d | "
-        "dupes=%d | auto=%d errors=%d | %.1f saved/min (%.0fs)",
-        s["rounds"], s["grids_3x3"], s["tiles_saved"], s["grids_4x4"],
-        s["dupes_skipped"],
+        "rounds=%d | 3x3=%d(%d saved) 4x4=%d(%d saved) | "
+        "discarded=%d(%d%%) | auto=%d err=%d | %.1f saved/min (%.0fs)",
+        s["rounds"], s["grids_3x3"], s["tiles_saved"],
+        s["grids_4x4"], s["images_saved"],
+        s["dupes_skipped"], discard_pct,
         s["auto_pass"], s["errors"],
         rate, elapsed,
     )
@@ -207,19 +212,89 @@ class DedupIndex:
                     if not img_path.is_file():
                         self._exact.add(dh)
                         continue
-                    try:
-                        img = Image.open(img_path)
-                        ph = _phash(img)
+                    ph = entry.get("phash")
+                    if ph is not None:
                         self.add(dh, ph, str(img_path))
                         count += 1
-                    except Exception:
-                        self._exact.add(dh)
+                    else:
+                        try:
+                            img = Image.open(img_path)
+                            ph = _phash(img)
+                            self.add(dh, ph, str(img_path))
+                            count += 1
+                        except Exception:
+                            self._exact.add(dh)
         except Exception:
             pass
         if count:
             logger.info(
                 "[%s] Loaded %d from %s", self.name, count,
                 collect_dir,
+            )
+
+    def _load_frozen_dataset(self, ds_dir: Path):
+        """Load a dataset that never changes. Caches hashes to .hashes.jsonl."""
+        from PIL import Image
+        if not ds_dir.is_dir():
+            return
+        name = ds_dir.name
+        cache = ds_dir / ".hashes.jsonl"
+
+        if cache.is_file():
+            count = 0
+            with open(cache) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                        dh = entry.get("dhash")
+                        ph = entry.get("phash")
+                        rel = entry.get("file")
+                        if dh is None or ph is None or rel is None:
+                            continue
+                        self.add(dh, ph, str(ds_dir / rel))
+                        count += 1
+                    except Exception:
+                        continue
+            if count:
+                logger.info(
+                    "[%s] Loaded %d from %s (cached)",
+                    self.name, count, name,
+                )
+                return
+
+        count = 0
+        cache_entries: list[dict] = []
+        for img_path in ds_dir.rglob("*"):
+            if img_path.suffix.lower() not in (".jpg", ".jpeg", ".png"):
+                continue
+            try:
+                img = Image.open(img_path)
+                dh = _dhash(img)
+                ph = _phash(img)
+                rel = str(img_path.relative_to(ds_dir))
+                self.add(dh, ph, str(img_path))
+                cache_entries.append({"file": rel, "dhash": dh, "phash": ph})
+                count += 1
+                if count % 10000 == 0:
+                    logger.info(
+                        "[%s] Indexed %d from %s...",
+                        self.name, count, name,
+                    )
+            except Exception:
+                pass
+        if cache_entries:
+            try:
+                with open(cache, "w") as f:
+                    for entry in cache_entries:
+                        f.write(json.dumps(entry) + "\n")
+            except Exception:
+                pass
+        if count:
+            logger.info(
+                "[%s] Loaded %d from %s", self.name, count, name,
             )
 
     def _load_dataset(self, ds_dir: Path):
@@ -318,7 +393,7 @@ class _ClsDedup(DedupIndex):
             if d:
                 self._load_collected(d)
                 ds = Path(d).parent / "datasets"
-                self._load_dataset(ds / "wafer_cls_classic")
+                self._load_frozen_dataset(ds / "wafer_cls_classic")
                 self._load_dataset(ds / "wafer_cls")
 
             logger.info(
@@ -586,14 +661,10 @@ def _worker(wid: int, headless: bool):
             _print_stats()
 
             if consecutive_fails >= MAX_AUTOPASSES:
-                idx = min(
-                    consecutive_fails - MAX_AUTOPASSES,
-                    len(BACKOFF_SCHEDULE) - 1,
-                )
-                backoff = BACKOFF_SCHEDULE[idx]
+                backoff = random.uniform(*BACKOFF_RANGE)
                 logger.warning(
-                    "W%d: %d consecutive fails, backing off %ds (%dh)",
-                    wid, consecutive_fails, backoff, backoff // 3600,
+                    "W%d: %d consecutive fails, backing off %.0fs (%.1fh)",
+                    wid, consecutive_fails, backoff, backoff / 3600,
                 )
                 _shutdown.wait(backoff)
             else:

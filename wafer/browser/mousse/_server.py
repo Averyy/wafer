@@ -447,16 +447,13 @@ class MousseHandler(BaseHTTPRequestHandler):
 
             # Write annotation to wafer_det/
             annotation = {
-                "file": bare,
+                "file_name": f"{class_name}/{bare}",
                 "keyword_folder": class_name,
                 "keyword": keyword,
                 "grid_type": body.get("grid_type", ""),
                 "ground_truth": body.get("ground_truth", []),
             }
-            if _WAFER_DET_DIR:
-                ann_path = _WAFER_DET_DIR / "annotations.jsonl"
-            else:
-                ann_path = _COLLECTED_DET_DIR / "annotations.jsonl"
+            ann_path = _WAFER_DET_DIR / "metadata.jsonl"
             ann_path.parent.mkdir(parents=True, exist_ok=True)
             with open(ann_path, "a") as f:
                 f.write(json.dumps(annotation) + "\n")

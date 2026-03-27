@@ -146,7 +146,7 @@ The solver also collects training data during live reCAPTCHA solves (zero overhe
 
 **DET mode**: Shows full grid images with model cell selections overlaid. Click cells to mark ground truth. On annotation:
 1. Grid moved to `collected_det/{ClassName}/` (Title Case, e.g. `Bicycle/`, `Traffic Light/`)
-2. Grid copied to `datasets/wafer_det/{ClassName}/`, ground truth saved to `datasets/wafer_det/annotations.jsonl`
+2. Grid copied to `datasets/wafer_det/{ClassName}/`, ground truth saved to `datasets/wafer_det/metadata.jsonl`
 3. Grid also copied to `datasets/wafer_cls/{ClassName}/` for CLS retraining (450x450 scene photo = valid CLS training data)
 
 **CLS mode**: Shows individual tiles with model predictions and top-3 confidence bars. Click one of 17 class buttons (16 classes + None for distractors) to label. Labeled tiles moved to `datasets/wafer_cls/{ClassName}/`.
@@ -172,7 +172,7 @@ Finds intra-set dupes within collected_cls and cross-set dupes against wafer_cls
 | `training/recaptcha/collected_det/` | Raw unlabeled DET grids (flat queue, images + metadata.jsonl) |
 | `training/recaptcha/datasets/wafer_cls_classic/` | Deduplicated base tiles (46,753 from DannyLuna 57k, MIT) |
 | `training/recaptcha/datasets/wafer_cls/` | Our labeled CLS tiles (Mousse output, training-ready) |
-| `training/recaptcha/datasets/wafer_det/` | Our labeled DET grids + annotations.jsonl (Mousse output) |
+| `training/recaptcha/datasets/wafer_det/` | Our labeled DET grids + metadata.jsonl (Mousse output) |
 
 ## Known DET Issues
 

@@ -53,7 +53,7 @@ training/recaptcha/
     wafer_cls_classic/        # Deduplicated base dataset (46,753 tiles, 14 classes)
     wafer_cls/{ClassName}/    # Our labeled CLS tiles (Mousse output)
     wafer_det/{ClassName}/    # Our labeled DET grids (Mousse output)
-    wafer_det/annotations.jsonl  # Cell-level ground truth
+    wafer_det/metadata.jsonl     # Cell-level ground truth
 ```
 
 ## Training

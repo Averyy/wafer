@@ -83,7 +83,7 @@ Annotate 4x4 (and 3x3) reCAPTCHA grid images collected during live solves or the
 - Class override dropdown lets you correct the keyword if Google's label is wrong (e.g. image shows a bicycle but keyword says "motorcycles")
 - Enter = save annotation, Esc = skip
 - On annotation:
-  1. Grid copied to `datasets/wafer_det/{ClassName}/`, ground truth saved to `datasets/wafer_det/annotations.jsonl`
+  1. Grid copied to `datasets/wafer_det/{ClassName}/`, ground truth saved to `datasets/wafer_det/metadata.jsonl`
   2. Grid also copied to `datasets/wafer_cls/{ClassName}/` for CLS retraining
   3. Grid removed from `collected_det/` queue
 
