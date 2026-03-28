@@ -123,7 +123,11 @@ class SyncSession(BaseSession):
         )
 
     def _retire_session(self, domain: str) -> None:
-        """Full identity reset: new fingerprint, empty jar, clear cache."""
+        """Full identity reset: new fingerprint, empty jar, clear cache.
+
+        Dart/Safari profiles keep their identity -- only cookies and
+        TLS session are refreshed (no fingerprint rotation).
+        """
         # Restore Chrome if rotated to Safari (not explicit Safari profile)
         if (
             self._safari_identity is not None
@@ -589,12 +593,12 @@ class SyncSession(BaseSession):
             # - Non-HTML text (JSON, XML) — API endpoints may have
             #   challenge markers in cookies/headers but browser-solving
             #   the API URL itself can't work (renders raw JSON).
-            # - Opera Mini — can't solve challenges.
+            # - Opera Mini / Dart -- non-browser profiles.
             content_type = headers.get("content-type", "")
             challenge = (
                 detect_challenge(status, headers, body)
                 if body is not None
-                and self._profile is not Profile.OPERA_MINI
+                and self._profile not in (Profile.OPERA_MINI, Profile.DART)
                 and _is_challengeable_content_type(content_type)
                 else None
             )

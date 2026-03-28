@@ -70,7 +70,7 @@ from wafer import (
     SyncSession,       # synchronous session
     AsyncSession,      # async session (same API; request methods are coroutines)
     WaferResponse,     # response object
-    Profile,           # enum: OPERA_MINI, SAFARI
+    Profile,           # enum: OPERA_MINI, SAFARI, DART
     DEFAULT_HEADERS,   # dict[str, str] - default Accept/Accept-Language/etc headers
     # Errors (all inherit WaferError):
     WaferError,
@@ -109,7 +109,7 @@ SyncSession(
     emulation: rnet.Emulation | None = None,  # default: Emulation.Chrome145 (newest)
 
     # Non-Chrome profiles (overrides emulation)
-    profile: Profile | None = None,           # Profile.OPERA_MINI or Profile.SAFARI
+    profile: Profile | None = None,           # Profile.OPERA_MINI, Profile.SAFARI, or Profile.DART
     safari_locale: str = "us",                # "us" or "ca" (only used with Profile.SAFARI)
 
     # Custom headers (replaces DEFAULT_HEADERS entirely if provided).
@@ -338,6 +338,18 @@ capabilities and trade-offs.
 - `safari_locale=` param: `"us"` (default) or `"ca"`
 - More effective than Chrome against DataDome (less commonly spoofed TLS)
 
+### Dart (`profile=Profile.DART`)
+
+- TLS fingerprint matches real Dart 3.11 (dart:io) / Flutter BoringSSL
+- HTTP/1.1 only (no h2), no ALPN, no GREASE, no sec-ch-ua headers
+- JA3 hash: `203503b7023848ab87b9836c336b8e81` (wire-verified identical)
+- Minimal default headers: `User-Agent: Dart/3.11 (dart:io)` + `Accept-Encoding: gzip`
+- Pass application-specific headers (e.g. `X-User-Agent`) via per-request `headers=`
+- No challenge detection, no fingerprint rotation, no browser solving
+- Embed mode (`embed=`) is not supported (raises ValueError)
+- All other features work: retry, rate limiting, cookies, redirects, proxy
+- Useful for impersonating Flutter/Dart mobile apps behind bot detection
+
 ### Opera Mini (`profile=Profile.OPERA_MINI`)
 
 - Impersonates Opera Mini in Extreme data-saving mode
@@ -495,7 +507,8 @@ logging.getLogger("wafer").setLevel(logging.DEBUG)
 ## Common Mistakes
 
 1. **Do not pass `emulation=` and `profile=` together.** Profile overrides emulation.
-   Chrome is the default when neither is set.
+   Chrome is the default when neither is set. Dart and Safari use custom TlsOptions,
+   not rnet Emulation.
 
 2. **`resp.headers` is a plain `dict[str, str]` with lowercase keys.** Use
    `resp.headers.get("etag")`, not `resp.headers.get("ETag")`.

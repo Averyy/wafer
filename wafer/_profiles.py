@@ -18,3 +18,4 @@ class Profile(Enum):
     """
     OPERA_MINI = "opera_mini"
     SAFARI = "safari"
+    DART = "dart"

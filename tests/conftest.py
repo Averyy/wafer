@@ -10,6 +10,7 @@ from wafer._base import (
     DEFAULT_TIMEOUT,
 )
 from wafer._fingerprint import FingerprintManager
+from wafer._profiles import Profile
 
 # ---------------------------------------------------------------------------
 # Mock rnet types
@@ -268,11 +269,22 @@ def make_sync_session(responses, **session_kwargs):
     session._proxy = None
     session._rotate_every = session_kwargs.get("rotate_every", None)
     session._request_count = 0
-    session._profile = session_kwargs.get("profile", None)
+    profile = session_kwargs.get("profile", None)
+    session._profile = profile
     session._om_identity = None
     session._safari_identity = None
+    session._dart_identity = None
     session._safari_locale = "us"
-    session._tried_safari = False
+    session._tried_safari = profile in (Profile.SAFARI, Profile.DART)
+
+    if profile is Profile.DART:
+        from wafer._dart import DartIdentity
+
+        session._dart_identity = DartIdentity()
+        session.headers = session._dart_identity.client_headers()
+        session._chrome_headers = None
+        session._fingerprint = None
+
     session._client_headers = session._compute_client_headers()
 
     use_cookie_jar = session_kwargs.get("use_cookie_jar", False)
@@ -326,11 +338,22 @@ def make_async_session(responses, **session_kwargs):
     session._rotate_every = session_kwargs.get("rotate_every", None)
     session._request_count = 0
     session._rotate_lock = asyncio.Lock()
-    session._profile = session_kwargs.get("profile", None)
+    profile = session_kwargs.get("profile", None)
+    session._profile = profile
     session._om_identity = None
     session._safari_identity = None
+    session._dart_identity = None
     session._safari_locale = "us"
-    session._tried_safari = False
+    session._tried_safari = profile in (Profile.SAFARI, Profile.DART)
+
+    if profile is Profile.DART:
+        from wafer._dart import DartIdentity
+
+        session._dart_identity = DartIdentity()
+        session.headers = session._dart_identity.client_headers()
+        session._chrome_headers = None
+        session._fingerprint = None
+
     session._client_headers = session._compute_client_headers()
 
     async_responses = to_async_responses(responses)

@@ -10,6 +10,7 @@ from urllib.parse import urlencode, urljoin, urlparse
 from rnet import CertStore, Emulation, Method
 
 from wafer._cookies import CookieCache
+from wafer._dart import DartIdentity
 from wafer._fingerprint import FingerprintManager
 from wafer._kasada import get_session as get_kasada_session  # noqa: F401
 from wafer._opera_mini import OperaMiniIdentity
@@ -241,16 +242,26 @@ class BaseSession:
             if profile is Profile.SAFARI
             else None
         )
+        self._dart_identity = (
+            DartIdentity()
+            if profile is Profile.DART
+            else None
+        )
 
         if headers is not None:
             self.headers = headers
         elif self._safari_identity is not None:
             self.headers = self._safari_identity.client_headers()
+        elif self._dart_identity is not None:
+            self.headers = self._dart_identity.client_headers()
         else:
             self.headers = dict(DEFAULT_HEADERS)
         # Save Chrome-mode headers for restoration after Safari rotation
         self._chrome_headers = (
-            dict(self.headers) if self._safari_identity is None else None
+            dict(self.headers)
+            if self._safari_identity is None
+            and self._dart_identity is None
+            else None
         )
         self.connect_timeout = (
             _normalize_timeout(connect_timeout)
@@ -268,9 +279,9 @@ class BaseSession:
         self.max_redirects = max_redirects
         self.max_failures = max_failures
 
-        if profile in (Profile.SAFARI, Profile.OPERA_MINI):
-            # Safari uses TlsOptions (not Emulation). Opera Mini
-            # bypasses rnet entirely. Neither needs FingerprintManager.
+        if profile in (Profile.SAFARI, Profile.OPERA_MINI, Profile.DART):
+            # Safari/Dart use TlsOptions (not Emulation). Opera Mini
+            # bypasses rnet entirely. None need FingerprintManager.
             self._fingerprint = None
         else:
             self._fingerprint = FingerprintManager(
@@ -288,7 +299,7 @@ class BaseSession:
 
         # Session health: consecutive failure count per domain
         self._domain_failures: dict[str, int] = {}
-        self._tried_safari = profile is Profile.SAFARI
+        self._tried_safari = profile in (Profile.SAFARI, Profile.DART)
 
         # Cookie cache (disk persistence)
         if cache_dir is not None and profile is not Profile.OPERA_MINI:
@@ -305,6 +316,11 @@ class BaseSession:
         # embed_origin without embed= defaults to "xhr"
         if embed_origin and embed is None:
             embed = "xhr"
+        if embed and profile is Profile.DART:
+            raise ValueError(
+                "Embed mode is not supported with Profile.DART "
+                "(Dart apps don't send Sec-Fetch-* headers)"
+            )
         self._embed = embed
         self._embed_origin = embed_origin
         self._embed_referers = embed_referers or []
@@ -455,11 +471,11 @@ class BaseSession:
         setting it to empty string in session headers or per-request
         overrides; empty-string values are stripped at the end.
         """
-        # Opera Mini: identity headers are already at client level
+        # Opera Mini / Dart: identity headers are already at client level
         # (set in _build_client_kwargs). Only return per-request
-        # overrides — returning the full identity here would duplicate
+        # overrides -- returning the full identity here would duplicate
         # every header at both client and request level.
-        if self._profile is Profile.OPERA_MINI:
+        if self._profile in (Profile.OPERA_MINI, Profile.DART):
             return dict(extra) if extra else {}
 
         # Use cached client-level headers (refreshed on rotation/rebuild)
@@ -708,7 +724,18 @@ class BaseSession:
         # Refresh cached client headers (fingerprint may have rotated)
         self._client_headers = self._compute_client_headers()
 
-        if self._safari_identity is not None:
+        if self._dart_identity is not None:
+            # Dart: custom TLS, no Emulation. HTTP/1.1 is forced by
+            # omitting ALPN in TlsOptions (not http1_only, which
+            # injects an ALPN extension that breaks the fingerprint).
+            kwargs = {
+                "tls_options": self._dart_identity.tls_options(),
+                "headers": dict(self._client_headers),
+                "connect_timeout": self.connect_timeout,
+                "timeout": self.timeout,
+                "cookie_store": True,
+            }
+        elif self._safari_identity is not None:
             # Safari: custom TLS + H2, no Emulation.
             # Use _client_headers (not self.headers) so embed mode
             # stripping of Sec-Fetch-* is reflected at client level,
