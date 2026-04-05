@@ -1,6 +1,6 @@
-# rnet Reference
+# wreq Reference
 
-Wafer wraps rnet **3.0.0rc21+** (the `Emulation` API). NOT the stable 2.x series (which uses the old `Impersonate` API).
+Wafer wraps wreq **0.10.2+** (the `Emulation` API, formerly rnet).
 
 ## TlsOptions Silent Failure
 
@@ -17,8 +17,8 @@ Wafer wraps rnet **3.0.0rc21+** (the `Emulation` API). NOT the stable 2.x series
 - SCT: `enable_signed_cert_timestamps`
 
 **Diagnosis order when something doesn't appear on wire:**
-1. **Suspect our kwarg name first** -check the Rust `TlsOptions` struct in rnet/wreq source for exact field names
-2. Check `wreq-util` emulation profiles -if Chrome/Safari profiles use a feature, rnet supports it
+1. **Suspect our kwarg name first** -check the Rust `TlsOptions` struct in wreq source for exact field names
+2. Check `wreq-util` emulation profiles -if Chrome/Safari profiles use a feature, wreq supports it
 3. Verify on the wire with `tls.peet.ws/api/all`
 4. Only after all above: consider build/binary limitations
 
@@ -26,11 +26,11 @@ Wafer wraps rnet **3.0.0rc21+** (the `Emulation` API). NOT the stable 2.x series
 
 ## HTTP/2 Header Duplication
 
-**NEVER send the same header at both client level AND per-request level.** rnet creates duplicate entries in HTTP/2 HEADERS frames, which strict WAFs (Cloudflare, DataDome) detect as non-browser behavior → instant 403.
+**NEVER send the same header at both client level AND per-request level.** wreq creates duplicate entries in HTTP/2 HEADERS frames, which strict WAFs (Cloudflare, DataDome) detect as non-browser behavior -> instant 403.
 
 The `_build_headers()` method returns a **delta** -only headers that are NEW or DIFFERENT from client-level. Static headers (Accept, sec-ch-ua, etc.) are set ONCE at client construction. Per-request only adds dynamic headers (Referer, embed headers, user overrides).
 
-Also: **never send Host per-request** -rnet auto-sets it from the URL. Sending it per-request duplicates the `:authority` pseudo-header.
+Also: **never send Host per-request** -wreq auto-sets it from the URL. Sending it per-request duplicates the `:authority` pseudo-header.
 
 ## Emulation Enum
 
@@ -47,11 +47,11 @@ Also: **never send Host per-request** -rnet auto-sets it from the URL. Sending i
   - `.get_all(key)` returns **all** values -required for multi-value headers like `Set-Cookie`.
   - All values are bytes. Decode with `.decode("utf-8", errors="replace")`.
 - **Body reading:** sync `resp.bytes()` / `resp.text()`, async `await resp.bytes()` / `await resp.text()`.
-- **No automatic redirect following.** rnet returns 3xx responses as-is. Wafer implements its own redirect loop with method conversion (POST→GET on 301/302/303).
+- **No automatic redirect following.** wreq returns 3xx responses as-is. Wafer implements its own redirect loop with method conversion (POST->GET on 301/302/303).
 
 ## Client Construction
 
-- Sync: `rnet.blocking.Client(**kwargs)`, async: `rnet.Client(**kwargs)`.
+- Sync: `wreq.blocking.Client(**kwargs)`, async: `wreq.Client(**kwargs)`.
 - **Mutually exclusive identity:** pass `emulation=` (Chrome) OR `tls_options=` + `http2_options=` (Safari). Never both.
 - Cookie jar: `cookie_store=True` enables it. Access via `client.cookie_jar.add(raw_set_cookie_string, url)`.
-- Proxy: `from rnet import Proxy` → `Proxy.all(proxy_url)`, passed as `proxies=[proxy]`.
+- Proxy: `from wreq import Proxy` -> `Proxy.all(proxy_url)`, passed as `proxies=[proxy]`.

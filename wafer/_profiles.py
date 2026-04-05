@@ -12,7 +12,7 @@ class Profile(Enum):
     Chrome is the default (no profile needed). Profiles exist for
     non-Chrome HTTP identities that serve a specific purpose.
 
-    OPERA_MINI bypasses rnet entirely — it uses Python's stdlib urllib
+    OPERA_MINI bypasses wreq entirely — it uses Python's stdlib urllib
     with system OpenSSL for transport, matching real Opera Mini's
     server-side proxy architecture.
     """

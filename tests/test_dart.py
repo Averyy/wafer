@@ -1,7 +1,7 @@
 """Tests for Dart profile and identity."""
 
 import pytest
-from rnet.tls import TlsOptions
+from wreq.tls import TlsOptions
 
 from wafer._dart import _DART_VERSION, DartIdentity
 from wafer._profiles import Profile

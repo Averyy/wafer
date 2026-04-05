@@ -7,7 +7,7 @@ import random
 import subprocess
 from urllib.parse import urlencode, urljoin, urlparse
 
-from rnet import CertStore, Emulation, Method
+from wreq import CertStore, Emulation, Method
 
 from wafer._cookies import CookieCache
 from wafer._dart import DartIdentity
@@ -33,7 +33,7 @@ _METHOD_MAP: dict[str, Method] = {
 
 
 def _to_method(method: str) -> Method:
-    """Convert a string HTTP method to rnet Method enum."""
+    """Convert a string HTTP method to wreq Method enum."""
     try:
         return _METHOD_MAP[method.upper()]
     except KeyError:
@@ -41,7 +41,7 @@ def _to_method(method: str) -> Method:
 
 
 def _load_system_cert_store() -> CertStore | None:
-    """Load system CA certificates into an rnet CertStore."""
+    """Load system CA certificates into a wreq CertStore."""
     try:
         if platform.system() == "Darwin":
             result = subprocess.run(
@@ -89,7 +89,7 @@ if _SYSTEM_CERT_STORE:
     logger.debug("Loaded system CA certificate store")
 else:
     logger.debug(
-        "No system CA store found; using rnet defaults"
+        "No system CA store found; using wreq defaults"
     )
 
 # Default to newest Chrome emulation profile
@@ -174,9 +174,9 @@ def _is_challengeable_content_type(content_type: str) -> bool:
 
 
 def _decode_headers(header_map) -> dict[str, str]:
-    """Decode rnet HeaderMap to lowercase string dict.
+    """Decode wreq HeaderMap to lowercase string dict.
 
-    rnet's HeaderMap: keys() returns unique bytes keys (deduped),
+    wreq's HeaderMap: keys() returns unique bytes keys (deduped),
     get()/[] returns only the first value, get_all() returns all
     values for a key. We use get_all() so multi-value headers
     (especially Set-Cookie) are fully captured, joined with "; ".
@@ -281,7 +281,7 @@ class BaseSession:
 
         if profile in (Profile.SAFARI, Profile.OPERA_MINI, Profile.DART):
             # Safari/Dart use TlsOptions (not Emulation). Opera Mini
-            # bypasses rnet entirely. None need FingerprintManager.
+            # bypasses wreq entirely. None need FingerprintManager.
             self._fingerprint = None
         else:
             self._fingerprint = FingerprintManager(
@@ -328,7 +328,7 @@ class BaseSession:
         # Proxy
         self._proxy = None
         if proxy:
-            from rnet import Proxy
+            from wreq import Proxy
 
             self._proxy = Proxy.all(proxy)
 
@@ -378,7 +378,7 @@ class BaseSession:
         fingerprint rotation (_build_client_kwargs does this).
 
         Embed mode adjustments happen here (not in _build_headers) because
-        rnet's header model is additive: per-request headers cannot remove
+        wreq's header model is additive: per-request headers cannot remove
         or replace client-level headers, they only add. Setting a header
         at both levels creates HTTP/2 duplicates that WAFs detect.
         """
@@ -398,7 +398,7 @@ class BaseSession:
 
         if self._embed == "xhr":
             # XHR/fetch never sends navigation-only headers. Strip from
-            # client level since rnet can't remove them per-request.
+            # client level since wreq can't remove them per-request.
             headers.pop("Cache-Control", None)
             headers.pop("Upgrade-Insecure-Requests", None)
             # Replace navigation Accept with XHR Accept at client level
@@ -462,7 +462,7 @@ class BaseSession:
         """Build per-request headers as a delta over client-level headers.
 
         Returns only headers that differ from what's already set on the
-        rnet Client (via _build_client_kwargs). This avoids sending
+        wreq Client (via _build_client_kwargs). This avoids sending
         duplicate headers in HTTP/2 frames, which strict WAFs like
         Cloudflare detect as non-browser behavior.
 
@@ -628,8 +628,8 @@ class BaseSession:
     def _apply_params(url: str, params: dict[str, str] | None) -> str:
         """Append query parameters to a URL.
 
-        rnet doesn't support a params= kwarg, so wafer handles it by
-        building the query string into the URL before passing to rnet.
+        wreq doesn't support a params= kwarg, so wafer handles it by
+        building the query string into the URL before passing to wreq.
         """
         if not params:
             return url
@@ -712,9 +712,9 @@ class BaseSession:
         return cls(**defaults)
 
     def _build_client_kwargs(self) -> dict:
-        """Build kwargs for rnet Client construction.
+        """Build kwargs for wreq Client construction.
 
-        Not called for Opera Mini (which bypasses rnet entirely).
+        Not called for Opera Mini (which bypasses wreq entirely).
         Safari uses TlsOptions + Http2Options (no Emulation).
         Chrome uses Emulation (no TlsOptions).
 

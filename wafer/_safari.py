@@ -4,16 +4,16 @@ Wire-verified against real Safari 26.2/26.3 on M3/M4 hardware (2026-02-23).
 Produces requests matching JA4 t13d1414h2_ecfee8bf6ab3_bc9a4605e104 and
 H2 akamai_fingerprint 2:0;3:100;4:6291456;9:1|8290305|0|m,s,a,p.
 
-Uses rnet with custom TlsOptions (not Emulation). TlsOptions overrides
+Uses wreq with custom TlsOptions (not Emulation). TlsOptions overrides
 Emulation entirely — they cannot be combined.
 """
 
 import logging
 import random
 
-import rnet
-from rnet import http2
-from rnet.tls import (
+import wreq
+from wreq import http2
+from wreq.tls import (
     AlpnProtocol,
     CertificateCompressionAlgorithm,
     ExtensionType,
@@ -103,13 +103,13 @@ class SafariIdentity:
             ],
         )
 
-    def http2_options(self) -> rnet.Http2Options:
+    def http2_options(self) -> wreq.Http2Options:
         """Wire-verified H2 config matching Safari M3/M4."""
-        so = rnet.SettingsOrder(
-            rnet.SettingId.ENABLE_PUSH,
-            rnet.SettingId.MAX_CONCURRENT_STREAMS,
-            rnet.SettingId.INITIAL_WINDOW_SIZE,
-            rnet.SettingId.NO_RFC7540_PRIORITIES,
+        so = wreq.SettingsOrder(
+            wreq.SettingId.ENABLE_PUSH,
+            wreq.SettingId.MAX_CONCURRENT_STREAMS,
+            wreq.SettingId.INITIAL_WINDOW_SIZE,
+            wreq.SettingId.NO_RFC7540_PRIORITIES,
         )
         po = http2.PseudoOrder(
             http2.PseudoId.METHOD,
@@ -117,7 +117,7 @@ class SafariIdentity:
             http2.PseudoId.AUTHORITY,
             http2.PseudoId.PATH,
         )
-        return rnet.Http2Options(
+        return wreq.Http2Options(
             enable_push=False,
             max_concurrent_streams=100,
             initial_window_size=6291456,
@@ -128,7 +128,7 @@ class SafariIdentity:
         )
 
     def client_headers(self) -> dict[str, str]:
-        """Safari-specific headers (set at rnet.Client level).
+        """Safari-specific headers (set at wreq.Client level).
 
         Safari omits: sec-ch-ua (all variants), Sec-Fetch-User,
         Cache-Control, Upgrade-Insecure-Requests.

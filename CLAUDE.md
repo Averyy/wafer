@@ -1,6 +1,6 @@
 # Wafer
 
-Anti-detection HTTP client for Python. Wraps rnet with opinionated defaults for TLS fingerprinting, challenge detection/solving, cookie caching, retry, and rate limiting.
+Anti-detection HTTP client for Python. Wraps wreq with opinionated defaults for TLS fingerprinting, challenge detection/solving, cookie caching, retry, and rate limiting.
 
 ## Web Fetching and Web Searching
 
@@ -29,11 +29,11 @@ See `docs/site-list.md` for WAF test sites and maintenance rules.
 
 **NEVER mark a manual smoke test as passed unless the specific behavior was actually observed against the real site.** If a WAF challenge doesn't trigger, the smoke test is untestable -not passed. Local mocks don't count.
 
-## rnet
+## wreq
 
-Wraps rnet **3.0.0rc21+** (the `Emulation` API). NOT the stable 2.x series. See `docs/ref-rnet.md` for TlsOptions gotchas and HTTP/2 header duplication rules.
+Wraps wreq **0.10.2+** (the `Emulation` API, formerly rnet). See `docs/ref-wreq.md` for TlsOptions gotchas and HTTP/2 header duplication rules.
 
-**When upgrading rnet**, check for new Chrome Emulation profiles (e.g. Chrome146). If found:
+**When upgrading wreq**, check for new Chrome Emulation profiles (e.g. Chrome146). If found:
 1. Update `DEFAULT_EMULATION` in `wafer/_base.py` to the newest Chrome profile.
 2. Add the new version's real build number to `_CHROME_BUILDS` in `wafer/_fingerprint.py`. Get it from `versionhistory.googleapis.com/v1/chrome/platforms/mac/channels/stable/versions`.
 3. Update `test_profiles_discovered` count and `test_newest_first` version in `tests/test_fingerprint.py`.
@@ -42,13 +42,13 @@ Wraps rnet **3.0.0rc21+** (the `Emulation` API). NOT the stable 2.x series. See 
 
 - No `from __future__ import annotations`
 - Logging via `logging.getLogger("wafer")`, never print()
-- rnet's `Emulation` enum is the source of truth for browser fingerprints
+- wreq's `Emulation` enum is the source of truth for browser fingerprints
 - Always default to the newest Chrome `Emulation` profile available (currently Chrome145)
 - Solver docs live in `docs/ref-*.md` -one per WAF type
 - Mousse changes must update both `wafer/browser/mousse/README.md` and `README.md`
 - **Keep `llms.txt` up to date.** It is the implementation guide for LLMs helping users write code that uses wafer (not for contributors). When adding/changing public API, session params, response fields, error types, challenge types, profiles, or browser solver features, update `llms.txt` to match. Rules for what belongs:
   - **Include:** exact types/defaults, concurrency safety, lifecycle/cleanup, error behavior (what raises what and when), how features interact (e.g. per-request headers vs embed mode), scoping (per-session, per-hostname, per-domain), gotchas that cause silent bugs (shared BrowserSolver, no close(), CWD-relative paths)
-  - **Exclude:** internal implementation details (rnet HeaderMap, TlsOptions vs Emulation), contributor workflows (tests, lint, releases), file layout, dependency internals (rnet platform wheels), anything the consumer never touches
+  - **Exclude:** internal implementation details (wreq HeaderMap, TlsOptions vs Emulation), contributor workflows (tests, lint, releases), file layout, dependency internals (wreq platform wheels), anything the consumer never touches
 
 ## Optional Dependencies
 

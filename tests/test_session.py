@@ -1,4 +1,4 @@
-"""Tests for SyncSession and AsyncSession with mocked rnet client."""
+"""Tests for SyncSession and AsyncSession with mocked wreq client."""
 
 import json
 
@@ -75,7 +75,7 @@ class TestSyncSession:
         assert resp.headers["x-custom"] == "val"
 
     def test_default_headers_sent(self):
-        """Session sends Accept-Language and other defaults to rnet."""
+        """Session sends Accept-Language and other defaults to wreq."""
         session, mock = make_sync_session([ok_response()])
         session.get("https://example.com")
         # Default headers are set at client level, so per-request delta

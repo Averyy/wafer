@@ -11,7 +11,7 @@ import logging
 import time
 from pathlib import Path
 
-import rnet
+import wreq
 from patchright.sync_api import sync_playwright
 
 logging.basicConfig(
@@ -50,7 +50,7 @@ if (window.chrome && !window.chrome.runtime) {
 
 def trigger_tmd() -> str | None:
     """Rapid-fire AliExpress search until TMD triggers."""
-    client = rnet.blocking.Client(emulation=rnet.Emulation.Chrome145)
+    client = wreq.blocking.Client(emulation=wreq.Emulation.Chrome145)
     for i, kw in enumerate(KEYWORDS):
         url = f"https://www.aliexpress.com/w/wholesale-{kw}.html"
         log.info("[%d/%d] GET %s", i + 1, len(KEYWORDS), url)

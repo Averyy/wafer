@@ -2,13 +2,15 @@
 
 > **Proof of concept.** This project is experimental and not intended for production use. Expect breaking changes, rough edges, and missing features.
 
-Anti-detection HTTP client for Python. Built on [rnet](https://github.com/0x676e67/rnet) (Rust + BoringSSL).
+Anti-detection HTTP client for Python. Built on [wreq](https://github.com/0x676e67/wreq-python) (Rust + BoringSSL).
 
 Handles TLS fingerprinting, WAF challenge detection/solving, cookie caching, retry with backoff, rate limiting, embed mode for iframe/XHR impersonation, and proxy support.
 
 ```bash
 pip install wafer-py
 ```
+
+> **Upgrading from rnet?** wafer's underlying HTTP library was renamed from `rnet` to `wreq`. If upgrading, run `pip uninstall rnet` first, then reinstall wafer.
 
 ## Quick Start
 
@@ -67,7 +69,7 @@ from wafer import SyncSession, AsyncSession
 
 session = SyncSession(
     # TLS fingerprint (defaults to newest Chrome)
-    emulation=None,  # or rnet.Emulation.Chrome145
+    emulation=None,  # or wreq.Emulation.Chrome145
 
     # Timeouts (float seconds or timedelta)
     timeout=30,                                    # float/int seconds
@@ -136,14 +138,14 @@ Per-request kwargs: `headers`, `params`, `json`, `form`, `body`, `timeout`, `mul
 
 ## TLS Fingerprinting
 
-Wafer uses rnet's `Emulation` profiles to produce browser-identical TLS fingerprints (JA3, JA4, HTTP/2 SETTINGS frames, header order). Defaults to the newest Chrome profile.
+Wafer uses wreq's `Emulation` profiles to produce browser-identical TLS fingerprints (JA3, JA4, HTTP/2 SETTINGS frames, header order). Defaults to the newest Chrome profile.
 
 ```python
 # Automatic -newest Chrome
 session = SyncSession()
 
 # Specific profile
-from rnet import Emulation
+from wreq import Emulation
 session = SyncSession(emulation=Emulation.Chrome145)
 ```
 
@@ -153,7 +155,7 @@ On a 403 or challenge, wafer automatically switches from Chrome to Safari (funda
 
 ## Opera Mini Profile
 
-`Profile.OPERA_MINI` impersonates Opera Mini in Extreme/Mini data-saving mode. Bypasses rnet entirely -uses Python's stdlib `urllib` with system OpenSSL, producing a server-side proxy TLS fingerprint (OpenSSL, not BoringSSL). HTTP/1.1 only, no `Sec-Ch-Ua` or `Sec-Fetch-*` headers.
+`Profile.OPERA_MINI` impersonates Opera Mini in Extreme/Mini data-saving mode. Bypasses wreq entirely -uses Python's stdlib `urllib` with system OpenSSL, producing a server-side proxy TLS fingerprint (OpenSSL, not BoringSSL). HTTP/1.1 only, no `Sec-Ch-Ua` or `Sec-Fetch-*` headers.
 
 Because Opera Mini cannot execute JavaScript, **challenge detection, fingerprint rotation, retry logic, and browser solving are all disabled**. Rate limiting still applies. GET only (`ValueError` on other methods).
 
@@ -169,7 +171,7 @@ async with AsyncSession(profile=Profile.OPERA_MINI) as session:
 
 ## Safari Profile
 
-`Profile.SAFARI` impersonates Safari 26 on macOS (M3/M4 hardware). Uses rnet with custom `TlsOptions` and `Http2Options` instead of Chrome's `Emulation` profiles, producing a TLS+H2 fingerprint matching real Safari 26.2/26.3 M3/M4 exactly.
+`Profile.SAFARI` impersonates Safari 26 on macOS (M3/M4 hardware). Uses wreq with custom `TlsOptions` and `Http2Options` instead of Chrome's `Emulation` profiles, producing a TLS+H2 fingerprint matching real Safari 26.2/26.3 M3/M4 exactly.
 
 Safari gets all of wafer's features -challenge detection, cookie caching, retry, rate limiting, browser solving, and session rotation.
 
@@ -389,7 +391,7 @@ How it works:
 2. Iframes load naturally -CSP, CORS, X-Frame-Options all pass (it's a real browser)
 3. Playwright captures every HTTP response from the target domain across all frames
 4. Cookies for the target domain are extracted from the browser context
-5. Everything is returned in an `InterceptResult` for replay via rnet
+5. Everything is returned in an `InterceptResult` for replay via wreq
 
 ## Mouse Recorder (Mousse)
 
@@ -446,8 +448,8 @@ Logs retry attempts, fingerprint rotations, challenge detection, cookie cache op
 wafer/
   __init__.py       # SyncSession, AsyncSession, module-level get/post/etc
   _base.py          # BaseSession -shared config and logic, zero I/O
-  _sync.py          # SyncSession -wraps rnet.blocking.Client
-  _async.py         # AsyncSession -wraps rnet.Client
+  _sync.py          # SyncSession -wraps wreq.blocking.Client
+  _async.py         # AsyncSession -wraps wreq.Client
   _response.py      # WaferResponse wrapper
   _challenge.py     # Challenge detection (16 WAF types)
   _solvers.py       # Inline solvers (ACW, Amazon, TMD)

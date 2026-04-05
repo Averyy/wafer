@@ -43,7 +43,7 @@ The bail-out was added March 2026. Previously the solver spent 15-30s on audio t
 
 DataDome cookies can be replayed via TLS. Requirements:
 - OS must match (DD's `plv3` fingerprint includes OS)
-- TLS fingerprint must be consistent (rnet Emulation handles this)
+- TLS fingerprint must be consistent (wreq Emulation handles this)
 - IP doesn't need to match exactly (DD allows IP changes within reason)
 
 Cookie TTL is ~4 hours. After initial browser solve, subsequent TLS requests reuse the `datadome` cookie without re-challenging.

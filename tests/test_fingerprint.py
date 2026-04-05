@@ -1,6 +1,6 @@
 """Tests for fingerprint management and sec-ch-ua generation."""
 
-from rnet import Emulation
+from wreq import Emulation
 
 from wafer._fingerprint import (
     CHROME_PROFILES,

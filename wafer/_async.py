@@ -1,12 +1,12 @@
-"""AsyncSession -- async HTTP client wrapping rnet.Client."""
+"""AsyncSession -- async HTTP client wrapping wreq.Client."""
 
 import asyncio
 import datetime
 import logging
 import time
 
-import rnet
-from rnet import Method
+import wreq
+from wreq import Method
 
 from wafer._base import (
     BaseSession,
@@ -49,9 +49,9 @@ class AsyncSession(BaseSession):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         if self._profile is Profile.OPERA_MINI:
-            self._client = None  # Opera Mini bypasses rnet entirely
+            self._client = None  # Opera Mini bypasses wreq entirely
         else:
-            self._client = rnet.Client(**self._build_client_kwargs())
+            self._client = wreq.Client(**self._build_client_kwargs())
             self._hydrate_jar_from_cache()
         self._rotate_lock = asyncio.Lock()
 
@@ -103,9 +103,9 @@ class AsyncSession(BaseSession):
             )
 
     def _rebuild_client(self) -> None:
-        """Rebuild the rnet client with a fresh TLS session and cookie jar.
+        """Rebuild the wreq client with a fresh TLS session and cookie jar.
 
-        Creates a new rnet.Client, discarding the old client's connection
+        Creates a new wreq.Client, discarding the old client's connection
         pool, TLS session tickets, and in-memory cookie jar. Only cookies
         persisted to disk cache (via _cache_response_cookies or browser
         solve) survive the rebuild; normal HTTP response cookies that were
@@ -116,7 +116,7 @@ class AsyncSession(BaseSession):
         fingerprint can trigger WAF flags. For rotate_every (unlinkable
         request sequences), cookie loss is the desired isolation property.
         """
-        self._client = rnet.Client(**self._build_client_kwargs())
+        self._client = wreq.Client(**self._build_client_kwargs())
         self._hydrate_jar_from_cache()
         logger.debug(
             "Client rebuilt with emulation=%s", self.emulation
@@ -136,7 +136,7 @@ class AsyncSession(BaseSession):
             await asyncio.to_thread(
                 self._cookie_cache.clear, domain
             )
-        self._client = rnet.Client(**self._build_client_kwargs())
+        self._client = wreq.Client(**self._build_client_kwargs())
         self._hydrate_jar_from_cache()
         self._domain_failures.pop(domain, None)
         logger.warning(
@@ -398,7 +398,7 @@ class AsyncSession(BaseSession):
             timeout_secs = self.timeout.total_seconds()
             deadline = None  # no per-request deadline
 
-        # Opera Mini: bypass rnet entirely, use stdlib urllib (OpenSSL).
+        # Opera Mini: bypass wreq entirely, use stdlib urllib (OpenSSL).
         # No challenge detection, no fingerprint rotation, no retries.
         # Opera Mini is a no-JS proxy browser — only GET navigations.
         if self._profile is Profile.OPERA_MINI:

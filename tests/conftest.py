@@ -13,7 +13,7 @@ from wafer._fingerprint import FingerprintManager
 from wafer._profiles import Profile
 
 # ---------------------------------------------------------------------------
-# Mock rnet types
+# Mock wreq types
 # ---------------------------------------------------------------------------
 
 
@@ -29,9 +29,9 @@ class MockStatus:
 
 
 class MockHeaderMap:
-    """Mock rnet HeaderMap with bytes keys and bytes values.
+    """Mock wreq HeaderMap with bytes keys and bytes values.
 
-    Mirrors rnet's real HeaderMap behavior:
+    Mirrors wreq's real HeaderMap behavior:
     - keys() returns unique bytes keys
     - get()/[] returns first value only
     - get_all() returns list of all values for a key
@@ -120,7 +120,7 @@ class MockJar:
 
 
 class MockClient:
-    """Mock rnet client that returns responses from a sequence.
+    """Mock wreq client that returns responses from a sequence.
 
     Unified superset: tracks request_count, last_kwargs, request_log,
     and optionally has a cookie_jar.
@@ -158,7 +158,7 @@ class MockClient:
 
 
 class AsyncMockClient:
-    """Async mock rnet client."""
+    """Async mock wreq client."""
 
     def __init__(
         self,

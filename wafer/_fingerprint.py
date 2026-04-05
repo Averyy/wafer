@@ -5,7 +5,7 @@ import platform
 import re
 import struct
 
-from rnet import Emulation
+from wreq import Emulation
 
 logger = logging.getLogger("wafer")
 
@@ -284,7 +284,7 @@ _CHROME_RE = re.compile(r"^Chrome(\d+)$")
 
 
 def _discover_chrome_profiles() -> list[tuple[int, Emulation]]:
-    """Discover Chrome Emulation profiles from rnet, sorted newest-first."""
+    """Discover Chrome Emulation profiles from wreq, sorted newest-first."""
     profiles = []
     for name in dir(Emulation):
         m = _CHROME_RE.match(name)

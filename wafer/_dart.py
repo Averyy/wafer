@@ -5,7 +5,7 @@ Produces requests matching:
   JA3 hash: 203503b7023848ab87b9836c336b8e81
   JA4: t13d1710_5b57614c22b0_78e6aca7449b
 
-Uses rnet with custom TlsOptions (not Emulation). HTTP/1.1 is forced
+Uses wreq with custom TlsOptions (not Emulation). HTTP/1.1 is forced
 by omitting ALPN (alpn_protocols=[]), NOT by http1_only (which injects
 an ALPN extension). Dart's HttpClient (dart:io) uses BoringSSL but
 never negotiates h2 and doesn't send ALPN. The fingerprint is shared
@@ -14,7 +14,7 @@ by all Flutter apps since they use the same Dart SDK TLS stack.
 
 import logging
 
-from rnet.tls import (
+from wreq.tls import (
     ExtensionType,
     TlsOptions,
     TlsVersion,

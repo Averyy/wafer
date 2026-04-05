@@ -1,6 +1,6 @@
 # wafer
 
-> Anti-detection HTTP client for Python wrapping rnet (Rust + BoringSSL).
+> Anti-detection HTTP client for Python wrapping wreq (Rust + BoringSSL).
 
 This file is for LLMs writing code that uses wafer. It contains the exact
 API surface, types, defaults, constraints, and common mistakes. Read this
@@ -27,9 +27,10 @@ challenges that require JavaScript execution (Cloudflare Turnstile, DataDome,
 PerimeterX, Kasada, AWS WAF, hCaptcha, reCAPTCHA, etc). The
 `from wafer.browser import BrowserSolver` import requires this extra.
 
-**uv note:** wafer depends on rnet which is currently a release candidate.
-If using uv, add `prerelease = "allow"` under `[tool.uv]` in pyproject.toml,
-or pass `--prerelease=allow` on the command line. pip handles this automatically.
+**Upgrading from rnet:** wafer's underlying HTTP library was renamed from `rnet` to
+`wreq`. If upgrading from an older wafer version, uninstall rnet first:
+`pip uninstall rnet` (or `uv pip uninstall rnet`). Then reinstall wafer normally.
+New installs need no extra steps.
 
 ---
 
@@ -105,8 +106,8 @@ Both support context managers (`with` / `async with`).
 
 ```python
 SyncSession(
-    # TLS identity (Chrome profiles from rnet)
-    emulation: rnet.Emulation | None = None,  # default: Emulation.Chrome145 (newest)
+    # TLS identity (Chrome profiles from wreq)
+    emulation: wreq.Emulation | None = None,  # default: Emulation.Chrome145 (newest)
 
     # Non-Chrome profiles (overrides emulation)
     profile: Profile | None = None,           # Profile.OPERA_MINI, Profile.SAFARI, or Profile.DART
@@ -192,7 +193,7 @@ session.add_cookie(raw_set_cookie: str, url: str) -> None
 - `json: dict` - JSON body (auto-sets Content-Type)
 - `form: dict` - form-encoded body
 - `body: bytes | str` - raw body
-- `multipart` - multipart form data (pass-through to rnet; see rnet docs for format)
+- `multipart` - multipart form data (pass-through to wreq; see wreq docs for format)
 
 ---
 
@@ -262,7 +263,7 @@ No-rotation mode (`max_rotations = 0`, including `.bulk()`):
 
 On 403 or challenge, rotations escalate in order:
 
-1. **Fresh TLS session** (rotation 1) - rebuilds the rnet client (new TLS session, empty cookie jar) with the same Chrome fingerprint. Also clears that domain's disk cookie cache (if `cache_dir` is set) so stale cookies aren't rehydrated. Often sufficient when the 403 is from a stale TLS session or tainted cookies, not a fingerprint block.
+1. **Fresh TLS session** (rotation 1) - rebuilds the wreq client (new TLS session, empty cookie jar) with the same Chrome fingerprint. Also clears that domain's disk cookie cache (if `cache_dir` is set) so stale cookies aren't rehydrated. Often sufficient when the 403 is from a stale TLS session or tainted cookies, not a fingerprint block.
 2. **Safari profile switch** (rotation 2) - switches to a completely different TLS fingerprint (Safari instead of Chrome). Much more effective against fingerprint-based blocks.
 3. **Chrome version rotation** (rotation 3+) - switches back from Safari to a different Chrome version, then cycles through Chrome versions on subsequent rotations.
 
@@ -328,7 +329,7 @@ capabilities and trade-offs.
 - Auto-generates `sec-ch-ua` Client Hints headers
 - On 403/challenge: switches to Safari profile (different TLS/H2 fingerprint)
 - All features enabled: challenge detection, retry, rotation, browser solving
-- Pass `emulation=rnet.Emulation.Chrome145` to pin a specific version
+- Pass `emulation=wreq.Emulation.Chrome145` to pin a specific version
 
 ### Safari (`profile=Profile.SAFARI`)
 
@@ -452,7 +453,7 @@ models), generic JS.
 
 ### Passthrough mode
 
-Some WAFs bind cookies to the TLS session, making cookie replay from rnet
+Some WAFs bind cookies to the TLS session, making cookie replay from wreq
 impossible after a browser solve. In these cases the solver captures the page
 content directly and returns it as the response. This is transparent -
 `session.get()` returns a normal `WaferResponse`. No special handling needed.
@@ -508,7 +509,7 @@ logging.getLogger("wafer").setLevel(logging.DEBUG)
 
 1. **Do not pass `emulation=` and `profile=` together.** Profile overrides emulation.
    Chrome is the default when neither is set. Dart and Safari use custom TlsOptions,
-   not rnet Emulation.
+   not wreq Emulation.
 
 2. **`resp.headers` is a plain `dict[str, str]` with lowercase keys.** Use
    `resp.headers.get("etag")`, not `resp.headers.get("ETag")`.

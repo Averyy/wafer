@@ -5,7 +5,7 @@ from typing import Any
 
 
 class WaferResponse:
-    """Friendly response object wrapping raw rnet responses.
+    """Friendly response object wrapping raw wreq responses.
 
     Provides a requests/httpx-like API:
     - ``status_code``: int

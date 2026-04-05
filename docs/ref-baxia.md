@@ -37,7 +37,7 @@ wafer/browser/
 
 ### TMD Challenge Flow
 
-1. rnet HTTP client hits AliExpress → 200 with JS redirect to `/_____tmd_____/punish?x5secdata=...`
+1. wreq HTTP client hits AliExpress → 200 with JS redirect to `/_____tmd_____/punish?x5secdata=...`
 2. Punish page has no `<head>` -bare `<script>` tag with redirect + config
 3. Redirect loads NoCaptcha SDK which renders slider widget
 4. User drags slider → behavioral payload sent server-side
@@ -101,5 +101,5 @@ All 7 naturally present in recorded human trajectories from mousse.
 
 - **Mock**: `tests/mocks/baxia/slide.html` -canvas-generated slider, exact Baxia dimensions
 - **Demo**: `tests/demo_baxia_solve.py` -offline solve against mock
-- **Live test**: `tests/live_baxia.py` -triggers TMD via rnet, solves with Patchright
+- **Live test**: `tests/live_baxia.py` -triggers TMD via wreq, solves with Patchright
 - **Recordings**: 15 slide_drags (3-5.4s, 196-380 events each) in `_recordings/slide_drags/`

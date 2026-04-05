@@ -12,7 +12,7 @@ This module generates realistic Opera Mini header sets with:
 - Correlated device + stock Chrome versions (reflects emerging market update lag)
 - Randomized X-OperaMini-Features per device capability
 
-HTTP transport: bypasses rnet entirely, using Python's urllib (system OpenSSL).
+HTTP transport: bypasses wreq entirely, using Python's urllib (system OpenSSL).
 This gives perfect header control (no Chrome Sec-Ch-Ua/Sec-Fetch-* leakage)
 and a more realistic TLS fingerprint — real Opera Mini routes through
 nginx/OpenSSL proxy infrastructure, not BoringSSL/Chrome.
@@ -302,7 +302,7 @@ class OperaMiniIdentity:
         headers: dict[str, str] | None = None,
         timeout: float = 30.0,
     ) -> tuple[int, dict[str, str], str, str]:
-        """Send an HTTP GET via stdlib urllib (bypasses rnet).
+        """Send an HTTP GET via stdlib urllib (bypasses wreq).
 
         Returns (status_code, headers_dict, body_text, final_url).
         final_url reflects the actual URL after any redirects (for SSRF checks).

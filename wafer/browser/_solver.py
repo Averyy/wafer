@@ -319,7 +319,7 @@ class BrowserSolver:
 
     Manages a persistent Chrome instance with idle timeout. Cookies are
     extracted after challenge resolution and returned for injection into
-    the rnet session.
+    the wreq session.
 
     Must run headful (headless = 16.7% bypass rate in benchmarks).
     Uses system Chrome via channel="chrome" for best stealth.

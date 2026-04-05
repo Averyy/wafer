@@ -18,7 +18,7 @@
 When updating, change the **Status** column and add a date + note. Don't assume a site's current behavior is permanent.
 
 **Status values:**
-- `pass` -confirmed working via TLS only (rnet Emulation)
+- `pass` -confirmed working via TLS only (wreq Emulation)
 - `browser-solve` -needs browser solver, confirmed working
 - `no-solver` -WAF vendor has no wafer solver yet (Kasada, F5 Shape, in-house)
 - `no-drag` -needs drag/slider solver (not yet built)
@@ -48,7 +48,7 @@ Should pass with any Chrome Emulation profile.
 
 ## Tier 2: TLS Fingerprint Required
 
-Passes with rnet Chrome Emulation (JA3/JA4 + H2 fingerprint match).
+Passes with wreq Chrome Emulation (JA3/JA4 + H2 fingerprint match).
 
 ### Cloudflare
 

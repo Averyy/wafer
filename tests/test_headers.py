@@ -123,7 +123,7 @@ class TestRefererChain:
 class TestAutoHost:
     @patch("time.sleep")
     def test_no_auto_host(self, mock_sleep):
-        """Host should NOT be auto-set (rnet handles it from the URL).
+        """Host should NOT be auto-set (wreq handles it from the URL).
 
         Sending Host per-request duplicates it in HTTP/2 frames, which
         strict WAFs like Cloudflare detect as non-browser behavior.
