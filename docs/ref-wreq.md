@@ -1,10 +1,12 @@
 # wreq Reference
 
-Wafer wraps wreq **0.10.2+** (the `Emulation` API, formerly rnet).
+Wafer wraps wreq **0.11.3+** (the `Emulation` API, formerly rnet).
 
 ## TlsOptions Silent Failure
 
-**`TlsOptions(**kwargs)` and `Http2Options(**kwargs)` silently accept ANY kwargs -including typos and wrong names.** There is no validation and no error. A kwarg being "accepted" means nothing. Only wire verification proves it works. Authoritative kwarg names are in the `.pyi` stubs' `Params` TypedDicts.
+**`TlsOptions(**kwargs)`, `Http2Options(**kwargs)`, AND `wreq.Client(**kwargs)` / `wreq.blocking.Client(**kwargs)` all silently accept ANY kwargs -including typos and wrong names.** There is no validation and no error. A kwarg being "accepted" means nothing. Only wire / behavior verification proves it works. Authoritative kwarg names are in the `.pyi` stubs' `Params` / `ClientConfig` TypedDicts.
+
+Concrete example: `wreq.blocking.Client(verify=False).get("https://expired.badssl.com/")` raises an SSL error -the `verify=` kwarg was silently dropped (renamed to `tls_verify=` in v0.11). The new name works: `tls_verify=False` returns 200 on the same URL.
 
 **When a TlsOptions/Http2Options feature doesn't appear on the wire, the kwarg name is almost certainly wrong.** Do NOT conclude the feature is missing from the binary/build. Known corrections:
 - ~~`ocsp_stapling`~~ → `enable_ocsp_stapling`
@@ -12,7 +14,7 @@ Wafer wraps wreq **0.10.2+** (the `Emulation` API, formerly rnet).
 - ~~`curves`~~ → `curves_list`
 - ~~`alpn_protos`~~ → `alpn_protocols`
 - ~~`extensions`~~ → `extension_permutation`
-- ~~`key_shares`~~ (list) → `key_shares_limit` (int count)
+- ~~`key_shares_limit`~~ (int count, pre-0.11) → `key_shares` (`Sequence[KeyShare]`, 0.11+)
 - ~~`pseudo_order`~~ → `headers_pseudo_order` (Http2Options)
 - SCT: `enable_signed_cert_timestamps`
 
@@ -34,7 +36,7 @@ Also: **never send Host per-request** -wreq auto-sets it from the URL. Sending i
 
 ## Emulation Enum
 
-- **Not hashable.** Cannot use as a dict key. Use `repr(emulation)` instead (e.g. `"Emulation.Chrome145"`).
+- **Not hashable.** Cannot use as a dict key. Use `repr(emulation)` instead (e.g. `"Profile.Chrome147"` — note: `Emulation.ChromeXXX` is a ClassVar pointing at `Profile.ChromeXXX`, so repr returns the `Profile.` form).
 - **No `.name` attribute.** Use `repr()` for display and lookups.
 - **macOS User-Agent.** Chrome Emulation profiles produce a macOS User-Agent when running on macOS hosts. This is correct browser behavior -real Chrome does the same.
 
@@ -55,3 +57,4 @@ Also: **never send Host per-request** -wreq auto-sets it from the URL. Sending i
 - **Mutually exclusive identity:** pass `emulation=` (Chrome) OR `tls_options=` + `http2_options=` (Safari). Never both.
 - Cookie jar: `cookie_store=True` enables it. Access via `client.cookie_jar.add(raw_set_cookie_string, url)`.
 - Proxy: `from wreq import Proxy` -> `Proxy.all(proxy_url)`, passed as `proxies=[proxy]`.
+- **Client-level TLS kwargs got a `tls_` prefix in v0.11** (PR #556). Renamed: `verify` -> `tls_verify`, `verify_hostname` -> `tls_verify_hostname`, `identity` -> `tls_identity`, `keylog` -> `tls_keylog`, `min_tls_version` -> `tls_min_version`, `max_tls_version` -> `tls_max_version`. Inside `TlsOptions` itself, `min_tls_version`/`max_tls_version` are unchanged. Old names are silently ignored - see Silent Failure section.

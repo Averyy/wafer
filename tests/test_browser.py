@@ -181,12 +181,12 @@ class TestEmulationForVersion:
     def test_known_version_145(self):
         em = emulation_for_version(145)
         assert em is not None
-        assert repr(em) == "Emulation.Chrome145"
+        assert repr(em) == "Profile.Chrome145"
 
     def test_known_version_100(self):
         em = emulation_for_version(100)
         assert em is not None
-        assert repr(em) == "Emulation.Chrome100"
+        assert repr(em) == "Profile.Chrome100"
 
     def test_unknown_version(self):
         assert emulation_for_version(999) is None
@@ -493,7 +493,7 @@ class TestSyncBrowserSolveIntegration:
 
         session.get("https://example.com/page")
         # Fingerprint should have been reset to Chrome133
-        assert repr(session._fingerprint.current) == "Emulation.Chrome133"
+        assert repr(session._fingerprint.current) == "Profile.Chrome133"
 
     @patch("time.sleep")
     def test_browser_solve_with_cookie_cache(

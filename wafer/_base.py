@@ -93,7 +93,7 @@ else:
     )
 
 # Default to newest Chrome emulation profile
-DEFAULT_EMULATION = Emulation.Chrome145
+DEFAULT_EMULATION = Emulation.Chrome147
 
 DEFAULT_HEADERS = {
     "Accept": (
@@ -759,7 +759,7 @@ class BaseSession:
                 "cookie_store": True,
             }
         if _SYSTEM_CERT_STORE is not None:
-            kwargs["verify"] = _SYSTEM_CERT_STORE
+            kwargs["tls_verify"] = _SYSTEM_CERT_STORE
         if self._proxy is not None:
             kwargs["proxies"] = [self._proxy]
         return kwargs

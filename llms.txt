@@ -107,7 +107,7 @@ Both support context managers (`with` / `async with`).
 ```python
 SyncSession(
     # TLS identity (Chrome profiles from wreq)
-    emulation: wreq.Emulation | None = None,  # default: Emulation.Chrome145 (newest)
+    emulation: wreq.Emulation | None = None,  # default: Emulation.Chrome147 (newest)
 
     # Non-Chrome profiles (overrides emulation)
     profile: Profile | None = None,           # Profile.OPERA_MINI, Profile.SAFARI, or Profile.DART
@@ -325,11 +325,11 @@ capabilities and trade-offs.
 
 ### Chrome (default, no profile= needed)
 
-- TLS + HTTP/2 fingerprint matches real Chrome (currently Chrome 145)
+- TLS + HTTP/2 fingerprint matches real Chrome (currently Chrome 147)
 - Auto-generates `sec-ch-ua` Client Hints headers
 - On 403/challenge: switches to Safari profile (different TLS/H2 fingerprint)
 - All features enabled: challenge detection, retry, rotation, browser solving
-- Pass `emulation=wreq.Emulation.Chrome145` to pin a specific version
+- Pass `emulation=wreq.Emulation.Chrome147` to pin a specific version
 
 ### Safari (`profile=Profile.SAFARI`)
 

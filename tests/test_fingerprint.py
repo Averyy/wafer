@@ -94,44 +94,44 @@ class TestChromeVersion:
 
 class TestChromeProfiles:
     def test_profiles_discovered(self):
-        assert len(CHROME_PROFILES) == 37
+        assert len(CHROME_PROFILES) == 39
 
     def test_newest_first(self):
         versions = [v for v, _ in CHROME_PROFILES]
-        assert versions[0] == 145
+        assert versions[0] == 147
         assert versions == sorted(versions, reverse=True)
 
 
 class TestFingerprintManager:
     def test_defaults_to_newest_chrome(self):
         fm = FingerprintManager()
-        assert fm.current == Emulation.Chrome145
+        assert fm.current == Emulation.Chrome147
 
     def test_custom_initial(self):
         fm = FingerprintManager(initial=Emulation.Chrome130)
         assert fm.current == Emulation.Chrome130
 
     def test_rotation_changes_profile(self):
-        fm = FingerprintManager(initial=Emulation.Chrome145)
+        fm = FingerprintManager(initial=Emulation.Chrome147)
         original = fm.current
         fm.rotate()
         assert fm.current != original
 
     def test_rotation_cycles_through_profiles(self):
-        fm = FingerprintManager(initial=Emulation.Chrome145)
+        fm = FingerprintManager(initial=Emulation.Chrome147)
         seen = {repr(fm.current)}
-        for _ in range(36):  # 37 total profiles - 1 initial
+        for _ in range(38):  # 39 total profiles - 1 initial
             fm.rotate()
             seen.add(repr(fm.current))
-        # Should have visited all 37 Chrome profiles
-        assert len(seen) == 37
+        # Should have visited all 39 Chrome profiles
+        assert len(seen) == 39
 
     def test_pinning_prevents_rotation(self):
-        fm = FingerprintManager(initial=Emulation.Chrome145)
+        fm = FingerprintManager(initial=Emulation.Chrome147)
         fm.pin()
         assert fm.pinned
         fm.rotate()
-        assert fm.current == Emulation.Chrome145
+        assert fm.current == Emulation.Chrome147
 
     def test_pin_is_idempotent(self):
         fm = FingerprintManager()
@@ -144,7 +144,7 @@ class TestFingerprintManager:
         fm.pin()
         fm.reset()
         assert not fm.pinned
-        assert fm.current == Emulation.Chrome145  # resets to newest
+        assert fm.current == Emulation.Chrome147  # resets to newest
 
     def test_reset_with_custom_emulation(self):
         fm = FingerprintManager()
@@ -153,16 +153,16 @@ class TestFingerprintManager:
         assert not fm.pinned
 
     def test_sec_ch_ua_headers_for_chrome(self):
-        fm = FingerprintManager(initial=Emulation.Chrome145)
+        fm = FingerprintManager(initial=Emulation.Chrome147)
         headers = fm.sec_ch_ua_headers()
         assert "sec-ch-ua" in headers
         assert "sec-ch-ua-mobile" in headers
         assert "sec-ch-ua-platform" in headers
-        assert '"145"' in headers["sec-ch-ua"]
+        assert '"147"' in headers["sec-ch-ua"]
         assert headers["sec-ch-ua-mobile"] == "?0"
 
     def test_sec_ch_ua_updates_after_rotation(self):
-        fm = FingerprintManager(initial=Emulation.Chrome145)
+        fm = FingerprintManager(initial=Emulation.Chrome147)
         headers_before = fm.sec_ch_ua_headers()
         fm.rotate()
         headers_after = fm.sec_ch_ua_headers()
@@ -176,7 +176,7 @@ class TestSessionFingerprint:
 
         s = SyncSession()
         assert hasattr(s, "_fingerprint")
-        assert s.emulation == Emulation.Chrome145
+        assert s.emulation == Emulation.Chrome147
 
     def test_session_sends_sec_ch_ua(self):
         from wafer import SyncSession
@@ -186,16 +186,16 @@ class TestSessionFingerprint:
         data = resp.json()
         headers = data["headers"]
         assert "Sec-Ch-Ua" in headers
-        assert '"145"' in headers["Sec-Ch-Ua"]
+        assert '"147"' in headers["Sec-Ch-Ua"]
 
     def test_session_rebuild_changes_emulation(self):
         from wafer import SyncSession
 
         s = SyncSession()
-        assert s.emulation == Emulation.Chrome145
+        assert s.emulation == Emulation.Chrome147
         s._fingerprint.rotate()
         s._rebuild_client()
-        assert s.emulation != Emulation.Chrome145
+        assert s.emulation != Emulation.Chrome147
 
     def test_auto_sec_ch_ua_overrides_user_header(self):
         """Auto-generated sec-ch-ua must override user-provided headers.
@@ -212,7 +212,7 @@ class TestSessionFingerprint:
         # Client-level headers should have the correct sec-ch-ua
         client_kwargs = s._build_client_kwargs()
         assert client_kwargs["headers"]["sec-ch-ua"] != "custom-bad-value"
-        assert '"145"' in client_kwargs["headers"]["sec-ch-ua"]
+        assert '"147"' in client_kwargs["headers"]["sec-ch-ua"]
         # Per-request delta should NOT include sec-ch-ua (already correct)
         built = s._build_headers("https://example.com")
         assert "sec-ch-ua" not in built

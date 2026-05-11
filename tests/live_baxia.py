@@ -50,7 +50,7 @@ if (window.chrome && !window.chrome.runtime) {
 
 def trigger_tmd() -> str | None:
     """Rapid-fire AliExpress search until TMD triggers."""
-    client = wreq.blocking.Client(emulation=wreq.Emulation.Chrome145)
+    client = wreq.blocking.Client(emulation=wreq.Emulation.Chrome147)
     for i, kw in enumerate(KEYWORDS):
         url = f"https://www.aliexpress.com/w/wholesale-{kw}.html"
         log.info("[%d/%d] GET %s", i + 1, len(KEYWORDS), url)

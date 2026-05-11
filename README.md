@@ -69,7 +69,7 @@ from wafer import SyncSession, AsyncSession
 
 session = SyncSession(
     # TLS fingerprint (defaults to newest Chrome)
-    emulation=None,  # or wreq.Emulation.Chrome145
+    emulation=None,  # or wreq.Emulation.Chrome147
 
     # Timeouts (float seconds or timedelta)
     timeout=30,                                    # float/int seconds
@@ -146,7 +146,7 @@ session = SyncSession()
 
 # Specific profile
 from wreq import Emulation
-session = SyncSession(emulation=Emulation.Chrome145)
+session = SyncSession(emulation=Emulation.Chrome147)
 ```
 
 The `sec-ch-ua` header is auto-generated to match the emulated Chrome version using the same GREASE algorithm as Chromium source.
@@ -458,6 +458,7 @@ wafer/
   _profiles.py      # Profile enum (OPERA_MINI, SAFARI)
   _opera_mini.py    # Opera Mini identity generation + stdlib HTTP transport
   _safari.py        # Safari 26 identity -TLS options, H2 options, headers
+  _dart.py          # Dart 3.11 (Flutter) identity -TLS options, headers
   _kasada.py        # Kasada CD (proof-of-work) generation
   _retry.py         # Retry strategy and backoff
   _ratelimit.py     # Per-domain rate limiting

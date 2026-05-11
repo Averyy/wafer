@@ -148,6 +148,8 @@ _CHROME_BUILDS: dict[int, tuple[int, int]] = {
     143: (7499, 52),
     144: (7559, 46),
     145: (7632, 46),
+    146: (7680, 31),
+    147: (7727, 24),
 }
 
 # Fallback for versions outside the lookup table.

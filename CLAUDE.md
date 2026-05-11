@@ -31,19 +31,21 @@ See `docs/site-list.md` for WAF test sites and maintenance rules.
 
 ## wreq
 
-Wraps wreq **0.10.2+** (the `Emulation` API, formerly rnet). See `docs/ref-wreq.md` for TlsOptions gotchas and HTTP/2 header duplication rules.
+Wraps wreq **0.11.3+** (the `Emulation` API, formerly rnet). See `docs/ref-wreq.md` for TlsOptions gotchas and HTTP/2 header duplication rules.
 
 **When upgrading wreq**, check for new Chrome Emulation profiles (e.g. Chrome146). If found:
 1. Update `DEFAULT_EMULATION` in `wafer/_base.py` to the newest Chrome profile.
 2. Add the new version's real build number to `_CHROME_BUILDS` in `wafer/_fingerprint.py`. Get it from `versionhistory.googleapis.com/v1/chrome/platforms/mac/channels/stable/versions`.
-3. Update `test_profiles_discovered` count and `test_newest_first` version in `tests/test_fingerprint.py`.
+3. Update `test_profiles_discovered` count and `test_newest_first` version in `tests/test_fingerprint.py`. Also update every "newest Chrome" assertion in test_fingerprint.py (sec-ch-ua `"NNN"` strings, `Emulation.ChromeNNN` references in `TestFingerprintManager` and `TestSessionFingerprint`). Keep `test_chrome_NNN` regression cases in `TestSecChUaGeneration` and any `Chrome130`/`Chrome133` fixtures unchanged.
+4. **Also check the changelog for kwarg renames at the Client level or in TlsOptions/Http2Options.** wreq silently accepts unknown kwargs - typos and stale names will not error, they will silently be ignored. v0.11 renamed `verify`→`tls_verify` (and other `tls_`-prefixed Client kwargs) and replaced `TlsOptions(key_shares_limit: int)` with `TlsOptions(key_shares: Sequence[KeyShare])`. After every wreq bump, wire-verify Safari + Dart against tls.peet.ws and run the badssl/expired test for `tls_verify`.
+5. After bumping, if `repr(Emulation.ChromeX)` changes shape (e.g. v0.11 changed it from `"Emulation.ChromeX"` to `"Profile.ChromeX"`), update any hardcoded `repr()` string comparisons in tests and docs.
 
 ## Conventions
 
 - No `from __future__ import annotations`
 - Logging via `logging.getLogger("wafer")`, never print()
 - wreq's `Emulation` enum is the source of truth for browser fingerprints
-- Always default to the newest Chrome `Emulation` profile available (currently Chrome145)
+- Always default to the newest Chrome `Emulation` profile available (currently Chrome147)
 - Solver docs live in `docs/ref-*.md` -one per WAF type
 - Mousse changes must update both `wafer/browser/mousse/README.md` and `README.md`
 - **Keep `llms.txt` up to date.** It is the implementation guide for LLMs helping users write code that uses wafer (not for contributors). When adding/changing public API, session params, response fields, error types, challenge types, profiles, or browser solver features, update `llms.txt` to match. Rules for what belongs:

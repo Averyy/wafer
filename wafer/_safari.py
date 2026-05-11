@@ -17,6 +17,7 @@ from wreq.tls import (
     AlpnProtocol,
     CertificateCompressionAlgorithm,
     ExtensionType,
+    KeyShare,
     TlsOptions,
     TlsVersion,
 )
@@ -84,7 +85,7 @@ class SafariIdentity:
             grease_enabled=True,
             permute_extensions=True,
             curves_list="X25519MLKEM768:X25519:P-256:P-384",
-            key_shares_limit=2,
+            key_shares=[KeyShare.X25519_MLKEM768, KeyShare.X25519],
             extension_permutation=[
                 ExtensionType.SIGNATURE_ALGORITHMS,
                 ExtensionType.EXTENDED_MASTER_SECRET,

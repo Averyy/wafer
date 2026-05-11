@@ -16,6 +16,7 @@ import logging
 
 from wreq.tls import (
     ExtensionType,
+    KeyShare,
     TlsOptions,
     TlsVersion,
 )
@@ -74,7 +75,7 @@ class DartIdentity:
             grease_enabled=False,
             permute_extensions=False,
             curves_list="X25519:P-256:P-384",
-            key_shares_limit=1,
+            key_shares=[KeyShare.X25519],
             # Fixed extension order matching captured fingerprint
             extension_permutation=[
                 ExtensionType.SERVER_NAME,

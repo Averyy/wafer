@@ -17,7 +17,7 @@ classifiers = [
     "Topic :: Internet :: WWW/HTTP",
 ]
 dependencies = [
-    "wreq>=0.10.2,<0.11",
+    "wreq>=0.11.3,<0.12",
 ]
 
 [project.urls]
