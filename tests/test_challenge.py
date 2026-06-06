@@ -333,6 +333,43 @@ class TestImperva:
         body = '<html><head><script src="/app.js"></script></head>' + 'x' * 10_000
         assert detect_challenge(200, headers, body) is None
 
+    def test_pardon_our_interruption_reese_interstitial(self):
+        """Modern Imperva 'Pardon Our Interruption' reese interstitial:
+        200, body >5KB (so the classic tiny-body check misses it),
+        distinguished by interstitial-only JS hooks. Regression for
+        realtor.ca, which returned this block page as successful HTML."""
+        body = (
+            '<!DOCTYPE html><html><head>'
+            '<noscript><title>Pardon Our Interruption</title></noscript>'
+            '<script>window.reeseSkipExpirationCheck = true;</script>'
+            '<script>scriptElement.src ='
+            ' "/_Incapsula_Resource?NWFURVBO=images/error_pages/bg.png";'
+            '</script></head><body>'
+            '<div id="interstitial-inprogress"></div>'
+            # Pad well past the 5KB classic-interstitial size cap.
+            + '<!-- ' + 'x' * 6000 + ' -->'
+            + '</body></html>'
+        )
+        assert len(body) > 5_000
+        assert detect_challenge(200, {}, body) == ChallengeType.IMPERVA
+
+    def test_imperva_sensor_on_real_page_not_challenge(self):
+        """A real protected page embeds the _Incapsula_Resource reese84
+        sensor via the same path the interstitial uses, but has none of
+        the interstitial-only JS hooks. It must NOT be re-detected as a
+        challenge — otherwise a browser solve would loop forever, since
+        the solved page still carries the sensor script."""
+        body = (
+            '<!DOCTYPE html><html><head>'
+            '<script type="text/javascript"'
+            ' src="/_Incapsula_Resource?SWJIYLWA=719d34d31c8e3a6e">'
+            '</script></head><body>Real listing content'
+            + 'x' * 6000
+            + '</body></html>'
+        )
+        assert len(body) > 5_000
+        assert detect_challenge(200, {}, body) is None
+
 
 # ---------------------------------------------------------------------------
 # Kasada

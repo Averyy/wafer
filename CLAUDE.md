@@ -31,7 +31,7 @@ See `docs/site-list.md` for WAF test sites and maintenance rules.
 
 ## wreq
 
-Wraps wreq **0.11.3+** (the `Emulation` API, formerly rnet). See `docs/ref-wreq.md` for TlsOptions gotchas and HTTP/2 header duplication rules.
+Wraps wreq **0.12.0+** (the `Emulation` API, formerly rnet). See `docs/ref-wreq.md` for TlsOptions gotchas and HTTP/2 header duplication rules.
 
 **When upgrading wreq**, check for new Chrome Emulation profiles (e.g. Chrome146). If found:
 1. Update `DEFAULT_EMULATION` in `wafer/_base.py` to the newest Chrome profile.

@@ -201,7 +201,7 @@ Wafer detects 17 WAF challenge types from response status, headers, and body:
 | Akamai | `_abck` cookie patterns, sensor script references |
 | DataDome | `datadome` cookie, challenge page markers |
 | PerimeterX / HUMAN | `_px` cookies, captcha div, press-and-hold |
-| Imperva / Incapsula | `___utmvc` cookie, Reese84 script |
+| Imperva / Incapsula | `reese84`/`___utmvc` cookie, `_Incapsula_Resource` script, 200 "Pardon Our Interruption" interstitial |
 | Kasada | `429` with Kasada script markers |
 | F5 Shape | `istlWasHere` interstitial page |
 | AWS WAF | `aws-waf-token` cookie, `AwsWafIntegration` script |
@@ -346,7 +346,8 @@ from wafer.browser import BrowserSolver
 solver = BrowserSolver(
     headless=False,       # headful for best stealth
     idle_timeout=300.0,   # close browser after 5min idle
-    solve_timeout=30.0,   # max time per solve attempt
+    solve_timeout=30.0,   # max time per solve attempt; a per-request
+                          # timeout= on the call caps it lower
 )
 
 # Use with a session -automatic fallback after rotation exhaustion

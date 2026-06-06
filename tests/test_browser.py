@@ -2647,3 +2647,136 @@ class TestReplayBrowseChunk:
         # Last row dispatched: dx=30, dy=15
         assert state.current_x == pytest.approx(130.0)
         assert state.current_y == pytest.approx(215.0)
+
+
+# ---------------------------------------------------------------------------
+# Browser-solve timeout bounding
+#
+# Regression: a caller must not hang past its request timeout while a
+# challenge is being browser-solved, and a shared solver's lock must not
+# block one caller while another solve is in flight. (Wellfound TODO.)
+# ---------------------------------------------------------------------------
+
+
+class _RecordingSolver:
+    """Solver stub that records the timeout passed to solve() and fails."""
+
+    def __init__(self):
+        self.timeouts = []
+
+    def solve(self, url, challenge_type=None, timeout=None):
+        self.timeouts.append(timeout)
+        return None  # "fails" → caller reports the challenge
+
+    def close(self):
+        pass
+
+
+class TestBrowserSolveTimeout:
+    @patch("time.sleep")
+    def test_solve_timeout_clamped_to_request_deadline_sync(self, mock_sleep):
+        """A per-request timeout clamps the browser solve to the remaining
+        budget, so a slow solve can't block the caller past their timeout."""
+        solver = _RecordingSolver()
+        cf_resp = MockResponse(
+            403,
+            {"cf-mitigated": "challenge"},
+            "<html>Just a moment...</html>",
+        )
+        session, _ = make_sync_session(
+            [cf_resp], max_rotations=0, browser_solver=solver
+        )
+        resp = session.get("https://example.com/page", timeout=5)
+        assert resp.challenge_type == "cloudflare"
+        assert len(solver.timeouts) == 1
+        # Finite budget within the 5s request timeout — NOT None, which
+        # would let the solver run its full 30s default.
+        assert solver.timeouts[0] is not None
+        assert 0 < solver.timeouts[0] <= 5
+
+    @patch("time.sleep")
+    def test_solve_no_request_timeout_uses_solver_default_sync(
+        self, mock_sleep
+    ):
+        """Without a per-request timeout the solve gets None, so the
+        BrowserSolver's own solve_timeout default applies."""
+        solver = _RecordingSolver()
+        cf_resp = MockResponse(
+            403,
+            {"cf-mitigated": "challenge"},
+            "<html>Just a moment...</html>",
+        )
+        session, _ = make_sync_session(
+            [cf_resp], max_rotations=0, browser_solver=solver
+        )
+        session.get("https://example.com/page")
+        assert solver.timeouts == [None]
+
+    @pytest.mark.asyncio
+    async def test_solve_timeout_clamped_to_request_deadline_async(self):
+        """Async path clamps the browser solve to the request deadline."""
+        solver = _RecordingSolver()
+        cf_resp = MockResponse(
+            403,
+            {"cf-mitigated": "challenge"},
+            "<html>Just a moment...</html>",
+        )
+        session, _ = make_async_session(
+            [cf_resp], max_rotations=0, browser_solver=solver
+        )
+        resp = await session.get("https://example.com/page", timeout=5)
+        assert resp.challenge_type == "cloudflare"
+        assert len(solver.timeouts) == 1
+        assert solver.timeouts[0] is not None
+        assert 0 < solver.timeouts[0] <= 5
+
+    def test_solve_skips_when_lock_busy(self):
+        """solve() must not block past its timeout waiting for the shared
+        solver lock. A concurrent solve (modeled by holding the lock on a
+        separate thread) must not stall this caller past its budget — so
+        concurrent or repeated solves can't block a caller past its
+        request timeout.
+
+        The lock is held on a *separate* thread and solve() runs on its
+        own thread joined with a timeout, so a regression to an unbounded
+        acquire fails this test cleanly (thread still alive) instead of
+        deadlocking the whole suite (the non-reentrant lock would block a
+        same-thread re-acquire forever, and there is no pytest-timeout)."""
+        import threading
+
+        solver = BrowserSolver()
+        held = threading.Event()
+        release = threading.Event()
+
+        def _holder():
+            solver._lock.acquire()
+            held.set()
+            release.wait(10)
+            solver._lock.release()
+
+        holder = threading.Thread(target=_holder, daemon=True)
+        holder.start()
+        assert held.wait(2), "holder thread failed to take the lock"
+
+        result = {}
+
+        def _run():
+            result["value"] = solver.solve(
+                "https://example.com/", "cloudflare", timeout=0.3
+            )
+
+        worker = threading.Thread(target=_run, daemon=True)
+        t0 = time.monotonic()
+        worker.start()
+        worker.join(timeout=5)
+        elapsed = time.monotonic() - t0
+
+        release.set()
+        holder.join(timeout=2)
+        solver.close()
+
+        assert not worker.is_alive(), (
+            "solve() hung on a busy lock (regression: unbounded acquire)"
+        )
+        assert result["value"] is None
+        assert elapsed < 3.0  # bounded by ~0.3s, not the 30s default

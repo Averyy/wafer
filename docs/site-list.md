@@ -164,6 +164,7 @@ Requires browser solver for initial solve, then TLS client replays cached cookie
 | `allegro.pl` | DataDome | browser-solve | 2026-02-21: Browser-solve verified. 403→browser→datadome cookie→200 1.3MB |
 | `deezer.com` | DataDome | pass | 2026-02-21: 200 188KB via TLS |
 | `tripadvisor.com` | DataDome | browser-solve | 2026-02-21: Browser-solve verified. 403→browser→datadome cookie→200 379KB. Major travel site. 2026-02-22: passed TLS-only (intermittent) |
+| `wellfound.com/jobs/4295822-staff-software-engineer` | DataDome | browser-solve | 2026-06-06: Job detail returns DD 403 (`x-datadome: protected`). Browser-solve verified: 403→browser→datadome cookie→200 79KB, bounded by the request timeout. GraphQL POST to `wellfound.com/graphql` returns a **Cloudflare** 403 (`cf-mitigated: challenge`, served as text/html) -classified as cloudflare, distinct from this DD HTML page challenge. Both report clearly (raise quickly) without a solver |
 
 ### Akamai
 
@@ -184,6 +185,7 @@ Requires browser solver for initial solve, then TLS client replays cached cookie
 
 | URL | Challenge Type | Status | Notes |
 |---|---|---|---|
+| `realtor.ca/on/st-catharines-niagara/real-estate` | Imperva (reese84 interstitial) | browser-solve | 2026-06-06: After a few rapid requests, serves the "Pardon Our Interruption" interstitial as **HTTP 200** (~6.4KB), not a 403. Now detected via interstitial-only JS markers (`reeseSkipExpirationCheck`, `interstitial-inprogress`) since the `_Incapsula_Resource` sensor also appears on real pages, so the marker alone would false-positive after a solve. Browser-solve verified: 200 interstitial→browser→reese84→200 362KB real page (8.3s) |
 | `amadeus.com` | Imperva (reese84) | pass | 2026-02-21: 200 183KB via TLS -no challenge on homepage. Previously required browser-solve |
 | `anz.com.au` | Imperva (reese84) | pass | 2026-02-21: 200 323KB via TLS |
 | `www.hkbea.com/html/en/index.html` | Imperva (incap_ses) | pass | 2026-02-22: 200 162KB via TLS. Bare `hkbea.com` DNS NXDomain -only `www.hkbea.com` resolves. |

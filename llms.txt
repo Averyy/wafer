@@ -189,7 +189,7 @@ session.add_cookie(raw_set_cookie: str, url: str) -> None
 
 - `headers: dict[str, str]` - merged over session headers AND embed mode headers (per-request wins over both)
 - `params: dict[str, str]` - appended to URL as query string
-- `timeout: int | float | timedelta` - per-request deadline; each attempt is clamped to the remaining budget
+- `timeout: int | float | timedelta` - per-request deadline; each attempt is clamped to the remaining budget. Also bounds any browser solve triggered by the request (including time spent waiting on a shared solver), so a challenge can't block the caller past this deadline. Without it, a browser solve falls back to the solver's own `solve_timeout`.
 - `json: dict` - JSON body (auto-sets Content-Type)
 - `form: dict` - form-encoded body
 - `body: bytes | str` - raw body
@@ -417,7 +417,9 @@ from wafer.browser import BrowserSolver, SolveResult, InterceptResult
 solver = BrowserSolver(
     headless=False,       # default: False. Headful recommended for stealth
     idle_timeout=300.0,   # default: 300s. Close browser after N seconds idle
-    solve_timeout=30.0,   # default: 30s. Max seconds per solve attempt
+    solve_timeout=30.0,   # default: 30s. Max seconds per solve attempt.
+                          # A per-request timeout= on the session call
+                          # caps this further (whichever is smaller wins).
 )
 
 # Automatic usage (pass to session):
@@ -446,6 +448,9 @@ solver.close()
 ```
 
 The solver is thread-safe and reuses a single browser instance with idle timeout.
+Solves are serialized on an internal lock; a caller waiting for a busy solver
+gives up once its own timeout budget is exhausted (it does not block forever),
+so one slow solve can't stall other callers past their request deadlines.
 Supports: Cloudflare, Akamai, DataDome (WASM PoW auto-resolve only), PerimeterX
 (press-and-hold), Imperva, Kasada, F5 Shape, AWS WAF, GeeTest v4 (slide),
 Baxia (slider), hCaptcha, reCAPTCHA v2 (checkbox + image grid via local ONNX

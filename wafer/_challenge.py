@@ -302,14 +302,28 @@ def detect_challenge(
             logger.info("Challenge detected: generic_js")
             return ChallengeType.GENERIC_JS
 
-    # Imperva interstitials — served as 200 with tiny body (<5KB).
-    # Detected by structural markers, never by locale-dependent text.
-    # The _Incapsula_Resource script path is unique to Imperva challenge
-    # pages and monitoring. Combined with a tiny body, it's definitive.
-    # NOTE: x-cdn header alone is NOT sufficient — real Imperva-CDN
-    # pages also have it, causing false re-detection after solve.
-    if status_code == 200 and len(body) < 5_000:
-        if "_incapsula_resource" in body_lower:
+    # Imperva interstitials — served as HTTP 200, detected by structural
+    # markers, never by locale-dependent text. The _Incapsula_Resource
+    # path is the Imperva resource loader, but it appears on BOTH the
+    # interstitial AND real protected pages (which embed the reese84
+    # sensor script via the same path). So the marker alone is not enough
+    # — matching it on every page would cause false re-detection after a
+    # solve. NOTE: the x-cdn header is likewise insufficient (real
+    # Imperva-CDN pages carry it too). The interstitial is distinguished
+    # from a real page by either of two body-only signals:
+    #   1. a tiny body (<5KB) — the classic Incapsula "Request
+    #      unsuccessful" block page, AND
+    #   2. interstitial-only JS hooks from the modern reese "Pardon Our
+    #      Interruption" template (e.g. realtor.ca, ~6.4KB). These hooks
+    #      never appear on real content pages, so they hold at any size.
+    if status_code == 200 and "_incapsula_resource" in body_lower:
+        interstitial_markers = (
+            "reeseskipexpirationcheck" in body_lower
+            or "__imperva_interstitial_started__" in body_lower
+            or 'id="interstitial-inprogress"' in body_lower
+            or "x-spa-interstitial" in body_lower
+        )
+        if len(body) < 5_000 or interstitial_markers:
             logger.info("Challenge detected (body): imperva interstitial")
             return ChallengeType.IMPERVA
 

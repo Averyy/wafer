@@ -1,6 +1,6 @@
 # wreq Reference
 
-Wafer wraps wreq **0.11.3+** (the `Emulation` API, formerly rnet).
+Wafer wraps wreq **0.12.0+** (the `Emulation` API, formerly rnet).
 
 ## TlsOptions Silent Failure
 
@@ -58,3 +58,4 @@ Also: **never send Host per-request** -wreq auto-sets it from the URL. Sending i
 - Cookie jar: `cookie_store=True` enables it. Access via `client.cookie_jar.add(raw_set_cookie_string, url)`.
 - Proxy: `from wreq import Proxy` -> `Proxy.all(proxy_url)`, passed as `proxies=[proxy]`.
 - **Client-level TLS kwargs got a `tls_` prefix in v0.11** (PR #556). Renamed: `verify` -> `tls_verify`, `verify_hostname` -> `tls_verify_hostname`, `identity` -> `tls_identity`, `keylog` -> `tls_keylog`, `min_tls_version` -> `tls_min_version`, `max_tls_version` -> `tls_max_version`. Inside `TlsOptions` itself, `min_tls_version`/`max_tls_version` are unchanged. Old names are silently ignored - see Silent Failure section.
+- **v0.12 renamed `ResolverOptions` -> `DnsOptions`** (added a `system_dns: bool` first arg for the OS resolver). Wafer does not use it, but the `dns_options=` Client kwarg now expects a `DnsOptions`. v0.12 also tracks Chrome/Edge 148 + Safari 26.2/26.4 at the Rust (`wreq-util`) level, but the Python `Emulation` enum still tops out at `Chrome147` -do not assume `Emulation.Chrome148` exists.

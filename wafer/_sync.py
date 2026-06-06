@@ -219,20 +219,41 @@ class SyncSession(BaseSession):
         return False
 
     def _try_browser_solve(
-        self, challenge: ChallengeType, url: str
+        self,
+        challenge: ChallengeType,
+        url: str,
+        deadline: float | None = None,
     ) -> WaferResponse | bool:
         """Attempt browser-based challenge solving.
+
+        Args:
+            deadline: monotonic-clock deadline for the overall request.
+                When set (a per-request ``timeout=`` was passed), the
+                browser solve is clamped to the remaining budget so it
+                can't block the caller past their timeout. ``None`` means
+                use the solver's own ``solve_timeout`` default.
 
         Returns:
             WaferResponse: browser got real content without challenge
                 (passthrough - caller should return this directly).
             True: challenge solved, cookies injected - caller should
                 retry the TLS request.
-            False: browser solve failed.
+            False: browser solve failed (or no time budget remained).
         """
         from wafer.browser import format_cookie_str
 
-        result = self._browser_solver.solve(url, challenge.value)
+        solve_timeout: float | None = None
+        if deadline is not None:
+            solve_timeout = deadline - time.monotonic()
+            if solve_timeout <= 0:
+                logger.debug(
+                    "No time budget left for browser solve at %s", url
+                )
+                return False
+
+        result = self._browser_solver.solve(
+            url, challenge.value, timeout=solve_timeout
+        )
         if result is None:
             return False
 
@@ -718,7 +739,7 @@ class SyncSession(BaseSession):
                 ):
                     browser_attempted_type = challenge.value
                     browser_result = self._try_browser_solve(
-                        challenge, current_url
+                        challenge, current_url, deadline
                     )
                     if isinstance(browser_result, WaferResponse):
                         self._record_success(domain)
@@ -765,7 +786,7 @@ class SyncSession(BaseSession):
                     ):
                         browser_attempted_type = challenge.value
                         browser_result = self._try_browser_solve(
-                            challenge, current_url
+                            challenge, current_url, deadline
                         )
                         if isinstance(browser_result, WaferResponse):
                             self._record_success(domain)

@@ -1165,9 +1165,36 @@ class BrowserSolver:
         """
         if timeout is None:
             timeout = self._solve_timeout
-        timeout_ms = int(timeout * 1000)
+        if timeout <= 0:
+            logger.debug("No solve budget left for %s", url)
+            return None
+        # Absolute deadline for the whole solve, including time spent
+        # waiting for the shared solver lock. Navigation and challenge
+        # dispatch each clamp to the remaining budget so a single solve
+        # can never overshoot the caller's request timeout.
+        overall_deadline = time.monotonic() + timeout
 
-        with self._lock:
+        # Bound lock acquisition: a shared BrowserSolver serializes
+        # solves, so without a timeout a concurrent solve could block
+        # this caller far past its own timeout. If the lock is busy,
+        # skip solving and let the caller report the challenge instead
+        # of hanging.
+        if not self._lock.acquire(timeout=timeout):
+            logger.warning(
+                "Browser solve skipped for %s: solver busy "
+                "(waited %.1fs)",
+                url,
+                timeout,
+            )
+            return None
+        try:
+            # The lock wait may have consumed the whole budget; don't
+            # launch a browser we'd have no time to actually use.
+            if time.monotonic() >= overall_deadline:
+                logger.debug(
+                    "Solve budget exhausted waiting for lock: %s", url
+                )
+                return None
             try:
                 self._ensure_browser()
             except Exception:
@@ -1211,10 +1238,14 @@ class BrowserSolver:
 
                 nav_response = None
                 try:
+                    nav_ms = max(
+                        1,
+                        int((overall_deadline - time.monotonic()) * 1000),
+                    )
                     nav_response = page.goto(
                         url,
                         wait_until="domcontentloaded",
-                        timeout=timeout_ms,
+                        timeout=nav_ms,
                     )
                 except Exception:
                     logger.debug(
@@ -1222,9 +1253,13 @@ class BrowserSolver:
                         exc_info=True,
                     )
 
-                # WAF-specific wait strategy
+                # WAF-specific wait strategy — clamp to remaining budget
+                dispatch_ms = max(
+                    1,
+                    int((overall_deadline - time.monotonic()) * 1000),
+                )
                 solved = self._dispatch_challenge(
-                    page, challenge_type, timeout_ms
+                    page, challenge_type, dispatch_ms
                 )
 
 
@@ -1333,7 +1368,12 @@ class BrowserSolver:
                 # The browser needs time to redirect after cookie
                 # update, so retry up to 5s for real content.
                 if solved and captured is None:
-                    passthrough_deadline = time.monotonic() + 5
+                    # Cap the passthrough wait at the overall deadline so
+                    # a near-deadline solve can't overshoot the caller's
+                    # request timeout.
+                    passthrough_deadline = min(
+                        overall_deadline, time.monotonic() + 5
+                    )
                     while time.monotonic() < passthrough_deadline:
                         try:
                             html = page.content()
@@ -1428,6 +1468,8 @@ class BrowserSolver:
                         context.close()
                     except Exception:
                         pass
+        finally:
+            self._lock.release()
 
     def _dispatch_challenge(
         self, page, challenge_type: str | None, timeout_ms: int
@@ -1518,7 +1560,17 @@ class BrowserSolver:
             timeout = self._solve_timeout
         timeout_ms = int(timeout * 1000)
 
-        with self._lock:
+        # Bound lock acquisition so a concurrent solve() on the shared
+        # solver can't block this intercept past its own timeout.
+        if not self._lock.acquire(timeout=max(timeout, 0.0)):
+            logger.warning(
+                "Iframe intercept skipped for %s: solver busy "
+                "(waited %.1fs)",
+                embedder_url,
+                timeout,
+            )
+            return None
+        try:
             try:
                 self._ensure_browser()
             except Exception:
@@ -1647,6 +1699,8 @@ class BrowserSolver:
                         context.close()
                     except Exception:
                         pass
+        finally:
+            self._lock.release()
 
     def close(self) -> None:
         """Shut down browser and release resources."""
