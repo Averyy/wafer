@@ -269,6 +269,28 @@ On 403 or challenge, rotations escalate in order:
 
 With the default `max_rotations=2`, wafer tries fresh session then Safari before giving up. Set `max_rotations=3` or higher if you need Chrome version rotation as well.
 
+### Imperva / Incapsula (automatic, no browser)
+
+Some Imperva-protected hosts (e.g. `api2.realtor.ca`) fingerprint the TLS
+stack itself and challenge *every* browser-emulating client - rotating Chrome
+or Safari fingerprints can't help, because they all share the same underlying
+TLS library. When wafer detects an Imperva challenge it automatically retries
+the request over a system-OpenSSL transport that presents as a plain API
+client (no `Sec-Fetch-*` headers), which these hosts wave through. You don't
+configure anything: pass your normal `Origin`/`Referer` headers and call
+`get`/`post` as usual; you just get the JSON back.
+
+- **No browser required** for this path (works without the `[browser]` extra).
+- **Sticky per hostname:** once a host is served this way, the whole session
+  keeps using it (the WAF cookies live in that transport's jar, so switching
+  back mid-flow would just get re-challenged). Other hosts are unaffected.
+- **Any method/body:** GET with `params=`, POST with `form=`/`json=`/`body=`
+  all work; the body and `Content-Type` are preserved.
+- **Heavy bursts:** under WAF rate-limiting the fallback may itself be
+  challenged; wafer backs off and retries it. If it still can't get through
+  and a `browser_solver` is set, it falls back to solving the JS challenge;
+  otherwise it raises `ChallengeDetected` like any other unsolved challenge.
+
 ---
 
 ## Concurrency and Thread Safety

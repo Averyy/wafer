@@ -30,6 +30,7 @@ from wafer._errors import (
     WaferTimeout,
 )
 from wafer._fingerprint import chrome_version_from_ua, emulation_for_version
+from wafer._native_tls import NATIVE_MAX_RETRIES
 from wafer._profiles import Profile
 from wafer._response import WaferResponse
 from wafer._retry import RetryState, calculate_backoff, parse_retry_after
@@ -358,6 +359,42 @@ class SyncSession(BaseSession):
         )
         return True
 
+    def _try_native_tls(
+        self,
+        method: str,
+        url: str,
+        extra_headers: dict[str, str] | None,
+        kwargs: dict,
+        deadline: float | None,
+        start_time: float,
+        state,
+    ) -> WaferResponse | None:
+        """Replay a request over system OpenSSL (urllib), off the wreq path.
+
+        Returns a WaferResponse for any HTTP reply (its ``challenge_type``
+        is set if the bypass itself got challenged), or None on a transport
+        error or exhausted time budget.
+        """
+        timeout = self.timeout.total_seconds()
+        if deadline is not None:
+            timeout = deadline - time.monotonic()
+            if timeout <= 0:
+                return None
+        headers, body = self._native_prepare(extra_headers, kwargs)
+        transport = self._native_transport()
+        try:
+            status, hdrs, body_bytes, final_url = transport.request(
+                method, url, headers, body, timeout
+            )
+        except Exception:
+            logger.warning(
+                "Native-TLS request failed for %s", url, exc_info=True
+            )
+            return None
+        return self._native_make_response(
+            status, hdrs, body_bytes, final_url, start_time, state
+        )
+
     def _make_response(
         self,
         *,
@@ -448,6 +485,8 @@ class SyncSession(BaseSession):
         current_url = url
 
         browser_attempted_type: str | None = None
+        native_attempted = False
+        native_retries = 0
         redirects_followed = 0
 
         logger.debug("%s %s", method, url)
@@ -460,6 +499,53 @@ class SyncSession(BaseSession):
             # Rate limiting: wait if too soon since last request to this domain
             if self._rate_limiter:
                 self._rate_limiter.wait_sync(domain)
+
+            # Sticky native-TLS: this host was proven to need OpenSSL
+            # (Imperva fingerprints wreq's BoringSSL stack and challenges it
+            # even with valid cookies). Route straight through urllib — and
+            # the native jar, not wreq's, holds the WAF cookies.
+            if domain in self._native_tls_domains:
+                native_resp = self._try_native_tls(
+                    method, current_url, extra_headers, kwargs,
+                    deadline, start_time, state,
+                )
+                if native_resp is not None and native_resp.challenge_type is None:
+                    if self._rate_limiter:
+                        self._rate_limiter.record(domain)
+                    self._record_success(domain)
+                    self._record_url(current_url)
+                    return native_resp
+                # Transport error or a transient (rate-based) reese84 page.
+                # OpenSSL is the only path that works for this pinned host, so
+                # back off and retry native rather than reverting to wreq
+                # (which is always challenged). The loop-top deadline check
+                # bounds total wait.
+                native_retries += 1
+                if native_retries <= NATIVE_MAX_RETRIES:
+                    delay = calculate_backoff(
+                        native_retries - 1, base=2.0, max_delay=15.0
+                    )
+                    if deadline is not None:
+                        delay = min(delay, max(0.0, deadline - time.monotonic()))
+                    logger.debug(
+                        "Native-TLS retry %d/%d for %s in %.1fs",
+                        native_retries, NATIVE_MAX_RETRIES, current_url, delay,
+                    )
+                    time.sleep(delay)
+                    continue
+                if native_resp is None:
+                    raise ConnectionFailed(
+                        current_url, "native-TLS request failed"
+                    )
+                if self.max_rotations == 0:
+                    if self._rate_limiter:
+                        self._rate_limiter.record(domain)
+                    return native_resp
+                raise ChallengeDetected(
+                    native_resp.challenge_type or ChallengeType.IMPERVA.value,
+                    current_url,
+                    native_resp.status_code,
+                )
 
             # TLS session rotation for unlinkable requests
             if self._rotate_every:
@@ -728,6 +814,39 @@ class SyncSession(BaseSession):
                     )
                     time.sleep(delay)
                     continue
+
+                # Imperva: try the native-TLS (OpenSSL) bypass before
+                # burning rotations or a browser. Imperva free-passes
+                # non-BoringSSL clients that omit Sec-Fetch-*; wreq can't
+                # be one, urllib can. On success, pin this host to native.
+                if (
+                    challenge == ChallengeType.IMPERVA
+                    and domain not in self._native_tls_domains
+                    and not native_attempted
+                ):
+                    native_attempted = True
+                    native_resp = self._try_native_tls(
+                        method, current_url, extra_headers, kwargs,
+                        deadline, start_time, state,
+                    )
+                    if (
+                        native_resp is not None
+                        and native_resp.challenge_type is None
+                        and 200 <= native_resp.status_code < 400
+                    ):
+                        self._native_tls_domains.add(domain)
+                        self._record_success(domain)
+                        self._record_url(current_url)
+                        logger.info(
+                            "Imperva bypassed via native-TLS at %s "
+                            "(host pinned)",
+                            current_url,
+                        )
+                        return native_resp
+                    logger.debug(
+                        "Native-TLS did not bypass Imperva at %s",
+                        current_url,
+                    )
 
                 # Early browser solve for JS-only challenges (rotation
                 # can't help — these require JS execution)

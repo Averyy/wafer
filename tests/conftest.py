@@ -266,6 +266,8 @@ def make_sync_session(responses, **session_kwargs):
     session._browser_solver = session_kwargs.get(
         "browser_solver", None
     )
+    session._native_tls = None
+    session._native_tls_domains = set()
     session._proxy = None
     session._rotate_every = session_kwargs.get("rotate_every", None)
     session._request_count = 0
@@ -334,6 +336,8 @@ def make_async_session(responses, **session_kwargs):
     session._browser_solver = session_kwargs.get(
         "browser_solver", None
     )
+    session._native_tls = None
+    session._native_tls_domains = set()
     session._proxy = None
     session._rotate_every = session_kwargs.get("rotate_every", None)
     session._request_count = 0

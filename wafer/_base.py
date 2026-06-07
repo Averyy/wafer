@@ -5,6 +5,7 @@ import logging
 import platform
 import random
 import subprocess
+import time
 from urllib.parse import urlencode, urljoin, urlparse
 
 from wreq import CertStore, Emulation, Method
@@ -334,6 +335,14 @@ class BaseSession:
 
         # Optional browser solver for JS challenges.
         self._browser_solver = browser_solver
+
+        # Native-TLS fallback (urllib/OpenSSL) for WAFs that fingerprint
+        # the BoringSSL stack wreq is built on (Imperva/Incapsula). Lazily
+        # created. Hostnames proven to need it are routed through it on
+        # later requests too: wreq gets challenged even *with* the WAF
+        # cookies, so once a domain goes native the whole flow stays there.
+        self._native_tls = None
+        self._native_tls_domains: set[str] = set()
 
         # TLS session rotation: rebuild client every N requests
         self._rotate_every = rotate_every
@@ -763,3 +772,129 @@ class BaseSession:
         if self._proxy is not None:
             kwargs["proxies"] = [self._proxy]
         return kwargs
+
+    # ------------------------------------------------------------------
+    # Native-TLS fallback (urllib / system OpenSSL)
+    # ------------------------------------------------------------------
+
+    def _native_transport(self):
+        """Lazily create the per-session native-TLS transport."""
+        if self._native_tls is None:
+            from wafer._native_tls import NativeTLSTransport
+
+            self._native_tls = NativeTLSTransport(
+                follow_redirects=self.follow_redirects
+            )
+        return self._native_tls
+
+    def _native_user_agent(self, extra_headers: dict[str, str] | None) -> str:
+        """Pick a User-Agent for the native path.
+
+        Prefer a caller-supplied UA, then the session identity's UA
+        (Safari/Dart set one in self.headers), then a host Chrome UA
+        derived from the current fingerprint version.
+        """
+        if extra_headers:
+            for k, v in extra_headers.items():
+                if k.lower() == "user-agent" and v:
+                    return v
+        for k, v in self.headers.items():
+            if k.lower() == "user-agent" and v:
+                return v
+        from wafer._fingerprint import chrome_version, host_user_agent
+
+        major = None
+        if self._fingerprint is not None:
+            major = chrome_version(self._fingerprint.current)
+        if major is None:
+            major = chrome_version(DEFAULT_EMULATION) or 147
+        return host_user_agent(major)
+
+    def _native_prepare(
+        self,
+        extra_headers: dict[str, str] | None,
+        kwargs: dict,
+    ) -> tuple[dict[str, str], bytes | None]:
+        """Build the sanitized header set and request body for the native path.
+
+        Strips browser-fingerprint headers (Sec-Fetch-*, Sec-Ch-Ua) so the
+        request reads as a generic OpenSSL client, and mirrors wreq's
+        ``form=``/``json=``/``body=`` kwargs into a raw body + Content-Type.
+        """
+        from wafer._native_tls import sanitize_headers
+
+        # Minimal "API client" shape: UA + Accept, plus whatever the caller
+        # passed (Origin/Referer). sanitize_headers then drops anything
+        # browser-typical (Sec-Fetch-*, Accept-Language/Encoding) that would
+        # make Imperva challenge an OpenSSL client under rate pressure.
+        headers = {
+            "User-Agent": self._native_user_agent(extra_headers),
+            "Accept": "*/*",
+        }
+        if extra_headers:
+            headers.update(extra_headers)
+        headers = sanitize_headers(headers)
+
+        body, content_type = self._extract_native_body(kwargs)
+        if content_type and not any(
+            k.lower() == "content-type" for k in headers
+        ):
+            headers["Content-Type"] = content_type
+        return headers, body
+
+    @staticmethod
+    def _extract_native_body(kwargs: dict) -> tuple[bytes | None, str | None]:
+        """Convert wreq body kwargs (form/json/body) to raw bytes + Content-Type."""
+        form = kwargs.get("form")
+        if form is not None:
+            return (
+                urlencode(form).encode(),
+                "application/x-www-form-urlencoded",
+            )
+        payload = kwargs.get("json")
+        if payload is not None:
+            import json as _json
+
+            return _json.dumps(payload).encode(), "application/json"
+        raw = kwargs.get("body")
+        if raw is not None:
+            return (
+                raw.encode() if isinstance(raw, str) else raw,
+                None,
+            )
+        return None, None
+
+    def _native_make_response(
+        self,
+        status: int,
+        headers: dict[str, str],
+        body_bytes: bytes,
+        final_url: str,
+        start_time: float,
+        state=None,
+    ):
+        """Build a WaferResponse from a native-TLS result, tagging any challenge."""
+        from wafer._challenge import detect_challenge
+        from wafer._response import WaferResponse
+
+        content_type = headers.get("content-type", "")
+        text = None
+        challenge_type = None
+        if not _is_binary_content_type(content_type):
+            text = body_bytes.decode("utf-8", errors="replace")
+            if _is_challengeable_content_type(content_type):
+                detected = detect_challenge(status, headers, text)
+                challenge_type = detected.value if detected else None
+        return WaferResponse(
+            status_code=status,
+            content=body_bytes,
+            text=text,
+            headers=headers,
+            url=final_url,
+            elapsed=time.monotonic() - start_time,
+            was_retried=True,
+            retries=state.normal_retries if state else 0,
+            rotations=state.rotation_retries if state else 0,
+            inline_solves=state.inline_solves if state else 0,
+            challenge_type=challenge_type,
+        )

@@ -78,6 +78,33 @@ def _detect_platform() -> str:
 _HOST_PLATFORM = _detect_platform()
 
 
+# UA-reduced platform tokens. Chrome's User-Agent Reduction freezes these
+# strings (e.g. macOS always reports "Intel Mac OS X 10_15_7" even on Apple
+# Silicon), so they match what wreq's Chrome Emulation puts on the wire.
+_UA_PLATFORM_TOKENS = {
+    "Darwin": "Macintosh; Intel Mac OS X 10_15_7",
+    "Windows": "Windows NT 10.0; Win64; x64",
+    "Linux": "X11; Linux x86_64",
+}
+
+
+def host_user_agent(major_version: int) -> str:
+    """Build a UA-reduced Chrome User-Agent string for the host platform.
+
+    Chrome's UA Reduction freezes the platform token and collapses the
+    version to ``MAJOR.0.0.0``, so this reproduces what wreq's Chrome
+    Emulation sends. Used by the native-TLS fallback transport, which has
+    to supply its own UA (urllib doesn't go through wreq's Emulation).
+    """
+    token = _UA_PLATFORM_TOKENS.get(
+        platform.system(), _UA_PLATFORM_TOKENS["Windows"]
+    )
+    return (
+        f"Mozilla/5.0 ({token}) AppleWebKit/537.36 (KHTML, like Gecko) "
+        f"Chrome/{major_version}.0.0.0 Safari/537.36"
+    )
+
+
 # ---------------------------------------------------------------------------
 # High-entropy Client Hints (Sec-CH-UA-Arch, Bitness, Full-Version, etc.)
 # Real Chrome sends these after a site requests them via Accept-CH /
