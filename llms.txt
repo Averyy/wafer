@@ -269,7 +269,7 @@ On 403 or challenge, rotations escalate in order:
 
 With the default `max_rotations=2`, wafer tries fresh session then Safari before giving up. Set `max_rotations=3` or higher if you need Chrome version rotation as well.
 
-### Imperva / Incapsula (automatic, no browser)
+### Imperva / Incapsula (automatic; browserless at light load)
 
 Some Imperva-protected hosts (e.g. `api2.realtor.ca`) fingerprint the TLS
 stack itself and challenge *every* browser-emulating client - rotating Chrome

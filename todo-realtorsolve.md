@@ -27,19 +27,29 @@ table below):
   `Origin`) is what was escalating to the **interactive checkbox**; it's a
   symptom, not the cause.
 
-**Fix:** a native-TLS fallback transport (`wafer/_native_tls.py`, stdlib urllib
-over system OpenSSL) that wafer auto-invokes on Imperva detection and pins
-per-host. It strips `Sec-Fetch-*`/`Sec-Ch-Ua`, keeps `Origin`/`Referer`, and
-carries any GET/POST body. No browser, no fetchaller changes. Wired into both
-`_async.py` and `_sync.py` (trigger + sticky routing with rate-aware backoff).
+**Fix:** a native-TLS fallback transport (`wafer/_native_tls.py`, stdlib
+`http.client` over system OpenSSL, curl-byte-identical: Host first, no
+`Accept-Encoding: identity`/`Connection: close`) that wafer auto-invokes on
+Imperva detection and pins per-host. It strips `Sec-Fetch-*`/`Sec-Ch-Ua`, keeps
+`Origin`/`Referer`, and carries any GET/POST body. No browser, no fetchaller
+changes. Wired into both `_async.py` and `_sync.py` (trigger + sticky routing
+with rate-aware backoff).
 
-**Verified no-browser, full flow:** SubAreaSearch (geocode) → LocationDescription
-(polygons) → PropertySearch_Post (map view) → list view (RecordsPerPage=50) →
-pagination pages 2-3 -all 200 + JSON, real listings/polygons/paging returned.
-Caveat: rapid-firing the endpoint trips a *rate-based* reese84 page even on
-OpenSSL (recovers after a cooldown; the sticky path backs off and retries).
+**Light usage -no browser, full flow verified 12/12:** SubAreaSearch (geocode) →
+LocationDescription (polygons) → PropertySearch_Post (map view) → list view
+(RecordsPerPage=50) → pagination pages 2-3, two cities -all 200 + JSON, real
+listings/polygons/paging returned.
 
-Tests: `tests/test_native_tls.py`. See memory `imperva_native_tls_bypass.md`.
+**Heavy usage -solved with the browser (no longer a caveat):** rapid-firing
+revokes the OpenSSL free pass and demands the `reese84` JS token from everyone.
+With a `browser_solver` set, wafer solves `reese84` once in a real browser and
+wreq carries the token through the rest of the session (the token is accepted
+cross-TLS, verified live; **18/18** under a sustained burst). Both the unpinned
+and pinned paths skip the (useless) fingerprint rotations and go straight to the
+browser. Without a `browser_solver` the heavy state raises `ChallengeDetected`.
+
+Tests: `tests/test_native_tls.py`. Docs: `docs/ref-imperva.md`. See memory
+`imperva_native_tls_bypass.md`.
 
 Original spec retained below for reference.
 

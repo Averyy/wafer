@@ -64,3 +64,5 @@ Sec-Fetch-User, Sec-Fetch-Dest, Accept-Encoding, Accept-Language, Cookie
 ## WebView Evasion (potential future technique)
 
 Android/iOS WebViews often omit all Sec-Fetch-* and Client Hints headers. WAFs can't flag "missing Sec-Fetch = bot" because legitimate WebView traffic looks identical. Trades desktop Chrome impersonation for mobile WebView impersonation.
+
+This "omit Sec-Fetch to look like a non-browser client" insight is **already realized** for Imperva: TLS-fingerprinting sites (e.g. `api2.realtor.ca`) challenge every BoringSSL browser-emulation but free-pass a plain OpenSSL client that sends no `Sec-Fetch-*`. wafer's native-TLS fallback (`wafer/_native_tls.py`, `docs/ref-imperva.md`) does exactly that -OpenSSL TLS + minimal headers, no `Sec-Fetch-*`/`Sec-Ch-Ua`. The flip side of layer 2 above: it works precisely *because* the request no longer claims to be Chrome, so the Chrome-vs-OpenSSL TLS mismatch isn't a contradiction.

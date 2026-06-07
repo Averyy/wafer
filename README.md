@@ -215,11 +215,14 @@ Wafer detects 17 WAF challenge types from response status, headers, and body:
 | Vercel | Vercel bot protection challenge |
 | Generic JS | Unclassified JavaScript challenges |
 
-When a challenge is detected, wafer:
-1. Tries inline solving (ACW, Amazon, TMD - no browser needed)
-2. Tries browser solver if configured (for JS-only challenges like Cloudflare, reCAPTCHA)
-3. Switches from Chrome to Safari and retries
-4. Raises `ChallengeDetected` if all attempts fail
+When a challenge is detected, wafer escalates automatically:
+1. Inline solving (ACW, Amazon, TMD - no browser needed)
+2. For Imperva, a native OpenSSL transport that TLS-fingerprinting sites
+   free-pass (no browser - see [Imperva bypass](#imperva--incapsula-no-browser-bypass))
+3. Browser solver if configured (JS challenges: Cloudflare, DataDome, reCAPTCHA,
+   and Imperva `reese84` under heavy load)
+4. Chrome -> Safari fingerprint rotation
+5. Raises `ChallengeDetected` if all attempts fail
 
 ## Inline Solvers
 
@@ -365,6 +368,37 @@ Uses [Patchright](https://github.com/Kaliiiiiiiiii-Vinyzu/patchright-python) (pa
 
 Supports: Cloudflare (managed + Turnstile), Akamai, DataDome (VM PoW + puzzle slider + slide-right + audio captcha), PerimeterX (including press-and-hold), Imperva, Kasada, F5 Shape, AWS WAF, GeeTest v4 (slide puzzle), Alibaba Baxia (slider), hCaptcha (checkbox), reCAPTCHA v2 (checkbox + image grid via EfficientNet + D-FINE), and generic JS challenges.
 
+## Imperva / Incapsula (no-browser bypass)
+
+Some Imperva deployments (e.g. `api2.realtor.ca`) fingerprint the **TLS stack
+itself** and challenge every BoringSSL client - so wreq's Chrome/Safari/Edge
+emulations are all challenged and rotating between them can't help. A generic
+OpenSSL client that sends the minimal "API client" header set (no `Sec-Fetch-*`)
+gets a free pass instead. wreq can't produce an OpenSSL fingerprint, so wafer
+automatically falls back to a stdlib `http.client` transport over system OpenSSL
+(curl-byte-identical) on Imperva detection, pinned per host. No browser, no
+`[browser]` extra:
+
+```python
+session = wafer.AsyncSession()  # no browser_solver needed for light usage
+resp = await session.get(
+    "https://api2.realtor.ca/Location.svc/SubAreaSearch",
+    params={"Area": "Ottawa", "ApplicationId": "1", "CultureId": "1",
+            "Version": "7.0", "CurrentPage": "1"},
+    headers={"Origin": "https://www.realtor.ca",
+             "Referer": "https://www.realtor.ca/"},
+)
+data = resp.json()  # real JSON, no challenge
+```
+
+Under **heavy load** these sites revoke the free pass and demand the `reese84`
+JS token from every client. With a `browser_solver` configured, wafer solves
+`reese84` once in a real browser and reuses the token across the session
+(exactly how a real browser behaves) - so bursts keep returning data; without
+one, the heavy state raises `ChallengeDetected`. The classic `reese84` JS
+interstitial on full pages (amadeus, hkbea, realtor.ca's main site) is
+browser-solved as before. See [`docs/ref-imperva.md`](docs/ref-imperva.md).
+
 ## Iframe Intercept
 
 For embedded content that requires real browser bootstrapping -when the iframe runs JavaScript to generate auth tokens, solve challenges, or set cookies before API calls work.
@@ -460,6 +494,7 @@ wafer/
   _opera_mini.py    # Opera Mini identity generation + stdlib HTTP transport
   _safari.py        # Safari 26 identity -TLS options, H2 options, headers
   _dart.py          # Dart 3.11 (Flutter) identity -TLS options, headers
+  _native_tls.py    # Native OpenSSL transport (Imperva TLS-fingerprint bypass)
   _kasada.py        # Kasada CD (proof-of-work) generation
   _retry.py         # Retry strategy and backoff
   _ratelimit.py     # Per-domain rate limiting

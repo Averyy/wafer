@@ -48,17 +48,20 @@ pressure Imperva flags them, especially on POSTs.)
 
 Wiring in the request loop (`_async.py` / `_sync.py`):
 
-- **Trigger:** on `IMPERVA` detection, probe the native transport once. If it
+- **Trigger:** on `IMPERVA` detection (and only when `_native_tls_usable()` -
+  no proxy or an `http://` proxy), probe the native transport once. If it
   returns a non-challenge response, **pin** the host (`_native_tls_domains`) and
-  return. If it is also challenged, fall through to the normal escalation
-  (rotation, then `browser_solver` if set).
+  return. If it is also challenged and a `browser_solver` is set, exhaust the
+  rotation budget so the next wreq attempt goes straight to the last-resort
+  browser solve - fingerprint rotation can never help an Imperva TLS-stack
+  challenge (Safari is BoringSSL too, and re-challenged).
 - **Sticky:** a pinned host routes straight to native (wreq stays challenged in
   the free-pass state, and the WAF cookies live in the native jar). A challenge
   on a pinned host is first treated as transient rate-limiting: back off and
   retry native up to `NATIVE_MAX_RETRIES`. If it persists (the heavy reese84
-  state), un-pin and fall through to the wreq path, which escalates to the
-  browser solve - see below. With no `browser_solver` (and `max_rotations>0`)
-  the exhausted native path raises `ChallengeDetected`.
+  state) and a `browser_solver` is set, un-pin, exhaust rotations, and fall
+  through to the wreq path -> browser solve (below). With no `browser_solver`
+  (and `max_rotations>0`) the exhausted native path raises `ChallengeDetected`.
 
 ### Heavy state: reese84 token, earned once, reused
 
