@@ -190,7 +190,7 @@ Requires browser solver for initial solve, then TLS client replays cached cookie
 | `amadeus.com` | Imperva (reese84) | pass | 2026-02-21: 200 183KB via TLS -no challenge on homepage. Previously required browser-solve |
 | `anz.com.au` | Imperva (reese84) | pass | 2026-02-21: 200 323KB via TLS |
 | `www.hkbea.com/html/en/index.html` | Imperva (incap_ses) | pass | 2026-02-22: 200 162KB via TLS. Bare `hkbea.com` DNS NXDomain -only `www.hkbea.com` resolves. |
-| `appdev.pwc.com` | Imperva (___utmvc) | pass | 2026-02-21: 200 3KB via TLS -Imperva challenge not triggered |
+| `appdev.pwc.com` | Imperva (reese84 interstitial) | browser-solve | 2026-06-07: now serves the Incapsula JS interstitial (HTTP 200, ~3.3KB body with `_Incapsula_Resource` + visid_incap/nlbi/incap_ses cookies, `x-cdn: Imperva`); curl gets the same challenge page, not real content. Correctly detected `imperva` by the 0.2.2 200-interstitial logic. OpenSSL native fallback does NOT bypass it (curl is also challenged), so it falls through to browser-solve. Was a TLS pass in Feb before that site change / before interstitial detection existed. |
 
 ### AWS WAF
 
