@@ -119,10 +119,13 @@ class NativeTLSTransport:
     so concurrent use from a thread pool (AsyncSession) is safe.
     """
 
-    def __init__(self, follow_redirects: bool = True):
+    def __init__(
+        self, follow_redirects: bool = True, proxy_url: str | None = None
+    ):
         self._ctx = ssl.create_default_context()
         self._jar = CookieJar()
         self._follow_redirects = follow_redirects
+        self._proxy_url = proxy_url
 
     def request(
         self,
@@ -141,16 +144,21 @@ class NativeTLSTransport:
         """
         method = method.upper()
         max_hops = 6 if self._follow_redirects else 1
+        requested = url
+        status: int = 0
+        resp_headers: dict[str, str] = {}
+        raw = b""
         for _hop in range(max_hops):
+            requested = url
             status, resp_headers, raw = self._send(
-                method, url, headers, body, timeout
+                method, requested, headers, body, timeout
             )
             if (
                 self._follow_redirects
                 and status in _REDIRECT_CODES
                 and resp_headers.get("location")
             ):
-                url = urljoin(url, resp_headers["location"])
+                url = urljoin(requested, resp_headers["location"])
                 # 301/302/303 turn a non-GET into a GET and drop the body
                 # (per the Fetch spec / what browsers and curl do).
                 if status in (301, 302, 303) and method not in ("GET", "HEAD"):
@@ -162,8 +170,10 @@ class NativeTLSTransport:
                         if k.lower() != "content-type"
                     }
                 continue
-            return status, resp_headers, raw, url
-        return status, resp_headers, raw, url
+            return status, resp_headers, raw, requested
+        # Redirect budget exhausted: return the last response we actually
+        # made, tagged with the URL we requested it at (never a phantom hop).
+        return status, resp_headers, raw, requested
 
     def _send(
         self,
@@ -189,12 +199,32 @@ class NativeTLSTransport:
         self._jar.add_cookie_header(cookie_req)
         cookie_header = cookie_req.get_header("Cookie")
 
-        if parsed.scheme == "https":
-            conn = http.client.HTTPSConnection(
-                host, port, context=self._ctx, timeout=timeout
-            )
+        secure = parsed.scheme == "https"
+        conn_cls = (
+            http.client.HTTPSConnection if secure
+            else http.client.HTTPConnection
+        )
+        if self._proxy_url:
+            # Honor the session proxy. http.client only does plain HTTP CONNECT
+            # tunnelling; for socks/https proxies it would silently leak the
+            # real IP, so fail loud instead (the caller falls back to the wreq
+            # path, which does honor the proxy).
+            pp = urlparse(self._proxy_url)
+            if pp.scheme == "http" and pp.hostname:
+                ckw = {"timeout": timeout}
+                if secure:
+                    ckw["context"] = self._ctx
+                conn = conn_cls(pp.hostname, pp.port or 80, **ckw)
+                conn.set_tunnel(host, port)
+            else:
+                raise ConnectionFailed(
+                    url,
+                    f"native-TLS cannot tunnel through a {pp.scheme!r} proxy",
+                )
+        elif secure:
+            conn = conn_cls(host, port, context=self._ctx, timeout=timeout)
         else:
-            conn = http.client.HTTPConnection(host, port, timeout=timeout)
+            conn = conn_cls(host, port, timeout=timeout)
 
         logger.debug("Native-TLS %s %s", method, url)
         try:

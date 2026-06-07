@@ -829,12 +829,16 @@ class SyncSession(BaseSession):
                         method, current_url, extra_headers, kwargs,
                         deadline, start_time, state,
                     )
+                    # A non-challenge reply means the OpenSSL client got past
+                    # the WAF — pin the host regardless of HTTP status (a real
+                    # 404/500 from the origin still proves the bypass works).
                     if (
                         native_resp is not None
                         and native_resp.challenge_type is None
-                        and 200 <= native_resp.status_code < 400
                     ):
                         self._native_tls_domains.add(domain)
+                        if self._rate_limiter:
+                            self._rate_limiter.record(domain)
                         self._record_success(domain)
                         self._record_url(current_url)
                         logger.info(

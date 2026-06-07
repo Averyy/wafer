@@ -1,7 +1,7 @@
 # TODO: Reliably pass wellfound.com (DataDome + Cloudflare Turnstile) — handoff spec
 
 **Owner:** wafer
-**Status:** RESOLVED (2026-06-06) — wafer already handles it; no code change
+**Status:** RESOLVED (2026-06-06) -wafer already handles it; no code change
 **Consumer:** fetchaller-mcp wellfound.com search/job/company feature is blocked on this.
 
 ---

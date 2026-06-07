@@ -328,6 +328,7 @@ class BaseSession:
 
         # Proxy
         self._proxy = None
+        self._proxy_url = proxy  # raw URL, for the native-TLS transport
         if proxy:
             from wreq import Proxy
 
@@ -783,7 +784,8 @@ class BaseSession:
             from wafer._native_tls import NativeTLSTransport
 
             self._native_tls = NativeTLSTransport(
-                follow_redirects=self.follow_redirects
+                follow_redirects=self.follow_redirects,
+                proxy_url=self._proxy_url,
             )
         return self._native_tls
 
