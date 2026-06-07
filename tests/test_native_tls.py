@@ -313,6 +313,47 @@ async def test_async_sticky_exhausted_reaches_browser_solve():
 
 
 @pytest.mark.asyncio
+async def test_async_trigger_native_fail_reaches_browser_not_rotation():
+    # Unpinned host, native probe fails (heavy/non-free-pass), browser set:
+    # rotation can't help Imperva (BoringSSL), so the browser solve must be
+    # reached directly. With [403, 200] queued, a *rotation* would resolve on
+    # the second wreq (solve_calls==0); the rotation-skip routes to the browser
+    # instead (solve_calls==1).
+    pytest.importorskip("wafer.browser")
+
+    class _Solver:
+        def __init__(self):
+            self.solve_calls = []
+
+        def solve(self, url, challenge_type=None, timeout=None):
+            self.solve_calls.append((url, challenge_type))
+            return SimpleNamespace(
+                cookies=[{"name": "reese84", "value": "t",
+                          "domain": ".realtor.ca", "path": "/", "expires": -1,
+                          "secure": True, "httpOnly": True, "sameSite": "None"}],
+                user_agent="Mozilla/5.0 Chrome/147.0.0.0",
+                extras=None, response=None,
+            )
+
+        def close(self):
+            pass
+
+    solver = _Solver()
+    session, client = make_async_session(
+        [_imperva_403(), MockResponse(200, body='{"ok": 1}')],
+        max_rotations=2, browser_solver=solver, use_cookie_jar=True,
+    )
+    session._native_tls = FakeNativeTransport([NATIVE_CHALLENGE] * 2)
+
+    with patch("asyncio.sleep", new=AsyncMock()):
+        resp = await session.get(URL, headers=HDRS)
+
+    assert resp.status_code == 200
+    assert len(solver.solve_calls) == 1  # browser reached, not a lucky rotation
+    assert "api2.realtor.ca" not in session._native_tls_domains
+
+
+@pytest.mark.asyncio
 async def test_async_sticky_exhausted_skips_native_with_socks_proxy():
     # A socks proxy can't be tunnelled by the native path, so a fresh Imperva
     # challenge must never probe/pin native -it goes straight to wreq.

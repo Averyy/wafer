@@ -903,6 +903,12 @@ class AsyncSession(BaseSession):
                         "Native-TLS did not bypass Imperva at %s",
                         current_url,
                     )
+                    # Fingerprint rotation can't help an Imperva TLS-stack
+                    # challenge (Safari is BoringSSL too, and re-challenged),
+                    # so when a browser is available skip the rotations and go
+                    # straight to the last-resort browser solve below.
+                    if self._browser_solver is not None:
+                        state.rotation_retries = state.max_rotations
 
                 # Early browser solve for JS-only challenges (rotation
                 # can't help — these require JS execution)
