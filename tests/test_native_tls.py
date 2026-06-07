@@ -2,6 +2,7 @@
 
 import gzip
 import zlib
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -267,24 +268,67 @@ async def test_async_sticky_raises_after_native_retries_exhausted():
 
 
 @pytest.mark.asyncio
-async def test_async_sticky_exhausted_falls_back_to_browser_path():
+async def test_async_sticky_exhausted_reaches_browser_solve():
     # Pinned host stays challenged (heavy reese84 state) AND a browser_solver
-    # is available: un-pin and fall through to the wreq path (which escalates
-    # to the browser solve), rather than raising. Here the wreq fall-through
-    # gets a clean 200, proving the request was routed off the native path.
-    ok = MockResponse(200, body='{"ok": 1}')
-    session, client = make_async_session([ok], max_rotations=2)
+    # is set: un-pin, fall through to wreq, and -because the rotation budget is
+    # force-exhausted- the very first wreq Imperva 403 goes straight to the
+    # browser solve (no wasted Safari/Chrome rotations). The browser injects
+    # the token and the retried wreq request succeeds.
+    pytest.importorskip("wafer.browser")  # _try_browser_solve needs [browser]
+
+    class _Solver:
+        def __init__(self):
+            self.solve_calls = []
+
+        def solve(self, url, challenge_type=None, timeout=None):
+            self.solve_calls.append((url, challenge_type))
+            return SimpleNamespace(
+                cookies=[{"name": "reese84", "value": "t",
+                          "domain": ".realtor.ca", "path": "/", "expires": -1,
+                          "secure": True, "httpOnly": True, "sameSite": "None"}],
+                user_agent="Mozilla/5.0 Chrome/147.0.0.0",
+                extras=None, response=None,
+            )
+
+        def close(self):
+            pass
+
+    solver = _Solver()
+    # wreq sees an Imperva 403 after the fall-through, then 200 post-solve.
+    session, client = make_async_session(
+        [_imperva_403(), MockResponse(200, body='{"ok": 1}')],
+        max_rotations=2, browser_solver=solver, use_cookie_jar=True,
+    )
     session._native_tls_domains.add("api2.realtor.ca")
     session._native_tls = FakeNativeTransport([NATIVE_CHALLENGE] * 6)
-    session._browser_solver = object()  # presence triggers the fall-back
 
     with patch("asyncio.sleep", new=AsyncMock()):
         resp = await session.get(URL, headers=HDRS)
 
     assert resp.status_code == 200
     assert "api2.realtor.ca" not in session._native_tls_domains  # un-pinned
-    assert client.request_count >= 1  # wreq path was used
     assert len(session._native_tls.calls) == 4  # native exhausted first
+    assert len(solver.solve_calls) == 1  # browser reached, no wasted rotations
+    assert solver.solve_calls[0][1] == "imperva"
+
+
+@pytest.mark.asyncio
+async def test_async_sticky_exhausted_skips_native_with_socks_proxy():
+    # A socks proxy can't be tunnelled by the native path, so a fresh Imperva
+    # challenge must never probe/pin native -it goes straight to wreq.
+    session, client = make_async_session(
+        [_imperva_403(), MockResponse(200, body='{"ok": 1}')],
+        max_rotations=0,
+    )
+    session._proxy_url = "socks5://127.0.0.1:9050"
+    session._native_tls = FakeNativeTransport([JSON_OK])
+
+    resp = await session.get(URL, headers=HDRS)
+
+    # native never used; the 403 is returned (max_rotations=0, no browser)
+    assert len(session._native_tls.calls) == 0
+    assert "api2.realtor.ca" not in session._native_tls_domains
+    assert resp.challenge_type == "imperva"
 
 
 # ---------------------------------------------------------------------------

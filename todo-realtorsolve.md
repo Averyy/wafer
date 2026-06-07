@@ -1,4 +1,4 @@
-# TODO: Reliably pass api2.realtor.ca (Imperva) — handoff spec
+# TODO: Reliably pass api2.realtor.ca (Imperva) -handoff spec
 
 **Owner:** wafer
 **Status:** RESOLVED (2026-06-06) -no browser required
@@ -45,7 +45,7 @@ Original spec retained below for reference.
 
 ---
 
-fetchaller does NOT and MUST NOT do any of this — all bot-challenge detection,
+fetchaller does NOT and MUST NOT do any of this -all bot-challenge detection,
 solving, and cookie handling is wafer's responsibility. fetchaller only calls
 `session.get/post(..., browser_solver=<shared solver>)`. This spec is for wafer.
 
@@ -56,7 +56,7 @@ solving, and cookie handling is wafer's responsibility. fetchaller only calls
 The realtor.ca home-search feature depends on three Imperva-protected XHR
 endpoints on `api2.realtor.ca`. The public `www.realtor.ca/map` page is an empty
 shell; **all** search results come from these calls, so there is no HTML
-fallback — wafer MUST be able to hit api2 reliably.
+fallback -wafer MUST be able to hit api2 reliably.
 
 The browser issues these as CORS XHRs from origin `https://www.realtor.ca` with
 `Origin` + `Referer` set to the site.
@@ -97,7 +97,7 @@ api2 is behind Imperva/Incapsula (`x-cdn: Imperva`, `x-iinfo` header; cookies
 `2271082`, Incapsula instance `1226`).
 
 When wafer's request is flagged, Imperva serves the **interactive "I'm not a
-robot" checkbox interstitial** ("Access Denied — Error 15 … Just click the I'm
+robot" checkbox interstitial** ("Access Denied -Error 15 … Just click the I'm
 not a robot checkbox to pass the security check … Powered by Imperva", Incident
 ID prefixed `1226…`). This is an interactive challenge, not the passive JS
 (`reese84`) variant.
@@ -116,20 +116,20 @@ All three observations are from the **same machine / same egress IP**:
 
 Because curl succeeds and wafer fails on the **identical IP**, the discriminator
 is in **wafer's outbound request** (TLS/HTTP2/header fingerprint and/or cookie
-handling) and in the **missing interactive-checkbox solve** — not the network.
+handling) and in the **missing interactive-checkbox solve** -not the network.
 Do not attribute this to the IP.
 
 ### Repro
 
 ```bash
-# Baseline — succeeds (200 + Set-Cookie), proves the IP is fine:
+# Baseline -succeeds (200 + Set-Cookie), proves the IP is fine:
 curl -s -i "https://api2.realtor.ca/Location.svc/SubAreaSearch?Area=Ottawa&ApplicationId=1&CultureId=1&Version=7.0&CurrentPage=1" \
   -H "Origin: https://www.realtor.ca" -H "Referer: https://www.realtor.ca/" \
   -A "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
 ```
 
 ```python
-# wafer raw — reproduces the 403 (no browser_solver):
+# wafer raw -reproduces the 403 (no browser_solver):
 import asyncio, wafer
 from datetime import timedelta
 async def main():
@@ -142,7 +142,7 @@ asyncio.run(main())
 ```
 
 ```python
-# wafer + browser_solver — succeeds on passive challenge, hits Error 15 checkbox intermittently:
+# wafer + browser_solver -succeeds on passive challenge, hits Error 15 checkbox intermittently:
 from wafer.browser import BrowserSolver
 s = wafer.AsyncSession(browser_solver=BrowserSolver(), timeout=timedelta(seconds=60))
 # ...same GET, then POST PropertySearch_Post with the body in §1...
@@ -153,13 +153,13 @@ s = wafer.AsyncSession(browser_solver=BrowserSolver(), timeout=timedelta(seconds
 ## 4. Current wafer behaviour (what exists vs the gap)
 
 **Detection works.** api2's block is correctly classified as `IMPERVA`:
-- `wafer/_challenge.py:103-112` — `reese84`/`___utmvc` cookie + 403/429; `x-cdn` incapsula/imperva
-- `wafer/_challenge.py:262-267` — body markers
-- `wafer/_challenge.py:305-328` — the HTTP-200 interstitial (added in 0.2.2)
+- `wafer/_challenge.py:103-112` -`reese84`/`___utmvc` cookie + 403/429; `x-cdn` incapsula/imperva
+- `wafer/_challenge.py:262-267` -body markers
+- `wafer/_challenge.py:305-328` -the HTTP-200 interstitial (added in 0.2.2)
 
 **Solve is incomplete.** `wafer/browser/_imperva.py:26 wait_for_imperva()` only
 **polls for a JS-set solve cookie** (`reese84` / `___utmvc` / `incap_ses_*`) to
-appear or change, then replays. It never interacts with the page — there is **no
+appear or change, then replays. It never interacts with the page -there is **no
 checkbox click**. Dispatch: `wafer/browser/_solver.py:1503` routes `imperva` →
 `wait_for_imperva` only.
 
@@ -172,17 +172,17 @@ timeout") improved **detection** but did not add interactive checkbox
 
 ### Reference implementations already in wafer (mirror these)
 Interactive checkbox/iframe solving the Imperva path should follow:
-- `wafer/browser/_cloudflare.py` — Turnstile: locate challenge iframe, human-like
+- `wafer/browser/_cloudflare.py` -Turnstile: locate challenge iframe, human-like
   body click, `patch_frame_screenxy`, retry-click loop, early bail-out.
-- `wafer/browser/_datadome.py` — `captcha-delivery` iframe, mouse-replay click via
+- `wafer/browser/_datadome.py` -`captcha-delivery` iframe, mouse-replay click via
   the `mousse` movement engine, hard-block detection, post-click cookie wait.
-- `wafer/browser/_hcaptcha.py`, `wafer/browser/_recaptcha.py` — checkbox click +
+- `wafer/browser/_hcaptcha.py`, `wafer/browser/_recaptcha.py` -checkbox click +
   solve-cookie wait patterns.
 
 The dev should also capture wafer's exact outbound request (TLS/JA3-JA4, HTTP/2
 settings + header order, header set/casing, and any replayed cached Imperva
 cookies) and diff it against a real Chrome XHR to api2 to find what triggers the
-escalation in the first place — the cheapest fix is to not get escalated to the
+escalation in the first place -the cheapest fix is to not get escalated to the
 checkbox at all.
 
 ---
@@ -199,12 +199,12 @@ checkbox at all.
    request transparently** (caller just gets the JSON back).
 3. Solved Imperva cookies are **persisted/scoped** so subsequent api2 calls in the
    same session reuse them (no re-solve per request); stale/expired cookies are
-   never replayed in a way that itself causes a 403 — a fresh request must be able
+   never replayed in a way that itself causes a 403 -a fresh request must be able
    to earn fresh cookies (curl with no cookies gets 200).
-4. The passive `reese84`/`incap_ses` path keeps working — **no regression** on
+4. The passive `reese84`/`incap_ses` path keeps working -**no regression** on
    sites that currently pass via `wait_for_imperva`.
 5. **Zero fetchaller changes required.** fetchaller continues to call
-   `session.get/post(..., browser_solver=...)` only — no cookie seeding, no
+   `session.get/post(..., browser_solver=...)` only -no cookie seeding, no
    retries-as-workaround, no api2-specific logic on the fetchaller side.
 
 ### How fetchaller will verify once wafer ships it

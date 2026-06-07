@@ -1,4 +1,4 @@
-# TODO: Reliably pass wellfound.com (DataDome + Cloudflare Turnstile) — handoff spec
+# TODO: Reliably pass wellfound.com (DataDome + Cloudflare Turnstile) -handoff spec
 
 **Owner:** wafer
 **Status:** RESOLVED (2026-06-06) -wafer already handles it; no code change
@@ -43,7 +43,7 @@ Original spec retained below for reference.
 ---
 
 fetchaller does NOT and MUST NOT do any bot-challenge detection, solving, or
-cookie handling — that is all wafer's responsibility. fetchaller only calls
+cookie handling -that is all wafer's responsibility. fetchaller only calls
 `session.get(url, browser_solver=<shared solver>)` and parses the returned HTML.
 This spec is for wafer.
 
@@ -51,7 +51,7 @@ This spec is for wafer.
 
 ## 1. What fetchaller needs to work
 
-All four wellfound page types are **server-rendered** — the data fetchaller needs
+All four wellfound page types are **server-rendered** -the data fetchaller needs
 is embedded in the **initial HTML document** (`__NEXT_DATA__` apolloState, or a
 `schema.org/JobPosting` JSON-LD block). fetchaller does **not** need wafer to run
 the page's client-side GraphQL XHRs; it only needs the real initial document
@@ -70,7 +70,7 @@ done.
 
 ---
 
-## 2. The block — a stacked DataDome + Cloudflare Turnstile setup
+## 2. The block -a stacked DataDome + Cloudflare Turnstile setup
 
 The served HTML head shows two layered protections:
 
@@ -84,7 +84,7 @@ The served HTML head shows two layered protections:
 <script src="https://ddm.wellfound.com/tags.js" async></script>
 ```
 Note this is **not** the standard `js.datadome.co` / `geo.captcha-delivery.com`
-hosts — DataDome is white-labeled behind `ddm.wellfound.com`.
+hosts -DataDome is white-labeled behind `ddm.wellfound.com`.
 
 **(b) Cloudflare Turnstile, triggered on XHR responses (not a full-page
 interstitial):** the page overrides `window.fetch`; when a GraphQL/XHR response
@@ -112,16 +112,16 @@ is present and fetchaller has nothing to parse.
 
 ## 3. Evidence
 
-- The data fetchaller needs is confirmed **SSR** — captured documents for all four
+- The data fetchaller needs is confirmed **SSR** -captured documents for all four
   page types contained the real embedded data (`__NEXT_DATA__` apolloState with
   `JobListing`/`JobListingSearchResult`/`Startup`/`StartupResult`, or JSON-LD
   `JobPosting`). So when the navigation gate passes, the content is right there in
-  the initial document — no XHR execution required.
+  the initial document -no XHR execution required.
 - wellfound is currently **not returning that document reliably through wafer**
   (block / challenge response instead). The navigation-level DataDome+Turnstile
   pass is not reliable.
 - This is about wafer's request + solve handling for this protection stack, not
-  the network — do not attribute it to the IP.
+  the network -do not attribute it to the IP.
 
 Reproduce (capture both the success and the failing response):
 ```python
@@ -155,15 +155,15 @@ Success = the SSR data markers are present. Failure = a DataDome/Turnstile page
 ## 4. Current wafer behaviour & likely gaps
 
 wafer already ships solvers for both systems:
-- `wafer/browser/_datadome.py` — but it keys on the standard `captcha-delivery`
+- `wafer/browser/_datadome.py` -but it keys on the standard `captcha-delivery`
   iframe URL. wellfound serves DataDome from the **first-party** host
   `ddm.wellfound.com`, so detection/solve may not fire. Detection should also key
   on `window.ddjskey` / `window.ddoptions` / `ddm.<site>.com/tags.js` and the
-  DataDome cookie — not just `captcha-delivery`.
-- `wafer/browser/_cloudflare.py` — targets full-page Turnstile interstitials.
+  DataDome cookie -not just `captcha-delivery`.
+- `wafer/browser/_cloudflare.py` -targets full-page Turnstile interstitials.
   wellfound's Turnstile is **XHR-triggered** via the `cf-mitigated: challenge`
   response header + an in-page widget, which is a different shape. (Only relevant
-  if the **initial navigation** is challenged — see scope note below.)
+  if the **initial navigation** is challenged -see scope note below.)
 
 Detection entry points to extend: `wafer/_challenge.py` (add the first-party
 DataDome signatures above; recognize `cf-mitigated: challenge`), dispatch in
@@ -171,7 +171,7 @@ DataDome signatures above; recognize `cf-mitigated: challenge`), dispatch in
 
 The dev should also capture wafer's exact outbound navigation request
 (TLS/JA3-JA4, HTTP/2 settings + header order/casing, cookies) and diff it against
-a real Chrome navigation to wellfound to find what triggers the challenge — the
+a real Chrome navigation to wellfound to find what triggers the challenge -the
 cheapest fix is to not get challenged on the navigation at all.
 
 ---
@@ -183,7 +183,7 @@ cheapest fix is to not get challenged on the navigation at all.
    four page types in §1: the response contains `__NEXT_DATA__` with
    `apolloState.data` entries of type `JobListing` / `JobListingSearchResult` /
    `Startup` / `StartupResult` (listing/search/company), or a `schema.org/JobPosting`
-   JSON-LD block (job detail) — **not** a DataDome interstitial or Turnstile
+   JSON-LD block (job detail) -**not** a DataDome interstitial or Turnstile
    "One more step" page or a shell missing the SSR data.
 2. **Scope:** fetchaller needs only the initial SSR document; wafer does **not**
    need to execute the page's GraphQL XHRs. The `cf-mitigated`/Turnstile XHR flow
@@ -193,7 +193,7 @@ cheapest fix is to not get challenged on the navigation at all.
    returns the document.
 4. **No regression** on standard DataDome / Cloudflare Turnstile sites.
 5. **Zero fetchaller changes.** fetchaller calls `session.get(url, browser_solver=...)`
-   and parses the returned HTML — no cookie seeding, no retries-as-workaround, no
+   and parses the returned HTML -no cookie seeding, no retries-as-workaround, no
    wellfound-specific logic on the fetchaller side.
 
 ### How fetchaller will verify once wafer ships it

@@ -563,7 +563,14 @@ class AsyncSession(BaseSession):
                     )
                     self._native_tls_domains.discard(domain)
                     native_attempted = True
+                    # Skip the wreq fingerprint rotations (Safari is also
+                    # BoringSSL and also challenged here) so the next wreq
+                    # attempt goes straight to the last-resort browser solve.
+                    state.rotation_retries = state.max_rotations
                     # fall through to the wreq request below
+                # No browser to mint the reese84 token. Mirror the usual
+                # contract: under no-rotation/.bulk() return the challenge
+                # response, otherwise raise.
                 elif self.max_rotations == 0:
                     if self._rate_limiter:
                         self._rate_limiter.record(domain)
@@ -656,6 +663,12 @@ class AsyncSession(BaseSession):
                     domain = (
                         extract_domain(current_url) or current_url
                     )
+                    # A redirect to a new host gets its own native-TLS probe
+                    # budget (Imperva often bounces between portal and API
+                    # subdomains; the target may need the bypass too).
+                    if cross_origin:
+                        native_attempted = False
+                        native_retries = 0
                     # POST redirects (301, 302, 303) → GET per RFC
                     method_changed = False
                     if status in (301, 302, 303) and m != Method.GET:
@@ -861,6 +874,7 @@ class AsyncSession(BaseSession):
                     challenge == ChallengeType.IMPERVA
                     and domain not in self._native_tls_domains
                     and not native_attempted
+                    and self._native_tls_usable()
                 ):
                     native_attempted = True
                     native_resp = await self._try_native_tls(

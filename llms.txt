@@ -299,10 +299,11 @@ configure anything: pass your normal `Origin`/`Referer` headers and call
   escalation. Without a `browser_solver` there's no way to mint the token, so
   the heavy state raises `ChallengeDetected` (or returns the 403 under
   `.bulk()`/`max_rotations=0`).
-- **Proxies:** the native path honors an `http://` session proxy (via CONNECT
-  tunnelling). It cannot tunnel a `socks://`/`https://` proxy, so rather than
-  leak your real IP it raises `ConnectionFailed` and lets the request fall back
-  to the (proxy-aware) wreq path.
+- **Proxies:** with no proxy or an `http://` proxy the native path is used (an
+  http proxy is honored via CONNECT tunnelling). With a `socks://`/`https://`
+  proxy - which `http.client` can't tunnel without leaking your real IP - wafer
+  **skips the native path entirely** for that session and handles the challenge
+  on the (proxy-aware) wreq path instead (rotation, then the `browser_solver`).
 
 ---
 

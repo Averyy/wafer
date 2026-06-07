@@ -75,9 +75,11 @@ reuses it. Both the unpinned-trigger and pinned-sticky paths reach this same
 escalation.
 
 Properties: per-host sticky, per-session cookie jar, follows redirects, handles
-GET/POST (`form`/`json`/`body`). Honors an `http://` session proxy via CONNECT
-tunnelling; refuses (raises, never leaks) a `socks://`/`https://` proxy so the
-request falls back to the proxy-aware wreq path.
+GET/POST (`form`/`json`/`body`). Proxy handling: with no proxy or an `http://`
+proxy the native path is used (an http proxy is honored via CONNECT tunnelling);
+with a `socks://`/`https://` proxy (which `http.client` can't tunnel without
+leaking the real IP) `_native_tls_usable()` returns False, so the trigger skips
+native entirely and the challenge is handled on the proxy-aware wreq path.
 
 ## Gotchas
 

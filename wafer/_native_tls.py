@@ -242,6 +242,9 @@ class NativeTLSTransport:
                 conn.putheader("Content-Length", str(len(body)))
             conn.endheaders(message_body=body)
             resp = conn.getresponse()
+            # Extract cookies from the headers now, before the body read: if
+            # read() fails mid-body, a Set-Cookie token would otherwise be lost.
+            self._jar.extract_cookies(resp, cookie_req)
             raw = resp.read()
         except (socket.timeout, TimeoutError) as e:
             raise WaferTimeout(url, timeout) from e
@@ -249,8 +252,6 @@ class NativeTLSTransport:
             raise ConnectionFailed(url, str(e)) from e
         finally:
             conn.close()
-
-        self._jar.extract_cookies(resp, cookie_req)
 
         resp_headers: dict[str, str] = {}
         for k, v in resp.getheaders():

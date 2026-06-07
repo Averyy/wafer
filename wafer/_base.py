@@ -778,6 +778,18 @@ class BaseSession:
     # Native-TLS fallback (urllib / system OpenSSL)
     # ------------------------------------------------------------------
 
+    def _native_tls_usable(self) -> bool:
+        """Whether the native-TLS path can be used for this session.
+
+        http.client can only CONNECT-tunnel an ``http://`` proxy. With a
+        ``socks://``/``https://`` proxy the native transport would have to
+        either leak the real IP or fail every attempt, so we skip it entirely
+        and let the (proxy-aware) wreq path handle the challenge instead.
+        """
+        if not self._proxy_url:
+            return True
+        return urlparse(self._proxy_url).scheme == "http"
+
     def _native_transport(self):
         """Lazily create the per-session native-TLS transport."""
         if self._native_tls is None:
@@ -894,6 +906,10 @@ class BaseSession:
             headers=headers,
             url=final_url,
             elapsed=time.monotonic() - start_time,
+            # The native path is only ever reached as a fallback (after an
+            # Imperva challenge, or for an already-pinned host), so the caller
+            # never got this from a clean first attempt -> was_retried=True even
+            # though the wreq retry/rotation counters stay 0.
             was_retried=True,
             retries=state.normal_retries if state else 0,
             rotations=state.rotation_retries if state else 0,
