@@ -286,15 +286,19 @@ configure anything: pass your normal `Origin`/`Referer` headers and call
   back mid-flow would just get re-challenged). Other hosts are unaffected.
 - **Any method/body:** GET with `params=`, POST with `form=`/`json=`/`body=`
   all work; the body and `Content-Type` are preserved.
-- **First detection vs pinned host:** the *first* time a host is challenged,
-  if the OpenSSL probe can't get past the WAF either, wafer falls through to
-  its normal escalation (fingerprint rotation, then the `browser_solver` if one
-  is set). Once a host is *pinned* to the native path (a probe succeeded), a
-  later challenge there is treated as transient rate-limiting: wafer backs off
-  and retries the native request a few times, then raises `ChallengeDetected`
-  (or returns the 403 under `.bulk()`/`max_rotations=0`). It does **not**
-  re-invoke the browser for a pinned host - OpenSSL is the only path that works
-  for these TLS-fingerprinting sites, so the browser's cookies wouldn't help.
+- **Light vs heavy usage (the no-browser/browser split):** at light load these
+  hosts give the OpenSSL client a free pass (no `reese84` token needed) - no
+  browser. Under heavy load the WAF revokes that and demands the `reese84`
+  JS token from *everyone* (even OpenSSL). When that happens and a
+  `browser_solver` is set, wafer solves `reese84` **once** in a real browser and
+  the token is then reused across the rest of the session (exactly how a real
+  browser reuses the token it earned) - so heavy bursts keep returning data.
+  This holds whether or not the host was pinned to the native path: a pinned
+  host first backs off and retries native (for a transient rate blip), and if
+  the challenge persists it un-pins and falls through to the same browser-solve
+  escalation. Without a `browser_solver` there's no way to mint the token, so
+  the heavy state raises `ChallengeDetected` (or returns the 403 under
+  `.bulk()`/`max_rotations=0`).
 - **Proxies:** the native path honors an `http://` session proxy (via CONNECT
   tunnelling). It cannot tunnel a `socks://`/`https://` proxy, so rather than
   leak your real IP it raises `ConnectionFailed` and lets the request fall back

@@ -537,15 +537,32 @@ class SyncSession(BaseSession):
                     raise ConnectionFailed(
                         current_url, "native-TLS request failed"
                     )
-                if self.max_rotations == 0:
+                # Native retries exhausted on a persistent reese84 challenge
+                # (the heavy state where even OpenSSL must present a token).
+                # If a browser is available, un-pin and fall back to the wreq
+                # path: it escalates to the browser solve, which earns a
+                # reese84 token that wreq then carries through. Without a
+                # browser there's no way to mint the token, so surface it.
+                if self._browser_solver is not None:
+                    logger.info(
+                        "Native-TLS exhausted at %s; reverting to "
+                        "wreq + browser solve",
+                        current_url,
+                    )
+                    self._native_tls_domains.discard(domain)
+                    native_attempted = True
+                    # fall through to the wreq request below
+                elif self.max_rotations == 0:
                     if self._rate_limiter:
                         self._rate_limiter.record(domain)
                     return native_resp
-                raise ChallengeDetected(
-                    native_resp.challenge_type or ChallengeType.IMPERVA.value,
-                    current_url,
-                    native_resp.status_code,
-                )
+                else:
+                    raise ChallengeDetected(
+                        native_resp.challenge_type
+                        or ChallengeType.IMPERVA.value,
+                        current_url,
+                        native_resp.status_code,
+                    )
 
             # TLS session rotation for unlinkable requests
             if self._rotate_every:

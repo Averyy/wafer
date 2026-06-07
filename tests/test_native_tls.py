@@ -251,8 +251,8 @@ async def test_async_sticky_rides_out_transient_challenge():
 
 @pytest.mark.asyncio
 async def test_async_sticky_raises_after_native_retries_exhausted():
-    # Pinned host stays challenged: retry native NATIVE_MAX_RETRIES times,
-    # then raise (never falls back to a doomed wreq request).
+    # Pinned host stays challenged and NO browser_solver: retry native
+    # NATIVE_MAX_RETRIES times, then raise (the token can't be minted).
     session, client = make_async_session([], max_rotations=2)
     session._native_tls_domains.add("api2.realtor.ca")
     session._native_tls = FakeNativeTransport([NATIVE_CHALLENGE] * 6)
@@ -264,6 +264,27 @@ async def test_async_sticky_raises_after_native_retries_exhausted():
     assert exc.value.challenge_type == "imperva"
     # initial attempt + NATIVE_MAX_RETRIES retries
     assert len(session._native_tls.calls) == 4
+
+
+@pytest.mark.asyncio
+async def test_async_sticky_exhausted_falls_back_to_browser_path():
+    # Pinned host stays challenged (heavy reese84 state) AND a browser_solver
+    # is available: un-pin and fall through to the wreq path (which escalates
+    # to the browser solve), rather than raising. Here the wreq fall-through
+    # gets a clean 200, proving the request was routed off the native path.
+    ok = MockResponse(200, body='{"ok": 1}')
+    session, client = make_async_session([ok], max_rotations=2)
+    session._native_tls_domains.add("api2.realtor.ca")
+    session._native_tls = FakeNativeTransport([NATIVE_CHALLENGE] * 6)
+    session._browser_solver = object()  # presence triggers the fall-back
+
+    with patch("asyncio.sleep", new=AsyncMock()):
+        resp = await session.get(URL, headers=HDRS)
+
+    assert resp.status_code == 200
+    assert "api2.realtor.ca" not in session._native_tls_domains  # un-pinned
+    assert client.request_count >= 1  # wreq path was used
+    assert len(session._native_tls.calls) == 4  # native exhausted first
 
 
 # ---------------------------------------------------------------------------

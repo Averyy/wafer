@@ -52,12 +52,27 @@ Wiring in the request loop (`_async.py` / `_sync.py`):
   returns a non-challenge response, **pin** the host (`_native_tls_domains`) and
   return. If it is also challenged, fall through to the normal escalation
   (rotation, then `browser_solver` if set).
-- **Sticky:** a pinned host routes straight to native (wreq stays challenged
-  even with the cookies, and the WAF cookies live in the native jar). A
-  challenge on a pinned host is treated as transient rate-limiting: back off and
-  retry native up to `NATIVE_MAX_RETRIES`, then raise `ChallengeDetected`. The
-  browser is **not** re-invoked for a pinned host -OpenSSL is the only path that
-  works there.
+- **Sticky:** a pinned host routes straight to native (wreq stays challenged in
+  the free-pass state, and the WAF cookies live in the native jar). A challenge
+  on a pinned host is first treated as transient rate-limiting: back off and
+  retry native up to `NATIVE_MAX_RETRIES`. If it persists (the heavy reese84
+  state), un-pin and fall through to the wreq path, which escalates to the
+  browser solve - see below. With no `browser_solver` (and `max_rotations>0`)
+  the exhausted native path raises `ChallengeDetected`.
+
+### Heavy state: reese84 token, earned once, reused
+
+Under heavy load the WAF revokes the OpenSSL free pass and demands the
+`reese84` JS token from everyone. The browser DataDome-style escalation handles
+it: the existing `_try_browser_solve` runs a real browser, earns the `reese84`
+token, and injects it into wreq's jar; wreq then carries the token through the
+rest of the session (the token is accepted cross-TLS, verified live: a
+browser-earned `reese84` replays on a plain OpenSSL connection -> 200). This is
+exactly how a real browser survives heavy usage (earn the token once on the
+site, replay it on every XHR). So: light usage is no-browser (the free pass or
+wreq's own 302-cookie dance); heavy usage browser-solves `reese84` once and then
+reuses it. Both the unpinned-trigger and pinned-sticky paths reach this same
+escalation.
 
 Properties: per-host sticky, per-session cookie jar, follows redirects, handles
 GET/POST (`form`/`json`/`body`). Honors an `http://` session proxy via CONNECT
