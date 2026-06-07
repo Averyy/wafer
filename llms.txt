@@ -468,6 +468,14 @@ result: SolveResult | None = solver.solve(url, challenge_type)
 # result.user_agent: str - browser's real User-Agent
 # result.extras: dict | None - WAF-specific data
 # result.response: CapturedResponse | None - passthrough content (see below)
+# Imperva on an API host (e.g. api2.example.com): a top-level browser nav to an
+# API host hits Imperva's "Error 15" block. Pass embedder= (the site's origin
+# page, e.g. "https://www.example.com/") so the token is earned there, and
+# replay={"method","body","content_type"} to get the API response as passthrough:
+#   solver.solve(api_url, "imperva", embedder="https://www.example.com/",
+#                replay={"method": "POST", "body": "...", "content_type": "..."})
+# The automatic session path (browser_solver=) derives both for you - no need to
+# call solve() manually unless you're driving the solver yourself.
 
 # Iframe intercept (for embedded widgets):
 result: InterceptResult | None = solver.intercept_iframe(

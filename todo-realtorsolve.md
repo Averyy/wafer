@@ -1,8 +1,87 @@
 # TODO: Reliably pass api2.realtor.ca (Imperva) -handoff spec
 
 **Owner:** wafer
-**Status:** RESOLVED (2026-06-06) -no browser required
-**Consumer:** fetchaller-mcp realtor.ca search/listing feature is blocked on this.
+**Status:** RESOLVED (2026-06-07). The "Error 15" tier was misdiagnosed as a
+missing interactive-checkbox solver; the real cause was wafer's own browser
+solve navigating *top-level* to the API host. Fixed by solving on the origin
+page (embedder). Light/moderate native path (2026-06-06) unchanged.
+**Consumer:** fetchaller-mcp realtor.ca search/listing feature. Zero fetchaller
+changes required.
+
+---
+
+## RESOLUTION (2026-06-07): the "Error 15 checkbox" was self-inflicted
+
+**The 2026-06-07 reopen misdiagnosed this.** "Error 15" is NOT a challenge real
+users see, and it does NOT need an interactive-checkbox solver. It was wafer's
+own browser solve triggering it.
+
+### Root cause (confirmed live, same IP, same minute)
+
+`BrowserSolver.solve()` did `page.goto(url)` where `url` is the *API endpoint*
+(`api2.realtor.ca/Location.svc/...`). That is a **top-level navigation directly
+to an API host** - something no real browser ever does. Imperva answers any
+top-level nav to api2 (deep path *or* root) with the interactive "Error 15"
+block. A real browser only ever touches api2 via **same-site XHR** from
+www.realtor.ca, which returns 200.
+
+| What the browser did | Result |
+|---|---|
+| `goto(api2/Location.svc/SubAreaSearch?...)` (deep path, top-level nav) | **403** Incapsula `edet=15` "Error 15" block |
+| `goto(api2/)` (host root, top-level nav) | **403** same Error 15 block |
+| `fetch(api2/...)` from inside the www.realtor.ca origin (same-site XHR) | **200** real JSON + earns `.realtor.ca` reese84/incap cookies |
+
+So `wait_for_imperva` never had a chance: it was handed a page that Imperva had
+already decided to block on sight, and it only polls for a cookie that a
+top-level API nav never sets.
+
+### The fix (`imperva_embedder` + embedder solve)
+
+When the browser must solve Imperva for an API host, navigate the **origin page**
+instead of the API URL, exactly as a real browser does:
+
+1. `imperva_embedder(url, headers)` (`wafer/browser/_imperva.py`) derives the
+   embedder origin - the request's `Referer`/`Origin` when it is same-site but a
+   different host (the real embedder the app uses), else `https://www.<reg>/`.
+   Returns `None` for a normal page (e.g. www.realtor.ca, amadeus, hkbea), which
+   keeps the legacy direct-nav behaviour untouched.
+2. `solve_imperva_embedder(...)` navigates that origin, replays human movement so
+   the reese84 sensor mints a genuine token, and waits for a solve cookie.
+3. The original request is then satisfied strongest-first:
+   - **In-page same-site XHR passthrough (`imperva_xhr_replay`)**: while on the
+     embedder page, replay the original GET/POST as `fetch(..., credentials:
+     'include')` - a real-browser same-site request. A 2xx is returned to the
+     caller verbatim (the `replay={method,body,content_type}` descriptor carries
+     POST bodies). This is the "100%" path: if it fails, a real browser fails too.
+   - **Cookie replay (fallback)**: the earned `.<registrable>` reese84/incap
+     cookies replay cross-host **and cross-TLS** (verified live: 200 over
+     native-TLS and wreq). Injected into wreq's jar + seeded into the native jar;
+     the normal retry then succeeds. We do **not** re-pin native after the solve -
+     the solve only fires under escalation, where native is itself challenged and
+     wreq carries the token (the documented heavy path).
+
+### Verified (2026-06-07)
+- Direct-nav reproduction → Error 15 (403); same-site XHR → 200. (root cause)
+- Heavy path via embedder solve, **both fetchaller endpoints**:
+  - `SubAreaSearch` GET → **200** JSON (passthrough).
+  - `PropertySearch_Post` POST → **200**, 128 KB, TotalRecords 13680 (passthrough).
+- Full `session.get()` with a `browser_solver` under live escalation → **200**
+  (never hangs on Error 15).
+- Light native free-pass path (no browser), real `session.get`/`session.post`:
+  GET + POST both 200 (TotalRecords 7086). No regression.
+- 730 unit/integration tests pass (17 new: embedder derivation, embedder
+  navigation, in-page XHR replay, native-jar seeding, no-repin, replay
+  descriptor, full request-loop wiring).
+- Note: Imperva's escalation here is largely **per-session-jar state**, not
+  purely per-IP - a fresh session free-passes even while another from the same
+  IP is throttled, so the browser path is rarely hit in practice.
+
+### Why the earlier "interactive checkbox solver" plan was wrong
+Building a checkbox clicker would have automated solving a block we were causing
+ourselves. The Error 15 page only ever appeared because we navigated to it
+top-level. Real browsers never see it, so per the project rule ("if a site works
+in a normal browser, it must work in wafer") the fix is to stop producing the
+non-browser request shape, not to defeat its challenge.
 
 ---
 

@@ -1157,11 +1157,24 @@ class BrowserSolver:
         url: str,
         challenge_type: str | None = None,
         timeout: float | None = None,
+        embedder: str | None = None,
+        replay: dict | None = None,
     ) -> SolveResult | None:
         """Solve a WAF challenge by navigating in a real browser.
 
         Returns SolveResult with cookies and user_agent, or None on
         failure.
+
+        ``embedder`` (Imperva only): a same-site origin page to navigate
+        instead of ``url`` itself. Imperva serves a top-level navigation to
+        an API host its interactive "Error 15" block; loading the real
+        origin page earns the registrable-domain reese84 / incap cookies,
+        which then replay to the API host. See ``imperva_embedder``.
+
+        ``replay`` (Imperva embedder only): ``{method, body, content_type}``
+        of the original request. After earning cookies on the embedder, the
+        solve replays it as a same-site XHR from that page and returns the
+        response as a passthrough - bytes identical to a real browser's.
         """
         if timeout is None:
             timeout = self._solve_timeout
@@ -1222,6 +1235,86 @@ class BrowserSolver:
                     challenge_type or "unknown",
                     url,
                 )
+
+                # Imperva on an API host: navigate the real origin page
+                # (earns the registrable-domain reese84/incap cookies) rather
+                # than the API URL itself - a top-level nav to an API host is
+                # served Imperva's interactive "Error 15" block, which no
+                # cookie-poll can pass. The earned cookies replay cross-host
+                # (and cross-TLS) to the API host, so the caller's retry over
+                # native-TLS / wreq then succeeds. See imperva_embedder.
+                if challenge_type == "imperva" and embedder:
+                    from wafer.browser._imperva import (
+                        imperva_xhr_replay,
+                        solve_imperva_embedder,
+                    )
+
+                    dispatch_ms = max(
+                        1,
+                        int((overall_deadline - time.monotonic()) * 1000),
+                    )
+                    solved = solve_imperva_embedder(
+                        self, page, embedder, dispatch_ms
+                    )
+                    cookies = context.cookies()
+                    if not cookies:
+                        logger.warning(
+                            "Imperva embedder solve yielded no cookies "
+                            "for %s via %s",
+                            url, embedder,
+                        )
+                        return None
+
+                    # Strongest guarantee: replay the original request as a
+                    # same-site XHR from the embedder page (a real-browser
+                    # fetch). A 2xx is the exact bytes a browser would get, so
+                    # we return it directly; on any failure we fall back to
+                    # cookie replay (the harvested token still rides the retry).
+                    captured = None
+                    if solved and replay:
+                        rem_ms = max(
+                            1,
+                            int((overall_deadline - time.monotonic()) * 1000),
+                        )
+                        res = imperva_xhr_replay(page, url, replay, rem_ms)
+                        # The in-page fetch read the body as text (UTF-8). Only
+                        # trust it for text-ish content; a binary body would be
+                        # mojibake, so fall back to cookie replay for those.
+                        from wafer._base import _is_binary_content_type
+
+                        if (
+                            res
+                            and 200 <= res["status"] < 300
+                            and not _is_binary_content_type(
+                                res.get("content_type") or ""
+                            )
+                        ):
+                            body = res["body"].encode("utf-8")
+                            captured = CapturedResponse(
+                                url=url,
+                                status=res["status"],
+                                headers={
+                                    "content-type": (
+                                        res.get("content_type")
+                                        or "application/json"
+                                    )
+                                },
+                                body=body,
+                            )
+
+                    self._last_used = time.monotonic()
+                    logger.info(
+                        "Imperva embedder solve for %s via %s "
+                        "(%d cookies, solved=%s, passthrough=%s)",
+                        url, embedder, len(cookies), solved,
+                        captured is not None,
+                    )
+                    return SolveResult(
+                        cookies=cookies,
+                        user_agent=self._browser_ua or "",
+                        extras=None,
+                        response=captured,
+                    )
 
                 # No JS stealth injection needed.  The launch flag
                 # --disable-blink-features=AutomationControlled

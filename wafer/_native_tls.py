@@ -32,7 +32,7 @@ import logging
 import socket
 import ssl
 import zlib
-from http.cookiejar import CookieJar
+from http.cookiejar import Cookie, CookieJar
 from urllib.parse import urljoin, urlparse
 from urllib.request import Request as _CookieRequest
 
@@ -126,6 +126,44 @@ class NativeTLSTransport:
         self._jar = CookieJar()
         self._follow_redirects = follow_redirects
         self._proxy_url = proxy_url
+
+    def add_cookies(self, cookies: list[dict]) -> None:
+        """Seed the jar from Playwright-style cookie dicts.
+
+        Lets a browser-earned WAF token (e.g. Imperva ``reese84``) replay on
+        the OpenSSL path: the browser solves the challenge on the site's
+        origin page, and these cookies carry the proof to the API host over
+        native TLS. Each dict has ``name``/``value``/``domain`` (Playwright's
+        ``BrowserContext.cookies()`` shape); ``path``/``secure``/``expires``
+        are honoured when present.
+        """
+        for c in cookies:
+            name = c.get("name")
+            if not name:
+                continue
+            domain = c.get("domain", "") or ""
+            expires = c.get("expires", -1)
+            self._jar.set_cookie(
+                Cookie(
+                    version=0,
+                    name=name,
+                    value=c.get("value", ""),
+                    port=None,
+                    port_specified=False,
+                    domain=domain,
+                    domain_specified=bool(domain),
+                    domain_initial_dot=domain.startswith("."),
+                    path=c.get("path", "/") or "/",
+                    path_specified=True,
+                    secure=bool(c.get("secure", True)),
+                    expires=int(expires) if expires and expires > 0 else None,
+                    discard=not (expires and expires > 0),
+                    comment=None,
+                    comment_url=None,
+                    rest={},
+                    rfc2109=False,
+                )
+            )
 
     def request(
         self,

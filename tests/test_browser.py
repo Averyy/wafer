@@ -40,7 +40,7 @@ class MockBrowserSolver:
         self._result = result
         self.solve_calls = []
 
-    def solve(self, url, challenge_type=None, timeout=None):
+    def solve(self, url, challenge_type=None, timeout=None, embedder=None, replay=None):
         self.solve_calls.append((url, challenge_type))
         return self._result
 
@@ -2237,6 +2237,140 @@ class TestWaitForImperva:
         assert wait_for_imperva(solver, page, 10000) is False
 
 
+class TestSolveImpervaEmbedder:
+    """Error 15 fix: solve on the origin page, not the API host directly."""
+
+    @patch("time.sleep")
+    @patch("time.monotonic")
+    def test_navigates_embedder_and_succeeds_on_reese84(
+        self, mock_mono, mock_sleep
+    ):
+        from wafer.browser._imperva import solve_imperva_embedder
+        page = MagicMock()
+        solver = MagicMock()
+        # Cookie absent, then reese84 appears on the embedder page.
+        page.context.cookies.side_effect = [
+            [],
+            [{"name": "reese84", "value": "earned"}],
+        ]
+        mock_mono.side_effect = [0.0, 0.1, 0.2, 0.3, 0.4]
+
+        assert solve_imperva_embedder(
+            solver, page, "https://www.realtor.ca/", 10000
+        ) is True
+        # Navigated the embedder origin, not the API URL.
+        assert page.goto.call_args[0][0] == "https://www.realtor.ca/"
+
+    @patch("time.sleep")
+    @patch("time.monotonic")
+    def test_succeeds_on_incap_ses(self, mock_mono, mock_sleep):
+        from wafer.browser._imperva import solve_imperva_embedder
+        page = MagicMock()
+        solver = MagicMock()
+        page.context.cookies.side_effect = [
+            [],
+            [{"name": "incap_ses_1226_999", "value": "y"}],
+        ]
+        mock_mono.side_effect = [0.0, 0.1, 0.2, 0.3, 0.4]
+
+        assert solve_imperva_embedder(
+            solver, page, "https://www.realtor.ca/", 10000
+        ) is True
+
+    @patch("time.sleep")
+    @patch("time.monotonic")
+    def test_succeeds_on_legacy_utmvc(self, mock_mono, mock_sleep):
+        # Legacy Incapsula sets ___utmvc, not reese84 - the poll must accept it
+        # (else it times out and the XHR passthrough never runs).
+        from wafer.browser._imperva import solve_imperva_embedder
+        page = MagicMock()
+        solver = MagicMock()
+        page.context.cookies.side_effect = [
+            [],
+            [{"name": "___utmvc", "value": "z"}],
+        ]
+        mock_mono.side_effect = [0.0, 0.1, 0.2, 0.3, 0.4]
+
+        assert solve_imperva_embedder(
+            solver, page, "https://legacy.example.com/", 10000
+        ) is True
+
+    @patch("time.sleep")
+    @patch("time.monotonic")
+    def test_returns_false_on_timeout(self, mock_mono, mock_sleep):
+        from wafer.browser._imperva import solve_imperva_embedder
+        page = MagicMock()
+        solver = MagicMock()
+        page.context.cookies.return_value = []
+        mock_mono.side_effect = [0.0, 0.1, 5.0, 15.0]
+
+        assert solve_imperva_embedder(
+            solver, page, "https://www.realtor.ca/", 10000
+        ) is False
+
+    @patch("time.monotonic")
+    def test_returns_false_when_navigation_fails(self, mock_mono):
+        from wafer.browser._imperva import solve_imperva_embedder
+        page = MagicMock()
+        solver = MagicMock()
+        page.goto.side_effect = RuntimeError("nav blew up")
+        mock_mono.side_effect = [0.0, 0.1]
+
+        assert solve_imperva_embedder(
+            solver, page, "https://www.realtor.ca/", 10000
+        ) is False
+
+
+class TestImpervaXhrReplay:
+    """Same-site XHR replay from the embedder page (passthrough source)."""
+
+    def test_returns_result_dict(self):
+        from wafer.browser._imperva import imperva_xhr_replay
+        page = MagicMock()
+        page.evaluate.return_value = {
+            "status": 200, "body": '{"ok":1}',
+            "content_type": "application/json",
+        }
+        res = imperva_xhr_replay(
+            page, "https://api2.realtor.ca/x",
+            {"method": "POST", "body": "a=1",
+             "content_type": "application/x-www-form-urlencoded"},
+            10000,
+        )
+        assert res["status"] == 200 and res["body"] == '{"ok":1}'
+        # The page received the replay descriptor (method/body/content-type).
+        arg = page.evaluate.call_args[0][1]
+        assert arg["method"] == "POST"
+        assert arg["body"] == "a=1"
+        assert arg["content_type"] == "application/x-www-form-urlencoded"
+
+    def test_none_on_evaluate_error(self):
+        from wafer.browser._imperva import imperva_xhr_replay
+        page = MagicMock()
+        page.evaluate.side_effect = RuntimeError("evaluate failed")
+        assert imperva_xhr_replay(
+            page, "https://api2.realtor.ca/x", {"method": "GET"}, 10000
+        ) is None
+
+    def test_none_on_negative_status(self):
+        from wafer.browser._imperva import imperva_xhr_replay
+        page = MagicMock()
+        page.evaluate.return_value = {
+            "status": -1, "body": "AbortError", "content_type": "",
+        }
+        assert imperva_xhr_replay(
+            page, "https://api2.realtor.ca/x", {"method": "GET"}, 10000
+        ) is None
+
+    def test_method_defaults_to_get(self):
+        from wafer.browser._imperva import imperva_xhr_replay
+        page = MagicMock()
+        page.evaluate.return_value = {"status": 200, "body": "{}",
+                                      "content_type": "application/json"}
+        imperva_xhr_replay(page, "https://api2.realtor.ca/x", {}, 10000)
+        assert page.evaluate.call_args[0][1]["method"] == "GET"
+
+
 # ---------------------------------------------------------------------------
 # Dispatch tests (solver routes to correct module)
 # ---------------------------------------------------------------------------
@@ -2664,7 +2798,7 @@ class _RecordingSolver:
     def __init__(self):
         self.timeouts = []
 
-    def solve(self, url, challenge_type=None, timeout=None):
+    def solve(self, url, challenge_type=None, timeout=None, embedder=None, replay=None):
         self.timeouts.append(timeout)
         return None  # "fails" → caller reports the challenge
 

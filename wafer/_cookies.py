@@ -18,6 +18,32 @@ def extract_domain(url: str) -> str | None:
     return urlparse(url).hostname
 
 
+def registrable_domain(host: str) -> str:
+    """Registrable domain via the TLD+1 heuristic (last two labels).
+
+    ``api2.realtor.ca`` -> ``realtor.ca``; ``realtor.ca`` -> ``realtor.ca``.
+    Good enough to group a site's API host with its www host and to scope
+    WAF cookies. Wrong for multi-label public suffixes (.co.uk, .com.au):
+    those collapse to the suffix itself - callers that navigate based on this
+    (see ``imperva_embedder``) must treat the result as a hint, not a trust
+    boundary.
+    """
+    if not host:
+        return host
+    parts = host.rsplit(".", 2)
+    return ".".join(parts[-2:]) if len(parts) >= 2 else host
+
+
+def cookie_domain_matches(cookie_domain: str, registrable: str) -> bool:
+    """True if a cookie's Domain belongs to ``registrable`` (or a subdomain).
+
+    Boundary-aware: ``realtor.ca`` and ``api2.realtor.ca`` match
+    ``realtor.ca``; ``evil-realtor.ca`` does not.
+    """
+    d = (cookie_domain or "").lstrip(".")
+    return bool(registrable) and (d == registrable or d.endswith("." + registrable))
+
+
 def _parse_cookie_name(raw: str) -> str | None:
     """Extract cookie name from a Set-Cookie header value."""
     eq = raw.find("=")

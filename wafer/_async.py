@@ -21,7 +21,11 @@ from wafer._challenge import (
     ChallengeType,
     detect_challenge,
 )
-from wafer._cookies import extract_domain
+from wafer._cookies import (
+    cookie_domain_matches,
+    extract_domain,
+    registrable_domain,
+)
 from wafer._errors import (
     ChallengeDetected,
     ConnectionFailed,
@@ -225,6 +229,8 @@ class AsyncSession(BaseSession):
         challenge: ChallengeType,
         url: str,
         deadline: float | None = None,
+        embedder: str | None = None,
+        replay: dict | None = None,
     ) -> WaferResponse | bool:
         """Attempt browser-based challenge solving.
 
@@ -234,6 +240,10 @@ class AsyncSession(BaseSession):
                 browser solve is clamped to the remaining budget so it
                 can't block the caller past their timeout. ``None`` means
                 use the solver's own ``solve_timeout`` default.
+            embedder: Imperva only - a same-site origin page to solve on
+                instead of an API ``url`` (see ``imperva_embedder``).
+            replay: Imperva embedder only - ``{method, body, content_type}``
+                replayed as a same-site XHR for a passthrough response.
 
         Returns:
             WaferResponse: browser got real content without challenge
@@ -258,20 +268,24 @@ class AsyncSession(BaseSession):
             url,
             challenge.value,
             timeout=solve_timeout,
+            embedder=embedder,
+            replay=replay,
         )
         if result is None:
             return False
 
         domain = extract_domain(url) or ""
 
-        # Filter cookies to target domain only (browser context
-        # returns cookies for all domains including CDN/challenge
-        # subdomains like challenges.cloudflare.com)
+        # Filter cookies to the target's registrable domain (browser context
+        # returns cookies for all domains including CDN/challenge subdomains
+        # like challenges.cloudflare.com). Match on the registrable domain, not
+        # the exact host: an Imperva embedder solve earns the WAF token on
+        # ``.realtor.ca`` while the request URL is ``api2.realtor.ca``, so a
+        # host-exact match would drop ``reese84``.
+        reg = registrable_domain(domain)
         target_cookies = [
             c for c in result.cookies
-            if domain and c.get("domain", "").lstrip(".").endswith(
-                domain.lstrip("www.")
-            )
+            if cookie_domain_matches(c.get("domain", ""), reg)
         ] or result.cookies  # fallback to all if filter matches none
 
         # Persist browser cookies to disk cache
@@ -334,6 +348,20 @@ class AsyncSession(BaseSession):
                     cookie.get("name", "?"),
                     e,
                 )
+
+        # Imperva: the earned reese84/incap token replays over OpenSSL, so
+        # seed the native jar - a later native-TLS probe (e.g. after load
+        # eases) then carries the token. We deliberately do NOT pin native
+        # here: the browser solve only fires under rate escalation, where the
+        # OpenSSL free pass is revoked and native+token is itself challenged,
+        # while wreq carries the token fine (the documented heavy-state path).
+        # The immediate retry is left unpinned so it rides wreq; the existing
+        # per-request native probe re-pins later if/when the free pass returns.
+        if challenge == ChallengeType.IMPERVA and self._native_tls_usable():
+            try:
+                self._native_transport().add_cookies(target_cookies)
+            except Exception as e:
+                logger.debug("Failed to seed native-TLS jar: %s", e)
 
         # Passthrough: browser got real content without solving
         if result.response is not None:
@@ -920,7 +948,11 @@ class AsyncSession(BaseSession):
                 ):
                     browser_attempted_type = challenge.value
                     browser_result = await self._try_browser_solve(
-                        challenge, current_url, deadline
+                        challenge, current_url, deadline,
+                        embedder=self._imperva_embedder(
+                            challenge, current_url, extra_headers, kwargs
+                        ),
+                        replay=self._browser_replay(method, kwargs),
                     )
                     if isinstance(browser_result, WaferResponse):
                         self._record_success(domain)
@@ -968,7 +1000,12 @@ class AsyncSession(BaseSession):
                         browser_attempted_type = challenge.value
                         browser_result = (
                             await self._try_browser_solve(
-                                challenge, current_url, deadline
+                                challenge, current_url, deadline,
+                                embedder=self._imperva_embedder(
+                                    challenge, current_url,
+                                    extra_headers, kwargs,
+                                ),
+                                replay=self._browser_replay(method, kwargs),
                             )
                         )
                         if isinstance(browser_result, WaferResponse):

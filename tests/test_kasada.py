@@ -165,7 +165,7 @@ class MockBrowserSolver:
         self._result = result
         self.solve_calls = []
 
-    def solve(self, url, challenge_type=None, timeout=None):
+    def solve(self, url, challenge_type=None, timeout=None, embedder=None, replay=None):
         self.solve_calls.append((url, challenge_type))
         return self._result
 

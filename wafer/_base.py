@@ -790,6 +790,43 @@ class BaseSession:
             return True
         return urlparse(self._proxy_url).scheme == "http"
 
+    def _imperva_embedder(self, challenge, url, extra_headers, kwargs):
+        """Origin page to browser-solve an Imperva API-host challenge, or None.
+
+        Imperva serves a top-level navigation to an API host its interactive
+        "Error 15" block; the real flow loads the site's origin page (earning
+        the registrable-domain reese84/incap cookies) and calls the API via
+        same-site XHR. Returns that embedder origin for Imperva when a browser
+        solver is present, else None - callers pass it unconditionally.
+        """
+        from wafer._challenge import ChallengeType
+
+        if challenge != ChallengeType.IMPERVA or self._browser_solver is None:
+            return None
+        from wafer.browser._imperva import imperva_embedder
+
+        merged: dict = {}
+        if extra_headers:
+            merged.update(extra_headers)
+        hdrs = kwargs.get("headers")
+        if hdrs:
+            merged.update(hdrs)
+        return imperva_embedder(url, merged)
+
+    def _browser_replay(self, method, kwargs) -> dict:
+        """Replay descriptor (method/body/content-type) for an in-page XHR.
+
+        Lets the Imperva embedder solve re-issue the *original* request -
+        GET or POST with its form/json/body - as a same-site fetch from the
+        origin page, so the caller gets the real response directly.
+        """
+        body, content_type = self._extract_native_body(kwargs)
+        return {
+            "method": (method if isinstance(method, str) else "GET").upper(),
+            "body": body.decode("utf-8", errors="replace") if body else None,
+            "content_type": content_type,
+        }
+
     def _native_transport(self):
         """Lazily create the per-session native-TLS transport."""
         if self._native_tls is None:

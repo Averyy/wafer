@@ -141,12 +141,16 @@ class FakeNativeTransport:
     def __init__(self, responses):
         self._responses = list(responses)
         self.calls = []
+        self.seeded = []
 
     def request(self, method, url, headers, body=None, timeout=30.0):
         self.calls.append(
             {"method": method, "url": url, "headers": dict(headers), "body": body}
         )
         return self._responses.pop(0)
+
+    def add_cookies(self, cookies):
+        self.seeded.extend(cookies)
 
 
 def _imperva_403():
@@ -280,7 +284,8 @@ async def test_async_sticky_exhausted_reaches_browser_solve():
         def __init__(self):
             self.solve_calls = []
 
-        def solve(self, url, challenge_type=None, timeout=None):
+        def solve(self, url, challenge_type=None, timeout=None,
+                  embedder=None, replay=None):
             self.solve_calls.append((url, challenge_type))
             return SimpleNamespace(
                 cookies=[{"name": "reese84", "value": "t",
@@ -325,7 +330,8 @@ async def test_async_trigger_native_fail_reaches_browser_not_rotation():
         def __init__(self):
             self.solve_calls = []
 
-        def solve(self, url, challenge_type=None, timeout=None):
+        def solve(self, url, challenge_type=None, timeout=None,
+                  embedder=None, replay=None):
             self.solve_calls.append((url, challenge_type))
             return SimpleNamespace(
                 cookies=[{"name": "reese84", "value": "t",
@@ -413,3 +419,214 @@ def test_sync_non_imperva_challenge_never_uses_native():
     assert resp.challenge_type == "cloudflare"
     assert len(session._native_tls.calls) == 0
     assert "example.com" not in session._native_tls_domains
+
+
+# ---------------------------------------------------------------------------
+# Imperva embedder derivation + browser-solve wiring (Error 15 fix)
+# ---------------------------------------------------------------------------
+
+
+def test_imperva_embedder_derivation():
+    pytest.importorskip("wafer.browser")
+    from wafer.browser._imperva import imperva_embedder
+
+    # API host called as a same-site XHR -> navigate the real origin page.
+    assert imperva_embedder(URL, HDRS) == "https://www.realtor.ca/"
+    # A deep Referer collapses to the origin root.
+    assert imperva_embedder(
+        URL, {"Referer": "https://www.realtor.ca/map/listing/9"}
+    ) == "https://www.realtor.ca/"
+    # No Referer/Origin: an API subdomain still maps to its www origin.
+    assert imperva_embedder(URL, None) == "https://www.realtor.ca/"
+    # A normal www page is already navigable -> direct nav (no embedder).
+    assert imperva_embedder("https://www.realtor.ca/page", HDRS) is None
+    assert imperva_embedder("https://www.amadeus.com/x", None) is None
+    # Apex host -> direct nav.
+    assert imperva_embedder("https://realtor.ca/x", None) is None
+    # A cross-site Referer is ignored; falls back to the www heuristic.
+    assert imperva_embedder(
+        URL, {"Referer": "https://evil.com/"}
+    ) == "https://www.realtor.ca/"
+
+
+def test_imperva_embedder_hardening():
+    pytest.importorskip("wafer.browser")
+    from wafer.browser._imperva import imperva_embedder
+
+    # IP-address targets have no registrable domain -> direct nav.
+    assert imperva_embedder("https://192.168.1.1/x", None) is None
+    assert imperva_embedder("https://[::1]/x", None) is None
+    # Referer userinfo + port are stripped (must never reach goto()/logs).
+    assert imperva_embedder(
+        URL, {"Referer": "https://user:pass@www.realtor.ca:8443/p"}
+    ) == "https://www.realtor.ca/"
+    # A non-http(s) Referer scheme is ignored -> www heuristic.
+    assert imperva_embedder(
+        URL, {"Referer": "ftp://www.realtor.ca/"}
+    ) == "https://www.realtor.ca/"
+    # The embedder scheme follows the TARGET's scheme (no https->http downgrade,
+    # no http->https surprise): an http Referer can't downgrade an https target.
+    assert imperva_embedder(
+        URL, {"Referer": "http://www.realtor.ca/"}
+    ) == "https://www.realtor.ca/"
+    # An http target keeps http for the embedder.
+    assert imperva_embedder(
+        "http://api2.realtor.ca/x", {"Referer": "http://www.realtor.ca/"}
+    ) == "http://www.realtor.ca/"
+
+
+def test_registrable_domain_and_cookie_match():
+    from wafer._cookies import cookie_domain_matches, registrable_domain
+
+    assert registrable_domain("api2.realtor.ca") == "realtor.ca"
+    assert registrable_domain("realtor.ca") == "realtor.ca"
+    assert registrable_domain("a.b.c.example.com") == "example.com"
+    assert registrable_domain("") == ""
+    # Boundary-aware cookie matching.
+    assert cookie_domain_matches(".realtor.ca", "realtor.ca")
+    assert cookie_domain_matches("api2.realtor.ca", "realtor.ca")
+    assert cookie_domain_matches("realtor.ca", "realtor.ca")
+    assert not cookie_domain_matches("evil-realtor.ca", "realtor.ca")
+    assert not cookie_domain_matches("cloudflare.com", "realtor.ca")
+    assert not cookie_domain_matches(".realtor.ca", "")
+
+
+def test_native_add_cookies_seeds_jar_for_subdomain():
+    from urllib.request import Request
+
+    from wafer._native_tls import NativeTLSTransport
+
+    t = NativeTLSTransport()
+    t.add_cookies([
+        {"name": "reese84", "value": "tok", "domain": ".realtor.ca",
+         "path": "/", "secure": True, "expires": -1},
+    ])
+    # A .realtor.ca cookie must be sent to the api2 subdomain.
+    req = Request("https://api2.realtor.ca/Location.svc/X")
+    t._jar.add_cookie_header(req)
+    assert "reese84=tok" in (req.get_header("Cookie") or "")
+
+
+def test_imperva_embedder_helper_only_for_imperva():
+    from wafer._challenge import ChallengeType
+
+    session, _ = make_sync_session([])
+    # Non-Imperva challenge -> no embedder regardless of headers.
+    assert session._imperva_embedder(
+        ChallengeType.CLOUDFLARE, URL, HDRS, {}
+    ) is None
+    # No browser solver -> no embedder (nothing to solve with).
+    assert session._browser_solver is None
+    assert session._imperva_embedder(
+        ChallengeType.IMPERVA, URL, HDRS, {}
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_async_browser_solve_uses_embedder_and_seeds_native():
+    # The Error 15 fix: when the heavy path reaches the browser solve for an
+    # api2 host, it must solve on the www *embedder* (not the API URL), seed
+    # the native jar with the earned token, and NOT re-pin native (the retry
+    # rides wreq, which carries the token).
+    pytest.importorskip("wafer.browser")
+
+    class _Solver:
+        def __init__(self):
+            self.calls = []
+
+        def solve(self, url, challenge_type=None, timeout=None,
+                  embedder=None, replay=None):
+            self.calls.append({"url": url, "type": challenge_type,
+                               "embedder": embedder})
+            return SimpleNamespace(
+                cookies=[{"name": "reese84", "value": "t",
+                          "domain": ".realtor.ca", "path": "/", "expires": -1,
+                          "secure": True, "httpOnly": True, "sameSite": "None"}],
+                user_agent="Mozilla/5.0 Chrome/147.0.0.0",
+                extras=None, response=None,
+            )
+
+        def close(self):
+            pass
+
+    solver = _Solver()
+    session, client = make_async_session(
+        [_imperva_403(), MockResponse(200, body='{"ok": 1}')],
+        max_rotations=2, browser_solver=solver, use_cookie_jar=True,
+    )
+    session._native_tls_domains.add("api2.realtor.ca")
+    session._native_tls = FakeNativeTransport([NATIVE_CHALLENGE] * 6)
+
+    with patch("asyncio.sleep", new=AsyncMock()):
+        resp = await session.get(URL, headers=HDRS)
+
+    assert resp.status_code == 200
+    # Solved on the www embedder, not the API URL.
+    assert solver.calls[0]["embedder"] == "https://www.realtor.ca/"
+    assert solver.calls[0]["type"] == "imperva"
+    # Native jar seeded with the earned token...
+    assert any(c["name"] == "reese84" for c in session._native_tls.seeded)
+    # ...but the host is left un-pinned (retry rides wreq).
+    assert "api2.realtor.ca" not in session._native_tls_domains
+
+
+@pytest.mark.asyncio
+async def test_embedder_solve_keeps_reese84_despite_api_host_cookie():
+    # Regression (review High finding): the cookie filter must match the
+    # registrable domain, not the exact host. The embedder earns reese84 on
+    # .realtor.ca; if an api2.realtor.ca-scoped cookie is ALSO present, a
+    # host-exact filter would match only that one, suppress the all-cookies
+    # fallback, and silently DROP reese84 from both the wreq jar and native jar.
+    pytest.importorskip("wafer.browser")
+
+    class _Solver:
+        def solve(self, url, challenge_type=None, timeout=None,
+                  embedder=None, replay=None):
+            return SimpleNamespace(
+                cookies=[
+                    {"name": "reese84", "value": "tok",
+                     "domain": ".realtor.ca", "path": "/", "expires": -1,
+                     "secure": True},
+                    # host-scoped cookie that the old filter would match:
+                    {"name": "incap_ses_1226_9", "value": "s",
+                     "domain": "api2.realtor.ca", "path": "/", "expires": -1,
+                     "secure": True},
+                ],
+                user_agent="Mozilla/5.0 Chrome/147.0.0.0",
+                extras=None, response=None,
+            )
+
+        def close(self):
+            pass
+
+    session, _ = make_async_session(
+        [_imperva_403(), MockResponse(200, body='{"ok": 1}')],
+        max_rotations=2, browser_solver=_Solver(), use_cookie_jar=True,
+    )
+    session._native_tls_domains.add("api2.realtor.ca")
+    session._native_tls = FakeNativeTransport([NATIVE_CHALLENGE] * 6)
+
+    with patch("asyncio.sleep", new=AsyncMock()):
+        await session.get(URL, headers=HDRS)
+
+    seeded = {c["name"] for c in session._native_tls.seeded}
+    assert "reese84" in seeded  # the token survived the filter
+    assert "incap_ses_1226_9" in seeded
+
+
+def test_browser_replay_descriptor():
+    from wafer._challenge import ChallengeType  # noqa: F401
+
+    session, _ = make_sync_session([])
+    # GET: no body.
+    r = session._browser_replay("GET", {})
+    assert r == {"method": "GET", "body": None, "content_type": None}
+    # POST form: urlencoded body + content type, method upper-cased.
+    r = session._browser_replay("post", {"form": {"Area": "Ottawa"}})
+    assert r["method"] == "POST"
+    assert r["body"] == "Area=Ottawa"
+    assert r["content_type"] == "application/x-www-form-urlencoded"
+    # POST json.
+    r = session._browser_replay("POST", {"json": {"a": 1}})
+    assert r["content_type"] == "application/json"
+    assert r["body"] == '{"a": 1}'
