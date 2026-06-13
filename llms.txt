@@ -50,9 +50,9 @@ with SyncSession(rate_limit=2.0) as session:
         resp.raise_for_status()
         data = resp.json()
     except ChallengeDetected as e:
-        ...  # e.challenge_type, e.url, e.status_code
+        ...  # e.challenge_type, e.url, e.status_code, e.response (final WaferResponse)
     except RateLimited as e:
-        ...  # e.retry_after (seconds or None)
+        ...  # e.retry_after (seconds or None), e.response (final WaferResponse)
 
 # Async:
 async with AsyncSession() as session:
@@ -183,6 +183,16 @@ session.request(method: str, url: str, **kwargs) -> WaferResponse
 session.add_cookie(raw_set_cookie: str, url: str) -> None
 # raw_set_cookie is a Set-Cookie header string, e.g. "name=value; Path=/; Secure"
 # Raises NotImplementedError for Opera Mini profile.
+
+# Cookie read access (sync on both SyncSession and AsyncSession - not a coroutine):
+session.get_cookie(name: str, url: str) -> str | None
+# Reads the session's accumulated cookie state, scoped to url's host: exact-host
+# cookies first, then parent-domain cookies (Domain=.example.com matches
+# www.example.com). Covers every transport the session uses (the normal jar,
+# the native-TLS Imperva-bypass jar, the Opera Mini jar). Cookies with the
+# Secure flag are only returned when url is https:// - pass the https URL if
+# you expect a Secure cookie (most WAF cookies are Secure). Returns None when
+# the cookie is absent - never raises, works on all profiles.
 ```
 
 ### Per-request kwargs
@@ -202,13 +212,33 @@ session.add_cookie(raw_set_cookie: str, url: str) -> None
 ```python
 resp.status_code    # int
 resp.ok             # bool (200 <= status < 300)
-resp.text           # str (lazy UTF-8 decode with replacement characters for invalid bytes)
-resp.content        # bytes (raw body, preserved exactly - safe for binary like PDFs/images)
+resp.text           # str (cached). Charset resolution: Content-Type charset= param,
+                    # else a <meta charset=...> / <meta http-equiv> tag in the first
+                    # 1KB of HTML bodies (when Content-Type is missing entirely, the
+                    # meta sniff only runs if the body looks like markup - first
+                    # non-whitespace byte is "<"), else UTF-8. Unknown/invalid charset
+                    # names fall back to UTF-8. Decodes with errors="replace" - never
+                    # raises, invalid bytes become replacement characters.
+resp.content        # bytes (the true decompressed body bytes in the server's
+                    # encoding - NOT a utf-8 re-encode of decoded text; safe for
+                    # binary like PDFs/images and for hashing/re-parsing)
 resp.headers        # dict[str, str] (lowercase keys, string values)
 resp.url            # str (final URL after redirects)
+resp.history        # list of (status_code, url) named tuples - one entry per followed
+                    # redirect hop, in order. Each entry is the 3xx status and the URL
+                    # that returned it (requests-style), so [h.url for h in resp.history]
+                    # plus resp.url is the full chain. [] when not redirected.
+                    # Entries have .status_code / .url and compare equal to plain tuples.
+resp.cookies        # dict[str, str] - cookies set by THIS response (parsed from its
+                    # Set-Cookie headers; name -> value, attributes dropped). ALL
+                    # cookies are included on every transport (incl. native-TLS and
+                    # Opera Mini, where the headers dict joins them). Per-response
+                    # only - for the session's accumulated cookie state use
+                    # session.get_cookie(name, url).
 resp.json(**kwargs) # parsed JSON (passes kwargs to json.loads; raises json.JSONDecodeError on invalid JSON)
 resp.raise_for_status()  # raises WaferHTTPError if not ok
-resp.get_all(key)   # list[str] - all values for a header (e.g. Set-Cookie)
+resp.get_all(key)   # list[str] - all values for a header. For "set-cookie" this
+                    # returns the individual Set-Cookie strings on every transport.
 resp.retry_after    # float | None - parsed Retry-After header
 
 # Retry metadata:
@@ -229,16 +259,24 @@ resp.challenge_type # str | None (e.g. "cloudflare", "datadome")
 
 ```
 WaferError (base)
-  +- ChallengeDetected    .challenge_type: str, .url: str, .status_code: int
-  +- RateLimited          .url: str, .retry_after: float | None
+  +- ChallengeDetected    .challenge_type: str, .url: str, .status_code: int, .response: WaferResponse | None
+  +- RateLimited          .url: str, .retry_after: float | None, .response: WaferResponse | None
   +- ConnectionFailed     .url: str, .reason: str
-  +- EmptyResponse        .url: str, .status_code: int
+  +- EmptyResponse        .url: str, .status_code: int, .response: WaferResponse | None
   +- TooManyRedirects     .url: str, .max_redirects: int
   +- WaferTimeout         .url: str, .timeout_secs: float  (also inherits TimeoutError)
   +- WaferHTTPError       .status_code: int, .url: str  (raised by raise_for_status())
 ```
 
 `except WaferError` catches everything including WaferTimeout.
+
+`ChallengeDetected`, `RateLimited`, and `EmptyResponse` carry the final
+`WaferResponse` as `e.response` (body, headers, status of the blocked reply) -
+read `e.response.text` / `e.response.headers` instead of string-matching
+`str(e)`. It can be None in edge cases where no response was in hand, so
+check before dereferencing. Caution: `e.response` may be a full WAF challenge
+page with embedded tokens/sensor data - do not log its body or headers
+unscrubbed.
 
 When `max_failures` consecutive failures occur on a domain, wafer silently resets
 the session identity (new TLS fingerprint, cleared cookies for that domain, new
@@ -401,13 +439,14 @@ capabilities and trade-offs.
 
 These are all automatic. Do not write code to handle these yourself:
 
-- **Redirects** - 3xx followed automatically (POST -> GET on 301/302/303). 304 passes through. Auth stripped on cross-origin redirects. Body headers stripped on method change.
+- **Redirects** - 3xx followed automatically (POST -> GET on 301/302/303). 304 passes through. Auth stripped on cross-origin redirects. Body headers stripped on method change. Followed hops are recorded in `resp.history`.
 - **Referer headers** - set automatically from the last URL visited per domain
 - **Cookies** - managed in-memory and optionally persisted to disk; no manual cookie jar needed
 - **WAF challenges** - detected, browser-solved if configured, retried with Safari fallback (different TLS fingerprint)
 - **Rate limiting** - per-hostname delays enforced automatically when `rate_limit` is set
 - **TLS fingerprint** - sec-ch-ua headers auto-generated to match the Chrome version
-- **Binary responses** - detected via Content-Type. `resp.content` preserves raw bytes exactly (safe for PDFs, images, etc.). `resp.text` decodes with UTF-8 replacement characters.
+- **Binary responses** - detected via Content-Type. `resp.content` preserves the decompressed body bytes exactly on every response (safe for PDFs, images, etc.). `resp.text` decodes charset-aware (Content-Type charset, HTML meta tag, UTF-8 fallback) with replacement characters - it never raises.
+- **Decompression** - gzip/brotli/zstd response bodies are decompressed automatically; `resp.content` is the decompressed bytes.
 
 ---
 
@@ -572,7 +611,8 @@ logging.getLogger("wafer").setLevel(logging.DEBUG)
    `iter_content()`, or `iter_lines()`.
 
 6. **No `Session.cookies` jar attribute.** Use `session.add_cookie(raw_set_cookie, url)`
-   to inject cookies. The cookie jar is managed internally.
+   to inject a cookie and `session.get_cookie(name, url)` to read one. The
+   cookie jar itself is managed internally and not exposed.
 
 7. **No `close()` method on sessions.** Use context managers, or let sessions go
    out of scope (no cleanup needed without a browser solver). See Session Lifecycle.
@@ -589,13 +629,16 @@ logging.getLogger("wafer").setLevel(logging.DEBUG)
 10. **`raise_for_status()` raises `WaferHTTPError`**, not a generic exception.
     Catch it specifically if you need the status code: `e.status_code`, `e.url`.
 
-11. **No `resp.cookies` or `resp.history`.** To read response cookies, use
-    `resp.get_all("set-cookie")`. There is no redirect history - only `resp.url`
-    (the final URL after all redirects).
+11. **`resp.cookies` is per-response, not the session jar.** It contains only
+    the name -> value pairs from that response's own Set-Cookie headers. For
+    the session's accumulated cookie state use `session.get_cookie(name, url)`,
+    and for full Set-Cookie strings (with attributes) use
+    `resp.get_all("set-cookie")`.
 
 12. **Empty 200 responses raise, not return.** Unlike requests/curl_cffi which
     return a response with empty `.text`, wafer raises `EmptyResponse` after
-    exhausting retries. If you want the response object back instead, use
+    exhausting retries (the raised exception still carries the reply as
+    `e.response`). If you want the response object returned instead, use
     `.bulk()` or set `max_retries=0`.
 
 13. **Set `rate_limit` for repeated requests.** Defaults to `0.0` (disabled).

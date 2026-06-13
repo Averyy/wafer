@@ -172,8 +172,13 @@ class NativeTLSTransport:
         headers: dict[str, str],
         body: bytes | None = None,
         timeout: float = 30.0,
-    ) -> tuple[int, dict[str, str], bytes, str]:
-        """Send a request via http.client. Returns (status, headers, body, url).
+    ) -> tuple[int, dict[str, str], bytes, str, list[str]]:
+        """Send a request via http.client.
+
+        Returns ``(status, headers, body, url, set_cookies)`` where
+        ``set_cookies`` is the final response's individual Set-Cookie
+        header values (the flat ``headers`` dict joins multi-value
+        headers with ``"; "``, which is lossy for Set-Cookie).
 
         ``headers`` is sent as-is after ``Host`` (caller sanitizes via
         ``sanitize_headers``). Follows redirects when configured. Raises
@@ -186,9 +191,10 @@ class NativeTLSTransport:
         status: int = 0
         resp_headers: dict[str, str] = {}
         raw = b""
+        set_cookies: list[str] = []
         for _hop in range(max_hops):
             requested = url
-            status, resp_headers, raw = self._send(
+            status, resp_headers, raw, set_cookies = self._send(
                 method, requested, headers, body, timeout
             )
             if (
@@ -208,10 +214,10 @@ class NativeTLSTransport:
                         if k.lower() != "content-type"
                     }
                 continue
-            return status, resp_headers, raw, requested
+            return status, resp_headers, raw, requested, set_cookies
         # Redirect budget exhausted: return the last response we actually
         # made, tagged with the URL we requested it at (never a phantom hop).
-        return status, resp_headers, raw, requested
+        return status, resp_headers, raw, requested, set_cookies
 
     def _send(
         self,
@@ -220,7 +226,7 @@ class NativeTLSTransport:
         headers: dict[str, str],
         body: bytes | None,
         timeout: float,
-    ) -> tuple[int, dict[str, str], bytes]:
+    ) -> tuple[int, dict[str, str], bytes, list[str]]:
         from wafer._errors import ConnectionFailed, WaferTimeout
 
         parsed = urlparse(url)
@@ -292,10 +298,15 @@ class NativeTLSTransport:
             conn.close()
 
         resp_headers: dict[str, str] = {}
+        set_cookies: list[str] = []
         for k, v in resp.getheaders():
             kl = k.lower()
+            if kl == "set-cookie":
+                # Preserve individual values: the "; "-joined dict form
+                # is ambiguous (cookie attributes use the same separator).
+                set_cookies.append(v)
             resp_headers[kl] = (
                 resp_headers[kl] + "; " + v if kl in resp_headers else v
             )
         raw = _decompress(raw, resp_headers.get("content-encoding", ""))
-        return resp.status, resp_headers, raw
+        return resp.status, resp_headers, raw, set_cookies

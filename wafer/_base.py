@@ -923,23 +923,26 @@ class BaseSession:
         final_url: str,
         start_time: float,
         state=None,
+        raw_set_cookie: list[str] | None = None,
     ):
         """Build a WaferResponse from a native-TLS result, tagging any challenge."""
         from wafer._challenge import detect_challenge
         from wafer._response import WaferResponse
 
         content_type = headers.get("content-type", "")
-        text = None
         challenge_type = None
-        if not _is_binary_content_type(content_type):
+        if not _is_binary_content_type(
+            content_type
+        ) and _is_challengeable_content_type(content_type):
             text = body_bytes.decode("utf-8", errors="replace")
-            if _is_challengeable_content_type(content_type):
-                detected = detect_challenge(status, headers, text)
-                challenge_type = detected.value if detected else None
+            detected = detect_challenge(status, headers, text)
+            challenge_type = detected.value if detected else None
         return WaferResponse(
             status_code=status,
             content=body_bytes,
-            text=text,
+            # text deliberately not pre-set: .text decodes lazily from
+            # content with charset detection (header param / meta tag).
+            text=None,
             headers=headers,
             url=final_url,
             elapsed=time.monotonic() - start_time,
@@ -952,4 +955,79 @@ class BaseSession:
             rotations=state.rotation_retries if state else 0,
             inline_solves=state.inline_solves if state else 0,
             challenge_type=challenge_type,
+            raw_set_cookie=raw_set_cookie,
         )
+
+    @staticmethod
+    def _cookie_applies_to_host(cookie_domain: str | None, host: str) -> bool:
+        """True if a stored cookie's Domain covers ``host`` (RFC 6265 5.1.3)."""
+        # TODO(phase8): no PSL check - a public-suffix Domain (e.g. co.uk)
+        # over-matches; closed when PSL-lite lands
+        domain = (cookie_domain or "").lstrip(".").lower()
+        if not domain or not host:
+            return False
+        host = host.lower()
+        return host == domain or host.endswith("." + domain)
+
+    def get_cookie(self, name: str, url: str) -> str | None:
+        """Read a cookie value from the session's cookie jar(s).
+
+        Looks up ``name`` scoped to ``url``'s host: exact-host cookies
+        first, then parent-domain cookies (``Domain=.example.com``
+        matching ``www.example.com``). Reads whichever jars the session
+        actually uses -- the wreq jar, the native-TLS (Imperva bypass)
+        jar, and the Opera Mini jar. Cookies with the ``Secure`` flag
+        are only returned for ``https://`` URLs (RFC 6265 5.4). Returns
+        the cookie value, or None if not found. Never raises.
+        """
+        host = urlparse(url).hostname or ""
+        # Secure cookies must not be exposed to non-https origins
+        # (wreq's Jar.get does not enforce this itself).
+        secure_ok = urlparse(url).scheme == "https"
+        client = getattr(self, "_client", None)
+        if client is not None:
+            jar = getattr(client, "cookie_jar", None)
+            if jar is not None:
+                try:
+                    cookie = jar.get(name, url)
+                    if cookie is not None and (
+                        secure_ok or not cookie.secure
+                    ):
+                        return cookie.value
+                    # Jar.get() matches the host exactly; if it found
+                    # nothing, scan for parent-domain cookies
+                    # (Domain=.example.com). Don't scan after a Secure
+                    # rejection -- a less-specific match must not win.
+                    if cookie is None:
+                        for c in jar.get_all():
+                            if (
+                                c.name == name
+                                and (secure_ok or not c.secure)
+                                and self._cookie_applies_to_host(
+                                    c.domain, host
+                                )
+                            ):
+                                return c.value
+                except Exception:
+                    logger.debug(
+                        "Cookie jar read failed for %r", name, exc_info=True
+                    )
+        # Native-TLS jar (Imperva OpenSSL bypass): http.cookiejar.CookieJar
+        if self._native_tls is not None:
+            for c in self._native_tls._jar:
+                if (
+                    c.name == name
+                    and (secure_ok or not c.secure)
+                    and self._cookie_applies_to_host(c.domain, host)
+                ):
+                    return c.value
+        # Opera Mini urllib jar: http.cookiejar.CookieJar
+        if self._om_identity is not None:
+            for c in self._om_identity._cookie_jar:
+                if (
+                    c.name == name
+                    and (secure_ok or not c.secure)
+                    and self._cookie_applies_to_host(c.domain, host)
+                ):
+                    return c.value
+        return None

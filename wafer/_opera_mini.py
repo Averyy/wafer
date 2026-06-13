@@ -301,11 +301,14 @@ class OperaMiniIdentity:
         *,
         headers: dict[str, str] | None = None,
         timeout: float = 30.0,
-    ) -> tuple[int, dict[str, str], str, str]:
+    ) -> tuple[int, dict[str, str], str, str, list[str]]:
         """Send an HTTP GET via stdlib urllib (bypasses wreq).
 
-        Returns (status_code, headers_dict, body_text, final_url).
-        final_url reflects the actual URL after any redirects (for SSRF checks).
+        Returns (status_code, headers_dict, body_text, final_url,
+        set_cookies). final_url reflects the actual URL after any
+        redirects (for SSRF checks). set_cookies holds the individual
+        Set-Cookie header values (the flat headers_dict joins
+        multi-value headers with "; ", which is lossy for Set-Cookie).
         Uses system OpenSSL for TLS — no Chrome header leakage,
         more realistic fingerprint for Opera Mini proxy.
         """
@@ -359,8 +362,15 @@ class OperaMiniIdentity:
                     pass  # return raw bytes
 
         text = raw.decode("utf-8", errors="replace")
-        resp_headers = {
-            k.lower(): v for k, v in resp.headers.items()
-        }
+        resp_headers: dict[str, str] = {}
+        set_cookies: list[str] = []
+        for k, v in resp.headers.items():
+            kl = k.lower()
+            if kl == "set-cookie":
+                set_cookies.append(v)
+            # Join duplicate headers instead of last-wins overwrite.
+            resp_headers[kl] = (
+                resp_headers[kl] + "; " + v if kl in resp_headers else v
+            )
         final_url = resp.url or url
-        return resp.status, resp_headers, text, final_url
+        return resp.status, resp_headers, text, final_url, set_cookies

@@ -36,7 +36,7 @@ from wafer._errors import (
 from wafer._fingerprint import chrome_version_from_ua, emulation_for_version
 from wafer._native_tls import NATIVE_MAX_RETRIES
 from wafer._profiles import Profile
-from wafer._response import WaferResponse
+from wafer._response import HistoryEntry, WaferResponse, resolve_charset
 from wafer._retry import RetryState, calculate_backoff, parse_retry_after
 from wafer._solvers import (
     parse_amazon_captcha,
@@ -410,7 +410,9 @@ class SyncSession(BaseSession):
         headers, body = self._native_prepare(extra_headers, kwargs)
         transport = self._native_transport()
         try:
-            status, hdrs, body_bytes, final_url = transport.request(
+            # *rest keeps older 4-tuple transports (test fakes) working;
+            # the real transport returns the Set-Cookie list as 5th item.
+            status, hdrs, body_bytes, final_url, *rest = transport.request(
                 method, url, headers, body, timeout
             )
         except Exception:
@@ -419,7 +421,8 @@ class SyncSession(BaseSession):
             )
             return None
         return self._native_make_response(
-            status, hdrs, body_bytes, final_url, start_time, state
+            status, hdrs, body_bytes, final_url, start_time, state,
+            raw_set_cookie=rest[0] if rest else None,
         )
 
     def _make_response(
@@ -434,6 +437,7 @@ class SyncSession(BaseSession):
         text: str | None = None,
         challenge_type: str | None = None,
         state: RetryState | None = None,
+        history: list | None = None,
         raw=None,
     ) -> WaferResponse:
         if content is None and text is not None:
@@ -444,6 +448,7 @@ class SyncSession(BaseSession):
             text=text,
             headers=headers,
             url=url,
+            history=history,
             elapsed=time.monotonic() - start_time,
             was_retried=was_retried,
             retries=state.normal_retries if state else 0,
@@ -489,8 +494,10 @@ class SyncSession(BaseSession):
                 self._rate_limiter.wait_sync(domain)
             logger.debug("%s %s (Opera Mini)", method, url)
             timeout = timeout_secs
-            status, resp_headers, text, final_url = self._om_identity.request(
-                url, headers=extra_headers, timeout=timeout,
+            status, resp_headers, text, final_url, set_cookies = (
+                self._om_identity.request(
+                    url, headers=extra_headers, timeout=timeout,
+                )
             )
             if self._rate_limiter:
                 self._rate_limiter.record(domain)
@@ -504,6 +511,7 @@ class SyncSession(BaseSession):
                 was_retried=False,
                 challenge_type=None,
                 raw=None,
+                raw_set_cookie=set_cookies,
             )
 
         state = RetryState(self.max_retries, self.max_rotations)
@@ -515,6 +523,7 @@ class SyncSession(BaseSession):
         native_attempted = False
         native_retries = 0
         redirects_followed = 0
+        history: list[HistoryEntry] = []
 
         logger.debug("%s %s", method, url)
 
@@ -536,6 +545,8 @@ class SyncSession(BaseSession):
                     method, current_url, extra_headers, kwargs,
                     deadline, start_time, state,
                 )
+                if native_resp is not None:
+                    native_resp.history = history
                 if native_resp is not None and native_resp.challenge_type is None:
                     if self._rate_limiter:
                         self._rate_limiter.record(domain)
@@ -596,6 +607,7 @@ class SyncSession(BaseSession):
                         or ChallengeType.IMPERVA.value,
                         current_url,
                         native_resp.status_code,
+                        response=native_resp,
                     )
 
             # TLS session rotation for unlinkable requests
@@ -656,6 +668,9 @@ class SyncSession(BaseSession):
                         current_url, location
                     )
                     redirects_followed += 1
+                    # Record the hop: the 3xx status and the URL that
+                    # returned it (requests-style history chain).
+                    history.append(HistoryEntry(status, current_url))
                     logger.debug(
                         "%d redirect %d/%d: %s → %s",
                         status,
@@ -702,17 +717,24 @@ class SyncSession(BaseSession):
                 or browser_attempted_type is not None
             )
 
-            # Read body: bytes for binary content, text for text
+            # Read body: wreq's bytes() returns the DECOMPRESSED body
+            # (gzip/br/zstd already handled), so raw_content is the true
+            # byte stream. Text content is decoded charset-aware (header
+            # charset -> <meta charset> sniff -> UTF-8) -- the same
+            # resolution WaferResponse.text uses -- instead of wreq's
+            # text(), which never meta-sniffs.
             is_binary = _is_binary_content_type(
                 headers.get("content-type", "")
             )
             try:
+                raw_content = resp.bytes()
                 if is_binary:
-                    raw_content = resp.bytes()
                     body = None
                 else:
-                    body = resp.text()
-                    raw_content = body.encode("utf-8")
+                    body = raw_content.decode(
+                        resolve_charset(headers, raw_content),
+                        errors="replace",
+                    )
             except Exception as e:
                 # Decompression errors (e.g. malformed gzip from eBay)
                 if not state.can_retry:
@@ -740,6 +762,7 @@ class SyncSession(BaseSession):
                         start_time=start_time,
                         was_retried=was_retried,
                         state=state,
+                        history=history,
                         raw=resp,
                     )
                 state.use_retry()
@@ -783,9 +806,25 @@ class SyncSession(BaseSession):
                             start_time=start_time,
                             was_retried=was_retried,
                             state=state,
+                            history=history,
                             raw=resp,
                         )
-                    raise RateLimited(current_url, retry_after)
+                    raise RateLimited(
+                        current_url,
+                        retry_after,
+                        response=self._make_response(
+                            status_code=status,
+                            content=raw_content,
+                            text=body,
+                            headers=headers,
+                            url=current_url,
+                            start_time=start_time,
+                            was_retried=was_retried,
+                            state=state,
+                            history=history,
+                            raw=resp,
+                        ),
+                    )
 
                 # Session health: track failure (only retire if
                 # we still have budget — avoids destroying state
@@ -887,6 +926,8 @@ class SyncSession(BaseSession):
                         method, current_url, extra_headers, kwargs,
                         deadline, start_time, state,
                     )
+                    if native_resp is not None:
+                        native_resp.history = history
                     # A non-challenge reply means the OpenSSL client got past
                     # the WAF — pin the host regardless of HTTP status (a real
                     # 404/500 from the origin still proves the bypass works).
@@ -938,6 +979,7 @@ class SyncSession(BaseSession):
                         browser_result.elapsed = (
                             time.monotonic() - start_time
                         )
+                        browser_result.history = history
                         return browser_result
                     if browser_result:
                         # Browser solved and injected cookies — reset
@@ -961,10 +1003,26 @@ class SyncSession(BaseSession):
                             was_retried=was_retried,
                             challenge_type=challenge.value,
                             state=state,
+                            history=history,
                             raw=resp,
                         )
                     raise ChallengeDetected(
-                        challenge.value, current_url, status
+                        challenge.value,
+                        current_url,
+                        status,
+                        response=self._make_response(
+                            status_code=status,
+                            content=raw_content,
+                            text=body,
+                            headers=headers,
+                            url=current_url,
+                            start_time=start_time,
+                            was_retried=was_retried,
+                            challenge_type=challenge.value,
+                            state=state,
+                            history=history,
+                            raw=resp,
+                        ),
                     )
 
                 # Fallback: rotate fingerprint
@@ -989,6 +1047,7 @@ class SyncSession(BaseSession):
                             browser_result.elapsed = (
                                 time.monotonic() - start_time
                             )
+                            browser_result.history = history
                             return browser_result
                         if browser_result:
                             self._record_success(domain)
@@ -1005,10 +1064,26 @@ class SyncSession(BaseSession):
                                 was_retried=was_retried,
                                 challenge_type=challenge.value,
                                 state=state,
+                                history=history,
                                 raw=resp,
                             )
                         raise ChallengeDetected(
-                            challenge.value, current_url, status
+                            challenge.value,
+                            current_url,
+                            status,
+                            response=self._make_response(
+                                status_code=status,
+                                content=raw_content,
+                                text=body,
+                                headers=headers,
+                                url=current_url,
+                                start_time=start_time,
+                                was_retried=was_retried,
+                                challenge_type=challenge.value,
+                                state=state,
+                                history=history,
+                                raw=resp,
+                            ),
                         )
                     return self._make_response(
                         status_code=status,
@@ -1019,6 +1094,7 @@ class SyncSession(BaseSession):
                         start_time=start_time,
                         was_retried=was_retried,
                         state=state,
+                        history=history,
                         raw=resp,
                     )
                 state.use_rotation()
@@ -1081,9 +1157,25 @@ class SyncSession(BaseSession):
                             start_time=start_time,
                             was_retried=was_retried,
                             state=state,
+                            history=history,
                             raw=resp,
                         )
-                    raise EmptyResponse(current_url, status)
+                    raise EmptyResponse(
+                        current_url,
+                        status,
+                        response=self._make_response(
+                            status_code=status,
+                            content=raw_content,
+                            text=body,
+                            headers=headers,
+                            url=current_url,
+                            start_time=start_time,
+                            was_retried=was_retried,
+                            state=state,
+                            history=history,
+                            raw=resp,
+                        ),
+                    )
                 state.use_retry()
                 delay = calculate_backoff(state.normal_retries - 1)
                 logger.debug(
@@ -1108,6 +1200,7 @@ class SyncSession(BaseSession):
                 start_time=start_time,
                 was_retried=was_retried,
                 state=state,
+                history=history,
                 raw=resp,
             )
 

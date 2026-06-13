@@ -278,3 +278,85 @@ class TestProfileImport:
         """Profile is importable from the top-level wafer package."""
         from wafer import Profile
         assert Profile.OPERA_MINI.value == "opera_mini"
+
+
+class TestOperaMiniSetCookie:
+    """Opera Mini responses must preserve every Set-Cookie value."""
+
+    def test_identity_request_returns_set_cookie_list(self):
+        """End-to-end over loopback HTTP: the urllib path returns the
+        individual Set-Cookie values as the 5th tuple element."""
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = b"<html>hi</html>"
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Set-Cookie", "a=1; Path=/")
+                self.send_header("Set-Cookie", "b=2; Path=/; HttpOnly")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        srv = HTTPServer(("127.0.0.1", 0), Handler)
+        port = srv.server_address[1]
+        thread = threading.Thread(target=srv.serve_forever, daemon=True)
+        thread.start()
+        try:
+            identity = OperaMiniIdentity()
+            status, headers, text, final_url, set_cookies = (
+                identity.request(f"http://127.0.0.1:{port}/x")
+            )
+            assert status == 200
+            assert set_cookies == ["a=1; Path=/", "b=2; Path=/; HttpOnly"]
+            # the flat dict joins duplicates instead of last-wins overwrite
+            assert headers["set-cookie"] == "a=1; Path=/; b=2; Path=/; HttpOnly"
+            assert "hi" in text
+        finally:
+            srv.shutdown()
+            thread.join(timeout=5)
+
+    def test_sync_session_cookies_all_preserved(self):
+        from wafer import SyncSession
+
+        session = SyncSession(profile=Profile.OPERA_MINI)
+
+        def fake_request(url, *, headers=None, timeout=30.0):
+            return (
+                200,
+                {"set-cookie": "a=1; Path=/; b=2; Path=/"},
+                "<html>ok</html>",
+                url,
+                ["a=1; Path=/", "b=2; Path=/"],
+            )
+
+        session._om_identity.request = fake_request
+        resp = session.get("https://example.com")
+        assert resp.cookies == {"a": "1", "b": "2"}
+        assert resp.get_all("set-cookie") == ["a=1; Path=/", "b=2; Path=/"]
+
+    def test_async_session_cookies_all_preserved(self):
+        import asyncio
+
+        from wafer import AsyncSession
+
+        session = AsyncSession(profile=Profile.OPERA_MINI)
+
+        def fake_request(url, *, headers=None, timeout=30.0):
+            return (
+                200,
+                {"set-cookie": "a=1; Path=/; b=2; Path=/"},
+                "<html>ok</html>",
+                url,
+                ["a=1; Path=/", "b=2; Path=/"],
+            )
+
+        session._om_identity.request = fake_request
+        resp = asyncio.run(session.get("https://example.com"))
+        assert resp.cookies == {"a": "1", "b": "2"}
+        assert resp.get_all("set-cookie") == ["a=1; Path=/", "b=2; Path=/"]

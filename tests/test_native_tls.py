@@ -167,6 +167,23 @@ NATIVE_CHALLENGE = (
 )
 HDRS = {"Origin": "https://www.realtor.ca", "Referer": "https://www.realtor.ca/"}
 
+# Real transports return a 5th element: the individual Set-Cookie values
+# (the flat headers dict joins them with "; ", lossy for cookies).
+MULTI_SET_COOKIE = [
+    "reese84=tok123; Path=/; Secure; HttpOnly",
+    "incap_ses_1226_9=abc; Path=/",
+]
+JSON_OK_MULTI_COOKIE = (
+    200,
+    {
+        "content-type": "application/json",
+        "set-cookie": "; ".join(MULTI_SET_COOKIE),
+    },
+    b'{"ok": true}',
+    URL,
+    MULTI_SET_COOKIE,
+)
+
 
 # ---------------------------------------------------------------------------
 # Async integration
@@ -403,6 +420,84 @@ def test_sync_sticky_skips_wreq():
 
     assert resp.status_code == 200
     assert len(session._native_tls.calls) == 1
+
+
+def test_sync_native_multi_set_cookie_preserved():
+    """Native-TLS responses keep EVERY Set-Cookie (reese84 + incap_ses_*),
+    not just the first one of the '; '-joined header dict."""
+    session, client = make_sync_session([_imperva_403()], max_rotations=0)
+    session._native_tls = FakeNativeTransport([JSON_OK_MULTI_COOKIE])
+
+    resp = session.get(URL, headers=HDRS)
+
+    assert resp.status_code == 200
+    assert resp.get_all("set-cookie") == MULTI_SET_COOKIE
+    assert resp.cookies == {
+        "reese84": "tok123",
+        "incap_ses_1226_9": "abc",
+    }
+
+
+@pytest.mark.asyncio
+async def test_async_native_multi_set_cookie_preserved():
+    session, client = make_async_session([_imperva_403()], max_rotations=0)
+    session._native_tls = FakeNativeTransport([JSON_OK_MULTI_COOKIE])
+
+    resp = await session.get(URL, headers=HDRS)
+
+    assert resp.status_code == 200
+    assert resp.get_all("set-cookie") == MULTI_SET_COOKIE
+    assert resp.cookies == {
+        "reese84": "tok123",
+        "incap_ses_1226_9": "abc",
+    }
+
+
+def test_native_transport_returns_individual_set_cookies():
+    """End-to-end over loopback HTTP: NativeTLSTransport.request returns
+    the individual Set-Cookie values alongside the joined header dict."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    from wafer._native_tls import NativeTLSTransport
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = b'{"ok": true}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Set-Cookie", "reese84=tok; Path=/")
+            self.send_header("Set-Cookie", "incap_ses_1=abc; Path=/")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    srv = HTTPServer(("127.0.0.1", 0), Handler)
+    port = srv.server_address[1]
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    try:
+        t = NativeTLSTransport()
+        status, headers, body, final_url, set_cookies = t.request(
+            "GET", f"http://127.0.0.1:{port}/x", {"Accept": "*/*"}
+        )
+        assert status == 200
+        assert set_cookies == [
+            "reese84=tok; Path=/",
+            "incap_ses_1=abc; Path=/",
+        ]
+        # joined form still present in the flat dict
+        assert headers["set-cookie"] == (
+            "reese84=tok; Path=/; incap_ses_1=abc; Path=/"
+        )
+        # both cookies landed in the jar for replay
+        assert {c.name for c in t._jar} == {"reese84", "incap_ses_1"}
+    finally:
+        srv.shutdown()
+        thread.join(timeout=5)
 
 
 def test_sync_non_imperva_challenge_never_uses_native():

@@ -306,6 +306,66 @@ class TestSyncRetryLoop:
         with pytest.raises(RateLimited):
             session.get("https://example.com")
 
+    def test_challenge_exhausted_exception_carries_response(
+        self, mock_sleep
+    ):
+        """ChallengeDetected.response exposes the final challenge reply."""
+        session, mock = make_sync_session(
+            [
+                MockResponse(
+                    403,
+                    headers={"cf-mitigated": "challenge"},
+                    body="CF challenge body",
+                ),
+            ]
+            * 15,
+            max_rotations=3,
+        )
+        with pytest.raises(ChallengeDetected) as exc_info:
+            session.get("https://example.com")
+        r = exc_info.value.response
+        assert r is not None
+        assert r.status_code == 403
+        assert r.text == "CF challenge body"
+        assert r.challenge_type == "cloudflare"
+
+    def test_429_exhausted_exception_carries_response(self, mock_sleep):
+        """RateLimited.response exposes the final 429 reply."""
+        session, mock = make_sync_session(
+            [
+                MockResponse(
+                    429,
+                    headers={"Retry-After": "7"},
+                    body="Rate limited body",
+                ),
+            ]
+            * 15,
+            max_rotations=3,
+        )
+        with pytest.raises(RateLimited) as exc_info:
+            session.get("https://example.com")
+        r = exc_info.value.response
+        assert r is not None
+        assert r.status_code == 429
+        assert r.text == "Rate limited body"
+        assert r.headers.get("retry-after") == "7"
+
+    def test_empty_200_exhausted_exception_carries_response(
+        self, mock_sleep
+    ):
+        """EmptyResponse.response exposes the final empty 200 reply."""
+        session, mock = make_sync_session(
+            [MockResponse(200, headers={"X-Trace": "abc"}, body="")] * 5,
+            max_retries=3,
+        )
+        with pytest.raises(EmptyResponse) as exc_info:
+            session.get("https://example.com")
+        r = exc_info.value.response
+        assert r is not None
+        assert r.status_code == 200
+        assert r.text == ""
+        assert r.headers.get("x-trace") == "abc"
+
     def test_separate_counters_5xx_then_403(self, mock_sleep):
         """5xx uses normal retries, 403 uses rotation retries — independent."""
         session, mock = make_sync_session(
@@ -531,6 +591,84 @@ class TestAsyncRetryLoop:
         assert resp.status_code == 200
         assert mock.request_count == 2
 
+    @pytest.mark.asyncio
+    async def test_history_records_redirect_chain(self):
+        """Async mirror: resp.history lists each followed hop in order."""
+        r1 = MockResponse(
+            301, {"location": "https://a.com/step1"}, ""
+        )
+        r2 = MockResponse(
+            302, {"location": "https://b.com/step2"}, ""
+        )
+        ok = MockResponse(200, body="Done")
+        session, _ = make_async_session([r1, r2, ok])
+        with patch("wafer._async.asyncio.sleep", return_value=None):
+            resp = await session.get("https://start.com/")
+        assert resp.history == [
+            (301, "https://start.com/"),
+            (302, "https://a.com/step1"),
+        ]
+        assert resp.url == "https://b.com/step2"
+
+    @pytest.mark.asyncio
+    async def test_history_empty_without_redirect(self):
+        session, _ = make_async_session([MockResponse(200, body="ok")])
+        with patch("wafer._async.asyncio.sleep", return_value=None):
+            resp = await session.get("https://example.com")
+        assert resp.history == []
+
+    @pytest.mark.asyncio
+    async def test_challenge_exhausted_exception_carries_response(self):
+        """Async mirror: ChallengeDetected.response is the final reply."""
+        session, mock = make_async_session(
+            [
+                MockResponse(
+                    403,
+                    headers={"cf-mitigated": "challenge"},
+                    body="CF challenge body",
+                ),
+            ]
+            * 5,
+            max_rotations=2,
+        )
+        with patch("wafer._async.asyncio.sleep", return_value=None):
+            with pytest.raises(ChallengeDetected) as exc_info:
+                await session.get("https://example.com")
+        r = exc_info.value.response
+        assert r is not None
+        assert r.status_code == 403
+        assert r.text == "CF challenge body"
+        assert r.challenge_type == "cloudflare"
+
+    @pytest.mark.asyncio
+    async def test_429_exhausted_exception_carries_response(self):
+        """Async mirror: RateLimited.response is the final 429 reply."""
+        session, mock = make_async_session(
+            [MockResponse(429, body="Rate limited body")] * 15,
+            max_rotations=3,
+        )
+        with patch("wafer._async.asyncio.sleep", return_value=None):
+            with pytest.raises(RateLimited) as exc_info:
+                await session.get("https://example.com")
+        r = exc_info.value.response
+        assert r is not None
+        assert r.status_code == 429
+        assert r.text == "Rate limited body"
+
+    @pytest.mark.asyncio
+    async def test_empty_200_exhausted_exception_carries_response(self):
+        """Async mirror: EmptyResponse.response is the final empty reply."""
+        session, mock = make_async_session(
+            [MockResponse(200, body="")] * 5,
+            max_retries=3,
+        )
+        with patch("wafer._async.asyncio.sleep", return_value=None):
+            with pytest.raises(EmptyResponse) as exc_info:
+                await session.get("https://example.com")
+        r = exc_info.value.response
+        assert r is not None
+        assert r.status_code == 200
+
 
 # ---------------------------------------------------------------------------
 # _decode_headers
@@ -732,6 +870,32 @@ class TestRedirectFollowing:
         session, _ = make_sync_session([resp_304])
         resp = session.get("https://example.com/cached")
         assert resp.status_code == 304
+
+    @patch("wafer._sync.time.sleep")
+    def test_history_records_redirect_chain(self, mock_sleep):
+        """resp.history lists each followed hop in order (requests-style)."""
+        r1 = MockResponse(
+            301, {"location": "https://a.com/step1"}, ""
+        )
+        r2 = MockResponse(
+            302, {"location": "https://b.com/step2"}, ""
+        )
+        ok = MockResponse(200, body="<html>Done</html>")
+        session, _ = make_sync_session([r1, r2, ok])
+        resp = session.get("https://start.com/")
+        assert resp.history == [
+            (301, "https://start.com/"),
+            (302, "https://a.com/step1"),
+        ]
+        assert resp.history[0].status_code == 301
+        assert resp.history[0].url == "https://start.com/"
+        assert resp.url == "https://b.com/step2"
+
+    @patch("wafer._sync.time.sleep")
+    def test_history_empty_without_redirect(self, mock_sleep):
+        session, _ = make_sync_session([MockResponse(200, body="ok")])
+        resp = session.get("https://example.com")
+        assert resp.history == []
 
 
 # ---------------------------------------------------------------------------

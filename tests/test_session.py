@@ -6,6 +6,7 @@ import pytest
 
 import wafer
 from tests.conftest import (
+    AsyncMockResponse,
     MockResponse,
     make_async_session,
     make_sync_session,
@@ -167,6 +168,90 @@ class TestAsyncSession:
         async with session:
             resp = await session.get("https://example.com")
             assert resp.status_code == 200
+
+
+class _BytesBodyResponse(MockResponse):
+    """MockResponse whose bytes() returns arbitrary raw bytes.
+
+    Mirrors a real wreq response for non-utf-8 bodies: bytes() is the
+    decompressed wire body, in whatever encoding the server used.
+    """
+
+    def __init__(self, status_code, headers, raw: bytes):
+        super().__init__(status_code, headers, raw.decode("utf-8", "replace"))
+        self._raw_bytes = raw
+
+    def bytes(self):
+        return self._raw_bytes
+
+
+class _AsyncBytesBodyResponse(AsyncMockResponse):
+    def __init__(self, status_code, headers, raw: bytes):
+        super().__init__(status_code, headers, raw.decode("utf-8", "replace"))
+        self._raw_bytes = raw
+
+    async def bytes(self):
+        return self._raw_bytes
+
+
+WIN1252_HTML = (
+    '<html><head><meta charset="windows-1252"></head>'
+    "<body>café — “quotes”</body></html>"
+)
+
+
+class TestWreqPathCharset:
+    """The main wreq path must be charset-aware and keep true body bytes.
+
+    wreq's own text() never sniffs <meta charset>, so wafer reads the
+    decompressed bytes() and decodes them itself (header charset ->
+    meta sniff -> utf-8).
+    """
+
+    def test_sync_meta_charset_decoded_on_wreq_path(self):
+        raw = WIN1252_HTML.encode("windows-1252")
+        session, _ = make_sync_session([
+            _BytesBodyResponse(200, {"content-type": "text/html"}, raw),
+        ])
+        resp = session.get("https://example.com")
+        assert "café" in resp.text
+        assert "“quotes”" in resp.text
+        # content is the true wire bytes, not a lossy utf-8 re-encode
+        assert resp.content == raw
+
+    @pytest.mark.asyncio
+    async def test_async_meta_charset_decoded_on_wreq_path(self):
+        raw = WIN1252_HTML.encode("windows-1252")
+        session, _ = make_async_session([
+            _AsyncBytesBodyResponse(
+                200, {"content-type": "text/html"}, raw
+            ),
+        ])
+        resp = await session.get("https://example.com")
+        assert "café" in resp.text
+        assert "“quotes”" in resp.text
+        assert resp.content == raw
+
+    def test_sync_header_charset_decoded_on_wreq_path(self):
+        raw = "héllo".encode("latin-1")
+        session, _ = make_sync_session([
+            _BytesBodyResponse(
+                200, {"content-type": "text/html; charset=latin-1"}, raw
+            ),
+        ])
+        resp = session.get("https://example.com")
+        assert resp.text == "héllo"
+        assert resp.content == raw
+
+    def test_sync_utf8_body_byte_identical(self):
+        """The common utf-8 case must stay byte-identical."""
+        body = "<html><body>café é中文</body></html>"
+        session, _ = make_sync_session([
+            MockResponse(200, {"content-type": "text/html"}, body),
+        ])
+        resp = session.get("https://example.com")
+        assert resp.text == body
+        assert resp.content == body.encode("utf-8")
 
 
 class TestModuleLevelGet:

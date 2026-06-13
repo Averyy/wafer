@@ -6,23 +6,52 @@ class WaferError(Exception):
 
 
 class ChallengeDetected(WaferError):
-    """A WAF challenge was detected and could not be solved."""
+    """A WAF challenge was detected and could not be solved.
 
-    def __init__(self, challenge_type: str, url: str, status_code: int):
+    ``response`` carries the final challenge ``WaferResponse`` (body,
+    headers, status code) when one was in hand at raise time, else None.
+
+    Caution: ``response`` may carry a full WAF challenge page with
+    embedded tokens/sensor data -- do not log its body or headers
+    unscrubbed.
+    """
+
+    def __init__(
+        self,
+        challenge_type: str,
+        url: str,
+        status_code: int,
+        response=None,
+    ):
         self.challenge_type = challenge_type
         self.url = url
         self.status_code = status_code
+        self.response = response
         super().__init__(
             f"{challenge_type} challenge detected at {url} (HTTP {status_code})"
         )
 
 
 class RateLimited(WaferError):
-    """Request was rate-limited (HTTP 429)."""
+    """Request was rate-limited (HTTP 429).
 
-    def __init__(self, url: str, retry_after: float | None = None):
+    ``response`` carries the final 429 ``WaferResponse`` (body, headers,
+    status code) when one was in hand at raise time, else None.
+
+    Caution: ``response`` may carry a full WAF challenge page with
+    embedded tokens/sensor data -- do not log its body or headers
+    unscrubbed.
+    """
+
+    def __init__(
+        self,
+        url: str,
+        retry_after: float | None = None,
+        response=None,
+    ):
         self.url = url
         self.retry_after = retry_after
+        self.response = response
         msg = f"Rate limited at {url}"
         if retry_after is not None:
             msg += f" (retry after {retry_after}s)"
@@ -39,11 +68,19 @@ class ConnectionFailed(WaferError):
 
 
 class EmptyResponse(WaferError):
-    """Server returned an empty response body."""
+    """Server returned an empty response body.
 
-    def __init__(self, url: str, status_code: int):
+    ``response`` carries the final empty ``WaferResponse`` (headers,
+    status code) when one was in hand at raise time, else None.
+
+    Caution: ``response`` headers may include WAF cookies/tokens -- do
+    not log it unscrubbed.
+    """
+
+    def __init__(self, url: str, status_code: int, response=None):
         self.url = url
         self.status_code = status_code
+        self.response = response
         super().__init__(f"Empty response from {url} (HTTP {status_code})")
 
 

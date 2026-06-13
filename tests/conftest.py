@@ -197,10 +197,14 @@ class AsyncMockClient:
 
 
 def to_async_responses(responses):
-    """Convert MockResponse/Exception list to AsyncMockResponse list."""
+    """Convert MockResponse/Exception list to AsyncMockResponse list.
+
+    Exceptions and pre-built AsyncMockResponse instances (including
+    subclasses with custom bytes()) pass through unchanged.
+    """
     result = []
     for r in responses:
-        if isinstance(r, Exception):
+        if isinstance(r, (Exception, AsyncMockResponse)):
             result.append(r)
         else:
             # Reconstruct flat headers dict from MockHeaderMap
