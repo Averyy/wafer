@@ -143,9 +143,17 @@ class FakeNativeTransport:
         self.calls = []
         self.seeded = []
 
-    def request(self, method, url, headers, body=None, timeout=30.0):
+    def request(
+        self, method, url, headers, body=None, timeout=30.0, max_size=None
+    ):
         self.calls.append(
-            {"method": method, "url": url, "headers": dict(headers), "body": body}
+            {
+                "method": method,
+                "url": url,
+                "headers": dict(headers),
+                "body": body,
+                "max_size": max_size,
+            }
         )
         return self._responses.pop(0)
 
@@ -420,6 +428,40 @@ def test_sync_sticky_skips_wreq():
 
     assert resp.status_code == 200
     assert len(session._native_tls.calls) == 1
+
+
+def test_sync_native_threads_max_size_into_transport():
+    """FIX 1: the session's max_response_size reaches the native transport."""
+    session, _ = make_sync_session(
+        [_imperva_403()], max_rotations=0, max_response_size=4096
+    )
+    session._native_tls = FakeNativeTransport([JSON_OK])
+    session.get(URL, headers=HDRS)
+    assert session._native_tls.calls[0]["max_size"] == 4096
+
+
+def test_sync_native_response_too_large_propagates():
+    """FIX 1: a ResponseTooLarge from the native transport must propagate,
+    not be swallowed into a None that falls back to the (challenged) wreq
+    path and silently bypasses the cap."""
+    from wafer import ResponseTooLarge
+
+    class RaisingTransport:
+        def request(self, *a, **k):
+            raise ResponseTooLarge(URL, 9999, 500)
+
+        def add_cookies(self, cookies):
+            pass
+
+    # Pin the host so the request routes straight to native.
+    session, _ = make_sync_session(
+        [], max_rotations=0, max_response_size=500
+    )
+    session._native_tls_domains.add("api2.realtor.ca")
+    session._native_tls = RaisingTransport()
+    with pytest.raises(ResponseTooLarge) as ei:
+        session.get(URL, headers=HDRS)
+    assert ei.value.limit == 500
 
 
 def test_sync_native_multi_set_cookie_preserved():

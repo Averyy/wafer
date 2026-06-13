@@ -91,22 +91,54 @@ def sanitize_headers(headers: dict[str, str]) -> dict[str, str]:
     return out
 
 
-def _decompress(raw: bytes, encoding: str) -> bytes:
-    """Decode gzip/deflate response bodies; return raw on any failure."""
+def _decompress(
+    raw: bytes, encoding: str, url: str = "", max_size: int | None = None
+) -> bytes:
+    """Decode gzip/deflate response bodies; return raw on any failure.
+
+    When ``max_size`` is set, the *decompressed* output is bounded: at most
+    ``max_size + 1`` bytes are produced, and if the decompressor yields more
+    (a compression bomb that would expand a tiny body past the cap) a
+    ``ResponseTooLarge`` is raised instead of buffering the full expansion.
+    ``max_size is None`` leaves the output byte-identical to before.
+    """
     enc = encoding.lower()
     if enc in ("gzip", "x-gzip"):
         try:
-            return gzip.GzipFile(fileobj=io.BytesIO(raw)).read()
+            with gzip.GzipFile(fileobj=io.BytesIO(raw)) as gz:
+                if max_size is None:
+                    return gz.read()
+                # Read at most cap+1 bytes: if the decompressor produced
+                # more than that, the body is over the cap (bomb-safe -
+                # the full expansion is never buffered).
+                out = gz.read(max_size + 1)
+                if len(out) > max_size:
+                    from wafer._errors import ResponseTooLarge
+
+                    raise ResponseTooLarge(url, len(out), max_size)
+                return out
         except (gzip.BadGzipFile, EOFError, OSError):
             return raw
     if enc == "deflate":
-        try:
-            return zlib.decompress(raw)
-        except zlib.error:
+        for wbits in (zlib.MAX_WBITS, -zlib.MAX_WBITS):
             try:
-                return zlib.decompress(raw, -zlib.MAX_WBITS)
+                if max_size is None:
+                    return zlib.decompress(raw, wbits)
+                # Incremental inflate with a max-length cap: decompressobj
+                # lets us stop after cap+1 bytes regardless of input size.
+                dec = zlib.decompressobj(wbits)
+                out = dec.decompress(raw, max_size + 1)
+                # Over the cap if the output already exceeds it, or if zlib
+                # stopped at the cap+1 limit with input still pending
+                # (unconsumed_tail) -> a larger body was being produced.
+                if len(out) > max_size or dec.unconsumed_tail:
+                    from wafer._errors import ResponseTooLarge
+
+                    raise ResponseTooLarge(url, len(out), max_size)
+                return out
             except zlib.error:
-                return raw
+                continue
+        return raw
     return raw
 
 
@@ -120,12 +152,18 @@ class NativeTLSTransport:
     """
 
     def __init__(
-        self, follow_redirects: bool = True, proxy_url: str | None = None
+        self,
+        follow_redirects: bool = True,
+        proxy_url: str | None = None,
+        max_redirects: int = 10,
     ):
         self._ctx = ssl.create_default_context()
         self._jar = CookieJar()
         self._follow_redirects = follow_redirects
         self._proxy_url = proxy_url
+        # Hop budget for the native redirect chain. Aligned with the session
+        # ``max_redirects`` so the bypass and the wreq path agree.
+        self._max_redirects = max_redirects
 
     def add_cookies(self, cookies: list[dict]) -> None:
         """Seed the jar from Playwright-style cookie dicts.
@@ -172,6 +210,7 @@ class NativeTLSTransport:
         headers: dict[str, str],
         body: bytes | None = None,
         timeout: float = 30.0,
+        max_size: int | None = None,
     ) -> tuple[int, dict[str, str], bytes, str, list[str]]:
         """Send a request via http.client.
 
@@ -184,9 +223,19 @@ class NativeTLSTransport:
         ``sanitize_headers``). Follows redirects when configured. Raises
         ``WaferTimeout``/``ConnectionFailed`` on network errors; non-2xx
         HTTP responses are returned normally (not raised).
+
+        ``max_size`` (bytes) caps the response body: an over-cap declared
+        Content-Length short-circuits before reading, the wire read is
+        bounded chunk-by-chunk, and the decompressor output is bounded
+        too (gzip-bomb safe). ``ResponseTooLarge`` is raised when exceeded.
+        ``None`` (default) = no cap, behavior byte-identical to before.
         """
+        from wafer._errors import TooManyRedirects
+
         method = method.upper()
-        max_hops = 6 if self._follow_redirects else 1
+        # One initial request + up to max_redirects follow-ups, aligned with
+        # the session's redirect budget (the wreq path uses the same cap).
+        max_hops = (self._max_redirects + 1) if self._follow_redirects else 1
         requested = url
         status: int = 0
         resp_headers: dict[str, str] = {}
@@ -195,7 +244,7 @@ class NativeTLSTransport:
         for _hop in range(max_hops):
             requested = url
             status, resp_headers, raw, set_cookies = self._send(
-                method, requested, headers, body, timeout
+                method, requested, headers, body, timeout, max_size
             )
             if (
                 self._follow_redirects
@@ -215,9 +264,11 @@ class NativeTLSTransport:
                     }
                 continue
             return status, resp_headers, raw, requested, set_cookies
-        # Redirect budget exhausted: return the last response we actually
-        # made, tagged with the URL we requested it at (never a phantom hop).
-        return status, resp_headers, raw, requested, set_cookies
+        # Hop budget exhausted while still on a redirect: a redirect loop /
+        # tarpit. Raise rather than returning the dangling 3xx (mirrors the
+        # wreq path, which raises TooManyRedirects). A non-redirecting final
+        # response would have returned inside the loop above.
+        raise TooManyRedirects(requested, self._max_redirects)
 
     def _send(
         self,
@@ -226,8 +277,13 @@ class NativeTLSTransport:
         headers: dict[str, str],
         body: bytes | None,
         timeout: float,
+        max_size: int | None = None,
     ) -> tuple[int, dict[str, str], bytes, list[str]]:
-        from wafer._errors import ConnectionFailed, WaferTimeout
+        from wafer._errors import (
+            ConnectionFailed,
+            ResponseTooLarge,
+            WaferTimeout,
+        )
 
         parsed = urlparse(url)
         host = parsed.hostname or ""
@@ -289,7 +345,35 @@ class NativeTLSTransport:
             # Extract cookies from the headers now, before the body read: if
             # read() fails mid-body, a Set-Cookie token would otherwise be lost.
             self._jar.extract_cookies(resp, cookie_req)
-            raw = resp.read()
+            # Content-Length short-circuit: if the server declared a length
+            # over the cap, abort before reading the body at all.
+            if max_size is not None:
+                declared = resp.getheader("Content-Length")
+                if declared is not None:
+                    try:
+                        declared_n = int(declared)
+                    except (TypeError, ValueError):
+                        declared_n = None
+                    if declared_n is not None and declared_n > max_size:
+                        raise ResponseTooLarge(url, declared_n, max_size)
+            if max_size is None:
+                raw = resp.read()
+            else:
+                # Bounded chunked read: stop the moment the running total
+                # passes the cap (the wire body is never fully buffered past
+                # it). Compressed length is checked here; the decompressed
+                # length is bounded separately in _decompress (bomb-safe).
+                chunks = []
+                total = 0
+                while True:
+                    chunk = resp.read(65536)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    chunks.append(chunk)
+                    if total > max_size:
+                        raise ResponseTooLarge(url, total, max_size)
+                raw = b"".join(chunks)
         except (socket.timeout, TimeoutError) as e:
             raise WaferTimeout(url, timeout) from e
         except (OSError, http.client.HTTPException) as e:
@@ -308,5 +392,7 @@ class NativeTLSTransport:
             resp_headers[kl] = (
                 resp_headers[kl] + "; " + v if kl in resp_headers else v
             )
-        raw = _decompress(raw, resp_headers.get("content-encoding", ""))
+        raw = _decompress(
+            raw, resp_headers.get("content-encoding", ""), url, max_size
+        )
         return resp.status, resp_headers, raw, set_cookies

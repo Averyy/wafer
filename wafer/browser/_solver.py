@@ -29,7 +29,7 @@ import random
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 logger = logging.getLogger("wafer")
 
@@ -284,12 +284,19 @@ class _BrowseState:
 
 @dataclass
 class CapturedResponse:
-    """A single HTTP response captured during iframe interception."""
+    """A single HTTP response captured during iframe interception.
+
+    ``headers`` is the flat (last-wins / joined) header dict; ``set_cookie``
+    preserves the individual ``Set-Cookie`` values, which the flat dict would
+    collapse (a response can carry several Set-Cookie headers and they must
+    stay separate to round-trip into the wreq jar).
+    """
 
     url: str
     status: int
     headers: dict[str, str]
     body: bytes
+    set_cookie: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -1418,11 +1425,23 @@ class BrowserSolver:
                                 nav_headers[k] = v
                         except Exception:
                             pass
+                        # Preserve individual Set-Cookie values: the flat
+                        # .headers dict collapses duplicates, so a response
+                        # with several Set-Cookie headers loses all but one.
+                        # headers_array() keeps each occurrence separate.
+                        nav_set_cookie = []
+                        try:
+                            for h in nav_response.headers_array():
+                                if h.get("name", "").lower() == "set-cookie":
+                                    nav_set_cookie.append(h.get("value", ""))
+                        except Exception:
+                            pass
                         captured = CapturedResponse(
                             url=nav_response.url,
                             status=nav_response.status,
                             headers=nav_headers,
                             body=body,
+                            set_cookie=nav_set_cookie,
                         )
                         logger.info(
                             "Browser passthrough for %s at %s "

@@ -770,6 +770,83 @@ class TestBrowserPassthrough:
         resp = session.get("https://example.com/page")
         assert resp.elapsed > 0
 
+    @patch("time.sleep")
+    def test_passthrough_preserves_individual_set_cookie(self, mock_sleep):
+        """FIX 4: a passthrough response with several Set-Cookie headers
+        exposes them individually (not collapsed into the flat dict)."""
+        from wafer.browser._solver import CapturedResponse
+
+        cf_resp = MockResponse(
+            403, {"cf-mitigated": "challenge"},
+            "<html>Just a moment...</html>",
+        )
+        multi = [
+            "cf_clearance=tok; Path=/; Secure; HttpOnly",
+            "__cf_bm=bm; Path=/; Secure",
+        ]
+        browser_result = SolveResult(
+            cookies=[
+                {
+                    "name": "cf_clearance", "value": "tok",
+                    "domain": ".example.com", "path": "/", "expires": -1,
+                }
+            ],
+            user_agent="Chrome/145.0.0.0",
+            response=CapturedResponse(
+                url="https://example.com/page",
+                status=200,
+                # Flat dict collapses to one "; "-joined value...
+                headers={"set-cookie": "; ".join(multi)},
+                body=b"<html>Real content</html>",
+                set_cookie=multi,  # ...but the individual values are kept.
+            ),
+        )
+        mock_solver = MockBrowserSolver(result=browser_result)
+        session, _ = make_sync_session(
+            [cf_resp],
+            max_rotations=0,
+            browser_solver=mock_solver,
+            use_cookie_jar=True,
+        )
+
+        resp = session.get("https://example.com/page")
+        # Individual Set-Cookie values survive the passthrough.
+        assert resp.get_all("set-cookie") == multi
+        assert resp.cookies.get("cf_clearance") == "tok"
+        assert resp.cookies.get("__cf_bm") == "bm"
+
+    @patch("time.sleep")
+    def test_passthrough_over_cap_raises(self, mock_sleep):
+        """FIX 1: the browser passthrough body is bounded by max_response_size."""
+        from wafer import ResponseTooLarge
+        from wafer.browser._solver import CapturedResponse
+
+        cf_resp = MockResponse(
+            403, {"cf-mitigated": "challenge"},
+            "<html>Just a moment...</html>",
+        )
+        browser_result = SolveResult(
+            cookies=[],
+            user_agent="Chrome/145.0.0.0",
+            response=CapturedResponse(
+                url="https://example.com/page",
+                status=200,
+                headers={"content-type": "text/html"},
+                body=b"z" * 5000,
+            ),
+        )
+        mock_solver = MockBrowserSolver(result=browser_result)
+        session, _ = make_sync_session(
+            [cf_resp],
+            max_rotations=0,
+            browser_solver=mock_solver,
+            use_cookie_jar=True,
+            max_response_size=500,
+        )
+        with pytest.raises(ResponseTooLarge) as ei:
+            session.get("https://example.com/page")
+        assert ei.value.limit == 500
+
 
 class TestSolveOrigin:
     """E8: session-level solve_origin threads to BrowserSolver.solve()."""

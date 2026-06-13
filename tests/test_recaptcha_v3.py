@@ -429,6 +429,120 @@ class TestSessionSyncWiring:
             session.mint_recaptcha_v3(SITEKEY, "act", origin=ORIGIN, v="V")
 
 
+class TestMintFromEmbedSession:
+    """FIX 6: minting from an embed-mode session must not leak the embed
+    Accept / X-Requested-With / Origin to google.com. mint suspends embed
+    for the duration of the cross-origin requests."""
+
+    def _embed_session(self, embed):
+        # A real-ish _rebuild_client that refreshes the cached client
+        # headers (the no-op default mock would mask the suspension).
+        session, mock = make_sync_session(
+            [
+                MockResponse(200, {"content-type": "text/html"}, ANCHOR_HTML),
+                MockResponse(
+                    200, {"content-type": "application/json"}, RELOAD_BODY
+                ),
+            ],
+            embed=embed,
+            embed_origin="https://widget.example.com",
+        )
+
+        def rebuild():
+            session._client_headers = session._compute_client_headers()
+
+        session._rebuild_client = rebuild
+        return session, mock
+
+    def test_embed_restored_after_mint(self):
+        session, _ = self._embed_session("xhr-jquery")
+        assert session._embed == "xhr-jquery"
+        session.mint_recaptcha_v3(SITEKEY, "login", origin=ORIGIN, v="V")
+        # Embed config must be put back exactly as it was.
+        assert session._embed == "xhr-jquery"
+        assert session._embed_origin == "https://widget.example.com"
+
+    def test_no_x_requested_with_to_google(self):
+        session, mock = self._embed_session("xhr-jquery")
+        # Capture embed state AT THE TIME OF each request (it is restored
+        # after the mint, so we must snapshot it mid-flight).
+        seen_embed = []
+        seen_client_headers = []
+        orig_request = mock.request
+
+        def spy(method, url, **kwargs):
+            seen_embed.append(session._embed)
+            seen_client_headers.append(dict(session._client_headers))
+            return orig_request(method, url, **kwargs)
+
+        mock.request = spy
+        session.mint_recaptcha_v3(SITEKEY, "login", origin=ORIGIN, v="V")
+        # Every Google request was issued with embed suspended.
+        assert seen_embed and all(e is None for e in seen_embed)
+        for ch in seen_client_headers:
+            assert "X-Requested-With" not in ch
+        for _m, url, _kw in mock.request_log:
+            assert "google.com" in url
+        # Embed comes back after the mint (so later same-site calls work).
+        assert "X-Requested-With" in session._compute_client_headers()
+
+    def test_no_embed_origin_leak_in_request_headers(self):
+        session, mock = self._embed_session("xhr")
+        session.mint_recaptcha_v3(SITEKEY, "login", origin=ORIGIN, v="V")
+        # No per-request header should carry the embed_origin as Origin.
+        for _m, _url, kw in mock.request_log:
+            hdrs = kw.get("headers", {})
+            assert hdrs.get("Origin") != "https://widget.example.com"
+
+    def test_non_embed_session_no_client_churn(self):
+        # No embed: _embed_suspended is a no-op (no rebuild side effects).
+        session, _ = make_sync_session(
+            [
+                MockResponse(200, {"content-type": "text/html"}, ANCHOR_HTML),
+                MockResponse(
+                    200, {"content-type": "application/json"}, RELOAD_BODY
+                ),
+            ]
+        )
+        rebuilds = []
+        session._rebuild_client = lambda: rebuilds.append(1)
+        token = session.mint_recaptcha_v3(
+            SITEKEY, "login", origin=ORIGIN, v="V"
+        )
+        assert token == "03AGdFINAL_TOKEN_xyz789"
+        # Non-embed session must not rebuild the client just to mint.
+        assert rebuilds == []
+
+
+class TestMintFromEmbedSessionAsync:
+    """FIX 6 async parity."""
+
+    def test_embed_restored_after_mint(self):
+        session, mock = make_async_session(
+            [
+                AsyncMockResponse(
+                    200, {"content-type": "text/html"}, ANCHOR_HTML
+                ),
+                AsyncMockResponse(
+                    200, {"content-type": "application/json"}, RELOAD_BODY
+                ),
+            ],
+            embed="xhr-jquery",
+            embed_origin="https://widget.example.com",
+        )
+
+        def rebuild():
+            session._client_headers = session._compute_client_headers()
+
+        session._rebuild_client = rebuild
+        token = asyncio.run(
+            session.mint_recaptcha_v3(SITEKEY, "login", origin=ORIGIN, v="V")
+        )
+        assert token == "03AGdFINAL_TOKEN_xyz789"
+        assert session._embed == "xhr-jquery"
+        assert "X-Requested-With" in session._compute_client_headers()
+
+
 class TestSessionAsyncWiring:
     def test_method_returns_token(self):
         session, _ = make_async_session(

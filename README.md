@@ -215,7 +215,7 @@ solver - you must handle it yourself).
 | Arkose / FunCaptcha | `arkoselabs.com` or `funcaptcha` markers | **detect-only** (no solver; the generic browser fallback can't pass FunCaptcha) |
 | GeeTest v4 | `initGeetest4`, `gcaptcha4.geetest.com`, `gt4.js` | browser |
 | hCaptcha | `hcaptcha.com` script, `h-captcha` div | browser |
-| reCAPTCHA | `google.com/recaptcha` script, `g-recaptcha` div | browser (**v2 only** - no v3 token minting) |
+| reCAPTCHA | `google.com/recaptcha` script, `g-recaptcha` div | browser for v2 (checkbox + grid); v3 score tokens are minted browser-free via [`session.mint_recaptcha_v3()`](#recaptcha-v3-token-minting) |
 | Vercel | Vercel bot protection challenge | browser (generic JS wait) |
 | Generic JS | Unclassified JavaScript challenges | browser (generic JS wait) |
 
@@ -237,6 +237,34 @@ Three challenge types are solved without a browser:
 - **TMD (Alibaba TMD)** -Warms the session by fetching the homepage to establish a valid TMD session token.
 
 These run automatically during the retry loop.
+
+## reCAPTCHA v3 token minting
+
+reCAPTCHA **v3** issues a *score* token rather than a checkbox/grid challenge.
+wafer mints these tokens **browser-free** -no Patchright, no JS execution -via
+the cross-origin anchor + reload flow against Google's endpoints, run under the
+session's own TLS-emulated client (so the token rides a real browser
+fingerprint):
+
+```python
+token = session.mint_recaptcha_v3(
+    sitekey="6Lc...",                  # readable from the page
+    action="login",                    # the action name
+    origin="https://www.example.com",  # site origin the sitekey is bound to
+)
+# Submit `token` to the site exactly as a browser would (g-recaptcha-response
+# form field, or a JSON body to the site's verify endpoint).
+```
+
+`v` (the api.js release hash) is auto-scraped and cached on the session;
+`enterprise=True` switches to the Enterprise endpoints. Raises `TokenMintFailed`
+if a token can't be extracted. Embed-mode sessions are handled automatically
+(embed headers are suspended for the Google requests). This is distinct from the
+browser-based **v2** checkbox/grid solver in the table above.
+
+**Caveat:** minting always produces a token, but the *score* Google assigns
+depends on request reputation (IP, TLS, cookies) -wafer mints the token, it
+cannot guarantee the site's score threshold passes.
 
 ## Cookie Cache
 

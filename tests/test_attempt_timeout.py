@@ -159,6 +159,60 @@ class TestSyncAttemptTimeout:
         assert "timeout" not in mock.request_log[0][2]
 
 
+@patch("wafer._sync.time.sleep")
+class TestSyncAttemptTimeoutRecordsFailure:
+    """FIX 5: an attempt-timeout rotation accrues failure strikes and
+    eventually retires the session, like the 403/429 paths."""
+
+    def test_attempt_timeout_records_failure_strike(self, mock_sleep):
+        # No retries, plenty of rotations: every hang rotates, and each
+        # rotation must register a failure strike on the domain.
+        session, mock = make_sync_session(
+            [hang(), ok()],
+            attempt_timeout=5,
+            max_retries=0,
+            max_rotations=3,
+            max_failures=None,  # never retire, just count strikes
+        )
+        resp = session.get(URL)
+        assert resp.status_code == 200
+        # One hang -> one rotation -> one recorded failure (cleared on the
+        # subsequent success, so check it was recorded by spying).
+        assert mock.request_count == 2
+
+    def test_persistent_tarpit_retires_session(self, mock_sleep):
+        # Every attempt hangs: strikes accrue until max_failures retires.
+        session, mock = make_sync_session(
+            [hang()] * 10,
+            attempt_timeout=5,
+            max_retries=0,
+            max_rotations=5,
+            max_failures=2,
+        )
+        retired = []
+        orig = session._retire_session
+        session._retire_session = lambda d: (retired.append(d), orig(d))[1]
+        with pytest.raises(WaferTimeout):
+            session.get(URL)
+        # The tarpit accrued strikes and triggered retirement (was never
+        # called before FIX 5).
+        assert retired, "attempt-timeout tarpit should retire the session"
+
+    def test_record_failure_called_on_timeout(self, mock_sleep):
+        session, _ = make_sync_session(
+            [hang(), ok()],
+            attempt_timeout=5,
+            max_retries=0,
+            max_rotations=2,
+            max_failures=None,
+        )
+        calls = []
+        orig = session._record_failure
+        session._record_failure = lambda d: (calls.append(d), orig(d))[1]
+        session.get(URL)
+        assert calls, "attempt-timeout rotation must call _record_failure"
+
+
 class TestSyncTimeoutAlonePreserved:
     """(b) timeout= alone keeps today's semantics: the first attempt may
     consume the entire budget and no extra attempt fires."""
@@ -241,6 +295,45 @@ class TestAsyncAttemptTimeout:
         assert wreq_timeout_of(mock, 0) == datetime.timedelta(seconds=7)
         await session.get(URL, attempt_timeout=7)
         assert wreq_timeout_of(mock, 1) == datetime.timedelta(seconds=7)
+
+
+@patch("wafer._async.asyncio.sleep", new_callable=AsyncMock)
+class TestAsyncAttemptTimeoutRecordsFailure:
+    """FIX 5 async parity."""
+
+    async def test_record_failure_called_on_timeout(self, mock_sleep):
+        session, _ = make_async_session(
+            [hang(), ok()],
+            attempt_timeout=5,
+            max_retries=0,
+            max_rotations=2,
+            max_failures=None,
+        )
+        calls = []
+        orig = session._record_failure
+        session._record_failure = lambda d: (calls.append(d), orig(d))[1]
+        await session.get(URL)
+        assert calls, "attempt-timeout rotation must call _record_failure"
+
+    async def test_persistent_tarpit_retires_session(self, mock_sleep):
+        session, _ = make_async_session(
+            [hang()] * 10,
+            attempt_timeout=5,
+            max_retries=0,
+            max_rotations=5,
+            max_failures=2,
+        )
+        retired = []
+
+        async def spy(d):
+            retired.append(d)
+            await orig(d)
+
+        orig = session._retire_session
+        session._retire_session = spy
+        with pytest.raises(WaferTimeout):
+            await session.get(URL)
+        assert retired, "attempt-timeout tarpit should retire the session"
 
 
 class TestAsyncTimeoutAlonePreserved:

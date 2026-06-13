@@ -28,6 +28,17 @@ class TestPublicSuffix:
     def test_github_io(self):
         assert _psl.public_suffix("alice.github.io") == "github.io"
 
+    def test_newly_added_suffixes(self):
+        # FIX 2: curated-subset expansion.
+        assert _psl.public_suffix("shop.co.id") == "co.id"
+        assert _psl.public_suffix("foo.com.ng") == "com.ng"
+        assert _psl.public_suffix("foo.co.th") == "co.th"
+        assert _psl.public_suffix("foo.co.ke") == "co.ke"
+        assert _psl.public_suffix("alice.blogspot.com") == "blogspot.com"
+        assert (
+            _psl.public_suffix("app.azurewebsites.net") == "azurewebsites.net"
+        )
+
     def test_empty(self):
         assert _psl.public_suffix("") == ""
 
@@ -132,6 +143,20 @@ class TestCookieAppliesToHostPSL:
         assert not self._applies("com.au", "victim.com.au")
         assert not self._applies("github.io", "victim.github.io")
 
+    def test_newly_covered_suffixes_reject_sibling(self):
+        # FIX 2: suffixes added to the curated subset now reject siblings
+        # instead of fail-open over-matching them.
+        assert not self._applies("co.id", "victim.co.id")
+        assert not self._applies(".co.id", "victim.co.id")
+        assert not self._applies("com.ng", "victim.com.ng")
+        assert not self._applies("co.th", "victim.co.th")
+        assert not self._applies("co.ke", "victim.co.ke")
+        # Hosting suffix where every subdomain is a distinct owner.
+        assert not self._applies("blogspot.com", "alice.blogspot.com")
+        assert not self._applies(
+            "azurewebsites.net", "victim.azurewebsites.net"
+        )
+
     def test_bare_tld_domain_rejected(self):
         assert not self._applies("com", "victim.com")
 
@@ -139,6 +164,15 @@ class TestCookieAppliesToHostPSL:
         # localhost is reserved, not a public suffix (RFC 6265 5.3):
         # a Domain=localhost cookie applies to the localhost host.
         assert self._applies("localhost", "localhost")
+
+    def test_trailing_dot_host_matches(self):
+        # FIX 3: an absolute-form host (FQDN trailing dot) is normalized
+        # so Domain=example.com still matches www.example.com.
+        assert self._applies("example.com", "www.example.com.")
+        assert self._applies(".example.com", "example.com.")
+        assert self._applies("example.com", "example.com.")
+        # The rejection path also survives the trailing dot.
+        assert not self._applies(".example.com", "evil.com.")
 
 
 class TestSecFetchSitePSL:

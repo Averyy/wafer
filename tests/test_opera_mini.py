@@ -326,7 +326,7 @@ class TestOperaMiniSetCookie:
 
         session = SyncSession(profile=Profile.OPERA_MINI)
 
-        def fake_request(url, *, headers=None, timeout=30.0):
+        def fake_request(url, *, headers=None, timeout=30.0, max_size=None):
             return (
                 200,
                 {"set-cookie": "a=1; Path=/; b=2; Path=/"},
@@ -347,7 +347,7 @@ class TestOperaMiniSetCookie:
 
         session = AsyncSession(profile=Profile.OPERA_MINI)
 
-        def fake_request(url, *, headers=None, timeout=30.0):
+        def fake_request(url, *, headers=None, timeout=30.0, max_size=None):
             return (
                 200,
                 {"set-cookie": "a=1; Path=/; b=2; Path=/"},

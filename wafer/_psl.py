@@ -40,13 +40,23 @@ _MULTI_LABEL_SUFFIXES = frozenset({
     "com.mx", "net.mx", "org.mx", "gob.mx", "edu.mx",
     # South Africa
     "co.za", "org.za", "net.za", "gov.za", "ac.za",
+    # Indonesia
+    "co.id", "or.id", "web.id", "go.id", "ac.id", "net.id", "my.id",
+    # Thailand
+    "co.th", "or.th", "in.th", "go.th", "ac.th", "net.th",
+    # Nigeria
+    "com.ng", "org.ng", "net.ng", "gov.ng", "edu.ng",
+    # Kenya
+    "co.ke", "or.ke", "go.ke", "ac.ke", "ne.ke",
     # Other common country second-levels
     "com.cn", "net.cn", "org.cn", "gov.cn", "com.tw", "com.hk", "com.sg",
-    "com.tr", "com.ar", "com.co", "com.pl", "co.il", "com.ua",
+    "com.tr", "com.ar", "com.co", "com.pl", "co.il", "com.ua", "com.my",
+    "com.ph", "com.vn", "com.sa", "com.eg", "com.gh",
     # Popular hosting suffixes where each subdomain is a distinct owner
     "github.io", "gitlab.io", "pages.dev", "workers.dev", "vercel.app",
     "netlify.app", "herokuapp.com", "web.app", "firebaseapp.com",
-    "s3.amazonaws.com", "cloudfront.net",
+    "blogspot.com", "azurewebsites.net", "s3.amazonaws.com",
+    "cloudfront.net",
 })
 
 
@@ -81,6 +91,13 @@ def registrable_domain(host: str) -> str:
     public suffix (``co.uk``) or a host that *is* a single label returns
     unchanged - there is no registrable label above it. Empty host returns
     empty. Never raises.
+
+    Backed by a CURATED-SUBSET PSL (``_MULTI_LABEL_SUFFIXES``), NOT the full
+    Mozilla PSL. For a multi-label public suffix NOT in the subset, this
+    falls back to the TLD+1 heuristic - so an unlisted suffix yields the
+    suffix itself as the "registrable domain" (e.g. ``a.co.example`` would
+    reduce to ``co.example`` if ``co.example`` were a public suffix not in
+    the list). Expand the subset to close a specific gap.
     """
     if not host:
         return ""

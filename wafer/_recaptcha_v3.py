@@ -53,7 +53,7 @@ _CB_LEN = 18
 
 
 def compute_co(origin: str) -> str:
-    """Compute the ``co`` param: base64url(origin + ":443"), Google-style.
+    """Compute the ``co`` param: base64url(scheme://host:port), Google-style.
 
     Google encodes the origin as standard base64url then replaces the
     ``=`` padding with ``.`` (e.g. ``https://www.bell.ca`` ->

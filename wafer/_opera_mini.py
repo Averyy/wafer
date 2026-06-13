@@ -301,6 +301,7 @@ class OperaMiniIdentity:
         *,
         headers: dict[str, str] | None = None,
         timeout: float = 30.0,
+        max_size: int | None = None,
     ) -> tuple[int, dict[str, str], str, str, list[str]]:
         """Send an HTTP GET via stdlib urllib (bypasses wreq).
 
@@ -311,6 +312,12 @@ class OperaMiniIdentity:
         multi-value headers with "; ", which is lossy for Set-Cookie).
         Uses system OpenSSL for TLS — no Chrome header leakage,
         more realistic fingerprint for Opera Mini proxy.
+
+        ``max_size`` (bytes) caps the response body: an over-cap declared
+        Content-Length short-circuits before reading, the wire read is
+        bounded, and the decompressor output is bounded too (gzip-bomb
+        safe). ``ResponseTooLarge`` is raised when exceeded. ``None``
+        (default) = no cap, behavior byte-identical to before.
         """
         merged = self.headers()
         if headers:
@@ -336,8 +343,39 @@ class OperaMiniIdentity:
 
             raise ConnectionFailed(url, str(e.reason)) from e
 
+        # Content-Length short-circuit: declared length over the cap aborts
+        # before reading the body at all.
+        if max_size is not None:
+            declared = resp.headers.get("Content-Length")
+            if declared is not None:
+                try:
+                    declared_n = int(declared)
+                except (TypeError, ValueError):
+                    declared_n = None
+                if declared_n is not None and declared_n > max_size:
+                    from wafer._errors import ResponseTooLarge
+
+                    raise ResponseTooLarge(url, declared_n, max_size)
+
         try:
-            raw = resp.read()
+            if max_size is None:
+                raw = resp.read()
+            else:
+                # Bounded chunked read: stop once the running total passes
+                # the cap (the compressed body is never fully buffered).
+                chunks = []
+                total = 0
+                while True:
+                    chunk = resp.read(65536)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    chunks.append(chunk)
+                    if total > max_size:
+                        from wafer._errors import ResponseTooLarge
+
+                        raise ResponseTooLarge(url, total, max_size)
+                raw = b"".join(chunks)
         except socket.timeout as e:
             from wafer._errors import WaferTimeout
 
@@ -349,17 +387,40 @@ class OperaMiniIdentity:
         encoding = resp.headers.get("Content-Encoding", "")
         if encoding in ("gzip", "x-gzip"):
             try:
-                raw = gzip.GzipFile(fileobj=io.BytesIO(raw)).read()
+                with gzip.GzipFile(fileobj=io.BytesIO(raw)) as gz:
+                    if max_size is None:
+                        raw = gz.read()
+                    else:
+                        # Bound the decompressed output too: read at most
+                        # cap+1 bytes so a gzip-bomb can't expand past the
+                        # cap (the full expansion is never buffered).
+                        out = gz.read(max_size + 1)
+                        if len(out) > max_size:
+                            from wafer._errors import ResponseTooLarge
+
+                            raise ResponseTooLarge(url, len(out), max_size)
+                        raw = out
             except (gzip.BadGzipFile, EOFError, OSError):
                 pass  # return raw bytes — will decode with replacement
         elif encoding == "deflate":
-            try:
-                raw = zlib.decompress(raw)
-            except zlib.error:
+            for wbits in (zlib.MAX_WBITS, -zlib.MAX_WBITS):
                 try:
-                    raw = zlib.decompress(raw, -zlib.MAX_WBITS)
+                    if max_size is None:
+                        raw = zlib.decompress(raw, wbits)
+                    else:
+                        dec = zlib.decompressobj(wbits)
+                        out = dec.decompress(raw, max_size + 1)
+                        # Over the cap if the output already exceeds it, or
+                        # if zlib stopped at the cap+1 limit with input still
+                        # pending (unconsumed_tail) -> a larger body.
+                        if len(out) > max_size or dec.unconsumed_tail:
+                            from wafer._errors import ResponseTooLarge
+
+                            raise ResponseTooLarge(url, len(out), max_size)
+                        raw = out
+                    break
                 except zlib.error:
-                    pass  # return raw bytes
+                    continue  # try raw deflate, then return raw bytes
 
         text = raw.decode("utf-8", errors="replace")
         resp_headers: dict[str, str] = {}

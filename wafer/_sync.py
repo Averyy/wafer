@@ -235,6 +235,7 @@ class SyncSession(BaseSession):
         deadline: float | None = None,
         embedder: str | None = None,
         replay: dict | None = None,
+        max_size: int | None = None,
     ) -> WaferResponse | bool:
         """Attempt browser-based challenge solving.
 
@@ -252,6 +253,9 @@ class SyncSession(BaseSession):
                 retries the real ``url``.
             replay: Imperva embedder only - ``{method, body, content_type}``
                 replayed as a same-site XHR for a passthrough response.
+            max_size: effective ``max_response_size`` (bytes). When a
+                passthrough body exceeds it, ``ResponseTooLarge`` is raised
+                instead of returning the oversize body.
 
         Returns:
             WaferResponse: browser got real content without challenge
@@ -378,25 +382,36 @@ class SyncSession(BaseSession):
 
         # Passthrough: browser got real content without solving
         if result.response is not None:
+            body_bytes = result.response.body
+            # Enforce the response-size cap on the browser body too (it never
+            # went through the wreq capped-read path).
+            if max_size is not None and len(body_bytes) > max_size:
+                raise ResponseTooLarge(
+                    result.response.url, len(body_bytes), max_size
+                )
             logger.info(
                 "Browser passthrough %s at %s "
                 "(%d cookies injected, %d bytes)",
                 challenge.value,
                 url,
                 len(target_cookies),
-                len(result.response.body),
+                len(body_bytes),
             )
-            text = result.response.body.decode(
-                "utf-8", errors="replace"
-            )
+            text = body_bytes.decode("utf-8", errors="replace")
             return WaferResponse(
                 status_code=result.response.status,
                 headers=result.response.headers,
                 url=result.response.url,
-                content=result.response.body,
+                content=body_bytes,
                 text=text,
                 was_retried=True,
                 emulation=self._serving_emulation_repr(),
+                # Individual Set-Cookie values from the captured response
+                # (the flat headers dict joins multi-value headers with
+                # "; ", which is lossy for Set-Cookie). Mirrors native-TLS.
+                raw_set_cookie=getattr(
+                    result.response, "set_cookie", None
+                ) or None,
             )
 
         logger.info(
@@ -416,12 +431,14 @@ class SyncSession(BaseSession):
         deadline: float | None,
         start_time: float,
         state,
+        max_size: int | None = None,
     ) -> WaferResponse | None:
         """Replay a request over system OpenSSL (urllib), off the wreq path.
 
         Returns a WaferResponse for any HTTP reply (its ``challenge_type``
         is set if the bypass itself got challenged), or None on a transport
-        error or exhausted time budget.
+        error or exhausted time budget. ``max_size`` (the effective
+        ``max_response_size``) bounds the native body read + decompression.
         """
         timeout = self.timeout.total_seconds()
         if deadline is not None:
@@ -434,8 +451,13 @@ class SyncSession(BaseSession):
             # *rest keeps older 4-tuple transports (test fakes) working;
             # the real transport returns the Set-Cookie list as 5th item.
             status, hdrs, body_bytes, final_url, *rest = transport.request(
-                method, url, headers, body, timeout
+                method, url, headers, body, timeout, max_size
             )
+        except (ResponseTooLarge, TooManyRedirects):
+            # Hard limits (size cap, redirect loop), not transport hiccups:
+            # propagate rather than swallowing into a None (which would fall
+            # back to the wreq path and silently bypass the limit).
+            raise
         except Exception:
             logger.warning(
                 "Native-TLS request failed for %s", url, exc_info=True
@@ -538,6 +560,7 @@ class SyncSession(BaseSession):
             status, resp_headers, text, final_url, set_cookies = (
                 self._om_identity.request(
                     url, headers=extra_headers, timeout=timeout,
+                    max_size=max_response_size,
                 )
             )
             if self._rate_limiter:
@@ -585,7 +608,7 @@ class SyncSession(BaseSession):
             if domain in self._native_tls_domains:
                 native_resp = self._try_native_tls(
                     method, current_url, extra_headers, kwargs,
-                    deadline, start_time, state,
+                    deadline, start_time, state, max_response_size,
                 )
                 if native_resp is not None:
                     native_resp.history = history
@@ -704,7 +727,28 @@ class SyncSession(BaseSession):
                     # is often fingerprint-linked (WAF tarpit), so a
                     # fresh TLS identity can escape it.
                     if attempt_timed_out and state.can_rotate:
+                        # Mirror the 403/429 path: a hung attempt is a failure
+                        # strike, so a persistent tarpit accrues strikes and
+                        # eventually retires the session (gated the same way -
+                        # check budget first, retire on the threshold).
+                        should_retire = self._record_failure(domain)
                         state.use_rotation()
+                        if should_retire:
+                            self._retire_session(domain)
+                            delay = self._rotation_delay()
+                            if deadline is not None:
+                                delay = min(
+                                    delay,
+                                    max(0.0, deadline - time.monotonic()),
+                                )
+                            logger.debug(
+                                "Attempt timed out after %.1fs, retired "
+                                "session, retrying in %.1fs",
+                                attempt_secs,
+                                delay,
+                            )
+                            time.sleep(delay)
+                            continue
                         pinned = (
                             self._fingerprint is not None
                             and self._fingerprint.pinned
@@ -1049,7 +1093,7 @@ class SyncSession(BaseSession):
                     native_attempted = True
                     native_resp = self._try_native_tls(
                         method, current_url, extra_headers, kwargs,
-                        deadline, start_time, state,
+                        deadline, start_time, state, max_response_size,
                     )
                     if native_resp is not None:
                         native_resp.history = history
@@ -1097,6 +1141,7 @@ class SyncSession(BaseSession):
                             challenge, current_url, extra_headers, kwargs
                         ),
                         replay=self._browser_replay(method, kwargs),
+                        max_size=max_response_size,
                     )
                     if isinstance(browser_result, WaferResponse):
                         self._record_success(domain)
@@ -1165,6 +1210,7 @@ class SyncSession(BaseSession):
                                 challenge, current_url, extra_headers, kwargs
                             ),
                             replay=self._browser_replay(method, kwargs),
+                            max_size=max_response_size,
                         )
                         if isinstance(browser_result, WaferResponse):
                             self._record_success(domain)
@@ -1445,16 +1491,20 @@ class SyncSession(BaseSession):
             self._recaptcha_v[cache_key] = scraped
             return scraped
 
-        return _recaptcha_v3.mint_sync(
-            self.request,
-            sitekey,
-            action,
-            origin=origin,
-            referer=referer,
-            v=v,
-            enterprise=enterprise,
-            scrape_v=scrape_v,
-        )
+        # Suspend embed mode for the cross-origin Google requests: in embed
+        # mode the client-level Accept / X-Requested-With would leak to or
+        # duplicate against google.com. No-op for a non-embed session.
+        with self._embed_suspended():
+            return _recaptcha_v3.mint_sync(
+                self.request,
+                sitekey,
+                action,
+                origin=origin,
+                referer=referer,
+                v=v,
+                enterprise=enterprise,
+                scrape_v=scrape_v,
+            )
 
     def __enter__(self):
         return self

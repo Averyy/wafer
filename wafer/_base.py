@@ -1,5 +1,6 @@
 """BaseSession -- shared configuration and logic, zero I/O."""
 
+import contextlib
 import datetime
 import logging
 import platform
@@ -1226,6 +1227,44 @@ class BaseSession:
             kwargs["proxies"] = [self._proxy]
         return kwargs
 
+    @contextlib.contextmanager
+    def _embed_suspended(self):
+        """Temporarily turn off embed mode for the wrapped requests.
+
+        ``mint_recaptcha_v3`` issues cross-origin requests to ``google.com``;
+        those must NOT carry the session's embed-mode header transforms. In
+        ``embed="xhr-jquery"`` the client-level ``X-Requested-With`` and the
+        jQuery ``Accept`` would leak to Google, and ``embed="xhr"`` sets a
+        client-level ``Accept: */*`` that the reload's per-request ``Accept``
+        would duplicate on the HTTP/2 wire. Those headers live at the wreq
+        *client* level (``_compute_client_headers``), so a per-request delta
+        cannot remove them - the client must be rebuilt without embed.
+
+        This saves the embed config, clears it, rebuilds the client (cookies
+        rehydrate from cache, fingerprint stays put), yields, then restores
+        the embed config and rebuilds again. Not concurrency-safe within a
+        single session - same as the rotation path, which also mutates the
+        client - so don't share one session across threads mid-mint.
+        """
+        if not self._embed:
+            # No embed mode: nothing to suspend, no client churn.
+            yield
+            return
+        saved_embed = self._embed
+        saved_origin = self._embed_origin
+        saved_referers = self._embed_referers
+        self._embed = None
+        self._embed_origin = None
+        self._embed_referers = []
+        self._rebuild_client()
+        try:
+            yield
+        finally:
+            self._embed = saved_embed
+            self._embed_origin = saved_origin
+            self._embed_referers = saved_referers
+            self._rebuild_client()
+
     # ------------------------------------------------------------------
     # Native-TLS fallback (urllib / system OpenSSL)
     # ------------------------------------------------------------------
@@ -1287,6 +1326,7 @@ class BaseSession:
             self._native_tls = NativeTLSTransport(
                 follow_redirects=self.follow_redirects,
                 proxy_url=self._proxy_url,
+                max_redirects=self.max_redirects,
             )
         return self._native_tls
 
@@ -1413,18 +1453,26 @@ class BaseSession:
 
     @staticmethod
     def _cookie_applies_to_host(cookie_domain: str | None, host: str) -> bool:
-        """True if a stored cookie's Domain covers ``host`` (RFC 6265 5.1.3).
+        """True if a stored cookie's Domain covers ``host`` (domain-match).
 
-        Rejects a public-suffix ``Domain`` (e.g. ``Domain=co.uk``): per
-        RFC 6265 5.3, a cookie whose Domain is a public suffix must be
-        ignored, so it never applies to a sibling like ``victim.co.uk``.
-        Backed by ``_psl`` (a curated subset, not the full Mozilla PSL); an
-        unlisted multi-label suffix degrades to the bare-TLD check.
+        Approximates RFC 6265 5.1.3 domain-matching plus the 5.3 public-suffix
+        rejection, but the public-suffix check is backed by ``_psl`` - a
+        CURATED SUBSET of the Mozilla PSL, NOT the full list and NOT full RFC
+        6265 5.3. It rejects a public-suffix ``Domain`` that IS listed (e.g.
+        ``Domain=co.uk`` never applies to a sibling like ``victim.co.uk``),
+        but an UNLISTED multi-label public suffix degrades to the bare-TLD
+        (TLD+1) check and FAILS OPEN: a cookie on an unlisted suffix can
+        over-match siblings. Expand ``_psl._MULTI_LABEL_SUFFIXES`` to close a
+        specific gap. ``localhost`` is exempt (a ``Domain=localhost`` cookie
+        legitimately applies to ``localhost``).
         """
         domain = (cookie_domain or "").lstrip(".").lower()
         if not domain or not host:
             return False
-        host = host.lower()
+        # Normalize the host's FQDN trailing dot (``www.example.com.``) just
+        # as the cookie Domain's leading dot was stripped above, so a
+        # ``Domain=example.com`` cookie still matches an absolute-form host.
+        host = host.lower().rstrip(".")
         # A Domain equal to a public suffix (``co.uk``, ``github.io``, or a
         # bare TLD like ``com``) is not a registrable domain - treating it
         # as one would let it over-match every sibling. Ignore it. The
@@ -1444,6 +1492,13 @@ class BaseSession:
         jar, and the Opera Mini jar. Cookies with the ``Secure`` flag
         are only returned for ``https://`` URLs (RFC 6265 5.4). Returns
         the cookie value, or None if not found. Never raises.
+
+        Parent-domain matching uses ``_cookie_applies_to_host``, which is
+        backed by a CURATED-SUBSET PSL (not the full Mozilla PSL / not full
+        RFC 6265 5.3): a cookie on an UNLISTED multi-label public suffix
+        degrades to the TLD+1 check and can fail open (over-match a sibling
+        host) on this read-only path. Expand ``_psl._MULTI_LABEL_SUFFIXES``
+        to close a specific gap.
         """
         host = urlparse(url).hostname or ""
         # Secure cookies must not be exposed to non-https origins

@@ -78,6 +78,7 @@ from wafer import (
     sec_ch_ua,                 # build a sec-ch-ua header value (see below)
     full_version,              # real Chrome full version for a major (e.g. "147.0.7727.24")
     emulation_family,          # classify a wreq.Emulation into a browser family
+    emulation_is_mobile,       # True if an Emulation is a mobile profile
     build_fingerprint_envelope,# coherent identity dict for any Emulation
     # Errors (all inherit WaferError):
     WaferError,
@@ -158,12 +159,13 @@ SyncSession(
     # Response-size cap (memory safety). None = no cap (default; behavior
     # unchanged). When set, a response body over this many bytes raises
     # ResponseTooLarge. Enforced two ways: a declared Content-Length over the
-    # cap raises BEFORE the body is read; otherwise the body is streamed and
+    # cap raises BEFORE the body is read; otherwise the body is read and
     # aborted EARLY once the running total passes the cap (the oversize body
-    # is never fully buffered). Measures the DECOMPRESSED body. Overridable
-    # per-request. NOTE: applies to the normal request path; the Opera Mini
-    # and Imperva native-TLS bypass paths read their body in full and are
-    # not capped.
+    # is never fully buffered). Measures the DECOMPRESSED body, and the
+    # decompressor output is bounded too, so a gzip/deflate bomb cannot expand
+    # past the cap. Applies to EVERY transport: the normal wreq path, the
+    # Opera Mini path, the Imperva native-TLS bypass, and the browser
+    # passthrough body. Overridable per-request.
     max_response_size: int | None = None,
 
     # Fingerprint pool (opt-in, additive). A fixed list of Emulation identities
@@ -880,8 +882,13 @@ def mint_recaptcha_v3(self, sitekey: str, action: str, *,
   `g-recaptcha-response` form field or a JSON body to the site's verify endpoint).
 - **`origin` / `referer`:** pass at least one. `origin` is the scheme+host the
   sitekey is registered for. If only `referer` is given, `origin` is derived from
-  it. The internal `co` param is `base64url(origin + ":443")` (Google's `.`-padded
-  form), computed for you.
+  it. The internal `co` param is `base64url(scheme://host:port)` (Google's
+  `.`-padded form), computed for you.
+- **Embed-mode safe:** if the session was created with `embed="xhr"` /
+  `"xhr-jquery"` / `"iframe"`, minting automatically suspends embed mode for the
+  cross-origin Google requests, so the embed `Accept` / `X-Requested-With` /
+  `Origin` are never leaked to or duplicated against google.com. You do NOT need
+  a separate non-embed session just to mint.
 - **`v` is auto-scraped:** when `v=None`, wafer fetches Google's `api.js` (or
   `enterprise.js`) and scrapes the current release hash, then **caches it on the
   session** so repeat mints don't refetch. This keeps minting working when Google
