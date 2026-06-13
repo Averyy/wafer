@@ -59,6 +59,17 @@ def generate_sec_ch_ua(
     return ", ".join(f'"{b}";v="{v}"' for b, v in shuffled)
 
 
+def sec_ch_ua(major_version: int, brand: str = "Google Chrome") -> str:
+    """Public: build a ``sec-ch-ua`` header value for a Chromium browser.
+
+    Supported, stable wrapper over the internal Chrome GREASE algorithm.
+    Pass ``brand="Microsoft Edge"`` for an Edge identity (Chrome and Edge
+    share the GREASE ordering; only the brand token differs). Firefox and
+    Safari send no ``sec-ch-ua`` at all, so this is Chromium-only.
+    """
+    return generate_sec_ch_ua(major_version, brand=brand)
+
+
 # ---------------------------------------------------------------------------
 # Platform detection (for sec-ch-ua-platform)
 # ---------------------------------------------------------------------------
@@ -103,6 +114,53 @@ def host_user_agent(major_version: int) -> str:
         f"Mozilla/5.0 ({token}) AppleWebKit/537.36 (KHTML, like Gecko) "
         f"Chrome/{major_version}.0.0.0 Safari/537.36"
     )
+
+
+# Firefox freezes the macOS token at "Intel Mac OS X 10.15" (no "_7"),
+# unlike the Chromium "Intel Mac OS X 10_15_7". Wire-verified 2026-06-12.
+_FIREFOX_UA_PLATFORM_TOKENS = {
+    "Darwin": "Macintosh; Intel Mac OS X 10.15",
+    "Windows": "Windows NT 10.0; Win64; x64",
+    "Linux": "X11; Linux x86_64",
+}
+
+
+def emulation_user_agent(emulation: Emulation) -> str | None:
+    """Reconstruct the User-Agent wreq sends for an Emulation, for the host.
+
+    Mirrors wreq's per-family UA shape (wire-verified 2026-06-12):
+
+    - Chrome: ``...Chrome/{major}.0.0.0 Safari/537.36`` (UA-reduced)
+    - Edge:   ``...Chrome/{major}.0.0.0 Safari/537.36 Edg/{edge_build}``
+    - Firefox:``Mozilla/5.0 ({token}; rv:{major}.0) Gecko/20100101
+      Firefox/{major}.0``
+
+    Returns ``None`` for families wafer doesn't reconstruct here (Safari,
+    Opera, OkHttp - those use their own identity modules or aren't UA-stamped
+    from this path). The Chrome segment is UA-reduced (``MAJOR.0.0.0``). The
+    Edge ``Edg/`` segment carries the REAL Edge build (e.g. ``147.0.3912.51``):
+    Edge does NOT UA-reduce the ``Edg/`` token, and wreq's wire UA emits the
+    full build (wire-verified Edge146/147, 2026-06-12). This also keeps the
+    envelope UA coherent with the Edge ``sec-ch-ua-full-version-list``, which
+    carries the same Edge build.
+    """
+    family = emulation_family(emulation)
+    ver = emulation_major_version(emulation)
+    if ver is None:
+        return None
+    if family == "chrome":
+        return host_user_agent(ver)
+    if family == "edge":
+        return f"{host_user_agent(ver)} Edg/{_edge_full_version(ver)}"
+    if family == "firefox":
+        token = _FIREFOX_UA_PLATFORM_TOKENS.get(
+            platform.system(), _FIREFOX_UA_PLATFORM_TOKENS["Windows"]
+        )
+        return (
+            f"Mozilla/5.0 ({token}; rv:{ver}.0) "
+            f"Gecko/20100101 Firefox/{ver}.0"
+        )
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -194,20 +252,96 @@ def _full_version(major: int) -> str:
     return f"{major}.0.{build}.{anchor_patch}"
 
 
+# Microsoft Edge full-version format: MAJOR.0.BUILD.PATCH. The Edge build
+# series is DISTINCT from Chrome's (Edge 147 = 147.0.3912.x, Chrome 147 =
+# 147.0.7727.x) even though both share the same Chromium MAJOR. Real
+# first-stable Edge build numbers from the Microsoft Update Catalog /
+# Edge release notes (and wire-verified for the values wreq actually emits:
+# Edge146 -> 3856.109, Edge147 -> 3912.51, 2026-06-12 via tls.peet.ws).
+# Used ONLY for the "Microsoft Edge" brand in sec-ch-ua-full-version[-list]
+# and the reconstructed Edge UA; the "Chromium" brand keeps the shared Chrome
+# build (_CHROME_BUILDS), because Edge IS that Chromium under the hood.
+# IMPORTANT: refresh this alongside _CHROME_BUILDS when bumping wreq (see
+# CLAUDE.md "When upgrading wreq").
+_EDGE_BUILDS: dict[int, tuple[int, int]] = {
+    122: (2365, 66),
+    127: (2651, 74),
+    131: (2903, 48),
+    134: (3124, 51),
+    135: (3179, 54),
+    136: (3240, 50),
+    137: (3296, 68),
+    138: (3351, 55),
+    139: (3405, 86),
+    140: (3485, 54),
+    141: (3537, 57),
+    142: (3595, 53),
+    143: (3650, 66),
+    144: (3719, 82),
+    145: (3800, 58),
+    146: (3856, 109),  # wire-verified: the build wreq's Edge146 UA emits
+    147: (3912, 51),   # wire-verified: the build wreq's Edge147 UA emits
+}
+
+# Linear-approximation fallback for Edge majors not in the table (same
+# pattern as Chrome's). Anchor on Edge147 -> 3912; the Edge build series
+# advances ~55-56 per major across the recent range (3856->3912->3967->4022).
+_EDGE_VERSION_ANCHOR = (147, 3912, 51)
+_EDGE_BUILD_STEP = 56
+
+
+def _edge_full_version(major: int) -> str:
+    """Return a real Edge full version string, or a plausible approximation.
+
+    The "Microsoft Edge" brand carries Edge's OWN build, not Chrome's.
+    """
+    if major in _EDGE_BUILDS:
+        build, patch = _EDGE_BUILDS[major]
+        return f"{major}.0.{build}.{patch}"
+    anchor_major, anchor_build, anchor_patch = _EDGE_VERSION_ANCHOR
+    build = anchor_build + (major - anchor_major) * _EDGE_BUILD_STEP
+    return f"{major}.0.{build}.{anchor_patch}"
+
+
+def _brand_full_version(family: str | None, major: int) -> str:
+    """Full version for a family's primary brand (Edge build for Edge, else Chrome)."""
+    if family == "edge":
+        return _edge_full_version(major)
+    return _full_version(major)
+
+
+def full_version(major: int) -> str:
+    """Public: a real Chrome full version (``MAJOR.0.BUILD.PATCH``) for ``major``.
+
+    Supported, stable wrapper over the internal Chrome build-number table.
+    Returns the real first-stable build number when known, or a plausible
+    linear approximation for versions outside the table.
+    """
+    return _full_version(major)
+
+
 def generate_sec_ch_ua_full_version_list(
     major_version: int,
     brand: str = "Google Chrome",
     full_version_override: str | None = None,
+    brand_full_version: str | None = None,
 ) -> str:
     """Generate Sec-CH-UA-Full-Version-List with full version numbers.
 
-    When *full_version_override* is given (e.g. ``"145.0.7632.117"``),
-    it is used verbatim for the Chrome and Chromium brand versions
-    instead of the static build-number table.  This keeps the header
-    consistent with the actual browser binary.
+    The "Chromium" brand always carries the shared Chromium build
+    (*full_version_override* if given -- e.g. a real ``browser.version``
+    like ``"145.0.7632.117"`` -- else the static Chrome build table).
+
+    *brand_full_version* sets the version for the *primary* brand
+    (e.g. "Microsoft Edge") independently. Edge ships a DISTINCT build
+    number from the Chromium it embeds (Edge147 = 147.0.3912.51 while
+    Chromium147 = 147.0.7727.24), so the Edge brand must NOT inherit the
+    Chromium build. When omitted, the primary brand uses the Chromium
+    version (correct for "Google Chrome", whose build IS the Chromium one).
     """
     seed = major_version
-    full_ver = full_version_override or _full_version(major_version)
+    chromium_ver = full_version_override or _full_version(major_version)
+    primary_ver = brand_full_version or chromium_ver
 
     char1 = _GREASY_CHARS[seed % 11]
     char2 = _GREASY_CHARS[(seed + 1) % 11]
@@ -217,8 +351,8 @@ def generate_sec_ch_ua_full_version_list(
 
     brands = [
         (grease_brand, grease_full),
-        ("Chromium", full_ver),
-        (brand, full_ver),
+        ("Chromium", chromium_ver),
+        (brand, primary_ver),
     ]
 
     order = _BRAND_ORDER[seed % 6]
@@ -303,6 +437,128 @@ def cdp_ua_metadata(
             "wow64": False,
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# Browser-family classification
+# ---------------------------------------------------------------------------
+#
+# wreq's Emulation enum spans several browser families (Chrome, Edge,
+# Firefox, Opera, Safari). repr(Emulation.XxxNNN) is "Profile.XxxNNN", so
+# the family + version can be derived from the repr string. Chrome and Edge
+# are Chromium-based (they send sec-ch-ua client hints); Firefox and Safari
+# are not (no client hints at all). Each family also has its own navigation
+# Accept / Accept-Language envelope.
+
+# Family name -> sec-ch-ua brand token (None = wafer emits no client hints
+# for this family). Opera is Chromium and DOES send sec-ch-ua, but wreq's
+# Opera Emulation already injects accurate, Opera-correct hints at the
+# client level (wire-verified 2026-06-12 against tls.peet.ws:
+# `"Not:A-Brand";v="99", "Opera";v="130", "Chromium";v="146"` -- Opera 130
+# rides Chromium 146, real Opera GREASE format). wafer's own Chrome-GREASE
+# generator produces the WRONG values for Opera (wrong Chromium major, wrong
+# GREASE char, Chrome full-version table), and emitting them at the client
+# level CLOBBERS wreq's correct native hints (no H2 duplication -- a single
+# header line -- but a degraded fingerprint). So wafer emits NOTHING for
+# Opera and lets wreq's native hints stand. Firefox/Safari send no hints at
+# all. (The envelope still reports family="opera"; only the brand is None.)
+_FAMILY_BRAND: dict[str, str | None] = {
+    "chrome": "Google Chrome",
+    "edge": "Microsoft Edge",
+    "firefox": None,
+    "opera": None,
+    "safari": None,
+}
+
+# The optional ``[A-Za-z]+`` between the family name and the version digits
+# captures wreq's profile *variants* (e.g. ``FirefoxAndroid135``,
+# ``FirefoxPrivate136``, ``SafariIos26_2``, ``SafariIPad18``,
+# ``SafariIpad26_2``) so they classify into their base family instead of
+# returning None (which would wrongly fall back to Chrome's header envelope).
+# OkHttp profiles still match nothing here -> family None -> no client hints.
+_FAMILY_RE = re.compile(
+    r"^Profile\.(Chrome|Edge|Firefox|Opera|Safari)(?:[A-Za-z]+)?(\d+)"
+)
+
+
+def emulation_family(emulation: Emulation) -> str | None:
+    """Classify an Emulation profile into a browser family.
+
+    Returns one of ``"chrome"``, ``"edge"``, ``"firefox"``, ``"opera"``,
+    ``"safari"`` (lowercased family name), or ``None`` if the profile's
+    ``repr()`` doesn't match a known family (e.g. ``Emulation.random``).
+    The family is derived from ``repr(emulation)`` (``"Profile.XxxNNN"``)
+    since the enum is not hashable and has no ``.name``.
+    """
+    m = _FAMILY_RE.match(repr(emulation))
+    if m is None:
+        return None
+    return m.group(1).lower()
+
+
+def emulation_major_version(emulation: Emulation) -> int | None:
+    """Extract the major version from any family's Emulation profile, or None."""
+    m = _FAMILY_RE.match(repr(emulation))
+    if m is None:
+        return None
+    return int(m.group(2))
+
+
+# Per-family navigation Accept / Accept-Language / Accept-Encoding envelope.
+# Wire-verified 2026-06-12 against tls.peet.ws + tools.scrapfly.io (the
+# values wreq itself sends for each Emulation, cross-checked with MDN's
+# "List of default Accept values"). Firefox 132+ (our Firefox149 target)
+# uses the SHORT Accept - the longer image/avif... form is Firefox 128-131
+# and is stale. Edge is Chromium, so it shares Chrome's navigation Accept
+# (only the sec-ch-ua brand differs).
+_CHROME_ACCEPT = (
+    "text/html,application/xhtml+xml,application/xml;q=0.9,"
+    "image/avif,image/webp,image/apng,*/*;q=0.8,"
+    "application/signed-exchange;v=b3;q=0.7"
+)
+_FIREFOX_ACCEPT = (
+    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+)
+
+# Navigation header envelope per family (the headers a real browser of
+# that family sends on a top-level navigation, minus sec-ch-ua, which is
+# generated dynamically per version). Chrome/Edge include the navigation
+# Cache-Control / Upgrade-Insecure-Requests; Firefox does too.
+_FAMILY_HEADERS: dict[str, dict[str, str]] = {
+    "chrome": {
+        "Accept": _CHROME_ACCEPT,
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br, zstd",
+        "Cache-Control": "max-age=0",
+        "Upgrade-Insecure-Requests": "1",
+    },
+    "edge": {
+        "Accept": _CHROME_ACCEPT,
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br, zstd",
+        "Cache-Control": "max-age=0",
+        "Upgrade-Insecure-Requests": "1",
+    },
+    "firefox": {
+        "Accept": _FIREFOX_ACCEPT,
+        "Accept-Language": "en-US,en;q=0.5",
+        "Accept-Encoding": "gzip, deflate, br, zstd",
+        "Upgrade-Insecure-Requests": "1",
+    },
+}
+
+
+def family_headers(family: str | None) -> dict[str, str] | None:
+    """Return the navigation header envelope for a browser family, or None.
+
+    Returns a fresh copy of the family's Accept / Accept-Language /
+    Accept-Encoding (+ navigation) headers, or ``None`` for families with
+    no defined envelope (the caller then keeps the Chrome ``DEFAULT_HEADERS``).
+    """
+    if family is None:
+        return None
+    env = _FAMILY_HEADERS.get(family)
+    return dict(env) if env is not None else None
 
 
 # ---------------------------------------------------------------------------
@@ -416,28 +672,128 @@ class FingerprintManager:
         logger.debug("Fingerprint reset to %s", self._current)
 
     def sec_ch_ua_headers(self) -> dict[str, str]:
-        """Generate sec-ch-ua headers for the current Chrome profile.
+        """Generate sec-ch-ua headers for the current emulation profile.
+
+        Family-aware: Chrome and Edge send the full low- + high-entropy
+        Client Hint set with the family's brand token ("Google Chrome" /
+        "Microsoft Edge"). Firefox, Safari, AND Opera return ``{}`` here:
+        Firefox/Safari send no client hints at all, and Opera's hints are
+        injected accurately by wreq's own Emulation (wafer would clobber
+        them with wrong Chrome-GREASE values -- see ``_FAMILY_BRAND``).
 
         Includes both low-entropy (always sent) and high-entropy Client
         Hints (sent after Accept-CH / Critical-CH).  Strict WAFs like
         Cloudflare on manta.com require high-entropy hints for
         cf_clearance cookie replay.
         """
-        ver = chrome_version(self._current)
-        if ver is None:
+        family = emulation_family(self._current)
+        brand = _FAMILY_BRAND.get(family) if family else None
+        ver = emulation_major_version(self._current)
+        # Firefox/Safari (brand None) and unknown profiles send no hints.
+        if brand is None or ver is None:
             return {}
+        # The primary brand's full version is family-specific: Edge ships its
+        # own build, so the "Microsoft Edge" brand must NOT carry Chrome's.
+        brand_full = _brand_full_version(family, ver)
         return {
-            # Low-entropy (always sent by Chrome)
-            "sec-ch-ua": generate_sec_ch_ua(ver),
+            # Low-entropy (always sent by Chromium browsers)
+            "sec-ch-ua": generate_sec_ch_ua(ver, brand=brand),
             "sec-ch-ua-mobile": "?0",
             "sec-ch-ua-platform": _HOST_PLATFORM,
             # High-entropy (sent after Accept-CH / Critical-CH)
             "sec-ch-ua-arch": _HOST_ARCH,
             "sec-ch-ua-bitness": _HOST_BITNESS,
-            "sec-ch-ua-full-version": f'"{_full_version(ver)}"',
+            "sec-ch-ua-full-version": f'"{brand_full}"',
             "sec-ch-ua-full-version-list": (
-                generate_sec_ch_ua_full_version_list(ver)
+                generate_sec_ch_ua_full_version_list(
+                    ver, brand=brand, brand_full_version=brand_full
+                )
             ),
             "sec-ch-ua-model": '""',
             "sec-ch-ua-platform-version": _HOST_PLATFORM_VERSION,
         }
+
+
+# ---------------------------------------------------------------------------
+# Public fingerprint envelope
+# ---------------------------------------------------------------------------
+
+
+def build_fingerprint_envelope(
+    emulation: Emulation, user_agent: str | None = None,
+) -> dict:
+    """Build the coherent client-identity envelope for an Emulation profile.
+
+    Returns the User-Agent + Client Hint identity that wafer actually puts
+    on the wire for ``emulation``, kept consistent with
+    ``FingerprintManager.sec_ch_ua_headers`` (same builders, same brand,
+    same host entropy).
+
+    Keys (always present):
+
+    - ``user_agent``: ``str | None`` -- the UA wreq sends for this profile
+      (the caller supplies it; wreq sets it from the Emulation, wafer never
+      overrides it for Chrome/Edge/Firefox)
+    - ``family``: ``"chrome" | "edge" | "firefox" | "opera" | "safari" | None``
+    - ``emulation``: ``repr(emulation)`` (e.g. ``"Profile.Chrome147"``)
+    - ``sec_ch_ua`` / ``sec_ch_ua_mobile`` / ``sec_ch_ua_platform``:
+      the low-entropy Client Hints. ``None`` for Firefox/Safari (no client
+      hints) and for Opera (wreq's Emulation emits accurate Opera hints
+      itself; wafer doesn't re-derive them -- only Chrome/Edge are populated)
+    - ``full_version_list``: the ``Sec-CH-UA-Full-Version-List`` value
+      (``None`` except for Chrome/Edge). For Edge the "Microsoft Edge" brand
+      carries Edge's OWN build (e.g. ``147.0.3912.51``) while "Chromium"
+      keeps the shared Chrome build -- they are deliberately different.
+    - ``platform_version``: ``Sec-CH-UA-Platform-Version`` (``None`` except
+      for Chrome/Edge)
+    - ``user_agent_data``: the ``navigator.userAgentData`` shape Chromium
+      exposes to JS (``brands`` / ``mobile`` / ``platform``), ``None`` except
+      for Chrome/Edge
+    """
+    family = emulation_family(emulation)
+    brand = _FAMILY_BRAND.get(family) if family else None
+    ver = emulation_major_version(emulation)
+
+    envelope: dict = {
+        "user_agent": user_agent,
+        "family": family,
+        "emulation": repr(emulation),
+        "sec_ch_ua": None,
+        "sec_ch_ua_mobile": None,
+        "sec_ch_ua_platform": None,
+        "full_version_list": None,
+        "platform_version": None,
+        "user_agent_data": None,
+    }
+
+    # Firefox / Safari (brand None) and unknown profiles: no client hints,
+    # no navigator.userAgentData. Leave the CH fields as None.
+    if brand is None or ver is None:
+        return envelope
+
+    brand_full = _brand_full_version(family, ver)
+    full_version_list = generate_sec_ch_ua_full_version_list(
+        ver, brand=brand, brand_full_version=brand_full
+    )
+    envelope.update(
+        {
+            "sec_ch_ua": generate_sec_ch_ua(ver, brand=brand),
+            "sec_ch_ua_mobile": "?0",
+            "sec_ch_ua_platform": _HOST_PLATFORM,
+            "full_version_list": full_version_list,
+            "platform_version": _HOST_PLATFORM_VERSION,
+            "user_agent_data": {
+                "brands": _parse_header_brands(
+                    generate_sec_ch_ua(ver, brand=brand)
+                ),
+                "fullVersionList": _parse_header_brands(full_version_list),
+                "mobile": False,
+                "platform": _HOST_PLATFORM.strip('"'),
+                "platformVersion": _HOST_PLATFORM_VERSION.strip('"'),
+                "architecture": _HOST_ARCH.strip('"'),
+                "bitness": _HOST_BITNESS.strip('"'),
+                "model": "",
+            },
+        }
+    )
+    return envelope

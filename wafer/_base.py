@@ -12,7 +12,13 @@ from wreq import CertStore, Emulation, Method
 
 from wafer._cookies import CookieCache
 from wafer._dart import DartIdentity
-from wafer._fingerprint import FingerprintManager
+from wafer._fingerprint import (
+    FingerprintManager,
+    build_fingerprint_envelope,
+    emulation_family,
+    emulation_user_agent,
+    family_headers,
+)
 from wafer._kasada import get_session as get_kasada_session  # noqa: F401
 from wafer._opera_mini import OperaMiniIdentity
 from wafer._profiles import Profile
@@ -250,6 +256,17 @@ class BaseSession:
             else None
         )
 
+        # Resolve the browser family of the chosen TLS Emulation so a
+        # non-Chrome emulation (Firefox/Edge) gets a coherent HTTP header
+        # envelope instead of Chrome's DEFAULT_HEADERS. Only meaningful for
+        # Emulation-based profiles (not Safari/Opera Mini/Dart, which carry
+        # their own identity headers).
+        self._emulation_family = (
+            emulation_family(emulation or DEFAULT_EMULATION)
+            if profile not in (Profile.SAFARI, Profile.OPERA_MINI, Profile.DART)
+            else None
+        )
+
         if headers is not None:
             self.headers = headers
         elif self._safari_identity is not None:
@@ -257,14 +274,27 @@ class BaseSession:
         elif self._dart_identity is not None:
             self.headers = self._dart_identity.client_headers()
         else:
-            self.headers = dict(DEFAULT_HEADERS)
-        # Save Chrome-mode headers for restoration after Safari rotation
-        self._chrome_headers = (
-            dict(self.headers)
-            if self._safari_identity is None
-            and self._dart_identity is None
-            else None
-        )
+            # Per-family navigation envelope. Firefox sends NO sec-ch-ua and
+            # a Firefox-shaped Accept; Edge is Chromium (Chrome-like headers,
+            # Microsoft Edge brand in sec-ch-ua). Falls back to Chrome's
+            # DEFAULT_HEADERS for the Chrome family and any unrecognized one.
+            env = family_headers(self._emulation_family)
+            self.headers = env if env is not None else dict(DEFAULT_HEADERS)
+        # Chrome-mode headers, restored by _switch_to_chrome() when rotation
+        # escalates back to a Chrome fingerprint. This MUST be the real Chrome
+        # navigation envelope, NOT the session's starting family envelope: a
+        # Firefox/Edge-emulation session would otherwise send Firefox's Accept
+        # / "...;q=0.5" Accept-Language on a Chrome TLS fingerprint -
+        # incoherent. When the user passed explicit headers=, the documented
+        # full-replace contract wins (we keep their set across rotation so the
+        # rotated request still reflects what they asked for). Identity
+        # profiles (Safari/Dart) carry their own headers, so None for them.
+        if self._safari_identity is not None or self._dart_identity is not None:
+            self._chrome_headers = None
+        elif headers is not None:
+            self._chrome_headers = dict(headers)
+        else:
+            self._chrome_headers = dict(DEFAULT_HEADERS)
         self.connect_timeout = (
             _normalize_timeout(connect_timeout)
             if connect_timeout is not None
@@ -395,6 +425,98 @@ class BaseSession:
         if self._fingerprint is None:
             return None
         return self._fingerprint.current
+
+    def _serving_user_agent(self) -> str | None:
+        """The User-Agent actually serving requests for this session.
+
+        Identity profiles (Safari/Dart/Opera Mini) carry their own UA in
+        self.headers; Emulation-based sessions get the UA from wreq, which
+        we reconstruct from the current Emulation.
+        """
+        if self._safari_identity is not None:
+            return self._safari_identity.user_agent
+        if self._dart_identity is not None:
+            return self._dart_identity.user_agent
+        if self._om_identity is not None:
+            return self._om_identity.user_agent
+        # User-supplied headers override (e.g. headers={"User-Agent": ...})
+        for k, v in self.headers.items():
+            if k.lower() == "user-agent" and v:
+                return v
+        if self._fingerprint is not None:
+            return emulation_user_agent(self._fingerprint.current)
+        return None
+
+    def fingerprint_envelope(self) -> dict:
+        """Return the coherent client identity this session serves with.
+
+        A snapshot of the User-Agent + Client Hint identity that wafer puts
+        on the wire, consistent with the headers actually sent. Useful for
+        feeding the same identity to other tooling (e.g. signing a JS
+        challenge) or diagnosing a 403.
+
+        Always returns a dict with these keys:
+
+        - ``user_agent``: ``str | None``
+        - ``family``: ``"chrome" | "edge" | "firefox" | "opera" |
+          "safari" | "dart" | "opera_mini" | None``
+        - ``emulation``: ``repr()`` of the Emulation, or the Profile name
+          for Safari/Dart/Opera Mini (e.g. ``"Profile.Chrome147"``,
+          ``"safari"``)
+        - ``sec_ch_ua`` / ``sec_ch_ua_mobile`` / ``sec_ch_ua_platform``:
+          the low-entropy Client Hints. ``None`` for Firefox/Safari (no
+          client hints) and for Opera (wreq's Emulation emits accurate
+          Opera hints itself; wafer doesn't re-derive them)
+        - ``full_version_list``: ``Sec-CH-UA-Full-Version-List`` (or None)
+        - ``platform_version``: ``Sec-CH-UA-Platform-Version`` (or None)
+        - ``user_agent_data``: the ``navigator.userAgentData`` shape Chromium
+          exposes (``None`` for Firefox/Safari)
+
+        For non-Emulation profiles (Safari/Dart/Opera Mini) only the
+        ``user_agent``, ``family``, and ``emulation`` fields are populated;
+        the Client-Hint fields are ``None`` (those identities send none).
+        """
+        ua = self._serving_user_agent()
+        if self._fingerprint is not None:
+            env = build_fingerprint_envelope(self._fingerprint.current, ua)
+            return env
+        # Non-Emulation identity profile (Safari / Dart / Opera Mini). Each
+        # is its own "family"; use the Profile value so it matches the
+        # `emulation` field (e.g. "dart", "opera_mini", "safari"). A default
+        # Chrome session that ROTATED to Safari has _safari_identity set but
+        # _profile is None -- still report "safari" for it.
+        if self._safari_identity is not None:
+            family = "safari"
+        elif self._profile is not None:
+            family = self._profile.value
+        else:
+            family = None
+        profile_name = self._profile.value if self._profile else None
+        return {
+            "user_agent": ua,
+            "family": family,
+            "emulation": profile_name,
+            "sec_ch_ua": None,
+            "sec_ch_ua_mobile": None,
+            "sec_ch_ua_platform": None,
+            "full_version_list": None,
+            "platform_version": None,
+            "user_agent_data": None,
+        }
+
+    def _serving_emulation_repr(self) -> str | None:
+        """The repr()/profile string of the identity serving requests.
+
+        Stamped on every WaferResponse as ``resp.emulation`` so callers can
+        diagnose which fingerprint served a 403/regression. For Emulation
+        sessions it's ``repr(Emulation.XxxNNN)``; for Safari/Dart/Opera Mini
+        it's the profile name.
+        """
+        if self._fingerprint is not None:
+            return repr(self._fingerprint.current)
+        if self._profile is not None:
+            return self._profile.value
+        return None
 
     def _compute_client_headers(self) -> dict[str, str]:
         """Compute client-level headers snapshot.
@@ -971,6 +1093,7 @@ class BaseSession:
             rotations=state.rotation_retries if state else 0,
             inline_solves=state.inline_solves if state else 0,
             challenge_type=challenge_type,
+            emulation=self._serving_emulation_repr(),
             raw_set_cookie=raw_set_cookie,
         )
 

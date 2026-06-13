@@ -3,10 +3,19 @@
 from wreq import Emulation
 
 from wafer._fingerprint import (
+    _CHROME_BUILDS,
+    _EDGE_BUILDS,
     CHROME_PROFILES,
     FingerprintManager,
+    build_fingerprint_envelope,
     chrome_version,
+    emulation_family,
+    emulation_major_version,
+    emulation_user_agent,
+    family_headers,
+    full_version,
     generate_sec_ch_ua,
+    sec_ch_ua,
 )
 
 
@@ -216,3 +225,447 @@ class TestSessionFingerprint:
         # Per-request delta should NOT include sec-ch-ua (already correct)
         built = s._build_headers("https://example.com")
         assert "sec-ch-ua" not in built
+
+
+class TestEmulationFamily:
+    """Family classification across Chrome/Edge/Firefox/Opera/Safari."""
+
+    def test_chrome_family(self):
+        assert emulation_family(Emulation.Chrome147) == "chrome"
+
+    def test_edge_family(self):
+        assert emulation_family(Emulation.Edge147) == "edge"
+
+    def test_firefox_family(self):
+        assert emulation_family(Emulation.Firefox149) == "firefox"
+
+    def test_opera_family(self):
+        assert emulation_family(Emulation.Opera130) == "opera"
+
+    def test_safari_family(self):
+        assert emulation_family(Emulation.Safari26) == "safari"
+
+    def test_major_version_chrome(self):
+        assert emulation_major_version(Emulation.Chrome147) == 147
+
+    def test_major_version_firefox(self):
+        assert emulation_major_version(Emulation.Firefox149) == 149
+
+    def test_major_version_edge(self):
+        assert emulation_major_version(Emulation.Edge147) == 147
+
+    def test_firefox_android_variant(self):
+        # Variant profile (digits not immediately after "Firefox") must
+        # classify into the firefox base family, not fall back to Chrome.
+        assert emulation_family(Emulation.FirefoxAndroid135) == "firefox"
+        assert emulation_major_version(Emulation.FirefoxAndroid135) == 135
+
+    def test_firefox_private_variant(self):
+        assert emulation_family(Emulation.FirefoxPrivate136) == "firefox"
+        assert emulation_major_version(Emulation.FirefoxPrivate136) == 136
+
+    def test_safari_ios_variant(self):
+        # SafariIos26_2 -> safari v26 (digits after "Ios", not "Safari").
+        assert emulation_family(Emulation.SafariIos26_2) == "safari"
+        assert emulation_major_version(Emulation.SafariIos26_2) == 26
+
+    def test_safari_ipad_variants(self):
+        # Both casings wreq uses: "IPad" and "Ipad".
+        assert emulation_family(Emulation.SafariIPad18) == "safari"
+        assert emulation_family(Emulation.SafariIpad26_2) == "safari"
+
+    def test_okhttp_classifies_as_none(self):
+        # OkHttp is not a browser family and sends no client hints.
+        assert emulation_family(Emulation.OkHttp5) is None
+
+    def test_all_profiles_classify_sensibly(self):
+        # Every wreq Emulation profile must classify into the family its
+        # repr name starts with (or None for OkHttp / random). A variant
+        # like FirefoxAndroid135 must NOT silently fall back to Chrome.
+        prefixes = {
+            "Chrome": "chrome",
+            "Edge": "edge",
+            "Firefox": "firefox",
+            "Opera": "opera",
+            "Safari": "safari",
+        }
+        for name in dir(Emulation):
+            if name.startswith("_") or name == "random":
+                continue
+            em = getattr(Emulation, name)
+            fam = emulation_family(em)
+            expected = None
+            for prefix, family in prefixes.items():
+                if name.startswith(prefix):
+                    expected = family
+                    break
+            assert fam == expected, (
+                f"{name!r} classified as {fam!r}, expected {expected!r}"
+            )
+
+
+class TestPublicSecChUa:
+    """The public sec_ch_ua wrapper, used by external tooling."""
+
+    def test_default_brand_is_chrome(self):
+        # Public wrapper matches the internal generator for Chrome.
+        assert sec_ch_ua(147) == generate_sec_ch_ua(147)
+
+    def test_edge_brand_token(self):
+        result = sec_ch_ua(147, brand="Microsoft Edge")
+        assert '"Microsoft Edge";v="147"' in result
+        assert '"Chromium";v="147"' in result
+        assert "Google Chrome" not in result
+
+    def test_edge_brand_matches_internal(self):
+        assert sec_ch_ua(147, brand="Microsoft Edge") == generate_sec_ch_ua(
+            147, brand="Microsoft Edge"
+        )
+
+
+class TestFamilyHeaders:
+    """Per-family navigation header envelope."""
+
+    def test_firefox_no_sec_ch_ua_and_short_accept(self):
+        env = family_headers("firefox")
+        # Firefox 132+ navigation Accept (MDN-authoritative, wire-verified).
+        assert env["Accept"] == (
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+        )
+        # Firefox uses q=0.5 in Accept-Language (not Chrome's q=0.9).
+        assert env["Accept-Language"] == "en-US,en;q=0.5"
+        # No sec-ch-ua keys in the Firefox envelope.
+        assert not any(k.lower().startswith("sec-ch-ua") for k in env)
+        # No Chrome-only signed-exchange token.
+        assert "application/signed-exchange" not in env["Accept"]
+
+    def test_edge_uses_chrome_accept(self):
+        # Edge is Chromium: same navigation Accept as Chrome.
+        assert family_headers("edge")["Accept"] == family_headers(
+            "chrome"
+        )["Accept"]
+
+    def test_unknown_family_returns_none(self):
+        # Safari has its own identity headers, not a family envelope here.
+        assert family_headers("safari") is None
+        assert family_headers(None) is None
+
+
+class TestEmulationUserAgent:
+    """UA reconstruction mirrors what wreq sends per family."""
+
+    def test_chrome_ua(self):
+        ua = emulation_user_agent(Emulation.Chrome147)
+        assert "Chrome/147.0.0.0" in ua
+        assert "Edg/" not in ua
+
+    def test_edge_ua_has_edg_token(self):
+        ua = emulation_user_agent(Emulation.Edge147)
+        assert "Chrome/147.0.0.0" in ua
+        assert "Edg/147" in ua
+
+    def test_firefox_ua(self):
+        ua = emulation_user_agent(Emulation.Firefox149)
+        assert "Firefox/149.0" in ua
+        assert "rv:149.0" in ua
+        assert "Gecko/20100101" in ua
+
+    def test_safari_not_reconstructed(self):
+        # Safari uses its own identity module, not this path.
+        assert emulation_user_agent(Emulation.Safari26) is None
+
+
+class TestFingerprintManagerFamilies:
+    """sec_ch_ua_headers() is family-aware."""
+
+    def test_edge_sends_microsoft_edge_brand(self):
+        fm = FingerprintManager(initial=Emulation.Edge147)
+        headers = fm.sec_ch_ua_headers()
+        assert '"Microsoft Edge";v="147"' in headers["sec-ch-ua"]
+        assert "sec-ch-ua-full-version-list" in headers
+        assert "Microsoft Edge" in headers["sec-ch-ua-full-version-list"]
+
+    def test_firefox_sends_no_client_hints(self):
+        fm = FingerprintManager(initial=Emulation.Firefox149)
+        assert fm.sec_ch_ua_headers() == {}
+
+    def test_opera_sends_no_client_hints(self):
+        # Opera hints are injected accurately by wreq's own Emulation;
+        # wafer must NOT emit its own (wrong) Opera-GREASE hints, which
+        # would clobber wreq's correct ones. Wire-verified 2026-06-12.
+        fm = FingerprintManager(initial=Emulation.Opera130)
+        assert fm.sec_ch_ua_headers() == {}
+
+    def test_chrome_unchanged(self):
+        fm = FingerprintManager(initial=Emulation.Chrome147)
+        headers = fm.sec_ch_ua_headers()
+        assert '"Google Chrome";v="147"' in headers["sec-ch-ua"]
+
+    def test_edge_brand_carries_edge_build_not_chrome(self):
+        # The "Microsoft Edge" brand must carry Edge's OWN build number,
+        # NOT Chrome's. Edge147 = 147.0.3912.51, Chrome147 = 147.0.7727.24.
+        fm = FingerprintManager(initial=Emulation.Edge147)
+        h = fm.sec_ch_ua_headers()
+        edge_build, edge_patch = _EDGE_BUILDS[147]
+        chrome_build, _ = _CHROME_BUILDS[147]
+        edge_full = f"147.0.{edge_build}.{edge_patch}"
+        # sec-ch-ua-full-version is the Edge brand build.
+        assert h["sec-ch-ua-full-version"] == f'"{edge_full}"'
+        assert edge_build != chrome_build  # genuinely different series
+        fvl = h["sec-ch-ua-full-version-list"]
+        # Microsoft Edge brand -> Edge build; Chromium brand -> Chrome build.
+        assert f'"Microsoft Edge";v="{edge_full}"' in fvl
+        assert f'"Chromium";v="{full_version(147)}"' in fvl
+        # Chrome's build must NOT appear on the Microsoft Edge brand.
+        assert f'"Microsoft Edge";v="{full_version(147)}"' not in fvl
+
+
+class TestFingerprintEnvelope:
+    """build_fingerprint_envelope() and session.fingerprint_envelope()."""
+
+    def test_chrome_envelope_coherent(self):
+        env = build_fingerprint_envelope(
+            Emulation.Chrome147, "ua-string"
+        )
+        assert env["family"] == "chrome"
+        assert env["emulation"] == "Profile.Chrome147"
+        assert env["user_agent"] == "ua-string"
+        assert '"Google Chrome";v="147"' in env["sec_ch_ua"]
+        assert env["sec_ch_ua_mobile"] == "?0"
+        assert env["user_agent_data"]["mobile"] is False
+        assert any(
+            b["brand"] == "Google Chrome"
+            for b in env["user_agent_data"]["brands"]
+        )
+
+    def test_edge_envelope_brand(self):
+        env = build_fingerprint_envelope(Emulation.Edge147)
+        assert env["family"] == "edge"
+        assert '"Microsoft Edge";v="147"' in env["sec_ch_ua"]
+        assert any(
+            b["brand"] == "Microsoft Edge"
+            for b in env["user_agent_data"]["brands"]
+        )
+
+    def test_edge_envelope_full_version_list_uses_edge_build(self):
+        env = build_fingerprint_envelope(Emulation.Edge147)
+        edge_build, edge_patch = _EDGE_BUILDS[147]
+        edge_full = f"147.0.{edge_build}.{edge_patch}"
+        fvl = env["full_version_list"]
+        assert f'"Microsoft Edge";v="{edge_full}"' in fvl
+        assert f'"Chromium";v="{full_version(147)}"' in fvl
+        # navigator.userAgentData.fullVersionList carries the Edge build too.
+        ms = [
+            b for b in env["user_agent_data"]["fullVersionList"]
+            if b["brand"] == "Microsoft Edge"
+        ]
+        assert ms and ms[0]["version"] == edge_full
+
+    def test_edge_envelope_ua_carries_real_edge_build(self):
+        # The reconstructed Edge UA's Edg/ token uses the real Edge build
+        # (wire-verified: wreq emits Edg/147.0.3912.51), not the reduced
+        # MAJOR.0.0.0, so it matches the wire and the full-version-list.
+        ua = emulation_user_agent(Emulation.Edge147)
+        edge_build, edge_patch = _EDGE_BUILDS[147]
+        assert f"Edg/147.0.{edge_build}.{edge_patch}" in ua
+        assert "Edg/147.0.0.0" not in ua
+
+    def test_opera_envelope_no_client_hints_but_family_opera(self):
+        env = build_fingerprint_envelope(Emulation.Opera130)
+        assert env["family"] == "opera"
+        assert env["sec_ch_ua"] is None
+        assert env["full_version_list"] is None
+        assert env["user_agent_data"] is None
+
+    def test_firefox_envelope_no_client_hints(self):
+        env = build_fingerprint_envelope(Emulation.Firefox149)
+        assert env["family"] == "firefox"
+        assert env["sec_ch_ua"] is None
+        assert env["sec_ch_ua_mobile"] is None
+        assert env["sec_ch_ua_platform"] is None
+        assert env["full_version_list"] is None
+        assert env["platform_version"] is None
+        assert env["user_agent_data"] is None
+
+    def test_session_envelope_chrome(self):
+        from wafer import SyncSession
+
+        s = SyncSession()
+        env = s.fingerprint_envelope()
+        assert env["family"] == "chrome"
+        assert env["emulation"] == "Profile.Chrome147"
+        assert "Chrome/147.0.0.0" in env["user_agent"]
+        assert '"147"' in env["sec_ch_ua"]
+
+    def test_session_envelope_firefox(self):
+        from wafer import SyncSession
+
+        s = SyncSession(emulation=Emulation.Firefox149)
+        env = s.fingerprint_envelope()
+        assert env["family"] == "firefox"
+        assert env["sec_ch_ua"] is None
+        assert "Firefox/149.0" in env["user_agent"]
+
+    def test_session_envelope_edge(self):
+        from wafer import SyncSession
+
+        s = SyncSession(emulation=Emulation.Edge147)
+        env = s.fingerprint_envelope()
+        assert env["family"] == "edge"
+        assert '"Microsoft Edge";v="147"' in env["sec_ch_ua"]
+        assert "Edg/147" in env["user_agent"]
+
+    def test_session_envelope_uses_user_supplied_ua(self):
+        from wafer import SyncSession
+
+        s = SyncSession(headers={"User-Agent": "my-custom-ua"})
+        env = s.fingerprint_envelope()
+        assert env["user_agent"] == "my-custom-ua"
+
+    def test_public_envelope_exported(self):
+        import wafer
+
+        assert wafer.build_fingerprint_envelope is build_fingerprint_envelope
+        assert callable(wafer.sec_ch_ua)
+        assert callable(wafer.full_version)
+        assert callable(wafer.emulation_family)
+
+
+class TestSessionFamilyHeaders:
+    """Session-level per-family header envelope wiring."""
+
+    def test_firefox_session_no_sec_ch_ua(self):
+        from wafer import SyncSession
+
+        s = SyncSession(emulation=Emulation.Firefox149)
+        headers = s._build_client_kwargs()["headers"]
+        assert not any(
+            k.lower().startswith("sec-ch-ua") for k in headers
+        )
+        assert headers["Accept"] == (
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+        )
+        assert headers["Accept-Language"] == "en-US,en;q=0.5"
+
+    def test_edge_session_microsoft_edge_brand(self):
+        from wafer import SyncSession
+
+        s = SyncSession(emulation=Emulation.Edge147)
+        headers = s._build_client_kwargs()["headers"]
+        assert '"Microsoft Edge";v="147"' in headers["sec-ch-ua"]
+        # Edge is Chromium, shares Chrome's navigation Accept.
+        assert "application/signed-exchange" in headers["Accept"]
+
+    def test_user_headers_override_family_envelope(self):
+        from wafer import SyncSession
+
+        # Explicit headers= replaces the family envelope entirely.
+        s = SyncSession(
+            emulation=Emulation.Firefox149,
+            headers={"Accept": "custom/accept"},
+        )
+        assert s.headers["Accept"] == "custom/accept"
+
+    def test_firefox_session_chrome_headers_are_real_chrome(self):
+        # _chrome_headers (restored on a rotation that switches back to a
+        # Chrome fingerprint) must be the REAL Chrome navigation envelope,
+        # NOT the Firefox envelope the session started with. Otherwise a
+        # rotated Chrome TLS fingerprint would send Firefox's Accept /
+        # "...;q=0.5" Accept-Language - incoherent.
+        from wafer import SyncSession
+        from wafer._base import DEFAULT_HEADERS
+
+        s = SyncSession(emulation=Emulation.Firefox149)
+        # Session headers are the Firefox envelope...
+        assert s.headers["Accept-Language"] == "en-US,en;q=0.5"
+        # ...but the Chrome-restore headers are the real Chrome envelope.
+        assert s._chrome_headers == DEFAULT_HEADERS
+        assert s._chrome_headers is not DEFAULT_HEADERS  # a copy
+
+    def test_edge_session_chrome_headers_are_real_chrome(self):
+        from wafer import SyncSession
+        from wafer._base import DEFAULT_HEADERS
+
+        s = SyncSession(emulation=Emulation.Edge147)
+        assert s._chrome_headers == DEFAULT_HEADERS
+
+    def test_user_headers_preserved_as_chrome_headers(self):
+        # When the user passes explicit headers=, the documented full-replace
+        # contract wins: those headers are what get restored on rotation too.
+        from wafer import SyncSession
+
+        custom = {"Accept": "custom/accept", "X-Mine": "1"}
+        s = SyncSession(emulation=Emulation.Firefox149, headers=dict(custom))
+        assert s._chrome_headers == custom
+
+    def test_switch_to_chrome_uses_real_chrome_headers(self):
+        # End-to-end: a Firefox session that rotates to Chrome must end up
+        # with the real Chrome navigation headers, not the Firefox envelope.
+        from wafer import SyncSession
+        from wafer._base import DEFAULT_HEADERS
+
+        s = SyncSession(emulation=Emulation.Firefox149)
+        s._switch_to_chrome()
+        assert s.headers == DEFAULT_HEADERS
+        assert s.headers["Accept-Language"] == "en-US,en;q=0.9"
+
+
+class TestIdentityProfileEnvelopeFamily:
+    """fingerprint_envelope() family for non-Emulation identity profiles."""
+
+    def test_dart_envelope_family(self):
+        from wafer import Profile, SyncSession
+
+        env = SyncSession(profile=Profile.DART).fingerprint_envelope()
+        assert env["family"] == "dart"
+        assert env["emulation"] == "dart"
+        assert env["sec_ch_ua"] is None
+
+    def test_opera_mini_envelope_family(self):
+        from wafer import Profile, SyncSession
+
+        env = SyncSession(profile=Profile.OPERA_MINI).fingerprint_envelope()
+        assert env["family"] == "opera_mini"
+        assert env["emulation"] == "opera_mini"
+
+    def test_safari_envelope_family(self):
+        from wafer import Profile, SyncSession
+
+        env = SyncSession(profile=Profile.SAFARI).fingerprint_envelope()
+        assert env["family"] == "safari"
+
+
+class TestResponseEmulationStamp:
+    """resp.emulation reports the serving identity."""
+
+    def test_chrome_response_stamped(self):
+        from wafer import SyncSession
+
+        s = SyncSession()
+        resp = s._make_response(
+            status_code=200,
+            headers={},
+            url="https://example.com",
+            start_time=0.0,
+            was_retried=False,
+        )
+        assert resp.emulation == "Profile.Chrome147"
+
+    def test_firefox_response_stamped(self):
+        from wafer import SyncSession
+
+        s = SyncSession(emulation=Emulation.Firefox149)
+        resp = s._make_response(
+            status_code=200,
+            headers={},
+            url="https://example.com",
+            start_time=0.0,
+            was_retried=False,
+        )
+        assert resp.emulation == "Profile.Firefox149"
+
+    def test_serving_emulation_repr_safari(self):
+        from wafer import Profile, SyncSession
+
+        s = SyncSession(profile=Profile.SAFARI)
+        assert s._serving_emulation_repr() == "safari"

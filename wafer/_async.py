@@ -384,6 +384,7 @@ class AsyncSession(BaseSession):
                 content=result.response.body,
                 text=text,
                 was_retried=True,
+                emulation=self._serving_emulation_repr(),
             )
 
         logger.info(
@@ -465,6 +466,7 @@ class AsyncSession(BaseSession):
             rotations=state.rotation_retries if state else 0,
             inline_solves=state.inline_solves if state else 0,
             challenge_type=challenge_type,
+            emulation=self._serving_emulation_repr(),
             raw=raw,
         )
 
@@ -541,6 +543,7 @@ class AsyncSession(BaseSession):
                 elapsed=time.monotonic() - start_time,
                 was_retried=False,
                 challenge_type=None,
+                emulation=self._serving_emulation_repr(),
                 raw=None,
                 raw_set_cookie=set_cookies,
             )

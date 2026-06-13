@@ -114,6 +114,7 @@ class WaferResponse:
         "rotations",
         "inline_solves",
         "elapsed",
+        "emulation",
         "_raw",
     )
 
@@ -132,6 +133,7 @@ class WaferResponse:
         rotations: int = 0,
         inline_solves: int = 0,
         elapsed: float = 0.0,
+        emulation: str | None = None,
         raw=None,
         raw_set_cookie: list[str] | None = None,
     ):
@@ -159,6 +161,10 @@ class WaferResponse:
         self.rotations = rotations
         self.inline_solves = inline_solves
         self.elapsed = elapsed
+        # repr() of the Emulation (or profile name) that served the request,
+        # e.g. "Profile.Chrome147". Populated by the session at construction;
+        # lets callers diagnose which fingerprint served a 403/regression.
+        self.emulation = emulation
         self._raw = raw
 
     @property

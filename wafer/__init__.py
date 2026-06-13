@@ -20,6 +20,12 @@ from wafer._errors import (
     WaferHTTPError,
     WaferTimeout,
 )
+from wafer._fingerprint import (
+    build_fingerprint_envelope,
+    emulation_family,
+    full_version,
+    sec_ch_ua,
+)
 from wafer._profiles import Profile
 from wafer._response import WaferResponse
 from wafer._sync import SyncSession
@@ -39,6 +45,10 @@ __all__ = [
     "TooManyRedirects",
     "Profile",
     "DEFAULT_HEADERS",
+    "sec_ch_ua",
+    "full_version",
+    "emulation_family",
+    "build_fingerprint_envelope",
     "get",
     "post",
     "put",

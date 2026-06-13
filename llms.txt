@@ -73,6 +73,12 @@ from wafer import (
     WaferResponse,     # response object
     Profile,           # enum: OPERA_MINI, SAFARI, DART
     DEFAULT_HEADERS,   # dict[str, str] - default Accept/Accept-Language/etc headers
+    # Fingerprint helpers (supported public surface - do NOT reach into
+    # wafer._fingerprint; these are the stable path):
+    sec_ch_ua,                 # build a sec-ch-ua header value (see below)
+    full_version,              # real Chrome full version for a major (e.g. "147.0.7727.24")
+    emulation_family,          # classify a wreq.Emulation into a browser family
+    build_fingerprint_envelope,# coherent identity dict for any Emulation
     # Errors (all inherit WaferError):
     WaferError,
     WaferHTTPError,    # raised by raise_for_status() on non-2xx
@@ -106,7 +112,12 @@ Both support context managers (`with` / `async with`).
 
 ```python
 SyncSession(
-    # TLS identity (Chrome profiles from wreq)
+    # TLS identity (any wreq Emulation profile). Default: Emulation.Chrome147 (newest).
+    # Non-Chrome families get a matching HTTP header envelope automatically:
+    #   Emulation.Edge147    -> Chromium headers, sec-ch-ua brand "Microsoft Edge"
+    #   Emulation.Firefox149 -> Firefox Accept/Accept-Language, NO sec-ch-ua
+    # See "Fingerprint Identity". (Choosing a non-Chrome emulation does not change
+    # rotation behavior - rotation still cycles Chrome versions.)
     emulation: wreq.Emulation | None = None,  # default: Emulation.Chrome147 (newest)
 
     # Non-Chrome profiles (overrides emulation)
@@ -264,10 +275,91 @@ resp.retries        # int (normal retries used)
 resp.rotations      # int (fingerprint rotations used)
 resp.inline_solves  # int (inline challenge solves)
 resp.challenge_type # str | None (e.g. "cloudflare", "datadome")
+resp.emulation      # str | None - the identity that SERVED this response, for
+                    # diagnosing a 403/regression. For Emulation sessions it's the
+                    # wreq profile repr, e.g. "Profile.Chrome147" / "Profile.Edge147"
+                    # / "Profile.Firefox149"; for non-Emulation profiles it's the
+                    # profile name ("safari", "dart", "opera_mini"). Reflects the
+                    # CURRENT identity, so after a rotation it shows the one that
+                    # actually served (not the session's original).
 ```
 
 `resp.headers` is a plain `dict[str, str]` with lowercase keys. Use `.items()`,
 `.get()`, `[]`, etc. normally. For example, `resp.headers.get("etag")` (lowercase).
+
+---
+
+## Fingerprint Identity
+
+wafer picks a TLS `emulation` (a wreq browser profile) and sends an HTTP header
+envelope that matches it. The envelope is **family-aware** - the family is
+derived from the chosen `emulation`:
+
+- **Chrome** (default): full sec-ch-ua client hints, brand `"Google Chrome"`,
+  Chrome navigation `Accept`.
+- **Edge** (`emulation=Emulation.Edge147`): Chromium, so Chrome-like headers and
+  the SAME navigation `Accept`, but the sec-ch-ua brand is `"Microsoft Edge"`.
+  UA is wreq's Edge UA.
+- **Firefox** (`emulation=Emulation.Firefox149`): sends **NO** sec-ch-ua client
+  hints at all, a Firefox `Accept`
+  (`text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8`) and
+  `Accept-Language: en-US,en;q=0.5`. UA is wreq's Firefox UA.
+
+Pass any wreq profile as `emulation=` and the matching envelope is applied
+automatically - you do NOT set headers yourself. (Passing your own `headers=`
+replaces the whole envelope, including the auto sec-ch-ua - see "headers="
+under the Session Constructor.) Selecting a non-Chrome `emulation` only sets a
+coherent identity; it does NOT change rotation behavior.
+
+### session.fingerprint_envelope() -> dict
+
+Snapshot of the identity the session currently serves with - the same UA +
+client hints actually on the wire. Useful to feed the same identity to other
+tooling (e.g. signing a JS challenge) or to log what served a 403. Replaces
+reaching into `wafer._fingerprint`. Always returns these keys:
+
+```python
+{
+  "user_agent": str | None,        # the UA wreq sends for this profile
+  "family": str | None,            # "chrome"|"edge"|"firefox"|"opera"|"safari"|"dart"|"opera_mini"|None
+  "emulation": str | None,         # "Profile.Chrome147" (Emulation) or "safari"/"dart"/"opera_mini"
+  "sec_ch_ua": str | None,         # low-entropy hint; None for Firefox/Safari/Opera (see below)
+  "sec_ch_ua_mobile": str | None,  # "?0" or None
+  "sec_ch_ua_platform": str | None,# e.g. '"macOS"' or None
+  "full_version_list": str | None, # Sec-CH-UA-Full-Version-List value or None
+  "platform_version": str | None,  # Sec-CH-UA-Platform-Version value or None
+  "user_agent_data": dict | None,  # navigator.userAgentData shape; None for Firefox/Safari/Opera
+}
+```
+
+Only Chrome and Edge populate the client-hint fields. Firefox and Safari send
+no client hints at all. Opera IS Chromium, but wreq's own Opera profile already
+puts accurate Opera sec-ch-ua on the wire, so wafer's envelope leaves the
+client-hint fields `None` for Opera (it doesn't re-derive them) -- `family` is
+still `"opera"`. For non-Emulation profiles (Safari/Dart/Opera Mini) only
+`user_agent` / `family` / `emulation` are populated (`family` is `"safari"` /
+`"dart"` / `"opera_mini"`).
+
+### Module-level fingerprint helpers
+
+```python
+wafer.sec_ch_ua(major_version: int, brand: str = "Google Chrome") -> str
+# Build a sec-ch-ua header value for a Chromium browser. Pass
+# brand="Microsoft Edge" for Edge. Chromium-only (Firefox/Safari send none).
+#   wafer.sec_ch_ua(147)                         -> '"Google Chrome";v="147", ...'
+#   wafer.sec_ch_ua(147, brand="Microsoft Edge") -> '"Microsoft Edge";v="147", ...'
+
+wafer.full_version(major: int) -> str
+# Real Chrome full version (MAJOR.0.BUILD.PATCH), e.g. full_version(147) -> "147.0.7727.24".
+
+wafer.emulation_family(emulation) -> str | None
+# Classify a wreq.Emulation: "chrome" | "edge" | "firefox" | "opera" | "safari" | None.
+
+wafer.build_fingerprint_envelope(emulation, user_agent: str | None = None) -> dict
+# Same dict shape as session.fingerprint_envelope(), for an arbitrary Emulation
+# (without a session). user_agent is the UA you intend to send (wreq sets it from
+# the Emulation); pass it so the envelope is complete.
+```
 
 ---
 
