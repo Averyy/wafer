@@ -19,6 +19,7 @@ WAF-specific logic lives in dedicated modules:
 - ``_recaptcha_grid`` — reCAPTCHA v2 image grid (EfficientNet + D-FINE)
 """
 
+import asyncio
 import csv
 import importlib.resources
 import io
@@ -1814,6 +1815,41 @@ class BrowserSolver:
                         pass
         finally:
             self._lock.release()
+
+    async def asolve(
+        self,
+        url: str,
+        challenge_type: str | None = None,
+        timeout: float | None = None,
+        embedder: str | None = None,
+        replay: dict | None = None,
+    ) -> "SolveResult | None":
+        """Async wrapper around :meth:`solve` - identical args and result.
+
+        ``solve`` drives Playwright's blocking API under a lock, so it would
+        stall an event loop if awaited directly. This dispatches it to a
+        thread executor and awaits it, letting an async app drive the solver
+        manually (``await solver.asolve(url)``) without blocking the loop.
+        Pure dispatch - all solve logic lives in :meth:`solve`.
+        """
+        return await asyncio.to_thread(
+            self.solve, url, challenge_type, timeout, embedder, replay
+        )
+
+    async def aintercept_iframe(
+        self,
+        embedder_url: str,
+        target_domain: str,
+        timeout: float | None = None,
+    ) -> "InterceptResult | None":
+        """Async wrapper around :meth:`intercept_iframe` - same args/result.
+
+        Dispatches the blocking interception to a thread executor so it can
+        be awaited from an event loop without blocking it. Pure dispatch.
+        """
+        return await asyncio.to_thread(
+            self.intercept_iframe, embedder_url, target_domain, timeout
+        )
 
     def close(self) -> None:
         """Shut down browser and release resources."""

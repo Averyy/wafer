@@ -66,22 +66,66 @@ class MockHeaderMap:
         return list(self._raw.get(key, []))
 
 
+class _MockStreamer:
+    """Mock wreq Streamer: yields body bytes in fixed-size chunks.
+
+    Supports both sync (for ... in) and async (async for ... in) iteration
+    plus context-manager use, mirroring wreq's real Streamer. Used to
+    exercise wafer's streamed early-abort (max_response_size) path.
+    """
+
+    def __init__(self, data: bytes, chunk_size: int = 16):
+        self._chunks = [
+            data[i : i + chunk_size]
+            for i in range(0, max(len(data), 1), chunk_size)
+        ] if data else []
+
+    def __iter__(self):
+        return iter(self._chunks)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def __aiter__(self):
+        async def _gen():
+            for c in self._chunks:
+                yield c
+        return _gen()
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+
 class MockResponse:
     def __init__(
         self,
         status_code: int,
         headers: dict[str, str] | None = None,
         body: str = "",
+        content_length: int | None = None,
     ):
         self.status = MockStatus(status_code)
         self.headers = MockHeaderMap(headers)
         self._body = body
+        # Declared Content-Length for the response-size-cap short-circuit.
+        # None (default) = no declared length, so the cap (if any) falls
+        # through to the streamed read - matching chunked responses.
+        self.content_length = content_length
 
     def text(self):
         return self._body
 
     def bytes(self):
         return self._body.encode("utf-8")
+
+    def stream(self):
+        return _MockStreamer(self._body.encode("utf-8"))
 
     def json(self):
         return json.loads(self._body)
@@ -95,16 +139,21 @@ class AsyncMockResponse:
         status_code: int,
         headers: dict[str, str] | None = None,
         body: str = "",
+        content_length: int | None = None,
     ):
         self.status = MockStatus(status_code)
         self.headers = MockHeaderMap(headers)
         self._body = body
+        self.content_length = content_length
 
     async def text(self):
         return self._body
 
     async def bytes(self):
         return self._body.encode("utf-8")
+
+    def stream(self):
+        return _MockStreamer(self._body.encode("utf-8"))
 
     def json(self):
         return json.loads(self._body)
@@ -255,6 +304,9 @@ def make_sync_session(responses, **session_kwargs):
     session.max_failures = session_kwargs.get(
         "max_failures", 3
     )
+    session.max_response_size = session_kwargs.get(
+        "max_response_size", None
+    )
     session._fingerprint = FingerprintManager(DEFAULT_EMULATION)
     _pool = session_kwargs.get("fingerprint_pool", None)
     session._fingerprint_pool = list(_pool) if _pool else None
@@ -338,6 +390,9 @@ def make_async_session(responses, **session_kwargs):
 
     session.max_failures = session_kwargs.get(
         "max_failures", 3
+    )
+    session.max_response_size = session_kwargs.get(
+        "max_response_size", None
     )
     session._fingerprint = FingerprintManager(DEFAULT_EMULATION)
     _pool = session_kwargs.get("fingerprint_pool", None)

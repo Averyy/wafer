@@ -135,29 +135,63 @@ class TestShape:
         assert detect_challenge(200, {}, body) is None
 
     def test_shape_sensor_header_403(self):
-        """Shape sensor response header on 403."""
-        headers = {"x-nordstrom-a": "2"}
+        """Shape sensor response header on 403 (nordstrom-style token).
+
+        Pins the tightened heuristic: a realistic digit-leading sensor
+        token (>= 8 token chars) on a short x-<prefix>-a header. The
+        live nordstrom path is the body marker; this header path is the
+        fallback for a bare 403 with no body.
+        """
+        headers = {"x-nordstrom-a": "31415926535"}
+        assert detect_challenge(403, headers, "") == ChallengeType.SHAPE
+
+    def test_shape_sensor_header_encoded_token_403(self):
+        """Encoded (base64url-ish) sensor blob on 403."""
+        headers = {"x-nordstrom-a": "AbC-123_xZ9.qQ=="}
         assert detect_challenge(403, headers, "") == ChallengeType.SHAPE
 
     def test_shape_sensor_header_429(self):
-        """Shape sensor response header on 429."""
+        """Long encoded Shape sensor response header on 429."""
         headers = {"x-site-a": "98765432109876543210987654321098765678901"}
         assert detect_challenge(429, headers, "") == ChallengeType.SHAPE
 
     def test_shape_sensor_header_200_not_detected(self):
         """Shape header heuristic must NOT fire on 200 (too broad)."""
-        headers = {"x-data-a": "12345"}
+        headers = {"x-data-a": "1234567890"}
         assert detect_challenge(200, headers, "") is None
 
     def test_shape_header_long_key_not_detected(self):
         """Headers longer than 20 chars don't match Shape heuristic."""
-        headers = {"x-very-long-header-name-a": "12345"}
+        headers = {"x-very-long-header-name-a": "1234567890"}
         assert detect_challenge(403, headers, "") is None
 
     def test_shape_header_non_numeric_short_value_not_detected(self):
         """Shape header with non-numeric short value doesn't match."""
         headers = {"x-test-a": "hello"}
         assert detect_challenge(403, headers, "") is None
+
+    def test_shape_header_short_numeric_echo_not_detected(self):
+        """Tightened: a short digit value (CDN status/timing echo) is NOT Shape.
+
+        ``x-cache-a: 1`` / ``x-served-a: 200`` are common CDN/cache hints on
+        403s; the old heuristic false-positived on any digit-leading value.
+        """
+        assert detect_challenge(403, {"x-cache-a": "1"}, "") is None
+        assert detect_challenge(403, {"x-served-a": "200"}, "") is None
+        assert detect_challenge(403, {"x-rt-a": "1234567"}, "") is None  # 7 < 8
+
+    def test_shape_header_value_with_spaces_not_detected(self):
+        """Tightened: a free-text value (has a space) is NOT a sensor token."""
+        headers = {"x-msg-a": "12 requests blocked by policy at this edge node"}
+        assert detect_challenge(403, headers, "") is None
+
+    def test_shape_header_plain_word_not_detected(self):
+        """Tightened: a plain word (no digit-lead, no separator) is NOT Shape.
+
+        ``redirected`` is >= 8 chars and all token-chars, but has no
+        encoding shape, so it must not match.
+        """
+        assert detect_challenge(403, {"x-status-a": "redirected"}, "") is None
 
 
 # ---------------------------------------------------------------------------

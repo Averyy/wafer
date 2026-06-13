@@ -10,10 +10,13 @@ from wreq import Method
 
 from wafer._base import (
     BaseSession,
+    _CapExceeded,
+    _content_length_over_cap,
     _decode_headers,
     _extract_location,
     _is_binary_content_type,
     _is_challengeable_content_type,
+    _read_body_capped,
     _to_method,
 )
 from wafer._challenge import (
@@ -31,6 +34,7 @@ from wafer._errors import (
     ConnectionFailed,
     EmptyResponse,
     RateLimited,
+    ResponseTooLarge,
     TooManyRedirects,
     WaferTimeout,
 )
@@ -485,6 +489,10 @@ class SyncSession(BaseSession):
         params = kwargs.pop("params", None)
         req_timeout = kwargs.pop("timeout", None)
         req_attempt_timeout = kwargs.pop("attempt_timeout", None)
+        # Per-request response-size cap overrides the session value.
+        max_response_size = kwargs.pop(
+            "max_response_size", self.max_response_size
+        )
         if params:
             url = self._apply_params(url, params)
 
@@ -819,6 +827,15 @@ class SyncSession(BaseSession):
                 or browser_attempted_type is not None
             )
 
+            # Response-size cap: short-circuit on a declared Content-Length
+            # over the cap before reading the body at all.
+            if max_response_size is not None:
+                declared = _content_length_over_cap(resp, max_response_size)
+                if declared is not None:
+                    raise ResponseTooLarge(
+                        current_url, declared, max_response_size
+                    )
+
             # Read body: wreq's bytes() returns the DECOMPRESSED body
             # (gzip/br/zstd already handled), so raw_content is the true
             # byte stream. Text content is decoded charset-aware (header
@@ -829,7 +846,12 @@ class SyncSession(BaseSession):
                 headers.get("content-type", "")
             )
             try:
-                raw_content = resp.bytes()
+                if max_response_size is not None:
+                    # Streamed early-abort: stop the moment the running total
+                    # passes the cap, never buffering the whole oversize body.
+                    raw_content = _read_body_capped(resp, max_response_size)
+                else:
+                    raw_content = resp.bytes()
                 if is_binary:
                     body = None
                 else:
@@ -837,6 +859,10 @@ class SyncSession(BaseSession):
                         resolve_charset(headers, raw_content),
                         errors="replace",
                     )
+            except _CapExceeded as ce:
+                raise ResponseTooLarge(
+                    current_url, ce.size, max_response_size
+                ) from None
             except Exception as e:
                 # Decompression errors (e.g. malformed gzip from eBay)
                 if not state.can_retry:

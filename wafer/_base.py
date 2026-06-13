@@ -10,6 +10,7 @@ from urllib.parse import urlencode, urljoin, urlparse
 
 from wreq import CertStore, Emulation, Method
 
+from wafer import _psl
 from wafer._cookies import CookieCache
 from wafer._dart import DartIdentity
 from wafer._fingerprint import (
@@ -123,6 +124,72 @@ def _normalize_timeout(val) -> datetime.timedelta:
     if isinstance(val, datetime.timedelta):
         return val
     return datetime.timedelta(seconds=float(val))
+
+
+def _content_length_over_cap(resp, cap: int) -> int | None:
+    """Declared Content-Length if it exceeds ``cap``, else None.
+
+    Lets a caller short-circuit before reading the body when the server
+    declared a length over the cap. Returns the declared length (so the
+    caller can put it on the error), or None when there is no usable
+    Content-Length or it is within the cap. Never raises on a malformed
+    value - an absent/garbage length just falls through to the streamed
+    read, which enforces the cap on actual bytes.
+    """
+    try:
+        declared = resp.content_length
+    except Exception:
+        return None
+    if declared is not None and declared > cap:
+        return declared
+    return None
+
+
+def _read_body_capped(resp, cap: int) -> bytes:
+    """Read a wreq Response body, aborting early once ``cap`` is exceeded.
+
+    Streams chunks via ``resp.stream()`` and stops the moment the running
+    total passes ``cap`` (the body is never fully buffered past the cap -
+    the memory-safety win). Raises ``_CapExceeded`` carrying the bytes seen
+    so far; the caller wraps it in ``ResponseTooLarge`` with the URL.
+
+    Note: ``stream()`` yields ``bytes`` chunks interleaved with HTTP-trailer
+    ``HeaderMap`` objects; only ``bytes`` count toward the size.
+    """
+    buf = bytearray()
+    with resp.stream() as streamer:
+        for chunk in streamer:
+            if not isinstance(chunk, (bytes, bytearray)):
+                continue  # HTTP trailers (HeaderMap), not body bytes
+            buf += chunk
+            if len(buf) > cap:
+                raise _CapExceeded(len(buf))
+    return bytes(buf)
+
+
+async def _aread_body_capped(resp, cap: int) -> bytes:
+    """Async twin of ``_read_body_capped`` - same early-abort semantics."""
+    buf = bytearray()
+    async with resp.stream() as streamer:
+        async for chunk in streamer:
+            if not isinstance(chunk, (bytes, bytearray)):
+                continue  # HTTP trailers (HeaderMap), not body bytes
+            buf += chunk
+            if len(buf) > cap:
+                raise _CapExceeded(len(buf))
+    return bytes(buf)
+
+
+class _CapExceeded(Exception):
+    """Internal: a streamed read passed the size cap. ``size`` = bytes seen.
+
+    Caught in the request loop and re-raised as the public
+    ``ResponseTooLarge`` (which needs the URL the loop has in hand).
+    """
+
+    def __init__(self, size: int):
+        self.size = size
+        super().__init__(size)
 
 
 _BINARY_CONTENT_PREFIXES = (
@@ -240,8 +307,14 @@ class BaseSession:
         profile: Profile | None = None,
         safari_locale: str = "us",
         fingerprint_pool: list | None = None,
+        max_response_size: int | None = None,
     ):
         self._profile = profile
+        # Optional byte cap on response bodies. None (default) = no cap,
+        # behavior byte-identical to before. Enforced via Content-Length
+        # short-circuit + streamed early-abort in the request loop; a
+        # per-request ``max_response_size=`` overrides this session value.
+        self.max_response_size = max_response_size
         self._om_identity = (
             OperaMiniIdentity()
             if profile is Profile.OPERA_MINI
@@ -632,11 +705,11 @@ class BaseSession:
 
         Returns "same-origin", "same-site", or "cross-site" per the spec.
 
-        Limitation: same-site uses a naive TLD+1 heuristic (last two
-        hostname labels) instead of a Public Suffix List lookup. This
-        gives wrong results for multi-label TLDs like .co.uk, .com.au,
-        and .github.io - two unrelated .co.uk domains would incorrectly
-        be classified as same-site. Override per-request if needed:
+        Same-site uses ``_psl`` (a curated PSL-lite subset of multi-label
+        public suffixes), so two unrelated ``.co.uk`` / ``.com.au`` /
+        ``.github.io`` domains are correctly classified cross-site. The
+        subset is intentionally incomplete; an unlisted multi-label TLD
+        degrades to the TLD+1 heuristic. Override per-request if needed:
         ``headers={"Sec-Fetch-Site": "cross-site"}``.
         """
         if not self._embed_origin:
@@ -657,20 +730,12 @@ class BaseSession:
         ):
             return "same-origin"
 
-        # Same site: same scheme + same registrable domain (TLD+1 heuristic)
-        origin_parts = origin_host.rsplit(".", 2)
-        request_parts = request_host.rsplit(".", 2)
-        origin_root = (
-            ".".join(origin_parts[-2:])
-            if len(origin_parts) >= 2
-            else origin_host
-        )
-        request_root = (
-            ".".join(request_parts[-2:])
-            if len(request_parts) >= 2
-            else request_host
-        )
-        if origin.scheme == request.scheme and origin_root == request_root:
+        # Same site: same scheme + same registrable domain (PSL-lite aware,
+        # so two unrelated hosts under a public suffix like .co.uk are
+        # cross-site, not same-site).
+        if origin.scheme == request.scheme and _psl.same_site(
+            origin_host, request_host
+        ):
             return "same-site"
 
         return "cross-site"
@@ -1348,13 +1413,25 @@ class BaseSession:
 
     @staticmethod
     def _cookie_applies_to_host(cookie_domain: str | None, host: str) -> bool:
-        """True if a stored cookie's Domain covers ``host`` (RFC 6265 5.1.3)."""
-        # TODO(phase8): no PSL check - a public-suffix Domain (e.g. co.uk)
-        # over-matches; closed when PSL-lite lands
+        """True if a stored cookie's Domain covers ``host`` (RFC 6265 5.1.3).
+
+        Rejects a public-suffix ``Domain`` (e.g. ``Domain=co.uk``): per
+        RFC 6265 5.3, a cookie whose Domain is a public suffix must be
+        ignored, so it never applies to a sibling like ``victim.co.uk``.
+        Backed by ``_psl`` (a curated subset, not the full Mozilla PSL); an
+        unlisted multi-label suffix degrades to the bare-TLD check.
+        """
         domain = (cookie_domain or "").lstrip(".").lower()
         if not domain or not host:
             return False
         host = host.lower()
+        # A Domain equal to a public suffix (``co.uk``, ``github.io``, or a
+        # bare TLD like ``com``) is not a registrable domain - treating it
+        # as one would let it over-match every sibling. Ignore it. The
+        # reserved name ``localhost`` is exempt (RFC 6265 5.3): a
+        # ``Domain=localhost`` cookie legitimately applies to ``localhost``.
+        if domain != "localhost" and domain == _psl.public_suffix(domain):
+            return False
         return host == domain or host.endswith("." + domain)
 
     def get_cookie(self, name: str, url: str) -> str | None:

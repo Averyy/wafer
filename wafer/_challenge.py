@@ -117,20 +117,75 @@ def _header_fast_path(
             return ChallengeType.AKAMAI
 
     # F5 Shape — sensor response headers on block status.
-    # Shape interstitials on 200 are caught by body markers (istlWasHere).
+    #
+    # INTENTIONAL HEURISTIC. Shape is server-side with no public header
+    # schema (https://my.f5.com/manage/s/article/K000150733), so there is
+    # no exact signature to key on. The site-specific sensor header is
+    # ``x-<prefix>-a`` carrying an encoded/numeric token. The reliable
+    # nordstrom path is the *body* marker (``istlWasHere``) checked later;
+    # this header path is a fallback for a bare 403/429 with no body.
+    #
+    # Tightened (phase 8) to cut false positives: the old check accepted
+    # any digit-leading value, so a trivial ``x-cache-a: 1`` /
+    # ``x-served-a: 200`` (cache hints, ms timings, status echoes) tripped
+    # it. We now require the value to actually *look* like a sensor token:
+    # a minimum length AND a token character-class (no spaces / free text),
+    # OR a long value. Real Shape tokens are long encoded blobs, so this
+    # keeps recall while rejecting short numeric/word noise.
     if status_code in (403, 429):
         for key in headers:
             kl = key.lower()
             # Shape's sensor headers have site-specific prefixes (x-<prefix>-a)
-            # but always include the -a suffix for the primary sensor
+            # but always include the -a suffix for the primary sensor.
             if kl.startswith("x-") and kl.endswith("-a") and len(kl) <= 20:
-                # Heuristic: short x-*-a headers are Shape sensor responses
                 val = headers[key]
-                # Shape response values are typically numeric or encoded
-                if val and (val[0].isdigit() or len(val) > 40):
+                if _looks_like_shape_sensor(val):
                     return ChallengeType.SHAPE
 
     return None
+
+
+# Token characters seen in Shape sensor response values (base64url / hex /
+# numeric, with a few separators). Notably excludes spaces, so free-text
+# values like "no-cache" attributes or "200 OK"-style echoes never match.
+_SHAPE_TOKEN_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.=/+"
+)
+# Encoding separators that an ordinary English word would not contain. A
+# moderate-length value carrying one of these is much more likely an
+# encoded sensor blob than a plain word.
+_SHAPE_SEPARATORS = frozenset("-_.=/+")
+# Minimum length for the short-token path. Short values (status codes, ms
+# timings, cache hit counts, single words) are common on x-*-a headers from
+# CDNs and must not be mistaken for a Shape sensor token.
+_SHAPE_MIN_TOKEN_LEN = 8
+
+
+def _looks_like_shape_sensor(val: str) -> bool:
+    """Heuristic: does ``val`` resemble an F5 Shape sensor response token?
+
+    Conservative tightening of the old "digit-leading OR len>40" rule.
+    The value must be entirely token characters (no spaces / free text),
+    and then either:
+
+    - long (>40 chars) — the typical encoded sensor blob, OR
+    - at least ``_SHAPE_MIN_TOKEN_LEN`` chars AND looks encoded: either
+      digit-leading (a numeric sensor token) or containing an encoding
+      separator (``-_.=/+``), which a plain English word would not.
+
+    This rejects short numeric echoes (``200``), single words (``blocked``,
+    ``redirect``), and free text, while still matching numeric tokens and
+    base64url blobs that may start with a letter.
+    """
+    if not val:
+        return False
+    if not all(c in _SHAPE_TOKEN_CHARS for c in val):
+        return False
+    if len(val) > 40:
+        return True
+    if len(val) < _SHAPE_MIN_TOKEN_LEN:
+        return False
+    return val[0].isdigit() or any(c in _SHAPE_SEPARATORS for c in val)
 
 
 def detect_challenge(

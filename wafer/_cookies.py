@@ -10,6 +10,8 @@ import time
 from pathlib import Path
 from urllib.parse import urlparse
 
+from wafer import _psl
+
 logger = logging.getLogger("wafer")
 
 
@@ -19,19 +21,18 @@ def extract_domain(url: str) -> str | None:
 
 
 def registrable_domain(host: str) -> str:
-    """Registrable domain via the TLD+1 heuristic (last two labels).
+    """Registrable domain of ``host``, PSL-lite-aware.
 
-    ``api2.realtor.ca`` -> ``realtor.ca``; ``realtor.ca`` -> ``realtor.ca``.
-    Good enough to group a site's API host with its www host and to scope
-    WAF cookies. Wrong for multi-label public suffixes (.co.uk, .com.au):
-    those collapse to the suffix itself - callers that navigate based on this
-    (see ``imperva_embedder``) must treat the result as a hint, not a trust
-    boundary.
+    ``api2.realtor.ca`` -> ``realtor.ca``; ``www.example.co.uk`` ->
+    ``example.co.uk``; ``alice.github.io`` -> ``alice.github.io``. Used to
+    group a site's API host with its www host and to scope WAF cookies.
+    Backed by ``_psl`` (a curated subset of multi-label public suffixes,
+    NOT the full Mozilla PSL); an unlisted multi-label TLD degrades to the
+    TLD+1 heuristic. Empty host returns unchanged.
     """
     if not host:
         return host
-    parts = host.rsplit(".", 2)
-    return ".".join(parts[-2:]) if len(parts) >= 2 else host
+    return _psl.registrable_domain(host)
 
 
 def cookie_domain_matches(cookie_domain: str, registrable: str) -> bool:

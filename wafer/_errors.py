@@ -117,6 +117,33 @@ class WaferHTTPError(WaferError):
         )
 
 
+class ResponseTooLarge(WaferError):
+    """The response body exceeded the configured ``max_response_size`` cap.
+
+    Raised when a response is larger than the byte cap set on the session
+    (``max_response_size=``) or per request (``max_response_size=`` kwarg,
+    which overrides the session value). Two cases raise it:
+
+    - **Content-Length short-circuit:** the server declared a
+      ``Content-Length`` over the cap, so the body is never read.
+    - **Streamed early-abort:** the body is read in chunks and aborted as
+      soon as the running total exceeds the cap (no full buffering).
+
+    ``size`` is the number of bytes seen when the cap was hit (the declared
+    ``Content-Length`` in the short-circuit case, or the bytes read so far
+    in the streamed case). ``limit`` is the configured cap.
+    """
+
+    def __init__(self, url: str, size: int, limit: int):
+        self.url = url
+        self.size = size
+        self.limit = limit
+        super().__init__(
+            f"Response from {url} exceeds max_response_size "
+            f"({size} > {limit} bytes)"
+        )
+
+
 class TokenMintFailed(WaferError):
     """A token-minting flow (e.g. reCAPTCHA v3) failed to produce a token.
 
