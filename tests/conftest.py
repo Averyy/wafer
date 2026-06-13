@@ -241,6 +241,7 @@ def make_sync_session(responses, **session_kwargs):
 
     session.headers = dict(DEFAULT_HEADERS)
     session._chrome_headers = dict(DEFAULT_HEADERS)
+    session._user_headers = False
 
     session.connect_timeout = DEFAULT_CONNECT_TIMEOUT
     session.timeout = DEFAULT_TIMEOUT
@@ -255,10 +256,15 @@ def make_sync_session(responses, **session_kwargs):
         "max_failures", 3
     )
     session._fingerprint = FingerprintManager(DEFAULT_EMULATION)
+    _pool = session_kwargs.get("fingerprint_pool", None)
+    session._fingerprint_pool = list(_pool) if _pool else None
+    session._pool_index = 0
+    session._pool_strikes = {}
     session._cookie_cache = session_kwargs.get("cookie_cache", None)
     session._rate_limiter = session_kwargs.get("rate_limiter", None)
     session._domain_failures = {}
     session._last_url = {}
+    session._body_capable_domains = set()
     embed_origin = session_kwargs.get("embed_origin", None)
     embed = session_kwargs.get("embed", None)
     if embed_origin and embed is None:
@@ -317,6 +323,7 @@ def make_async_session(responses, **session_kwargs):
 
     session.headers = dict(DEFAULT_HEADERS)
     session._chrome_headers = dict(DEFAULT_HEADERS)
+    session._user_headers = False
 
     session.connect_timeout = DEFAULT_CONNECT_TIMEOUT
     session.timeout = DEFAULT_TIMEOUT
@@ -331,10 +338,15 @@ def make_async_session(responses, **session_kwargs):
         "max_failures", 3
     )
     session._fingerprint = FingerprintManager(DEFAULT_EMULATION)
+    _pool = session_kwargs.get("fingerprint_pool", None)
+    session._fingerprint_pool = list(_pool) if _pool else None
+    session._pool_index = 0
+    session._pool_strikes = {}
     session._cookie_cache = session_kwargs.get("cookie_cache", None)
     session._rate_limiter = session_kwargs.get("rate_limiter", None)
     session._domain_failures = {}
     session._last_url = {}
+    session._body_capable_domains = set()
     embed_origin = session_kwargs.get("embed_origin", None)
     embed = session_kwargs.get("embed", None)
     if embed_origin and embed is None:

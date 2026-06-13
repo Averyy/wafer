@@ -116,8 +116,10 @@ SyncSession(
     # Non-Chrome families get a matching HTTP header envelope automatically:
     #   Emulation.Edge147    -> Chromium headers, sec-ch-ua brand "Microsoft Edge"
     #   Emulation.Firefox149 -> Firefox Accept/Accept-Language, NO sec-ch-ua
-    # See "Fingerprint Identity". (Choosing a non-Chrome emulation does not change
-    # rotation behavior - rotation still cycles Chrome versions.)
+    # See "Fingerprint Identity". On 403/challenge, rotation escalates ACROSS
+    # families (Chrome -> Firefox -> Safari -> Edge) before cycling versions -
+    # see "Rotation escalation". A non-Chrome starting emulation just changes
+    # the starting family; the same cross-family ladder still applies.
     emulation: wreq.Emulation | None = None,  # default: Emulation.Chrome147 (newest)
 
     # Non-Chrome profiles (overrides emulation)
@@ -140,12 +142,21 @@ SyncSession(
                           # attempt so retries/rotations fire while a server hangs.
                           # Overridable per-request.
 
-    # Retry behavior
+    # Retry behavior. WARNING: the defaults replay the WHOLE request up to
+    # max_retries + max_rotations times (up to 6x by default). For stateful
+    # multi-step flows (login, cart, checkout) that is hazardous - lower these
+    # or use bulk(). See "Reputation-burn guard" below.
     max_retries: int = 3,       # for 5xx, connection errors, empty 200
     max_rotations: int = 2,     # for 403/challenge (see rotation escalation below)
 
     # Session health
-    max_failures: int | None = 3,  # consecutive failures per domain before full identity reset; None to disable
+    max_failures: int | None = 3,  # consecutive failures per domain before full identity reset; None to disable.
+                                    # IGNORED when fingerprint_pool is set (a pool is never retired).
+
+    # Fingerprint pool (opt-in, additive). A fixed list of Emulation identities
+    # to rotate through on failure INSTEAD of the default cross-family ladder.
+    # See "Fingerprint pool" below.
+    fingerprint_pool: list[wreq.Emulation] | None = None,
 
     # Cookie persistence (path is relative to CWD; use absolute path for consistency)
     cache_dir: str | None = None,  # disk path for solver cookie persistence; None = in-memory only
@@ -395,7 +406,7 @@ cookie jar) and continues retrying. It does not raise.
 Default mode (`max_rotations > 0`):
 - 403 + challenge detected -> raises `ChallengeDetected` after exhausting rotations
 - 429 without challenge -> raises `RateLimited` after exhausting rotations
-- 200 with empty body -> raises `EmptyResponse` after exhausting retries
+- 200 with empty body -> retries; if the host already served a real body this session, also rotates to a fresh identity (within `max_rotations`); raises `EmptyResponse` once retries+rotations are exhausted (see "Reputation-burn guard")
 - Connection error -> raises `ConnectionFailed` after exhausting retries
 - 5xx -> returns response after exhausting retries
 - Other 4xx (400, 401, 404, etc.) -> returns response immediately (no retry)
@@ -407,13 +418,76 @@ No-rotation mode (`max_rotations = 0`, including `.bulk()`):
 
 ### Rotation escalation
 
-On 403 or challenge, rotations escalate in order:
+On 403 or challenge, rotation escalates ACROSS BROWSER FAMILIES before cycling
+versions within one family. WAF reputation pools key on browser family, so a
+Chrome->Firefox switch is real diversity, while Chrome145->146->147 all share
+one Chromium reputation pool (the weakest axis). Every family switch ALSO swaps
+the HTTP header envelope to that family's (Accept, Accept-Language, sec-ch-ua)
+so the headers stay coherent with the TLS fingerprint - a Firefox TLS shape with
+Chrome's Accept/sec-ch-ua would defeat the rotation.
 
-1. **Fresh TLS session** (rotation 1) - rebuilds the wreq client (new TLS session, empty cookie jar) with the same Chrome fingerprint. Also clears that domain's disk cookie cache (if `cache_dir` is set) so stale cookies aren't rehydrated. Often sufficient when the 403 is from a stale TLS session or tainted cookies, not a fingerprint block.
-2. **Safari profile switch** (rotation 2) - switches to a completely different TLS fingerprint (Safari instead of Chrome). Much more effective against fingerprint-based blocks.
-3. **Chrome version rotation** (rotation 3+) - switches back from Safari to a different Chrome version, then cycles through Chrome versions on subsequent rotations.
+The deterministic ladder (starting from the default Chrome family):
 
-With the default `max_rotations=2`, wafer tries fresh session then Safari before giving up. Set `max_rotations=3` or higher if you need Chrome version rotation as well.
+1. **Fresh TLS session** (rotation 1) - rebuilds the wreq client (new TLS session, empty cookie jar) with the SAME family. Also clears that domain's disk cookie cache (if `cache_dir` is set). Often sufficient when the 403 is from a stale TLS session or tainted cookies, not a fingerprint block.
+2. **Firefox** (rotation 2) - `Emulation.Firefox149`: Gecko TLS/H2, Firefox Accept, `Accept-Language: en-US,en;q=0.5`, NO sec-ch-ua.
+3. **Safari** (rotation 3) - wafer's wire-verified Safari 26 (custom TlsOptions/Http2Options), a fundamentally different TLS/H2 shape, no client hints.
+4. **Edge** (rotation 4) - `Emulation.Edge147`: Chromium TLS but the `"Microsoft Edge"` sec-ch-ua brand + Edge build.
+5. **Chrome version cycling** (rotation 5+) - returns to the Chrome family and cycles Chrome versions on subsequent rotations.
+
+The rung you reach is bounded by `max_rotations`: the full Chrome->Firefox->Safari->Edge ladder needs `max_rotations>=4` (Safari needs `>=3`, Edge `>=4`, Chrome-version cycling `>=5`). With the **default `max_rotations=2`** you get exactly one cross-family jump (a fresh Chrome session, then Firefox) before wafer raises. The default is deliberately low: a higher rotation budget burns more identities against the same host and worsens its reputation, so raise it only when you actually need deeper escalation. A **pinned** fingerprint (after a browser solve matched the emulation to the solving browser) does NOT rotate - its cookies are bound to that identity. A session started on a non-Chrome `emulation=` walks the same ladder skipping its own starting family; `profile=` identities (Safari/Dart/Opera Mini) keep their existing special-casing and are not forced into the ladder.
+
+### Fingerprint pool
+
+`fingerprint_pool: list[Emulation] | None` is an opt-in, additive way to give a
+session a fixed set of identities to rotate through, with per-identity backoff,
+WITHOUT retiring the whole session on N strikes.
+
+- **Overrides the default ladder.** When set, rotation steps through the pool in
+  order (cycling) instead of the Chrome->Firefox->Safari->Edge ladder. Each step
+  swaps to that identity's family header envelope (same coherence as the ladder).
+- **Per-identity backoff.** A pool member that fails accrues a strike; the next
+  time the cycle reaches it, its rotation delay grows (capped). A hot identity
+  "rests" while the others are tried, rather than being hammered.
+- **Never retired.** `max_failures` is IGNORED in pool mode: rotation-induced
+  403s are expected and must not nuke the session (this is why bell/pcbparts/
+  fetchaller disable retirement today). The pool backoff is the entire health
+  model. `max_rotations` still bounds the number of rotations per request.
+- **Emulation-only.** Pool entries are wreq `Emulation` profiles
+  (`[Emulation.Chrome147, Emulation.Firefox149, Emulation.Edge147]`). A pool is
+  ignored for `profile=` (Safari/Dart/Opera Mini) sessions.
+
+```python
+from wreq import Emulation
+session = SyncSession(
+    fingerprint_pool=[Emulation.Chrome147, Emulation.Firefox149, Emulation.Edge147],
+    max_rotations=6,  # bound how many pool steps a single request may take
+)
+```
+
+### Reputation-burn guard (stateful flows)
+
+**WARNING:** the default `max_retries=3, max_rotations=2` can replay a single
+request up to **6 times** - and the replay re-issues the WHOLE request (same
+URL, method, and body). For a STATEFUL multi-step flow (login -> add-to-cart ->
+checkout, or any request that mutates server state or consumes a one-time
+token), that silent re-execution is hazardous: it can double-submit a form,
+burn a nonce, or replay an expensive multi-step operation. For such flows:
+
+- Lower the budget: `SyncSession(max_retries=0, max_rotations=0)` (or `1`/`1`)
+  so a failed step surfaces immediately instead of being replayed, and you
+  drive the retry yourself at the flow level.
+- Or use `bulk()` / a `fingerprint_pool` so the costly identity churn happens
+  on cheap, idempotent GETs and your stateful POSTs run on a settled identity.
+
+**Empty-200 as a rotation signal.** A `200 OK` with an empty body from a host
+that ALREADY returned real content THIS SESSION (a "200-capable" host) is
+treated as a soft block on the current identity, not a real empty resource.
+After same-identity retries (`max_retries`) are spent, wafer rotates to a fresh
+identity (within `max_rotations`) and retries before giving up - a different
+fingerprint often gets the real body back. `EmptyResponse` is still the terminal
+outcome once rotations are exhausted (or returned, under `max_rotations=0`/
+`bulk()`). A FIRST-request empty 200 (host never proven 200-capable) is NOT
+rotated - it could legitimately be an empty endpoint - and just retries/raises.
 
 ### Imperva / Incapsula (automatic; browserless at light load)
 
@@ -512,7 +586,7 @@ capabilities and trade-offs.
 
 - TLS + HTTP/2 fingerprint matches real Chrome (currently Chrome 147)
 - Auto-generates `sec-ch-ua` Client Hints headers
-- On 403/challenge: switches to Safari profile (different TLS/H2 fingerprint)
+- On 403/challenge: rotates across families (Chrome -> Firefox -> Safari -> Edge -> Chrome versions), swapping the header envelope each switch (see "Rotation escalation")
 - All features enabled: challenge detection, retry, rotation, browser solving
 - Pass `emulation=wreq.Emulation.Chrome147` to pin a specific version
 
@@ -553,7 +627,7 @@ These are all automatic. Do not write code to handle these yourself:
 - **Redirects** - 3xx followed automatically (POST -> GET on 301/302/303). 304 passes through. Auth stripped on cross-origin redirects. Body headers stripped on method change. Followed hops are recorded in `resp.history`.
 - **Referer headers** - set automatically from the last URL visited per domain
 - **Cookies** - managed in-memory and optionally persisted to disk; no manual cookie jar needed
-- **WAF challenges** - detected, browser-solved if configured, retried with Safari fallback (different TLS fingerprint)
+- **WAF challenges** - detected, browser-solved if configured, retried with cross-family fingerprint rotation (Chrome -> Firefox -> Safari -> Edge)
 - **Rate limiting** - per-hostname delays enforced automatically when `rate_limit` is set
 - **TLS fingerprint** - sec-ch-ua headers auto-generated to match the Chrome version
 - **Binary responses** - detected via Content-Type. `resp.content` preserves the decompressed body bytes exactly on every response (safe for PDFs, images, etc.). `resp.text` decodes charset-aware (Content-Type charset, HTML meta tag, UTF-8 fallback) with replacement characters - it never raises.
@@ -742,9 +816,10 @@ logging.getLogger("wafer").setLevel(logging.DEBUG)
    See Session Lifecycle.
 
 8. **Challenge handling is automatic.** You do not need to detect or solve challenges
-   yourself. Wafer tries browser solving (if configured), then falls back from
-   Chrome to Safari (different TLS fingerprint), inside its retry loop. Just
-   catch `ChallengeDetected` if all attempts fail.
+   yourself. Wafer tries browser solving (if configured), then rotates across
+   browser families (Chrome -> Firefox -> Safari -> Edge, swapping the header
+   envelope each switch), inside its retry loop. Just catch `ChallengeDetected`
+   if all attempts fail.
 
 9. **Redirects are followed by default.** You do not need to check for 3xx or
    follow Location headers manually. 304 Not Modified is NOT followed - it passes
@@ -762,8 +837,10 @@ logging.getLogger("wafer").setLevel(logging.DEBUG)
 12. **Empty 200 responses raise, not return.** Unlike requests/curl_cffi which
     return a response with empty `.text`, wafer raises `EmptyResponse` after
     exhausting retries (the raised exception still carries the reply as
-    `e.response`). If you want the response object returned instead, use
-    `.bulk()` or set `max_retries=0`.
+    `e.response`). An empty 200 from a host that already served a real body this
+    session is treated as an identity-hot signal and also rotates to a fresh
+    fingerprint (within `max_rotations`) before raising. If you want the
+    response object returned instead, use `.bulk()` or set `max_retries=0`.
 
 13. **Set `rate_limit` for repeated requests.** Defaults to `0.0` (disabled).
     Without it, requests fire back-to-back. A semaphore limits concurrency,

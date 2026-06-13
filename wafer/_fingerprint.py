@@ -600,6 +600,44 @@ def emulation_for_version(version: int) -> Emulation | None:
     return _EMULATION_BY_VERSION.get(version)
 
 
+# ---------------------------------------------------------------------------
+# Cross-family rotation ladder
+# ---------------------------------------------------------------------------
+#
+# WAF reputation pools key on BROWSER FAMILY, so the strongest rotation axis
+# is to escalate ACROSS families (Chrome -> Firefox -> Safari -> Edge) before
+# cycling versions WITHIN a family (Chrome145 -> 146 -> 147 all share one
+# Chromium reputation pool, so version bumps are the *weakest* axis). The
+# ladder is therefore: a fresh TLS session on the starting family (handled in
+# the retry loop), then each *other* family in turn, then version cycling.
+#
+# "safari" is intentionally a string sentinel, not an Emulation: wafer's
+# Safari fingerprint is a custom TlsOptions/Http2Options identity (Safari 26
+# M3/M4, wire-verified) that wreq's own Emulation.Safari26* profiles do NOT
+# match. The retry loop maps the "safari" rung onto SafariIdentity via
+# _switch_to_safari(); the Emulation families map onto FingerprintManager.
+
+# Newest wreq Emulation member per non-Chrome family used in the ladder.
+# Pinned to concrete members (not auto-discovered) so the ladder is
+# deterministic and so a wreq bump that adds a newer member is a conscious
+# update (mirrors DEFAULT_EMULATION). Refresh alongside DEFAULT_EMULATION.
+FIREFOX_LADDER_EMULATION = Emulation.Firefox149
+EDGE_LADDER_EMULATION = Emulation.Edge147
+
+# The deterministic family escalation order. "chrome" is the implicit start
+# (the default family); the loop walks the *remaining* rungs in this order
+# after the rotation-1 fresh-session retry. Each rung is either an Emulation
+# (mapped via FingerprintManager) or the "safari" sentinel (mapped via
+# SafariIdentity). The trailing None means "fall back to cycling versions
+# within the current family" (FingerprintManager.rotate over Chrome versions).
+ROTATION_LADDER: list[object] = [
+    FIREFOX_LADDER_EMULATION,  # rung 2: Firefox (Gecko TLS, no client hints)
+    "safari",                  # rung 3: Safari (custom TlsOptions identity)
+    EDGE_LADDER_EMULATION,     # rung 4: Edge (Chromium, "Microsoft Edge" brand)
+    None,                      # rung 5+: cycle Chrome versions within family
+]
+
+
 _UA_CHROME_RE = re.compile(r"Chrome/(\d+)")
 _UA_CHROME_FULL_RE = re.compile(r"Chrome/(\d+\.\d+\.\d+\.\d+)")
 

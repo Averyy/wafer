@@ -3,6 +3,7 @@
 from unittest.mock import patch
 
 import pytest
+from wreq import Emulation
 
 from tests.conftest import (
     MockResponse,
@@ -16,6 +17,8 @@ from wafer._errors import (
     RateLimited,
     TooManyRedirects,
 )
+from wafer._fingerprint import emulation_family
+from wafer._profiles import Profile
 from wafer._retry import RetryState, calculate_backoff, parse_retry_after
 
 # ---------------------------------------------------------------------------
@@ -151,20 +154,77 @@ class TestSyncRetryLoop:
             MockResponse(200, body="OK"),
         ])
         session.get("https://example.com")
-        # First rotation: fresh TLS session, same fingerprint (no Safari)
+        # New cross-family ladder, rung 1: fresh TLS session, SAME Chrome
+        # fingerprint (a new family is not introduced until rotation 2).
+        # (Old ladder behaved identically at rung 1.)
         assert session._safari_identity is None
         assert session._fingerprint is not None
+        assert emulation_family(session._fingerprint.current) == "chrome"
 
-    def test_403_second_rotation_safari(self, mock_sleep):
+    def test_403_second_rotation_firefox(self, mock_sleep):
+        # New cross-family ladder, rung 2 = FIREFOX (was Safari in the old
+        # Chrome->Safari ladder). Cross-family is the strong rotation axis:
+        # WAF reputation pools key on browser family, so Chrome->Firefox is
+        # real diversity, whereas the old Chrome-version bumps were not.
         session, mock = make_sync_session([
             MockResponse(403, body="Denied"),
             MockResponse(403, body="Denied"),
             MockResponse(200, body="OK"),
         ])
         session.get("https://example.com")
-        # Second rotation: switch to Safari
+        assert session._safari_identity is None
+        assert session._fingerprint is not None
+        assert emulation_family(session._fingerprint.current) == "firefox"
+        # Header envelope swapped to Firefox's (q=0.5, no sec-ch-ua) for
+        # coherence with the Firefox TLS fingerprint.
+        assert session.headers["Accept-Language"] == "en-US,en;q=0.5"
+
+    def test_403_third_rotation_safari(self, mock_sleep):
+        # Rung 3 of the new ladder is Safari (after Chrome -> Firefox).
+        # max_failures=None so health-retirement doesn't short-circuit the
+        # ladder (it would reset the identity before rung 3 is reached).
+        session, mock = make_sync_session(
+            [
+                MockResponse(403, body="Denied"),
+                MockResponse(403, body="Denied"),
+                MockResponse(403, body="Denied"),
+                MockResponse(200, body="OK"),
+            ],
+            max_failures=None,
+        )
+        session.get("https://example.com")
         assert session._safari_identity is not None
         assert session._fingerprint is None
+
+    def test_403_fourth_rotation_edge(self, mock_sleep):
+        # Rung 4 of the new ladder is Edge (Chrome->Firefox->Safari->Edge).
+        session, mock = make_sync_session(
+            [
+                MockResponse(403, body="Denied"),
+                MockResponse(403, body="Denied"),
+                MockResponse(403, body="Denied"),
+                MockResponse(403, body="Denied"),
+                MockResponse(200, body="OK"),
+            ],
+            max_failures=None,
+        )
+        session.get("https://example.com")
+        assert session._safari_identity is None
+        assert session._fingerprint is not None
+        assert emulation_family(session._fingerprint.current) == "edge"
+
+    def test_403_ladder_falls_back_to_chrome_versions(self, mock_sleep):
+        # Beyond the family ladder, rotation cycles Chrome versions.
+        session, mock = make_sync_session(
+            [MockResponse(403, body="Denied")] * 5
+            + [MockResponse(200, body="OK")],
+            max_rotations=6,
+            max_failures=None,
+        )
+        session.get("https://example.com")
+        # rung 5 = Chrome (back from Edge to the Chrome family).
+        assert session._safari_identity is None
+        assert emulation_family(session._fingerprint.current) == "chrome"
 
     def test_no_pin_without_rotation(self, mock_sleep):
         session, mock = make_sync_session([
@@ -477,6 +537,252 @@ class TestSyncRetryLoop:
 
 
 # ---------------------------------------------------------------------------
+# fingerprint_pool rotation primitive
+# ---------------------------------------------------------------------------
+
+
+@patch("wafer._sync.time.sleep")
+class TestFingerprintPool:
+    """Opt-in pool replaces the default ladder as the rotation source."""
+
+    POOL = [Emulation.Chrome147, Emulation.Firefox149, Emulation.Edge147]
+
+    def test_pool_cycles_through_identities(self, mock_sleep):
+        # Each rotation steps to the next pool member (not the family ladder).
+        session, mock = make_sync_session(
+            [
+                MockResponse(403, body="Denied"),  # -> rotate to pool[1]
+                MockResponse(403, body="Denied"),  # -> rotate to pool[2]
+                MockResponse(200, body="OK"),
+            ],
+            fingerprint_pool=self.POOL,
+            max_rotations=5,
+            max_failures=None,
+        )
+        resp = session.get("https://example.com")
+        assert resp.status_code == 200
+        # Landed on pool[2] = Edge147 after two rotations.
+        assert emulation_family(session._fingerprint.current) == "edge"
+        # Safari ladder rung is never used in pool mode.
+        assert session._safari_identity is None
+
+    def test_pool_swaps_header_envelope_per_family(self, mock_sleep):
+        # Rotating to the Firefox pool member must swap to Firefox headers.
+        session, mock = make_sync_session(
+            [
+                MockResponse(403, body="Denied"),  # -> pool[1] = Firefox149
+                MockResponse(200, body="OK"),
+            ],
+            fingerprint_pool=self.POOL,
+            max_rotations=5,
+            max_failures=None,
+        )
+        session.get("https://example.com")
+        assert emulation_family(session._fingerprint.current) == "firefox"
+        assert session.headers["Accept-Language"] == "en-US,en;q=0.5"
+
+    def test_pool_disables_retirement(self, mock_sleep):
+        # With a pool, max_failures must NOT retire the session: rotation
+        # presses on through every pool member instead of nuking state.
+        session, mock = make_sync_session(
+            [MockResponse(403, body="Denied")] * 4
+            + [MockResponse(200, body="OK")],
+            fingerprint_pool=self.POOL,
+            max_rotations=6,
+            max_failures=3,  # would retire WITHOUT a pool
+        )
+        resp = session.get("https://example.com")
+        assert resp.status_code == 200
+        # 4 failures recorded but no retirement fired.
+        assert session._record_failure("never.example") is False
+
+    def test_pool_per_identity_backoff_grows(self, mock_sleep):
+        # A pool identity that fails twice rests longer the second time.
+        session, _ = make_sync_session(
+            [MockResponse(200, body="OK")],
+            fingerprint_pool=self.POOL,
+            max_failures=None,
+        )
+        # Walk a full cycle + revisit pool[0]: it accrues a strike, so its
+        # _rotation_delay penalty climbs above the flat 1.0s.
+        for r in range(1, len(self.POOL) + 1):
+            session._advance_rotation(r)
+        # Back on pool[0] (Chrome147) which now has 1 strike -> penalty 2.0.
+        assert emulation_family(session._fingerprint.current) == "chrome"
+        assert session._rotation_delay() == 2.0
+
+    def test_429_pool_backoff_reflects_incoming_identity(self, mock_sleep):
+        # FIX 4: on the 429 path the rotation delay must reflect the INCOMING
+        # (about-to-be-tried) identity's strike count, not the outgoing
+        # just-failed one. Pre-seed a strike on pool[1] (the incoming member);
+        # after one 429 the sleep must be pool[1]'s penalty (2.0), proving the
+        # identity advance happens BEFORE _rotation_delay() is computed.
+        session, mock = make_sync_session(
+            [
+                MockResponse(429, body="Rate limited"),  # -> advance to pool[1]
+                MockResponse(200, body="OK"),
+            ],
+            fingerprint_pool=self.POOL,
+            max_rotations=5,
+            max_failures=None,
+        )
+        # pool[1] = Firefox149 already has 1 strike -> incoming penalty 2.0.
+        session._pool_strikes[repr(Emulation.Firefox149)] = 1
+        session.get("https://example.com")
+        # Landed on pool[1].
+        assert emulation_family(session._fingerprint.current) == "firefox"
+        # The 429 sleep used pool[1]'s (incoming) backoff, not pool[0]'s flat 1s.
+        mock_sleep.assert_any_call(2.0)
+
+
+# ---------------------------------------------------------------------------
+# Profile sessions must NOT be dragged onto the cross-family ladder (FIX 1)
+# ---------------------------------------------------------------------------
+
+
+@patch("wafer._sync.time.sleep")
+class TestProfileSessionRotation:
+    """A profile= (Dart/Safari/Opera Mini) session keeps its own identity.
+
+    The cross-family ladder is Emulation-only. Routing a Dart session through
+    it would leave Dart TLS paired with Safari/Firefox headers (or re-roll an
+    explicit Safari version) -- an incoherent fingerprint. _advance_rotation
+    must be a no-op for these sessions (only the TLS session/cookies refresh).
+    """
+
+    def test_dart_session_not_corrupted_by_ladder(self, mock_sleep):
+        session, mock = make_sync_session(
+            [MockResponse(403, body="Denied")] * 4
+            + [MockResponse(200, body="OK")],
+            profile=Profile.DART,
+            max_rotations=4,
+            max_failures=None,
+        )
+        dart_headers = dict(session.headers)
+        assert session._dart_identity is not None
+        assert session._fingerprint is None
+
+        resp = session.get("https://example.com")
+        assert resp.status_code == 200
+        # Identity unchanged across 4 rotations: still Dart, no Safari swap,
+        # no Emulation FingerprintManager spun up, headers still Dart's.
+        assert session._dart_identity is not None
+        assert session._safari_identity is None
+        assert session._fingerprint is None
+        assert session.headers == dart_headers
+
+
+@patch("wafer._sync.time.sleep")
+class TestNonChromeStartLadderOrder:
+    """A non-Chrome-START session keeps the cross-family ladder order (FIX 7).
+
+    A session begun on Firefox must skip the Firefox rung (same family) and
+    advance to the NEXT rung (Safari -> Edge), not drop straight into Chrome
+    version cycling.
+    """
+
+    def test_firefox_start_reaches_safari_before_chrome(self, mock_sleep):
+        from wafer._fingerprint import FingerprintManager
+
+        session, _ = make_sync_session(
+            [MockResponse(200, body="OK")],
+            max_failures=None,
+        )
+        # Start the session on Firefox (as emulation=Emulation.Firefox149 would).
+        session._fingerprint = FingerprintManager(Emulation.Firefox149)
+        # rotation 1: fresh same-family session (no identity change).
+        session._advance_rotation(1)
+        assert emulation_family(session._fingerprint.current) == "firefox"
+        # rotation 2 hits the Firefox rung == current family -> must skip to the
+        # next rung (Safari), NOT fall into Chrome version cycling.
+        session._advance_rotation(2)
+        assert session._safari_identity is not None
+        assert session._fingerprint is None
+        # rotation 3 hits the already-tried Safari rung -> skips to Edge.
+        session._advance_rotation(3)
+        assert session._safari_identity is None
+        assert emulation_family(session._fingerprint.current) == "edge"
+
+
+@patch("wafer._sync.time.sleep")
+class TestEmpty200RotationSignal:
+    """An empty 200 from a 200-capable host triggers a rotation."""
+
+    def test_empty_200_from_capable_host_rotates(self, mock_sleep):
+        # First a real body (marks host 200-capable), then empty 200s that
+        # exhaust normal retries, then a rotation recovers the real body.
+        session, mock = make_sync_session(
+            [
+                MockResponse(200, body="real"),   # capability marker
+                MockResponse(200, body=""),        # empty x (max_retries+1)
+                MockResponse(200, body=""),
+                MockResponse(200, body=""),
+                MockResponse(200, body=""),
+                MockResponse(200, body="recovered"),  # after rotation
+            ],
+            max_retries=3,
+            max_rotations=2,
+            max_failures=None,
+        )
+        session.get("https://example.com")  # arm capability
+        resp = session.get("https://example.com")
+        assert resp.text == "recovered"
+        # The recovery used a rotation (a fresh identity), not just retries.
+        assert resp.rotations >= 1
+
+    def test_empty_200_first_request_not_rotated(self, mock_sleep):
+        # A host that has NEVER served a body is not assumed hot: empty 200
+        # exhausts retries and raises EmptyResponse without burning rotations.
+        session, mock = make_sync_session(
+            [MockResponse(200, body="")] * 6,
+            max_retries=2,
+            max_rotations=2,
+            max_failures=None,
+        )
+        with pytest.raises(EmptyResponse):
+            session.get("https://example.com")
+
+    def test_empty_200_terminal_when_rotations_exhausted(self, mock_sleep):
+        # Even for a 200-capable host, EmptyResponse is still the terminal
+        # outcome once rotations are spent.
+        session, mock = make_sync_session(
+            [MockResponse(200, body="real")]
+            + [MockResponse(200, body="")] * 20,
+            max_retries=2,
+            max_rotations=2,
+            max_failures=None,
+        )
+        session.get("https://example.com")  # arm capability
+        with pytest.raises(EmptyResponse):
+            session.get("https://example.com")
+
+    def test_max_retries_0_returns_empty_200_without_rotating(
+        self, mock_sleep
+    ):
+        # FIX 2: max_retries=0 must RETURN the empty 200 (the documented
+        # .bulk()/no-retry contract), NOT rotate -- even on a 200-capable host
+        # that still has rotation budget. The empty-200 rotation branch used to
+        # run before the max_retries==0 guard and would burn a rotation here.
+        session, mock = make_sync_session(
+            [
+                MockResponse(200, body="real"),  # arm host as 200-capable
+                MockResponse(200, body=""),       # empty -> must be RETURNED
+                MockResponse(200, body="recovered"),  # never requested
+            ],
+            max_retries=0,
+            max_rotations=2,
+            max_failures=None,
+        )
+        session.get("https://example.com")  # arm capability (request 1)
+        resp = session.get("https://example.com")  # request 2
+        assert resp.status_code == 200
+        assert resp.text == ""
+        assert resp.rotations == 0
+        # No rotation fired: only the 2 deliberate requests were made.
+        assert mock.request_count == 2
+
+
+# ---------------------------------------------------------------------------
 # AsyncSession retry loop (basic tests)
 # ---------------------------------------------------------------------------
 
@@ -668,6 +974,89 @@ class TestAsyncRetryLoop:
         r = exc_info.value.response
         assert r is not None
         assert r.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_second_rotation_firefox(self):
+        """Async mirror: rung 2 of the cross-family ladder is Firefox."""
+        session, mock = make_async_session(
+            [
+                MockResponse(403, body="Denied"),
+                MockResponse(403, body="Denied"),
+                MockResponse(200, body="OK"),
+            ],
+            max_failures=None,
+        )
+        with patch("wafer._async.asyncio.sleep", return_value=None):
+            await session.get("https://example.com")
+        assert session._safari_identity is None
+        assert emulation_family(session._fingerprint.current) == "firefox"
+        assert session.headers["Accept-Language"] == "en-US,en;q=0.5"
+
+    @pytest.mark.asyncio
+    async def test_fingerprint_pool_cycles(self):
+        """Async mirror: a pool replaces the ladder as the rotation source."""
+        session, mock = make_async_session(
+            [
+                MockResponse(403, body="Denied"),
+                MockResponse(403, body="Denied"),
+                MockResponse(200, body="OK"),
+            ],
+            fingerprint_pool=[
+                Emulation.Chrome147,
+                Emulation.Firefox149,
+                Emulation.Edge147,
+            ],
+            max_rotations=5,
+            max_failures=None,
+        )
+        with patch("wafer._async.asyncio.sleep", return_value=None):
+            resp = await session.get("https://example.com")
+        assert resp.status_code == 200
+        assert emulation_family(session._fingerprint.current) == "edge"
+        assert session._safari_identity is None
+
+    @pytest.mark.asyncio
+    async def test_empty_200_from_capable_host_rotates(self):
+        """Async mirror: empty 200 from a 200-capable host rotates."""
+        session, mock = make_async_session(
+            [
+                MockResponse(200, body="real"),
+                MockResponse(200, body=""),
+                MockResponse(200, body=""),
+                MockResponse(200, body=""),
+                MockResponse(200, body=""),
+                MockResponse(200, body="recovered"),
+            ],
+            max_retries=3,
+            max_rotations=2,
+            max_failures=None,
+        )
+        with patch("wafer._async.asyncio.sleep", return_value=None):
+            await session.get("https://example.com")
+            resp = await session.get("https://example.com")
+        assert resp.text == "recovered"
+        assert resp.rotations >= 1
+
+    @pytest.mark.asyncio
+    async def test_max_retries_0_returns_empty_200_without_rotating(self):
+        """Async mirror of FIX 2: max_retries=0 returns the empty 200."""
+        session, mock = make_async_session(
+            [
+                MockResponse(200, body="real"),  # arm host as 200-capable
+                MockResponse(200, body=""),       # empty -> must be RETURNED
+                MockResponse(200, body="recovered"),  # never requested
+            ],
+            max_retries=0,
+            max_rotations=2,
+            max_failures=None,
+        )
+        with patch("wafer._async.asyncio.sleep", return_value=None):
+            await session.get("https://example.com")  # arm capability
+            resp = await session.get("https://example.com")
+        assert resp.status_code == 200
+        assert resp.text == ""
+        assert resp.rotations == 0
+        assert mock.request_count == 2
 
 
 # ---------------------------------------------------------------------------

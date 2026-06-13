@@ -97,6 +97,7 @@ class TestSessionHealth:
         session = BaseSession.__new__(BaseSession)
         session.max_failures = 3
         session._domain_failures = {}
+        session._fingerprint_pool = None
 
         assert not session._record_failure("example.com")
         assert session._domain_failures["example.com"] == 1
@@ -107,11 +108,26 @@ class TestSessionHealth:
         session = BaseSession.__new__(BaseSession)
         session.max_failures = 3
         session._domain_failures = {}
+        session._fingerprint_pool = None
 
         session._record_failure("example.com")
         session._record_failure("example.com")
         result = session._record_failure("example.com")
         assert result is True
+
+    def test_record_failure_pool_never_retires(self):
+        # With a fingerprint_pool the session is never retired on N strikes:
+        # the per-identity pool backoff is the entire health model.
+        from wafer._base import BaseSession
+
+        session = BaseSession.__new__(BaseSession)
+        session.max_failures = 3
+        session._domain_failures = {}
+        session._fingerprint_pool = [object(), object()]  # any non-empty list
+
+        results = [session._record_failure("example.com") for _ in range(6)]
+        assert results == [False] * 6
+        assert session._domain_failures["example.com"] == 6
 
     def test_record_failure_per_domain(self):
         from wafer._base import BaseSession
@@ -119,6 +135,7 @@ class TestSessionHealth:
         session = BaseSession.__new__(BaseSession)
         session.max_failures = 3
         session._domain_failures = {}
+        session._fingerprint_pool = None
 
         session._record_failure("a.com")
         session._record_failure("a.com")
@@ -133,6 +150,7 @@ class TestSessionHealth:
         session = BaseSession.__new__(BaseSession)
         session.max_failures = 3
         session._domain_failures = {}
+        session._fingerprint_pool = None
 
         session._record_failure("example.com")
         session._record_failure("example.com")

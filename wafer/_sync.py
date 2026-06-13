@@ -686,8 +686,15 @@ class SyncSession(BaseSession):
                             self._fingerprint is not None
                             and self._fingerprint.pinned
                         )
-                        if self._fingerprint is not None and not pinned:
-                            self._fingerprint.rotate()
+                        # Mirror the 403 path: clear cookies (unless pinned)
+                        # and advance the cross-family ladder / fingerprint_pool
+                        # rather than only cycling Chrome versions. Going
+                        # through _advance_rotation keeps self.headers coherent
+                        # with the TLS identity for non-Chrome sessions.
+                        if self._cookie_cache and not pinned:
+                            self._cookie_cache.clear(domain)
+                        if not pinned:
+                            self._advance_rotation(state.rotation_retries)
                         self._rebuild_client()
                         delay = self._rotation_delay()
                         if deadline is not None:
@@ -914,17 +921,11 @@ class SyncSession(BaseSession):
                     self._retire_session(domain)
 
                 state.use_rotation()
-                rotation_floor = self._rotation_delay()
-                delay = (
-                    max(retry_after, rotation_floor)
-                    if retry_after is not None
-                    else rotation_floor
-                )
-                logger.debug(
-                    "429 rate limited, waiting %.1fs (rotation %d/%d)",
-                    delay, state.rotation_retries, state.max_rotations,
-                )
-                time.sleep(delay)
+                # Advance the identity BEFORE computing the rotation delay so
+                # that _rotation_delay() (pool mode) reads the INCOMING
+                # identity's strike count, not the outgoing just-failed one --
+                # matching the 403 / empty-200 paths. Sleep stays after the
+                # advance.
                 if not retired:
                     # Clear domain cookies on rotation unless the
                     # fingerprint is pinned (browser-solve matched the
@@ -936,23 +937,26 @@ class SyncSession(BaseSession):
                     )
                     if self._cookie_cache and not pinned:
                         self._cookie_cache.clear(domain)
-                    if pinned:
-                        pass  # keep TLS identity that cookies are bound to
-                    elif state.rotation_retries == 1:
-                        pass  # first rotation: just fresh TLS + cleared cookies
-                    elif (
-                        self._fingerprint is not None
-                        and not self._tried_safari
-                    ):
-                        self._switch_to_safari()
-                    elif (
-                        self._safari_identity is not None
-                        and self._profile is not Profile.SAFARI
-                    ):
-                        self._switch_to_chrome()
-                    elif self._fingerprint is not None:
-                        self._fingerprint.rotate()
+                    if not pinned:
+                        # Cross-family ladder (or fingerprint_pool when set).
+                        # rotation 1 = fresh TLS session on the same family;
+                        # 2+ escalate Firefox -> Safari -> Edge -> version
+                        # cycling, swapping the header envelope on each family
+                        # switch. Pinned = keep the TLS identity the cookies
+                        # are bound to (browser-solve matched the emulation).
+                        self._advance_rotation(state.rotation_retries)
                     self._rebuild_client()
+                rotation_floor = self._rotation_delay()
+                delay = (
+                    max(retry_after, rotation_floor)
+                    if retry_after is not None
+                    else rotation_floor
+                )
+                logger.debug(
+                    "429 rate limited, waiting %.1fs (rotation %d/%d)",
+                    delay, state.rotation_retries, state.max_rotations,
+                )
+                time.sleep(delay)
                 continue
 
             # Challenge or bare 403 → try inline solver, then rotate
@@ -1190,22 +1194,14 @@ class SyncSession(BaseSession):
                     )
                     if self._cookie_cache and not pinned:
                         self._cookie_cache.clear(domain)
-                    if pinned:
-                        pass  # keep TLS identity that cookies are bound to
-                    elif state.rotation_retries == 1:
-                        pass  # first rotation: just fresh TLS + cleared cookies
-                    elif (
-                        self._fingerprint is not None
-                        and not self._tried_safari
-                    ):
-                        self._switch_to_safari()
-                    elif (
-                        self._safari_identity is not None
-                        and self._profile is not Profile.SAFARI
-                    ):
-                        self._switch_to_chrome()
-                    elif self._fingerprint is not None:
-                        self._fingerprint.rotate()
+                    if not pinned:
+                        # Cross-family ladder (or fingerprint_pool when set).
+                        # rotation 1 = fresh TLS session on the same family;
+                        # 2+ escalate Firefox -> Safari -> Edge -> version
+                        # cycling, swapping the header envelope on each family
+                        # switch. Pinned = keep the TLS identity the cookies
+                        # are bound to (browser-solve matched the emulation).
+                        self._advance_rotation(state.rotation_retries)
                     self._rebuild_client()
                 delay = self._rotation_delay()
                 logger.debug(
@@ -1227,6 +1223,11 @@ class SyncSession(BaseSession):
                 and not body.strip()
             ):
                 if not state.can_retry:
+                    # max_retries=0 / .bulk(): the documented contract is to
+                    # RETURN the empty-200 response, never to rotate. This must
+                    # be checked BEFORE the 200-capable rotation branch below,
+                    # which would otherwise rotate a max_retries=0 caller that
+                    # still has rotation budget.
                     if self.max_retries == 0:
                         return self._make_response(
                             status_code=status,
@@ -1240,6 +1241,36 @@ class SyncSession(BaseSession):
                             history=history,
                             raw=resp,
                         )
+                    # Empty 200 from a host that ALREADY served real content
+                    # this session is bell's primary "this identity is hot"
+                    # signal. Once same-identity retries are spent, escalate to
+                    # a fresh identity (within max_rotations) before giving up:
+                    # a different fingerprint often gets the real body back.
+                    if (
+                        domain in self._body_capable_domains
+                        and state.can_rotate
+                    ):
+                        state.use_rotation()
+                        pinned = (
+                            self._fingerprint is not None
+                            and self._fingerprint.pinned
+                        )
+                        if self._cookie_cache and not pinned:
+                            self._cookie_cache.clear(domain)
+                        if not pinned:
+                            self._advance_rotation(state.rotation_retries)
+                        self._rebuild_client()
+                        delay = self._rotation_delay()
+                        logger.debug(
+                            "Empty 200 from 200-capable host %s, rotated "
+                            "(rotation %d/%d), retrying in %.1fs",
+                            domain,
+                            state.rotation_retries,
+                            self.max_rotations,
+                            delay,
+                        )
+                        time.sleep(delay)
+                        continue
                     raise EmptyResponse(
                         current_url,
                         status,
@@ -1268,6 +1299,10 @@ class SyncSession(BaseSession):
             # Success — reset failure counter, pin fingerprint, track URL
             self._record_success(domain)
             self._record_url(current_url)
+            # Mark host 200-capable (non-empty 2xx body) so a later empty 200
+            # is treated as an identity-hot signal worth a rotation.
+            if 200 <= status < 300 and body and body.strip():
+                self._body_capable_domains.add(domain)
             if state.rotation_retries > 0 and self._fingerprint is not None:
                 self._fingerprint.pin()
 

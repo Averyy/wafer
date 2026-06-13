@@ -13,6 +13,7 @@ from wreq import CertStore, Emulation, Method
 from wafer._cookies import CookieCache
 from wafer._dart import DartIdentity
 from wafer._fingerprint import (
+    ROTATION_LADDER,
     FingerprintManager,
     build_fingerprint_envelope,
     emulation_family,
@@ -237,6 +238,7 @@ class BaseSession:
         rotate_every: int | None = None,
         profile: Profile | None = None,
         safari_locale: str = "us",
+        fingerprint_pool: list | None = None,
     ):
         self._profile = profile
         self._om_identity = (
@@ -289,6 +291,11 @@ class BaseSession:
         # full-replace contract wins (we keep their set across rotation so the
         # rotated request still reflects what they asked for). Identity
         # profiles (Safari/Dart) carry their own headers, so None for them.
+        # Did the user pass explicit headers=? If so, the full-replace contract
+        # means their set rides every rotated family (vs. swapping to each
+        # family's navigation envelope). Tracked so _switch_to_emulation knows
+        # whether _chrome_headers holds the user's set or just DEFAULT_HEADERS.
+        self._user_headers = headers is not None
         if self._safari_identity is not None or self._dart_identity is not None:
             self._chrome_headers = None
         elif headers is not None:
@@ -329,6 +336,24 @@ class BaseSession:
                 emulation or DEFAULT_EMULATION
             )
 
+        # Opt-in fingerprint pool: a fixed list of Emulation identities to
+        # rotate through on failure with per-identity backoff, INSTEAD of the
+        # default cross-family ladder. When set, a failing identity rests
+        # (its backoff multiplier grows) while the next pool member is tried,
+        # and the session is NOT retired on N strikes (see _record_failure).
+        # Pools are Emulation-only (no Safari/Dart/Opera Mini); those profiles
+        # ignore the pool. Ignored entirely when None (default ladder applies).
+        self._fingerprint_pool = (
+            list(fingerprint_pool)
+            if fingerprint_pool and self._fingerprint is not None
+            else None
+        )
+        self._pool_index = 0
+        # Per-identity strike count (keyed by repr, since Emulation is not
+        # hashable). Drives per-identity backoff: an identity that keeps
+        # failing rests longer before it is tried again (vs. a flat delay).
+        self._pool_strikes: dict[str, int] = {}
+
         # Per-domain rate limiter
         if rate_limit > 0:
             self._rate_limiter: RateLimiter | None = RateLimiter(
@@ -352,6 +377,15 @@ class BaseSession:
 
         # Referer chain tracking: last URL fetched per domain
         self._last_url: dict[str, str] = {}
+
+        # Hosts that have served a NON-EMPTY 200 this session ("200-capable").
+        # An empty 200 from such a host is bell's primary "this identity is
+        # hot" signal: the host clearly CAN return content, so a blank body is
+        # most likely a soft block on the current fingerprint, not a real empty
+        # resource. The retry loop feeds that into rotation (a fresh identity)
+        # before raising EmptyResponse. A first-request empty 200 is NOT
+        # treated this way (could legitimately be an empty endpoint).
+        self._body_capable_domains: set[str] = set()
 
         # Embed mode: "xhr" or "iframe"
         # embed_origin without embed= defaults to "xhr"
@@ -709,12 +743,19 @@ class BaseSession:
         """Record a 403/429 failure for a domain.
 
         Returns True if the session should be retired (threshold hit).
+
+        When a ``fingerprint_pool`` is in use the session is NEVER retired:
+        rotation-induced 403s are expected (each pool identity gets probed
+        and a hot one is meant to rest, not nuke the whole session). The
+        per-identity backoff in ``_advance_rotation`` is the entire health
+        model in pool mode; full identity reset would defeat the pool.
         """
         count = self._domain_failures.get(domain, 0) + 1
         self._domain_failures[domain] = count
         if (
             self.max_failures is not None
             and count >= self.max_failures
+            and self._fingerprint_pool is None
         ):
             logger.warning(
                 "Session health: %d consecutive failures for %s "
@@ -763,14 +804,180 @@ class BaseSession:
             self._fingerprint.current,
         )
 
+    def _switch_to_emulation(self, emulation: Emulation) -> None:
+        """Switch the session to a specific Emulation, swapping the header
+        envelope to that browser family's.
+
+        Coherence is the whole point of cross-family rotation: a Firefox TLS
+        fingerprint with Chrome's Accept / sec-ch-ua is self-defeating, so the
+        navigation header envelope (family_headers: Firefox's Accept and
+        ``Accept-Language: ...;q=0.5``, no sec-ch-ua; Edge's Chromium Accept;
+        etc.) is swapped to match the new family. The family-specific
+        sec-ch-ua client hints follow automatically because
+        ``_compute_client_headers`` calls ``FingerprintManager.sec_ch_ua_headers``
+        on the now-current Emulation. Pins nothing and clears any Safari
+        identity. The caller rebuilds the wreq client afterwards.
+
+        When the user supplied explicit ``headers=`` we keep their full set
+        (documented full-replace contract: ``_chrome_headers`` holds that set),
+        so their headers ride every rotated family.
+        """
+        self._safari_identity = None
+        self._fingerprint = FingerprintManager(emulation)
+        family = emulation_family(emulation)
+        if self._chrome_headers is not None and self._user_headers:
+            # User passed explicit headers= -- honor the full-replace contract.
+            self.headers = dict(self._chrome_headers)
+        else:
+            env = family_headers(family)
+            self.headers = env if env is not None else dict(DEFAULT_HEADERS)
+        logger.info(
+            "Rotation: switched to %s (family=%s)", emulation, family,
+        )
+
+    def _advance_rotation(self, rotation_index: int) -> None:
+        """Advance the session's identity for rotation step ``rotation_index``.
+
+        ``rotation_index`` is ``state.rotation_retries`` AFTER ``use_rotation()``
+        (so the first rotation is 1). Mutates the session's identity in place;
+        the caller rebuilds the wreq client. A no-op for a pinned fingerprint
+        (the caller guards that) and for ``profile=`` identity sessions
+        (Safari/Dart/Opera Mini), which keep their own coherent identity.
+
+        Two modes:
+
+        * **Pool mode** (``fingerprint_pool`` set): step to the next pool
+          member, cycling. A failing identity rests while the others are
+          tried; no Safari/family ladder, no retirement.
+        * **Default cross-family ladder**: rotation 1 is a fresh TLS session on
+          the *same* family (handled by the caller; this is a no-op here).
+          Rotations 2+ walk ``ROTATION_LADDER`` -- Firefox, then Safari, then
+          Edge -- each swapping the matching header envelope. A rung that is
+          the session's CURRENT family (e.g. a Firefox-start session at the
+          Firefox rung), or the Safari rung once Safari was already tried, is
+          skipped to the NEXT rung so the cross-family order is preserved.
+          Beyond the ladder it cycles versions within the current Emulation
+          family.
+        """
+        if self._fingerprint_pool is not None:
+            # The identity we're leaving just failed: charge it a strike so it
+            # rests longer the next time the cycle reaches it (_rotation_delay
+            # reads the incoming identity's strike count).
+            if self._fingerprint is not None:
+                cur_repr = repr(self._fingerprint.current)
+                self._pool_strikes[cur_repr] = (
+                    self._pool_strikes.get(cur_repr, 0) + 1
+                )
+            self._pool_index += 1
+            em = self._fingerprint_pool[
+                self._pool_index % len(self._fingerprint_pool)
+            ]
+            self._switch_to_emulation(em)
+            return
+
+        # The cross-family ladder (Firefox/Safari/Edge rungs + version cycling)
+        # is for Emulation-based (Chrome-family-capable) sessions only. A
+        # profile=Dart/Safari/Opera-Mini session carries its own coherent
+        # TLS+headers identity; swapping in a family envelope (or re-rolling
+        # Safari's version) would produce an incoherent fingerprint (e.g. Dart
+        # TLS + Safari headers). Key off self._profile, NOT _fingerprint: a
+        # default (Chrome-start) session that the ladder has ALREADY rotated
+        # onto Safari also has _fingerprint=None, but it must keep climbing the
+        # ladder (Safari -> Edge -> Chrome cycling), so it must NOT be bounced
+        # out here. For profile= sessions rotation only refreshes the TLS
+        # session / cookies (the caller's _rebuild_client); identity stays put.
+        if self._profile in (
+            Profile.SAFARI, Profile.OPERA_MINI, Profile.DART
+        ):
+            return
+
+        # Default cross-family ladder. rotation_index 1 == fresh-session retry
+        # on the starting family (no identity change here).
+        if rotation_index <= 1:
+            return
+        # The family this session is CURRENTLY serving with. When the ladder has
+        # already put us on Safari, _fingerprint is None -- treat that as the
+        # "safari" family so the same-family skip below is computed correctly.
+        cur_family = (
+            "safari"
+            if self._safari_identity is not None
+            else emulation_family(self._fingerprint.current)
+            if self._fingerprint is not None
+            else None
+        )
+        # Map rotation 2 -> ladder[0], rotation 3 -> ladder[1], etc. When a
+        # rung is not real diversity for THIS session -- the "safari" rung after
+        # Safari was already tried, or an Emulation rung that IS the session's
+        # current family (e.g. a Firefox-START session reaching the Firefox
+        # rung) -- advance to the NEXT ladder rung rather than dropping straight
+        # into Chrome-version cycling. This keeps the cross-family order intact
+        # for non-Chrome starts (Firefox-start: Safari -> Edge before cycling).
+        # The common Chrome start is unaffected: rung 0 (Firefox) already
+        # differs from "chrome", so the first rung is used with no scan.
+        for rung in range(rotation_index - 2, len(ROTATION_LADDER)):
+            target = ROTATION_LADDER[rung]
+            if target == "safari":
+                # Safari is a custom-TLS identity, not an Emulation. Restore
+                # the OLD guard semantics: only swap to Safari from a session
+                # that hasn't already tried it (profile= Safari/Dart sessions
+                # already returned above).
+                if not self._tried_safari:
+                    self._switch_to_safari()
+                    return
+                # Already tried Safari this session: skip to the next rung.
+                continue
+            if target is not None:
+                # Skip a family rung that IS the session's current family
+                # (re-asserting it is not real diversity); try the next rung.
+                if emulation_family(target) != cur_family:
+                    self._switch_to_emulation(target)
+                    return
+                continue
+            # target is None: the trailing "cycle versions" sentinel -- stop
+            # scanning and fall into version cycling below.
+            break
+        # Beyond the ladder (or a fully-skipped scan): fall back to
+        # cycling Chrome versions (FingerprintManager.rotate only knows the
+        # Chrome profile set). If still on Safari, restore Chrome first; if on
+        # a non-Chrome Emulation (Firefox/Edge), rotate() lands on Chrome and
+        # then cycles Chrome versions on later rotations.
+        if self._safari_identity is not None:
+            self._switch_to_chrome()
+        elif self._fingerprint is not None:
+            self._fingerprint.rotate()
+            # rotate() may have crossed back into the Chrome family from a
+            # Firefox/Edge rung; resync the header envelope to match.
+            self.headers = (
+                dict(self._chrome_headers)
+                if self._user_headers and self._chrome_headers is not None
+                else (
+                    family_headers(
+                        emulation_family(self._fingerprint.current)
+                    )
+                    or dict(DEFAULT_HEADERS)
+                )
+            )
+
     def _rotation_delay(self) -> float:
         """Delay before a rotation retry: rate limiter interval + 1s.
 
         Ensures rotation retries never fire faster than the user's
         configured rate limit, with an extra 1s penalty on top.
+
+        In ``fingerprint_pool`` mode the penalty grows with the INCOMING
+        identity's strike count (per-identity backoff): a pool member that has
+        failed before rests proportionally longer before it is retried, capped
+        at +15s so a hot identity never starves the others.
         """
         base = self._rate_limiter.min_interval if self._rate_limiter else 0.0
-        return base + 1.0
+        penalty = 1.0
+        if self._fingerprint_pool is not None and self._fingerprint is not None:
+            strikes = self._pool_strikes.get(
+                repr(self._fingerprint.current), 0
+            )
+            if strikes:
+                penalty = min(1.0 * (2 ** strikes), 15.0)
+        return base + penalty
 
     @staticmethod
     def _apply_params(url: str, params: dict[str, str] | None) -> str:
