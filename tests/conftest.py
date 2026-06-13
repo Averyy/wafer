@@ -282,6 +282,7 @@ def make_sync_session(responses, **session_kwargs):
         "browser_solver", None
     )
     session._owns_solver = session_kwargs.get("owns_solver", False)
+    session._recaptcha_v = {}
     session._native_tls = None
     session._native_tls_domains = set()
     session._proxy = None
@@ -364,6 +365,7 @@ def make_async_session(responses, **session_kwargs):
         "browser_solver", None
     )
     session._owns_solver = session_kwargs.get("owns_solver", False)
+    session._recaptcha_v = {}
     session._native_tls = None
     session._native_tls_domains = set()
     session._proxy = None

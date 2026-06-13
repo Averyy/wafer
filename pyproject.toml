@@ -52,6 +52,9 @@ exclude = [".DS_Store", "**/.DS_Store", "**/.gitkeep"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+markers = [
+    "live: test hits the real network (skipped unless WAFER_LIVE=1)",
+]
 
 [tool.ruff]
 target-version = "py312"

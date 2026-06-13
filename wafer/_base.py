@@ -417,6 +417,13 @@ class BaseSession:
         self._browser_solver = browser_solver
         self._owns_solver = False
 
+        # Cache of scraped reCAPTCHA api.js release versions (the ``v``
+        # token), keyed by mode -- "std" for api.js, "ent" for
+        # enterprise.js. Populated lazily on the first mint_recaptcha_v3
+        # call that doesn't pass an explicit v=, so the api.js fetch
+        # happens at most once per mode per session.
+        self._recaptcha_v: dict[str, str] = {}
+
         # Native-TLS fallback (urllib/OpenSSL) for WAFs that fingerprint
         # the BoringSSL stack wreq is built on (Imperva/Incapsula). Lazily
         # created. Hostnames proven to need it are routed through it on

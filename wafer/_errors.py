@@ -115,3 +115,28 @@ class WaferHTTPError(WaferError):
         super().__init__(
             f"HTTP {status_code} at {url}"
         )
+
+
+class TokenMintFailed(WaferError):
+    """A token-minting flow (e.g. reCAPTCHA v3) failed to produce a token.
+
+    Raised when an expected token cannot be extracted from a minting
+    endpoint's response -- a missing anchor token, a missing reload
+    token, or a non-200 status from Google's reCAPTCHA endpoints. The
+    flow never silently returns None.
+
+    ``stage`` is a short label for where it failed (``"anchor"``,
+    ``"reload"``, or ``"apijs"``). ``status_code`` is the HTTP status of
+    the failing response when one was in hand, else None.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        stage: str | None = None,
+        status_code: int | None = None,
+    ):
+        self.stage = stage
+        self.status_code = status_code
+        super().__init__(message)

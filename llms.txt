@@ -88,6 +88,7 @@ from wafer import (
     ConnectionFailed,  # network/TLS error after all retries
     EmptyResponse,     # 200 with empty body after all retries
     TooManyRedirects,  # redirect loop exceeded max_redirects
+    TokenMintFailed,   # mint_recaptcha_v3() could not extract a token
 )
 
 # Module-level convenience (each creates a one-shot SyncSession with defaults).
@@ -223,6 +224,11 @@ session.get_cookie(name: str, url: str) -> str | None
 # Secure flag are only returned when url is https:// - pass the https URL if
 # you expect a Secure cookie (most WAF cookies are Secure). Returns None when
 # the cookie is absent - never raises, works on all profiles.
+
+# Browser-free reCAPTCHA v3 token minting (sync on SyncSession; coroutine on AsyncSession):
+session.mint_recaptcha_v3(sitekey: str, action: str, *, origin=None, referer=None,
+                          v=None, enterprise=False) -> str
+# See "reCAPTCHA v3 token minting" for full semantics and the score caveat.
 ```
 
 ### Per-request kwargs
@@ -383,6 +389,7 @@ WaferError (base)
   +- ConnectionFailed     .url: str, .reason: str
   +- EmptyResponse        .url: str, .status_code: int, .response: WaferResponse | None
   +- TooManyRedirects     .url: str, .max_redirects: int
+  +- TokenMintFailed      .stage: str | None ("anchor"|"reload"|"apijs"), .status_code: int | None
   +- WaferTimeout         .url: str, .timeout_secs: float  (also inherits TimeoutError)
   +- WaferHTTPError       .status_code: int, .url: str  (raised by raise_for_status())
 ```
@@ -668,9 +675,11 @@ cannot help. Pass a `BrowserSolver` to the session to handle these automatically
 Detection != solving. `"arkose"` has NO dedicated solver: without a
 `browser_solver` it raises `ChallengeDetected`; with one it falls through to a
 generic browser JS-wait that does NOT solve interactive FunCaptcha - so treat
-Arkose as unsolved and handle it yourself. `"recaptcha"` solving is v2 only
-(checkbox/image grid in the browser); wafer does NOT mint reCAPTCHA v3 score
-tokens. `"vercel"`/`"generic_js"` also get the generic browser JS-wait (no
+Arkose as unsolved and handle it yourself. `"recaptcha"` *challenge* solving is
+v2 only (checkbox/image grid in the browser). reCAPTCHA **v3** is different: it's
+a score token, not a visible challenge, and is minted browser-free via
+`session.mint_recaptcha_v3(...)` (see "reCAPTCHA v3 token minting").
+`"vercel"`/`"generic_js"` also get the generic browser JS-wait (no
 dedicated solver, but it passes their passive JS checks). The inline trio
 (`acw`, `tmd`, `amazon`) needs no browser at all.
 
@@ -743,6 +752,67 @@ content directly and returns it as the response. This is transparent -
 `session.get()` returns a normal `WaferResponse`. No special handling needed.
 Applies to Kasada, AWS WAF, and any challenge where the browser lands on the
 real page after solving.
+
+---
+
+## reCAPTCHA v3 token minting
+
+reCAPTCHA **v3** returns a *score* token, not a visible challenge. wafer mints
+one with two cross-origin HTTP requests to Google's reCAPTCHA endpoints - **no
+browser, no `[browser]` extra**. The token is minted under the session's own
+TLS-emulated fingerprint, so it rides a real browser identity.
+
+This is distinct from the browser-based reCAPTCHA **v2** grid/checkbox solver
+(`challenge_type="recaptcha"`, handled by `BrowserSolver`). v3 minting is pure
+HTTP and site-agnostic: it keys only off values readable from the embedding page.
+
+```python
+# Sync (SyncSession) - returns the token string directly:
+token = session.mint_recaptcha_v3(
+    sitekey,                       # the site's reCAPTCHA key (from the page)
+    action,                        # action name, e.g. "login" / "submit"
+    origin="https://www.site.com", # origin the sitekey is bound to
+    referer=None,                  # embedding page URL; defaults to origin
+    v=None,                        # api.js release token; None -> auto-scraped + cached
+    enterprise=False,              # True -> reCAPTCHA Enterprise paths + enterprise.js
+)
+
+# Async (AsyncSession) - same signature, returns a coroutine:
+token = await session.mint_recaptcha_v3(sitekey, action, origin="https://www.site.com")
+```
+
+Signature (identical on both sessions; async returns a coroutine):
+
+```python
+def mint_recaptcha_v3(self, sitekey: str, action: str, *,
+                      origin: str | None = None, referer: str | None = None,
+                      v: str | None = None, enterprise: bool = False) -> str
+```
+
+- **What it returns:** the reCAPTCHA response token (a non-empty string, ~1500-2000
+  chars). You then submit it to the site exactly as a browser would (typically a
+  `g-recaptcha-response` form field or a JSON body to the site's verify endpoint).
+- **`origin` / `referer`:** pass at least one. `origin` is the scheme+host the
+  sitekey is registered for. If only `referer` is given, `origin` is derived from
+  it. The internal `co` param is `base64url(origin + ":443")` (Google's `.`-padded
+  form), computed for you.
+- **`v` is auto-scraped:** when `v=None`, wafer fetches Google's `api.js` (or
+  `enterprise.js`) and scrapes the current release hash, then **caches it on the
+  session** so repeat mints don't refetch. This keeps minting working when Google
+  ships a new api.js. Pass `v=` explicitly only if you already know it.
+- **`enterprise=True`** switches to the `recaptcha/enterprise/anchor` +
+  `recaptcha/enterprise/reload` endpoints and `enterprise.js`.
+- **Errors:** raises `TokenMintFailed` (a `WaferError`) if a token can't be
+  extracted (missing anchor token, missing reload token, or a non-200 from
+  Google). It **never silently returns None**. `.stage` is `"anchor"`,
+  `"reload"`, or `"apijs"`; `.status_code` is the failing HTTP status when known.
+
+**Crucial caveat:** minting always *succeeds in producing a token*, but the
+**score** Google assigns it depends on request reputation - IP, TLS fingerprint,
+and cookies. wafer mints the token; it **cannot guarantee** the site's score
+threshold passes. A clean residential IP with the session's real-browser TLS
+fingerprint scores best; a flagged datacenter IP may mint a token that the site
+still rejects on score.
 
 ---
 

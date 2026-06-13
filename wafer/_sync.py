@@ -1348,6 +1348,73 @@ class SyncSession(BaseSession):
             )
         self._client.cookie_jar.add(raw_set_cookie, url)
 
+    def mint_recaptcha_v3(
+        self,
+        sitekey: str,
+        action: str,
+        *,
+        origin: str | None = None,
+        referer: str | None = None,
+        v: str | None = None,
+        enterprise: bool = False,
+    ) -> str:
+        """Mint a browser-free reCAPTCHA v3 score token.
+
+        Performs the cross-origin anchor + reload flow against Google's
+        reCAPTCHA endpoints using this session's own TLS-emulated client,
+        so the token is minted under a real browser fingerprint. This is
+        reCAPTCHA v3 (score tokens) -- distinct from the browser-based v2
+        grid solver.
+
+        Args:
+            sitekey: the site's reCAPTCHA key (readable from the page).
+            action: the action name (rides in the ``sa`` reload param).
+            origin: site origin the sitekey is bound to, e.g.
+                ``https://www.example.com``. If None, derived from
+                ``referer``.
+            referer: the page embedding the widget; defaults to ``origin``.
+            v: the api.js release token. If None, scraped from Google's
+                api.js (or enterprise.js) and cached on the session.
+            enterprise: use the reCAPTCHA Enterprise anchor/reload paths
+                and enterprise.js instead of the standard v3 paths.
+
+        Returns:
+            The reCAPTCHA response token (a non-empty string).
+
+        Raises:
+            TokenMintFailed: if an anchor/reload/api.js token cannot be
+                extracted, or an endpoint returns a non-200 status. Never
+                silently returns None.
+
+        Note:
+            Minting always produces a token, but the *score* Google
+            assigns depends on request reputation (IP, TLS, cookies).
+            wafer mints the token; it cannot guarantee the site's score
+            threshold passes.
+        """
+        from wafer import _recaptcha_v3
+
+        cache_key = "ent" if enterprise else "std"
+
+        def scrape_v() -> str:
+            cached = self._recaptcha_v.get(cache_key)
+            if cached is not None:
+                return cached
+            scraped = _recaptcha_v3._scrape_v_sync(self.request, enterprise)
+            self._recaptcha_v[cache_key] = scraped
+            return scraped
+
+        return _recaptcha_v3.mint_sync(
+            self.request,
+            sitekey,
+            action,
+            origin=origin,
+            referer=referer,
+            v=v,
+            enterprise=enterprise,
+            scrape_v=scrape_v,
+        )
+
     def __enter__(self):
         return self
 
