@@ -1029,6 +1029,35 @@ logging.getLogger("wafer").setLevel(logging.DEBUG)
     Destroying a session mid-use means the next request looks like a new
     visitor to the WAF. One session per domain, for its entire lifetime.
 
+    Recipe - reuse, don't recreate. In a long-running service (MCP server,
+    scraper, worker) build the session ONCE and reuse it. Sync:
+    ```python
+    _session = None
+    def session():
+        global _session
+        if _session is None:
+            _session = SyncSession(rate_limit=1.5, cache_dir="...")
+        return _session
+    ```
+    Async: guard the lazy init with an `asyncio.Lock` (double-checked) so two
+    concurrent coroutines don't race to create two sessions:
+    ```python
+    _session, _lock = None, asyncio.Lock()
+    async def session():
+        global _session
+        if _session is None:
+            async with _lock:
+                if _session is None:
+                    _session = AsyncSession(rate_limit=1.5, cache_dir="...")
+        return _session
+    ```
+    Generic fetcher hitting MANY hosts: keep a `dict[host, session]` and reuse
+    per host instead of a throwaway session per URL. One session already
+    rate-limits per-hostname and scopes cookies per domain, so a single shared
+    session can serve many hosts safely - reach for the per-host dict only when
+    you want a distinct identity (fingerprint/cookies) per host. wafer has no
+    built-in `SessionPool` type; this recipe is the whole feature.
+
 15. **Don't use embed mode for same-origin requests.** If the page origin and
     API origin match (e.g. `example.com` to `example.com/api`), pass
     Sec-Fetch headers per-request instead. Embed mode is for cross-origin.
