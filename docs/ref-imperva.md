@@ -71,6 +71,16 @@ the rest of the session working.
 > Building a checkbox solver would have automated defeating a self-inflicted
 > block. The fix is to stop producing the non-browser request shape.
 
+**Generalized as `solve_origin=` (any challenge type).** This origin-page solve
+is no longer Imperva-only. The session-level `solve_origin=` parameter exposes
+the same mechanism for **every** WAF: set it to the site's real page and the
+auto-solve navigates there to earn the token, then replays the cookies to the
+API host. When `solve_origin` is set it is used as the navigation target for any
+challenge; the Imperva-specific `imperva_embedder` heuristic above still runs as
+the fallback when `solve_origin` is None. An explicit `solve_origin` therefore
+**overrides** the Imperva auto-derivation. Use it for any JSON/XHR API that can't
+be top-navigated (see the README "Browser Solving" section and `llms.txt`).
+
 ### 2. TLS-stack fingerprinting -> native-TLS bypass (`wafer/_native_tls.py`)
 
 Some Imperva deployments fingerprint the **TLS stack itself** and challenge

@@ -32,7 +32,7 @@ Reference for `Sec-Fetch-*` headers, embed mode header behavior, and WAF detecti
 
 | Request Type | Correct Accept Header |
 |---|---|
-| Top-level navigation | `text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9` |
+| Top-level navigation | `text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7` |
 | XHR/fetch for JSON | `*/*` or `application/json` (never the full navigation Accept) |
 | Image subresource | `image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8` |
 | Script subresource | `*/*` |
@@ -47,9 +47,15 @@ Sec-Fetch-User, Sec-Fetch-Dest, Accept-Encoding, Accept-Language, Cookie
 
 ## Embed Mode Header Details
 
-**XHR mode** sets: `Sec-Fetch-Mode: cors`, `Sec-Fetch-Dest: empty`, `Origin`, `Accept: */*`. Computes `Sec-Fetch-Site` from `embed_origin` vs request URL (`same-origin`, `same-site`, or `cross-site`). Strips navigation headers (`Cache-Control`, `Upgrade-Insecure-Requests`). Referer sends the full URL from `embed_referers`. No `X-Requested-With` -add it per-request for jQuery-style XHR: `headers={"X-Requested-With": "XMLHttpRequest"}`.
+**XHR mode** (`embed="xhr"`) sets: `Sec-Fetch-Mode: cors`, `Sec-Fetch-Dest: empty`, `Origin`, `Accept: */*`. Computes `Sec-Fetch-Site` from `embed_origin` vs request URL (`same-origin`, `same-site`, or `cross-site`). Strips navigation headers (`Cache-Control`, `Upgrade-Insecure-Requests`). Referer sends the full URL from `embed_referers`. No `X-Requested-With` (modern `fetch()` doesn't send it).
 
-**Iframe mode** sets: `Sec-Fetch-Mode: navigate`, `Sec-Fetch-Dest: iframe`. Computes `Sec-Fetch-Site` (same as XHR). No `Origin` (GET navigations don't send it). Keeps navigation `Accept` and `Upgrade-Insecure-Requests`.
+**jQuery XHR mode** (`embed="xhr-jquery"`) is identical to XHR mode plus the two markers a legacy jQuery `$.ajax` / `XMLHttpRequest` call adds: `X-Requested-With: XMLHttpRequest` and `Accept: application/json, text/javascript, */*; q=0.01` (the jQuery Accept, replacing `*/*`). Both are set at the client level (no HTTP/2 header duplication). Use this when an older `/ajax`, `getData`, tile, or autocomplete endpoint requires `X-Requested-With`; use plain `"xhr"` for modern `fetch()` endpoints.
+
+**Iframe mode** (`embed="iframe"`) sets: `Sec-Fetch-Mode: navigate`, `Sec-Fetch-Dest: iframe`. Computes `Sec-Fetch-Site` (same as XHR). No `Origin` (GET navigations don't send it; POST/PUT/PATCH/DELETE navigations do). Keeps navigation `Accept` and `Upgrade-Insecure-Requests`.
+
+### Same-site computation (PSL-lite)
+
+`Sec-Fetch-Site: same-site` is computed by comparing the **registrable domain** of `embed_origin` against the request URL's host, using a curated public-suffix list (`wafer/_psl.py`) rather than a naive "last two labels" (TLD+1) heuristic. So two unrelated siblings under a multi-label public suffix -`a.co.uk` vs `b.co.uk`, `alice.github.io` vs `bob.github.io`, `x.com.au` vs `y.com.au` -are correctly classified **cross-site**, not same-site. The list is a hand-picked subset (country second-levels and popular hosting suffixes), intentionally incomplete: an *unlisted* multi-label suffix degrades gracefully to the old TLD+1 behavior (it never raises). The same PSL-lite backs cookie-domain matching (`get_cookie`/`add_cookie`). Override per-request if needed: `headers={"Sec-Fetch-Site": "cross-site"}`. Expand `wafer/_psl._MULTI_LABEL_SUFFIXES` to close a specific gap.
 
 ## WAF Detection Layers for Embed Requests
 
