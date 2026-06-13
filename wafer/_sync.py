@@ -240,8 +240,12 @@ class SyncSession(BaseSession):
                 browser solve is clamped to the remaining budget so it
                 can't block the caller past their timeout. ``None`` means
                 use the solver's own ``solve_timeout`` default.
-            embedder: Imperva only - a same-site origin page to solve on
-                instead of an API ``url`` (see ``imperva_embedder``).
+            embedder: a same-site origin page to navigate/solve on instead
+                of the API ``url``. Fed by the session-level ``solve_origin``
+                (any challenge type) or the Imperva heuristic embedder
+                (``imperva_embedder``). For a generic embedder no passthrough
+                body is returned - the earned cookies come back so the session
+                retries the real ``url``.
             replay: Imperva embedder only - ``{method, body, content_type}``
                 replayed as a same-site XHR for a passthrough response.
 
@@ -263,6 +267,17 @@ class SyncSession(BaseSession):
                 )
                 return False
 
+        # solve_origin generalizes the Imperva embedder to every challenge:
+        # navigate the browser to the caller-supplied origin page (where the
+        # WAF token is mintable) instead of the API ``url`` (raw JSON would
+        # never run the challenge JS). For Imperva it overrides the auto-derived
+        # embedder; for all other challenge types it is passed as the embedder
+        # so the solver navigates it, runs the challenge there, then the
+        # registrable-domain cookies replay to the API session on retry. The
+        # original ``url`` is still used below for cookie-domain filtering and
+        # caching so the token lands on the API host's registrable domain.
+        if self._solve_origin:
+            embedder = self._solve_origin
         result = self._browser_solver.solve(
             url, challenge.value, timeout=solve_timeout,
             embedder=embedder, replay=replay,

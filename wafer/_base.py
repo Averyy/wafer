@@ -235,6 +235,7 @@ class BaseSession:
         embed: str | None = None,
         proxy: str | None = None,
         browser_solver=None,
+        solve_origin: str | None = None,
         rotate_every: int | None = None,
         profile: Profile | None = None,
         safari_locale: str = "us",
@@ -417,6 +418,20 @@ class BaseSession:
         self._browser_solver = browser_solver
         self._owns_solver = False
 
+        # Per-session origin page for the AUTO-SOLVE browser path. When the
+        # session's request URL is a JSON/XHR API that can't be top-navigated
+        # (a real browser never navigates to a raw-JSON endpoint -- it would
+        # render the JSON and never run the WAF's challenge JS, so the solve
+        # times out), but the WAF token IS mintable on the site's real origin
+        # page, set solve_origin to that page (e.g. "https://www.example.com/").
+        # The browser solver navigates there first to earn the token, then the
+        # token (cookies, registrable-domain-scoped) replays back to the API
+        # session. Applies to ALL challenge types. Generalizes the Imperva
+        # "Error 15" embedder: when solve_origin is set, it is used as the
+        # navigation target for every challenge; the Imperva-specific embedder
+        # heuristic still runs as a fallback when solve_origin is None.
+        self._solve_origin = solve_origin
+
         # Cache of scraped reCAPTCHA api.js release versions (the ``v``
         # token), keyed by mode -- "std" for api.js, "ent" for
         # enterprise.js. Populated lazily on the first mint_recaptcha_v3
@@ -512,6 +527,10 @@ class BaseSession:
         - ``platform_version``: ``Sec-CH-UA-Platform-Version`` (or None)
         - ``user_agent_data``: the ``navigator.userAgentData`` shape Chromium
           exposes (``None`` for Firefox/Safari)
+        - ``is_mobile``: ``True`` for a mobile wreq Emulation identity
+          (iOS/iPad Safari, Android Firefox); ``False`` otherwise. Mobile
+          identities still send no ``sec-ch-ua`` (no mobile Chromium profile
+          exists in wreq), so this is the only mobility signal.
 
         For non-Emulation profiles (Safari/Dart/Opera Mini) only the
         ``user_agent``, ``family``, and ``emulation`` fields are populated;
@@ -543,6 +562,8 @@ class BaseSession:
             "full_version_list": None,
             "platform_version": None,
             "user_agent_data": None,
+            # Profile.SAFARI / DART / OPERA_MINI are all desktop identities.
+            "is_mobile": False,
         }
 
     def _serving_emulation_repr(self) -> str | None:
@@ -585,14 +606,24 @@ class BaseSession:
                 if key.startswith("Sec-Fetch-"):
                     del headers[key]
 
-        if self._embed == "xhr":
+        if self._embed in ("xhr", "xhr-jquery"):
             # XHR/fetch never sends navigation-only headers. Strip from
             # client level since wreq can't remove them per-request.
             headers.pop("Cache-Control", None)
             headers.pop("Upgrade-Insecure-Requests", None)
             # Replace navigation Accept with XHR Accept at client level
             # (setting it per-request would duplicate with the old value).
-            headers["Accept"] = "*/*"
+            # Plain xhr emulates fetch() (Accept: */*); xhr-jquery emulates a
+            # legacy jQuery $.ajax / XMLHttpRequest call, which sends the
+            # jQuery Accept and the X-Requested-With marker (both at client
+            # level to avoid HTTP/2 header duplication).
+            if self._embed == "xhr-jquery":
+                headers["Accept"] = (
+                    "application/json, text/javascript, */*; q=0.01"
+                )
+                headers["X-Requested-With"] = "XMLHttpRequest"
+            else:
+                headers["Accept"] = "*/*"
 
         return headers
 
@@ -676,9 +707,12 @@ class BaseSession:
         parsed = urlparse(url)
         domain = parsed.hostname or ""
 
-        if self._embed == "xhr":
-            # XHR/fetch impersonation. Accept and navigation headers
-            # already fixed at client level by _compute_client_headers.
+        if self._embed in ("xhr", "xhr-jquery"):
+            # XHR/fetch impersonation. Accept, X-Requested-With (jQuery only),
+            # and navigation headers are already fixed at client level by
+            # _compute_client_headers. The Sec-Fetch-* / Origin / Referer
+            # behavior is identical for fetch() and jQuery XHR -- both are CORS
+            # requests issued from the embed_origin page.
             merged["Origin"] = self._embed_origin or ""
             merged["Sec-Fetch-Site"] = self._compute_sec_fetch_site(url)
             merged["Sec-Fetch-Mode"] = "cors"
@@ -686,7 +720,8 @@ class BaseSession:
             if self._embed_referers:
                 merged["Referer"] = random.choice(self._embed_referers)
             logger.debug(
-                "Embed mode (xhr): Origin=%s, Sec-Fetch-Site=%s, Referer=%s",
+                "Embed mode (%s): Origin=%s, Sec-Fetch-Site=%s, Referer=%s",
+                self._embed,
                 self._embed_origin,
                 merged["Sec-Fetch-Site"],
                 merged.get("Referer", "(none)"),

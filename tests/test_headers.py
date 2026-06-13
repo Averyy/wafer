@@ -207,6 +207,103 @@ class TestEmbedMode:
         assert session._client_headers.get("Accept") == "*/*"
 
     @patch("time.sleep")
+    def test_jquery_xhr_sends_x_requested_with(self, mock_sleep):
+        """embed='xhr-jquery' should send X-Requested-With: XMLHttpRequest."""
+        session, mock = make_sync_session(
+            [MockResponse(200, body="ok")],
+            embed="xhr-jquery",
+            embed_origin=self.SEAWAY_ORIGIN,
+        )
+        session.get(self.MT_TILE_URL)
+
+        # X-Requested-With is set at client level (avoids H2 duplication).
+        assert (
+            session._client_headers.get("X-Requested-With")
+            == "XMLHttpRequest"
+        )
+
+    @patch("time.sleep")
+    def test_jquery_xhr_sends_jquery_accept(self, mock_sleep):
+        """embed='xhr-jquery' should send the jQuery $.ajax Accept."""
+        session, mock = make_sync_session(
+            [MockResponse(200, body="ok")],
+            embed="xhr-jquery",
+            embed_origin=self.SEAWAY_ORIGIN,
+        )
+        session.get(self.MT_TILE_URL)
+
+        assert session._client_headers.get("Accept") == (
+            "application/json, text/javascript, */*; q=0.01"
+        )
+
+    @patch("time.sleep")
+    def test_jquery_xhr_keeps_xhr_sec_fetch_and_origin(self, mock_sleep):
+        """jQuery XHR keeps the same CORS Sec-Fetch-* / Origin as plain xhr."""
+        session, mock = make_sync_session(
+            [MockResponse(200, body="ok")],
+            embed="xhr-jquery",
+            embed_origin=self.SEAWAY_ORIGIN,
+        )
+        session.get(self.MT_TILE_URL)
+
+        headers = mock.last_kwargs.get("headers", {})
+        assert headers.get("Origin") == self.SEAWAY_ORIGIN
+        assert headers.get("Sec-Fetch-Site") == "cross-site"
+        assert headers.get("Sec-Fetch-Mode") == "cors"
+        assert headers.get("Sec-Fetch-Dest") == "empty"
+        # No navigation-only headers in jQuery XHR mode.
+        assert "Cache-Control" not in session._client_headers
+        assert "Upgrade-Insecure-Requests" not in session._client_headers
+
+    @patch("time.sleep")
+    def test_plain_xhr_has_no_jquery_headers(self, mock_sleep):
+        """Plain embed='xhr' must NOT send X-Requested-With or jQuery Accept."""
+        session, mock = make_sync_session(
+            [MockResponse(200, body="ok")],
+            embed="xhr",
+            embed_origin=self.SEAWAY_ORIGIN,
+        )
+        session.get(self.MT_TILE_URL)
+
+        assert "X-Requested-With" not in session._client_headers
+        assert session._client_headers.get("Accept") == "*/*"
+
+    @patch("time.sleep")
+    def test_iframe_embed_has_no_jquery_headers(self, mock_sleep):
+        """Iframe embed mode is unchanged: no X-Requested-With, nav Accept."""
+        session, mock = make_sync_session(
+            [MockResponse(200, body="ok")],
+            embed="iframe",
+            embed_origin=self.SEAWAY_ORIGIN,
+        )
+        session.get(self.MT_TILE_URL)
+
+        assert "X-Requested-With" not in session._client_headers
+        # Iframe is a navigation: keeps the navigation Accept (not */* or
+        # the jQuery Accept).
+        assert "application/json, text/javascript" not in (
+            session._client_headers.get("Accept", "")
+        )
+
+    @pytest.mark.asyncio
+    async def test_async_jquery_xhr(self):
+        """Async jQuery XHR embed should set the same headers as sync."""
+        session, mock = make_async_session(
+            [MockResponse(200, body="ok")],
+            embed="xhr-jquery",
+            embed_origin=self.SEAWAY_ORIGIN,
+        )
+        await session.get(self.MT_TILE_URL)
+
+        assert (
+            session._client_headers.get("X-Requested-With")
+            == "XMLHttpRequest"
+        )
+        assert session._client_headers.get("Accept") == (
+            "application/json, text/javascript, */*; q=0.01"
+        )
+
+    @patch("time.sleep")
     def test_embed_sets_sec_fetch_headers(self, mock_sleep):
         """Embed mode should set cross-site Sec-Fetch headers."""
         session, mock = make_sync_session(

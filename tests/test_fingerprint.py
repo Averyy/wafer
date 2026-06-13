@@ -10,6 +10,7 @@ from wafer._fingerprint import (
     build_fingerprint_envelope,
     chrome_version,
     emulation_family,
+    emulation_is_mobile,
     emulation_major_version,
     emulation_user_agent,
     family_headers,
@@ -345,9 +346,26 @@ class TestFamilyHeaders:
             "chrome"
         )["Accept"]
 
+    def test_safari_short_accept_no_zstd_no_nav_headers(self):
+        # wreq's Safari Emulation profiles (desktop + mobile iOS/iPad) get
+        # the short WebKit Accept, q=0.9 Accept-Language, no zstd, and no
+        # navigation-only headers. Wire-verified 2026-06-12.
+        env = family_headers("safari")
+        assert env["Accept"] == (
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+        )
+        assert env["Accept-Language"] == "en-US,en;q=0.9"
+        assert env["Accept-Encoding"] == "gzip, deflate, br"  # no zstd
+        assert "Cache-Control" not in env
+        assert "Upgrade-Insecure-Requests" not in env
+        assert not any(k.lower().startswith("sec-ch-ua") for k in env)
+        # No Chromium-only signed-exchange / image-format tokens.
+        assert "application/signed-exchange" not in env["Accept"]
+        assert "image/avif" not in env["Accept"]
+
     def test_unknown_family_returns_none(self):
-        # Safari has its own identity headers, not a family envelope here.
-        assert family_headers("safari") is None
+        # Opera has its own wreq-native hints; None has no envelope.
+        assert family_headers("opera") is None
         assert family_headers(None) is None
 
 
@@ -608,6 +626,90 @@ class TestSessionFamilyHeaders:
         s._switch_to_chrome()
         assert s.headers == DEFAULT_HEADERS
         assert s.headers["Accept-Language"] == "en-US,en;q=0.9"
+
+
+class TestMobileProfiles:
+    """S5: wreq mobile Emulation profiles (iOS/iPad Safari, Android Firefox)."""
+
+    def test_no_mobile_chromium_profile_in_wreq(self):
+        # wreq exposes NO mobile Chromium profile, so wafer never invents one
+        # or emits sec-ch-ua-mobile: ?1. If wreq ever adds a "ChromeAndroid"
+        # member this guard fails -- wire a mobile CH envelope at that point.
+        import re
+
+        chromium_mobile = [
+            n
+            for n in dir(Emulation)
+            if "Chrome" in n
+            and re.search(r"Android|Mobile|Ios", n, re.I)
+        ]
+        assert chromium_mobile == []
+
+    def test_safari_ios_is_mobile(self):
+        assert emulation_is_mobile(Emulation.SafariIos26_2) is True
+
+    def test_safari_ipad_is_mobile(self):
+        assert emulation_is_mobile(Emulation.SafariIPad26) is True
+        assert emulation_is_mobile(Emulation.SafariIpad26_2) is True
+
+    def test_firefox_android_is_mobile(self):
+        assert emulation_is_mobile(Emulation.FirefoxAndroid135) is True
+
+    def test_desktop_profiles_not_mobile(self):
+        assert emulation_is_mobile(Emulation.Chrome147) is False
+        assert emulation_is_mobile(Emulation.Firefox149) is False
+        assert emulation_is_mobile(Emulation.Edge147) is False
+        assert emulation_is_mobile(Emulation.Safari26_2) is False
+
+    def test_mobile_safari_envelope_no_client_hints(self):
+        # Mobile Safari: is_mobile True, no sec-ch-ua (Safari sends none,
+        # mobile or not), and no mobile Chromium hint.
+        env = build_fingerprint_envelope(Emulation.SafariIos26_2, "ios-ua")
+        assert env["is_mobile"] is True
+        assert env["family"] == "safari"
+        assert env["sec_ch_ua"] is None
+        assert env["sec_ch_ua_mobile"] is None
+        assert env["user_agent_data"] is None
+
+    def test_mobile_firefox_envelope(self):
+        env = build_fingerprint_envelope(
+            Emulation.FirefoxAndroid135, "android-ua"
+        )
+        assert env["is_mobile"] is True
+        assert env["family"] == "firefox"
+        assert env["sec_ch_ua"] is None
+
+    def test_desktop_envelope_is_mobile_false(self):
+        env = build_fingerprint_envelope(Emulation.Chrome147, "ua")
+        assert env["is_mobile"] is False
+        # Chrome still sends its client hints with mobile: ?0.
+        assert env["sec_ch_ua_mobile"] == "?0"
+
+    def test_mobile_safari_session_coherent_envelope(self):
+        # A SafariIos session serves the Safari header envelope (short Accept,
+        # no zstd, no sec-ch-ua), NOT Chrome's DEFAULT_HEADERS, over the
+        # mobile Safari TLS shape. The wrong (Chrome) Accept was the bug.
+        from wafer import SyncSession
+
+        s = SyncSession(emulation=Emulation.SafariIos26_2)
+        headers = s._build_client_kwargs()["headers"]
+        assert headers["Accept"] == (
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+        )
+        assert headers["Accept-Encoding"] == "gzip, deflate, br"  # no zstd
+        assert "Cache-Control" not in headers
+        assert "Upgrade-Insecure-Requests" not in headers
+        assert not any(k.lower().startswith("sec-ch-ua") for k in headers)
+        # image/avif is the Chrome tell -- it must NOT leak onto Safari.
+        assert "image/avif" not in headers["Accept"]
+        env = s.fingerprint_envelope()
+        assert env["is_mobile"] is True
+        assert env["family"] == "safari"
+
+    def test_mobile_profile_exported(self):
+        import wafer
+
+        assert wafer.emulation_is_mobile is emulation_is_mobile
 
 
 class TestIdentityProfileEnvelopeFamily:

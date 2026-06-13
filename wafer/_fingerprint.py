@@ -504,6 +504,28 @@ def emulation_major_version(emulation: Emulation) -> int | None:
     return int(m.group(2))
 
 
+# Mobile Emulation profiles carry a phone/tablet TLS shape + a mobile UA from
+# wreq (iPhone/iPad Safari, Android Firefox). They are detected from the
+# variant token in the profile repr (``Ios``/``IPad``/``Ipad``/``Android``/
+# ``Mobile``). wreq exposes NO mobile *Chromium* profile (verified
+# 2026-06-12 via ``dir(Emulation)``: only ``SafariIos*``, ``SafariIPad*``,
+# ``SafariIpad*`` and ``FirefoxAndroid*``), so every mobile identity is in the
+# safari/firefox families -- which send no sec-ch-ua at all. wafer therefore
+# never emits ``sec-ch-ua-mobile: ?1`` (that hint only exists for Chromium,
+# and there is no mobile Chromium profile to attach it to).
+_MOBILE_RE = re.compile(r"^Profile\.\w*?(Ios|IPad|Ipad|Android|Mobile)", re.I)
+
+
+def emulation_is_mobile(emulation: Emulation) -> bool:
+    """True if the Emulation profile is a mobile (phone/tablet) identity.
+
+    Matches wreq's mobile variants -- iOS / iPad Safari (``SafariIos*``,
+    ``SafariIPad*``, ``SafariIpad*``) and Android Firefox
+    (``FirefoxAndroid*``). Desktop profiles return ``False``.
+    """
+    return bool(_MOBILE_RE.match(repr(emulation)))
+
+
 # Per-family navigation Accept / Accept-Language / Accept-Encoding envelope.
 # Wire-verified 2026-06-12 against tls.peet.ws + tools.scrapfly.io (the
 # values wreq itself sends for each Emulation, cross-checked with MDN's
@@ -517,6 +539,17 @@ _CHROME_ACCEPT = (
     "application/signed-exchange;v=b3;q=0.7"
 )
 _FIREFOX_ACCEPT = (
+    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+)
+# Safari's navigation Accept is the SHORT WebKit form (no image/avif, no
+# signed-exchange -- those are Chromium-only). Wire-verified 2026-06-12
+# against tls.peet.ws: the identical envelope ships for desktop Safari
+# (Emulation.Safari26_2) and mobile iOS/iPad Safari (SafariIos26_2,
+# SafariIpad26_2) -- only the TLS shape + UA differ, which wreq sets itself.
+# Safari uses `q=0.9` Accept-Language (like Chrome, unlike Firefox's q=0.5),
+# `gzip, deflate, br` (NO zstd), and sends NO Cache-Control /
+# Upgrade-Insecure-Requests and NO sec-ch-ua client hints.
+_SAFARI_ACCEPT = (
     "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
 )
 
@@ -544,6 +577,19 @@ _FAMILY_HEADERS: dict[str, dict[str, str]] = {
         "Accept-Language": "en-US,en;q=0.5",
         "Accept-Encoding": "gzip, deflate, br, zstd",
         "Upgrade-Insecure-Requests": "1",
+    },
+    # wreq's native Safari Emulation profiles (desktop Safari26*, mobile
+    # SafariIos*/SafariIPad*). These carry a coherent Safari TLS shape + Safari
+    # UA from wreq; without this envelope a Safari-Emulation session would
+    # serve Chrome's DEFAULT_HEADERS (image/avif Accept, zstd, Cache-Control,
+    # Upgrade-Insecure-Requests) over a Safari fingerprint -- incoherent.
+    # NOTE: this is for wreq's Safari Emulation members, distinct from
+    # Profile.SAFARI (wafer's custom-TlsOptions Safari identity, which supplies
+    # its own headers via SafariIdentity.client_headers()).
+    "safari": {
+        "Accept": _SAFARI_ACCEPT,
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
     },
 }
 
@@ -787,10 +833,16 @@ def build_fingerprint_envelope(
     - ``user_agent_data``: the ``navigator.userAgentData`` shape Chromium
       exposes to JS (``brands`` / ``mobile`` / ``platform``), ``None`` except
       for Chrome/Edge
+    - ``is_mobile``: ``bool`` -- ``True`` for a mobile (phone/tablet) wreq
+      Emulation identity (iOS/iPad Safari, Android Firefox). These send NO
+      ``sec-ch-ua`` (Safari/Firefox have no client hints), so ``is_mobile``
+      is the only mobility signal; wreq exposes no mobile Chromium profile,
+      so ``sec_ch_ua_mobile`` is never ``"?1"``
     """
     family = emulation_family(emulation)
     brand = _FAMILY_BRAND.get(family) if family else None
     ver = emulation_major_version(emulation)
+    is_mobile = emulation_is_mobile(emulation)
 
     envelope: dict = {
         "user_agent": user_agent,
@@ -802,10 +854,13 @@ def build_fingerprint_envelope(
         "full_version_list": None,
         "platform_version": None,
         "user_agent_data": None,
+        "is_mobile": is_mobile,
     }
 
     # Firefox / Safari (brand None) and unknown profiles: no client hints,
-    # no navigator.userAgentData. Leave the CH fields as None.
+    # no navigator.userAgentData. Leave the CH fields as None. Mobile Safari /
+    # Firefox land here too -- is_mobile is set, but no sec-ch-ua (those
+    # families send none, mobile or not).
     if brand is None or ver is None:
         return envelope
 

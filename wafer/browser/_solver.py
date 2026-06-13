@@ -1165,11 +1165,19 @@ class BrowserSolver:
         Returns SolveResult with cookies and user_agent, or None on
         failure.
 
-        ``embedder`` (Imperva only): a same-site origin page to navigate
-        instead of ``url`` itself. Imperva serves a top-level navigation to
-        an API host its interactive "Error 15" block; loading the real
-        origin page earns the registrable-domain reese84 / incap cookies,
-        which then replay to the API host. See ``imperva_embedder``.
+        ``embedder``: a same-site origin page to navigate instead of ``url``
+        itself. Two sources feed it:
+
+        - Imperva's auto-derived embedder (``imperva_embedder``): Imperva
+          serves a top-level navigation to an API host its interactive
+          "Error 15" block; loading the real origin page earns the
+          registrable-domain reese84 / incap cookies, which then replay to
+          the API host. This drives the specialized Imperva replay branch.
+        - A session-level ``solve_origin`` (any challenge type): the request
+          ``url`` is a JSON/XHR API that can't be top-navigated, but the WAF
+          token is mintable on the site's origin page. For non-Imperva
+          challenges the solver navigates ``embedder`` and runs the normal
+          per-WAF dispatch there; the earned cookies replay to the API host.
 
         ``replay`` (Imperva embedder only): ``{method, body, content_type}``
         of the original request. After earning cookies on the embedder, the
@@ -1329,6 +1337,12 @@ class BrowserSolver:
                     )
                     setup_kasada_listener(page)
 
+                # Navigate the origin page when one was supplied
+                # (solve_origin / a non-Imperva embedder): the request URL is
+                # a JSON/XHR API that can't be top-navigated, so we run the
+                # challenge on the real page and let the earned cookies replay
+                # to the API host. Falls back to ``url`` for the normal case.
+                nav_target = embedder or url
                 nav_response = None
                 try:
                     nav_ms = max(
@@ -1336,7 +1350,7 @@ class BrowserSolver:
                         int((overall_deadline - time.monotonic()) * 1000),
                     )
                     nav_response = page.goto(
-                        url,
+                        nav_target,
                         wait_until="domcontentloaded",
                         timeout=nav_ms,
                     )
@@ -1371,8 +1385,14 @@ class BrowserSolver:
                 # content without solving a challenge (WAF only
                 # challenges non-browser TLS clients)
                 captured = None
+                # Only treat the navigated page as the response when we
+                # navigated the actual request url. With solve_origin (an
+                # embedder), nav_target is a different origin page, so its
+                # body is NOT the API response: skip passthrough, return the
+                # earned cookies, and let the session retry the real url.
                 if (
                     not solved
+                    and nav_target == url
                     and nav_response is not None
                     and 200 <= nav_response.status < 300
                 ):
@@ -1416,7 +1436,7 @@ class BrowserSolver:
                 # (nav 403) but the browser resolved it in the
                 # background (WASM PoW, auto-cookie).  The page may
                 # have redirected to real content by now.
-                if not solved and captured is None:
+                if not solved and captured is None and nav_target == url:
                     try:
                         html = page.content()
                     except Exception:
@@ -1460,7 +1480,7 @@ class BrowserSolver:
                 # when cookie replay is unreliable (TLS-bound).
                 # The browser needs time to redirect after cookie
                 # update, so retry up to 5s for real content.
-                if solved and captured is None:
+                if solved and captured is None and nav_target == url:
                     # Cap the passthrough wait at the overall deadline so
                     # a near-deadline solve can't overshoot the caller's
                     # request timeout.

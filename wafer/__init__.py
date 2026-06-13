@@ -24,6 +24,7 @@ from wafer._errors import (
 from wafer._fingerprint import (
     build_fingerprint_envelope,
     emulation_family,
+    emulation_is_mobile,
     full_version,
     sec_ch_ua,
 )
@@ -50,6 +51,7 @@ __all__ = [
     "sec_ch_ua",
     "full_version",
     "emulation_family",
+    "emulation_is_mobile",
     "build_fingerprint_envelope",
     "get",
     "post",

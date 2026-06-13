@@ -178,12 +178,14 @@ SyncSession(
     proxy: str | None = None,   # "socks5://user:pass@host:port", "http://...", etc.
 
     # Embed mode (both modes select a random Referer from embed_referers)
-    embed: str | None = None,           # "xhr" or "iframe"
+    embed: str | None = None,           # "xhr", "xhr-jquery", or "iframe"
     embed_origin: str | None = None,    # Origin header value
     embed_referers: list[str] | None = None,  # random Referer picked per request
 
     # Browser solver (requires [browser] extra)
     browser_solver=None,  # BrowserSolver instance or None
+    solve_origin: str | None = None,  # origin page the auto-solve navigates to
+                                      # mint the WAF token (for JSON/XHR APIs)
 )
 ```
 
@@ -321,6 +323,32 @@ derived from the chosen `emulation`:
   hints at all, a Firefox `Accept`
   (`text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8`) and
   `Accept-Language: en-US,en;q=0.5`. UA is wreq's Firefox UA.
+- **Safari** (`emulation=Emulation.Safari26_2`): wreq's native Safari Emulation.
+  Sends **NO** sec-ch-ua, the short WebKit `Accept`
+  (`text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8`),
+  `Accept-Language: en-US,en;q=0.9`, `Accept-Encoding: gzip, deflate, br` (no
+  zstd), and no `Cache-Control`/`Upgrade-Insecure-Requests`. (This is wreq's
+  Safari Emulation; it is distinct from `profile=Profile.SAFARI`, wafer's custom
+  wire-verified Safari identity - see Profiles.)
+
+### Mobile profiles
+
+wreq exposes **mobile** Emulation identities. Select them via `emulation=`; the
+mobile TLS shape and mobile UA come from wreq automatically, and wafer applies
+the same family header envelope (no sec-ch-ua, family-correct `Accept`):
+
+- **iOS Safari**: `Emulation.SafariIos26_2`, `SafariIos18_1_1`, ... - iPhone
+  Safari UA + iOS TLS. Safari family -> no client hints.
+- **iPadOS Safari**: `Emulation.SafariIPad26`, `SafariIpad26_2`, ... - iPad
+  Safari UA. Safari family.
+- **Android Firefox**: `Emulation.FirefoxAndroid135` - `Android ...; Mobile`
+  Firefox UA. Firefox family.
+
+`fingerprint_envelope()["is_mobile"]` is `True` for these (and `False` for
+desktop profiles); it's the **only** mobility signal because these families send
+no client hints. wreq has **no mobile Chromium profile**, so wafer never sends
+`sec-ch-ua-mobile: ?1` (that hint is Chromium-only, and there is no mobile
+Chromium identity to attach it to).
 
 Pass any wreq profile as `emulation=` and the matching envelope is applied
 automatically - you do NOT set headers yourself. (Passing your own `headers=`
@@ -346,6 +374,7 @@ reaching into `wafer._fingerprint`. Always returns these keys:
   "full_version_list": str | None, # Sec-CH-UA-Full-Version-List value or None
   "platform_version": str | None,  # Sec-CH-UA-Platform-Version value or None
   "user_agent_data": dict | None,  # navigator.userAgentData shape; None for Firefox/Safari/Opera
+  "is_mobile": bool,               # True for a mobile Emulation (iOS/iPad Safari, Android Firefox)
 }
 ```
 
@@ -371,6 +400,9 @@ wafer.full_version(major: int) -> str
 
 wafer.emulation_family(emulation) -> str | None
 # Classify a wreq.Emulation: "chrome" | "edge" | "firefox" | "opera" | "safari" | None.
+
+wafer.emulation_is_mobile(emulation) -> bool
+# True for a mobile Emulation (iOS/iPad Safari, Android Firefox); False for desktop.
 
 wafer.build_fingerprint_envelope(emulation, user_agent: str | None = None) -> dict
 # Same dict shape as session.fingerprint_envelope(), for an arbitrary Emulation
@@ -753,6 +785,37 @@ content directly and returns it as the response. This is transparent -
 Applies to Kasada, AWS WAF, and any challenge where the browser lands on the
 real page after solving.
 
+### solve_origin (auto-solve on an origin page, not the API URL)
+
+When your session's request URL is a **JSON/XHR API** (e.g.
+`https://api.example.com/v1/data`, an MTop/GraphQL/REST endpoint), the automatic
+browser solver can't top-navigate to it: a real browser never navigates to a
+raw-JSON URL, so the page just renders the JSON, the WAF's challenge JS never
+runs, and the solve times out. But the WAF token is usually mintable on the
+site's real **origin page** (where the app's own JS runs). Pass `solve_origin`
+to point the auto-solve at that page:
+
+```python
+session = SyncSession(
+    browser_solver=solver,
+    solve_origin="https://www.example.com/",  # real page; mints the WAF token
+)
+resp = session.get("https://api.example.com/v1/data")  # JSON API
+# On a challenge, the browser navigates solve_origin, runs the challenge there,
+# earns the (registrable-domain-scoped) cookies, and they replay to the API host
+# on the retried TLS request. The original API URL is still used for cookie
+# scoping/caching.
+```
+
+- Applies to **all** challenge types (Cloudflare, DataDome, Imperva, etc.), not
+  just Imperva. It generalizes the Imperva "Error 15" origin-page solve.
+- For Imperva specifically, an explicit `solve_origin` **overrides** wafer's
+  auto-derived origin heuristic (you know your site's real page; use it).
+- Where to earn the token is WAF mechanics (wafer's job); the per-site **value**
+  of `solve_origin` (which page mints it) is yours to supply.
+- Without `solve_origin`, the auto-solve navigates the request URL itself
+  (correct for normal HTML pages, wrong for JSON APIs).
+
 ---
 
 ## reCAPTCHA v3 token minting
@@ -836,9 +899,23 @@ resp = await session.post("https://api.other.com/data", json=body)
 request from `embed_referers`.
 
 ### XHR mode (`embed="xhr"`)
+- Emulates a modern `fetch()` call.
 - `Sec-Fetch-Mode: cors`, `Sec-Fetch-Dest: empty`, `Accept: */*`
 - Sets `Origin` from embed_origin
 - Strips navigation headers (`Upgrade-Insecure-Requests`, `Cache-Control`)
+
+### jQuery XHR mode (`embed="xhr-jquery"`)
+- Emulates a legacy jQuery `$.ajax` / `XMLHttpRequest` call. Use this (instead
+  of `"xhr"`) when the endpoint is a classic jQuery/XHR backend that expects the
+  `X-Requested-With` marker - many older `/ajax`, `getData`, tile, and
+  autocomplete endpoints reject requests without it.
+- Everything `"xhr"` sends (same CORS `Sec-Fetch-*`, `Origin`, Referer, stripped
+  navigation headers), PLUS exactly two added headers:
+  - `X-Requested-With: XMLHttpRequest`
+  - `Accept: application/json, text/javascript, */*; q=0.01` (the jQuery Accept,
+    instead of `"xhr"`'s `*/*`)
+- Both are set at the client level (no HTTP/2 header duplication).
+- Use plain `"xhr"` for modern `fetch()` endpoints (no `X-Requested-With`).
 
 ### Iframe mode (`embed="iframe"`)
 - `Sec-Fetch-Mode: navigate`, `Sec-Fetch-Dest: iframe`

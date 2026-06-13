@@ -39,9 +39,20 @@ class MockBrowserSolver:
     def __init__(self, result=None):
         self._result = result
         self.solve_calls = []
+        # Full per-call kwargs (url, challenge_type, embedder, replay) so
+        # tests can assert solve_origin / embedder threading.
+        self.solve_kwargs = []
 
     def solve(self, url, challenge_type=None, timeout=None, embedder=None, replay=None):
         self.solve_calls.append((url, challenge_type))
+        self.solve_kwargs.append(
+            {
+                "url": url,
+                "challenge_type": challenge_type,
+                "embedder": embedder,
+                "replay": replay,
+            }
+        )
         return self._result
 
     def close(self):
@@ -758,6 +769,127 @@ class TestBrowserPassthrough:
 
         resp = session.get("https://example.com/page")
         assert resp.elapsed > 0
+
+
+class TestSolveOrigin:
+    """E8: session-level solve_origin threads to BrowserSolver.solve()."""
+
+    def _solved_result(self):
+        return SolveResult(
+            cookies=[
+                {
+                    "name": "cf_clearance",
+                    "value": "solved",
+                    "domain": ".example.com",
+                    "path": "/",
+                    "expires": -1,
+                    "secure": True,
+                    "httpOnly": True,
+                    "sameSite": "None",
+                }
+            ],
+            user_agent="Mozilla/5.0 Chrome/145.0.0.0 Safari/537.36",
+        )
+
+    @patch("time.sleep")
+    def test_solve_origin_passed_as_embedder(self, mock_sleep):
+        """solve_origin becomes the solver's navigation target (embedder),
+        while the API url stays the request url for cookie scoping."""
+        cf_resp = MockResponse(
+            403, {"cf-mitigated": "challenge"},
+            "<html>Just a moment...</html>",
+        )
+        ok_resp = MockResponse(200, body="<html>Real page</html>")
+        mock_solver = MockBrowserSolver(result=self._solved_result())
+
+        # JSON API url; the WAF token is mintable on the origin page.
+        api_url = "https://api.example.com/v1/data"
+        origin = "https://www.example.com/"
+        session, mock_client = make_sync_session(
+            [cf_resp, ok_resp],
+            max_rotations=0,
+            browser_solver=mock_solver,
+            solve_origin=origin,
+            use_cookie_jar=True,
+        )
+
+        resp = session.get(api_url)
+        assert resp.status_code == 200
+        # The solver was navigated to solve_origin, not the JSON API url.
+        assert mock_solver.solve_kwargs[0]["embedder"] == origin
+        # The request url is still the API url (cookie scoping uses it).
+        assert mock_solver.solve_kwargs[0]["url"] == api_url
+
+    @patch("time.sleep")
+    def test_no_solve_origin_navigates_request_url(self, mock_sleep):
+        """Without solve_origin, a non-Imperva challenge has embedder=None
+        (the solver navigates the request url itself)."""
+        cf_resp = MockResponse(
+            403, {"cf-mitigated": "challenge"},
+            "<html>Just a moment...</html>",
+        )
+        ok_resp = MockResponse(200, body="<html>Real page</html>")
+        mock_solver = MockBrowserSolver(result=self._solved_result())
+
+        session, mock_client = make_sync_session(
+            [cf_resp, ok_resp],
+            max_rotations=0,
+            browser_solver=mock_solver,
+            use_cookie_jar=True,
+        )
+
+        session.get("https://example.com/page")
+        assert mock_solver.solve_kwargs[0]["embedder"] is None
+        assert mock_solver.solve_kwargs[0]["url"] == (
+            "https://example.com/page"
+        )
+
+    @patch("time.sleep")
+    def test_solve_origin_overrides_imperva_embedder(self, mock_sleep):
+        """For Imperva, an explicit solve_origin overrides the auto-derived
+        embedder heuristic (the caller knows the real origin)."""
+        from wafer._challenge import ChallengeType
+
+        mock_solver = MockBrowserSolver(result=self._solved_result())
+        session, _ = make_sync_session(
+            [MockResponse(200, body="ok")],
+            browser_solver=mock_solver,
+            solve_origin="https://chosen-origin.example/",
+        )
+        # Drive _try_browser_solve directly with an Imperva-derived embedder.
+        session._try_browser_solve(
+            ChallengeType.IMPERVA,
+            "https://api2.example.com/listing",
+            embedder="https://www.example.com/",  # heuristic embedder
+            replay={"method": "GET", "body": None, "content_type": None},
+        )
+        # solve_origin wins over the heuristic embedder.
+        assert mock_solver.solve_kwargs[0]["embedder"] == (
+            "https://chosen-origin.example/"
+        )
+
+    @pytest.mark.asyncio
+    async def test_async_solve_origin_passed_as_embedder(self):
+        """Async parity: solve_origin threads through to the solver."""
+        cf_resp = MockResponse(
+            403, {"cf-mitigated": "challenge"},
+            "<html>Just a moment...</html>",
+        )
+        ok_resp = MockResponse(200, body="<html>Real page</html>")
+        mock_solver = MockBrowserSolver(result=self._solved_result())
+
+        origin = "https://www.example.com/"
+        session, _ = make_async_session(
+            [cf_resp, ok_resp],
+            max_rotations=0,
+            browser_solver=mock_solver,
+            solve_origin=origin,
+            use_cookie_jar=True,
+        )
+        with patch("asyncio.sleep"):
+            resp = await session.get("https://api.example.com/v1/data")
+        assert resp.status_code == 200
+        assert mock_solver.solve_kwargs[0]["embedder"] == origin
 
 
 class TestAsyncBrowserSolveIntegration:
