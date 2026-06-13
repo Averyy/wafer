@@ -214,6 +214,7 @@ class BaseSession:
         headers: dict[str, str] | None = None,
         connect_timeout: datetime.timedelta | float | int | None = None,
         timeout: datetime.timedelta | float | int | None = None,
+        attempt_timeout: datetime.timedelta | float | int | None = None,
         max_retries: int = 3,
         max_rotations: int = 2,
         cache_dir: str | None = None,
@@ -273,6 +274,15 @@ class BaseSession:
             _normalize_timeout(timeout)
             if timeout is not None
             else DEFAULT_TIMEOUT
+        )
+        # Per-attempt cap: bounds each individual wreq attempt so the
+        # retry/rotation machinery can fire within the total budget.
+        # None (default) = no per-attempt cap (an attempt may use the
+        # whole remaining budget, matching requests/httpx-naive usage).
+        self.attempt_timeout = (
+            _normalize_timeout(attempt_timeout)
+            if attempt_timeout is not None
+            else None
         )
         self.max_retries = max_retries
         self.max_rotations = max_rotations
@@ -334,8 +344,14 @@ class BaseSession:
 
             self._proxy = Proxy.all(proxy)
 
-        # Optional browser solver for JS challenges.
+        # Optional browser solver for JS challenges. The session closes
+        # a solver only if it created the solver itself (_owns_solver);
+        # a solver passed in via browser_solver= is shared and its
+        # lifecycle belongs to the caller. wafer never auto-creates a
+        # solver today, so _owns_solver is always False for now -- the
+        # flag keeps the ownership invariant explicit and future-proof.
         self._browser_solver = browser_solver
+        self._owns_solver = False
 
         # Native-TLS fallback (urllib/OpenSSL) for WAFs that fingerprint
         # the BoringSSL stack wreq is built on (Imperva/Incapsula). Lazily

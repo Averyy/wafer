@@ -5,6 +5,7 @@ import logging
 import time
 
 import wreq.blocking
+import wreq.exceptions
 from wreq import Method
 
 from wafer._base import (
@@ -466,6 +467,7 @@ class SyncSession(BaseSession):
         extra_headers = kwargs.pop("headers", None)
         params = kwargs.pop("params", None)
         req_timeout = kwargs.pop("timeout", None)
+        req_attempt_timeout = kwargs.pop("attempt_timeout", None)
         if params:
             url = self._apply_params(url, params)
 
@@ -480,6 +482,20 @@ class SyncSession(BaseSession):
         else:
             timeout_secs = self.timeout.total_seconds()
             deadline = None  # no per-request deadline
+
+        # Per-attempt timeout: bounds each individual wreq attempt so
+        # retries/rotations can fire within the total budget. The
+        # per-request value overrides the session default.
+        if req_attempt_timeout is None:
+            req_attempt_timeout = self.attempt_timeout
+        if req_attempt_timeout is not None:
+            attempt_secs = (
+                req_attempt_timeout.total_seconds()
+                if hasattr(req_attempt_timeout, "total_seconds")
+                else float(req_attempt_timeout)
+            )
+        else:
+            attempt_secs = None  # no per-attempt cap (legacy behavior)
 
         # Opera Mini: bypass wreq entirely, use stdlib urllib (OpenSSL).
         # No challenge detection, no fingerprint rotation, no retries.
@@ -623,22 +639,83 @@ class SyncSession(BaseSession):
 
             # Clamp per-attempt timeout to remaining deadline so a
             # single slow response can't overshoot the user's budget.
+            # attempt_timeout additionally caps each individual try
+            # (clamped to the remaining total budget when both are set).
+            attempt_limit = None
             if deadline is not None:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise WaferTimeout(url, timeout_secs)
+                attempt_limit = min(timeout_secs, remaining)
+            if attempt_secs is not None:
+                attempt_limit = (
+                    attempt_secs
+                    if attempt_limit is None
+                    else min(attempt_secs, attempt_limit)
+                )
+            if attempt_limit is not None:
                 kwargs["timeout"] = datetime.timedelta(
-                    seconds=min(timeout_secs, remaining)
+                    seconds=attempt_limit
                 )
 
             # Make the request
             try:
                 resp = self._client.request(m, current_url, **kwargs)
             except Exception as e:
+                # An attempt bounded by attempt_timeout that hits the
+                # wreq-layer timeout is retryable by design: the
+                # per-attempt cap exists precisely so retries/rotations
+                # can fire instead of one hung attempt eating the whole
+                # budget. The loop-top deadline check still bounds the
+                # total time.
+                attempt_timed_out = (
+                    attempt_secs is not None
+                    and isinstance(e, wreq.exceptions.TimeoutError)
+                )
                 if not state.can_retry:
+                    # Normal retries exhausted. A timed-out attempt may
+                    # still consume rotation budget: a hanging connection
+                    # is often fingerprint-linked (WAF tarpit), so a
+                    # fresh TLS identity can escape it.
+                    if attempt_timed_out and state.can_rotate:
+                        state.use_rotation()
+                        pinned = (
+                            self._fingerprint is not None
+                            and self._fingerprint.pinned
+                        )
+                        if self._fingerprint is not None and not pinned:
+                            self._fingerprint.rotate()
+                        self._rebuild_client()
+                        delay = self._rotation_delay()
+                        if deadline is not None:
+                            delay = min(
+                                delay,
+                                max(0.0, deadline - time.monotonic()),
+                            )
+                        logger.debug(
+                            "Attempt timed out after %.1fs, rotated "
+                            "(rotation %d/%d), retrying in %.1fs",
+                            attempt_secs,
+                            state.rotation_retries,
+                            state.max_rotations,
+                            delay,
+                        )
+                        time.sleep(delay)
+                        continue
+                    if attempt_timed_out:
+                        raise WaferTimeout(
+                            current_url,
+                            timeout_secs
+                            if deadline is not None
+                            else attempt_secs,
+                        ) from e
                     raise ConnectionFailed(current_url, str(e)) from e
                 state.use_retry()
                 delay = calculate_backoff(state.normal_retries - 1)
+                if deadline is not None:
+                    delay = min(
+                        delay, max(0.0, deadline - time.monotonic())
+                    )
                 logger.debug(
                     "Connection error, retry %d/%d in %.1fs: %s",
                     state.normal_retries, state.max_retries, delay, e,
@@ -1237,7 +1314,10 @@ class SyncSession(BaseSession):
         return self
 
     def __exit__(self, *args):
-        if self._browser_solver is not None:
+        # Close the browser solver only if this session created it.
+        # A solver passed in via browser_solver= is shared: closing it
+        # here would tear it down for every other session holding it.
+        if self._browser_solver is not None and self._owns_solver:
             try:
                 self._browser_solver.close()
             except Exception:

@@ -8,6 +8,7 @@ from wafer._base import (
     DEFAULT_EMULATION,
     DEFAULT_HEADERS,
     DEFAULT_TIMEOUT,
+    _normalize_timeout,
 )
 from wafer._fingerprint import FingerprintManager
 from wafer._profiles import Profile
@@ -243,6 +244,10 @@ def make_sync_session(responses, **session_kwargs):
 
     session.connect_timeout = DEFAULT_CONNECT_TIMEOUT
     session.timeout = DEFAULT_TIMEOUT
+    _attempt = session_kwargs.get("attempt_timeout", None)
+    session.attempt_timeout = (
+        _normalize_timeout(_attempt) if _attempt is not None else None
+    )
     session.max_retries = session_kwargs.get("max_retries", 3)
     session.max_rotations = session_kwargs.get("max_rotations", 10)
 
@@ -270,6 +275,7 @@ def make_sync_session(responses, **session_kwargs):
     session._browser_solver = session_kwargs.get(
         "browser_solver", None
     )
+    session._owns_solver = session_kwargs.get("owns_solver", False)
     session._native_tls = None
     session._native_tls_domains = set()
     session._proxy = None
@@ -314,6 +320,10 @@ def make_async_session(responses, **session_kwargs):
 
     session.connect_timeout = DEFAULT_CONNECT_TIMEOUT
     session.timeout = DEFAULT_TIMEOUT
+    _attempt = session_kwargs.get("attempt_timeout", None)
+    session.attempt_timeout = (
+        _normalize_timeout(_attempt) if _attempt is not None else None
+    )
     session.max_retries = session_kwargs.get("max_retries", 3)
     session.max_rotations = session_kwargs.get("max_rotations", 10)
 
@@ -341,6 +351,7 @@ def make_async_session(responses, **session_kwargs):
     session._browser_solver = session_kwargs.get(
         "browser_solver", None
     )
+    session._owns_solver = session_kwargs.get("owns_solver", False)
     session._native_tls = None
     session._native_tls_domains = set()
     session._proxy = None

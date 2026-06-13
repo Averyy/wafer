@@ -86,7 +86,7 @@ from wafer import (
 
 # Module-level convenience (each creates a one-shot SyncSession with defaults).
 # These are SYNC ONLY - there are no async module-level functions.
-# **kwargs are per-request kwargs only (headers, params, timeout, json, form, body).
+# **kwargs are per-request kwargs only (headers, params, timeout, attempt_timeout, json, form, body).
 # Session-constructor kwargs (rate_limit, proxy, etc.) are NOT accepted here.
 wafer.get(url, **kwargs) -> WaferResponse
 wafer.post(url, **kwargs) -> WaferResponse
@@ -119,7 +119,15 @@ SyncSession(
 
     # Timeouts (int, float seconds, or datetime.timedelta)
     connect_timeout=10,   # default: 10s
-    timeout=30,           # default: 30s (also serves as retry loop deadline when passed per-request)
+    timeout=30,           # default: 30s. SESSION-level timeout is the default
+                          # per-attempt bound (the wreq client timeout); it does
+                          # NOT cap total time across retries/rotations. A
+                          # PER-REQUEST timeout= IS the total budget for the whole
+                          # call (see Per-request kwargs). For a hard total ceiling,
+                          # pass timeout= per request.
+    attempt_timeout=None, # default: None (no per-attempt cap). Caps each individual
+                          # attempt so retries/rotations fire while a server hangs.
+                          # Overridable per-request.
 
     # Retry behavior
     max_retries: int = 3,       # for 5xx, connection errors, empty 200
@@ -199,7 +207,15 @@ session.get_cookie(name: str, url: str) -> str | None
 
 - `headers: dict[str, str]` - merged over session headers AND embed mode headers (per-request wins over both)
 - `params: dict[str, str]` - appended to URL as query string
-- `timeout: int | float | timedelta` - per-request deadline; each attempt is clamped to the remaining budget. Also bounds any browser solve triggered by the request (including time spent waiting on a shared solver), so a challenge can't block the caller past this deadline. Without it, a browser solve falls back to the solver's own `solve_timeout`.
+- `timeout: int | float | timedelta` - TOTAL deadline for the whole call, covering ALL retries, rotations, and any browser solve (including time spent waiting on a shared solver). **This differs from requests/httpx, where `timeout=` bounds each attempt.** Without `attempt_timeout`, one hanging attempt may consume the entire budget, so `max_retries`/`max_rotations` never fire. Each attempt is clamped to the remaining budget. Without a `timeout`, a browser solve falls back to the solver's own `solve_timeout`.
+- `attempt_timeout: int | float | timedelta` - caps each INDIVIDUAL attempt (overrides the session-level `attempt_timeout` for this call). An attempt that hits this cap is a retryable failure: the loop retries, then consumes rotation budget (fresh TLS identity - hangs are often fingerprint-linked WAF tarpits), until budgets or the total `timeout` deadline are exhausted, then raises `WaferTimeout`. With `attempt_timeout` alone (no `timeout`), the total is unbounded and attempts are limited only by `max_retries`/`max_rotations`. Canonical combo:
+
+```python
+session = SyncSession(max_rotations=3)
+resp = session.get(url, timeout=60, attempt_timeout=15)
+# 60s total budget, each try capped at 15s -> up to 4 bounded tries
+# (rotating between them) instead of one 60s hang with zero retries
+```
 - `json: dict` - JSON body (auto-sets Content-Type)
 - `form: dict` - form-encoded body
 - `body: bytes | str` - raw body
@@ -370,25 +386,26 @@ the same path may lose updates under concurrent writes to the same domain.
 
 ## Session Lifecycle
 
-Sessions have no `close()` or `aclose()` method. Use context managers:
+Sessions have no `close()` or `aclose()` method. Context managers are
+supported but optional:
 
 ```python
 with SyncSession(browser_solver=solver) as session:
-    ...  # solver.close() called on exit
+    ...  # solver is NOT closed on exit - you own it
 
 async with AsyncSession(browser_solver=solver) as session:
-    ...  # solver.close() called on exit
+    ...  # same
 ```
 
-**Without a browser solver, sessions have no resources to clean up.** Letting
-them go out of scope is fine. The context manager only matters when a
-`browser_solver` is attached.
+**Sessions hold no resources that need explicit cleanup.** Letting them go
+out of scope is fine.
 
-**Shared BrowserSolver warning:** `__exit__` / `__aexit__` calls
-`browser_solver.close()`. If you share one BrowserSolver across multiple
-sessions, exiting ANY session closes the solver for ALL of them. Either
-use one session per solver, or call `solver.close()` yourself at the end
-instead of relying on context managers.
+**Solver ownership:** a `BrowserSolver` you pass in via `browser_solver=` is
+owned by YOU - the session never closes it on exit (a session would only close
+a solver it created internally, which wafer currently never does). Sharing one
+solver across multiple sessions and re-entering `with` blocks on the same
+session are both safe. Call `solver.close()` yourself when all sessions are
+done with it, or let the solver's `idle_timeout` shut the browser down.
 
 ---
 
@@ -526,7 +543,9 @@ result: InterceptResult | None = solver.intercept_iframe(
 # result.responses: list[CapturedResponse]
 # result.user_agent: str
 
-# Explicit cleanup (also called by session context manager __exit__):
+# Explicit cleanup. The solver is yours: session __exit__ does NOT close
+# a solver you passed in, so close it when all sessions are done with it
+# (or let idle_timeout shut the browser down):
 solver.close()
 ```
 
@@ -614,8 +633,10 @@ logging.getLogger("wafer").setLevel(logging.DEBUG)
    to inject a cookie and `session.get_cookie(name, url)` to read one. The
    cookie jar itself is managed internally and not exposed.
 
-7. **No `close()` method on sessions.** Use context managers, or let sessions go
-   out of scope (no cleanup needed without a browser solver). See Session Lifecycle.
+7. **No `close()` method on sessions.** Let sessions go out of scope - they hold
+   no resources needing cleanup. A `browser_solver=` you pass in is owned by you
+   (session exit does not close it); call `solver.close()` yourself when done.
+   See Session Lifecycle.
 
 8. **Challenge handling is automatic.** You do not need to detect or solve challenges
    yourself. Wafer tries browser solving (if configured), then falls back from
@@ -659,3 +680,14 @@ logging.getLogger("wafer").setLevel(logging.DEBUG)
     `headers={"Authorization": "Bearer ..."}` and the server 302s to a
     different host, the token is dropped (Fetch spec). Make two explicit
     requests if you need to send auth to both origins.
+
+17. **A per-request `timeout=` is the TOTAL retry-loop budget, not per-attempt.**
+    Unlike requests/httpx, where `timeout=` bounds each attempt, a per-request
+    `timeout=` caps the WHOLE call - all retries, rotations, and browser solves.
+    One hanging attempt can eat the entire budget so `max_retries`/`max_rotations`
+    never fire. Pass `attempt_timeout=` to bound each individual try:
+    `session.get(url, timeout=60, attempt_timeout=15)` on a
+    `SyncSession(max_rotations=3)` gives up to 4 bounded tries (rotating
+    between them) inside a 60s total budget. (A SESSION-level `timeout=` is only
+    the default per-attempt bound and does NOT cap total time - pass a
+    per-request `timeout=` for a hard total ceiling.)
