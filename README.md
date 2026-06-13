@@ -193,27 +193,31 @@ Safari is particularly effective against DataDome, which heavily fingerprints th
 
 ## Challenge Detection
 
-Wafer detects 17 WAF challenge types from response status, headers, and body:
+Wafer detects 17 WAF challenge types from response status, headers, and body.
+**Detection is not the same as solving** - the "Solved by" column shows how each
+type is actually handled: `inline` (over HTTP, no browser), `browser` (needs a
+configured `browser_solver`), or `detect-only` (raises `ChallengeDetected`; no
+solver - you must handle it yourself).
 
-| WAF | Detection |
-|-----|-----------|
-| Cloudflare | `cf-mitigated` header, managed challenge HTML |
-| Akamai | `_abck` cookie patterns, sensor script references |
-| DataDome | `datadome` cookie, challenge page markers |
-| PerimeterX / HUMAN | `_px` cookies, captcha div, press-and-hold |
-| Imperva / Incapsula | `reese84`/`___utmvc` cookie, `_Incapsula_Resource` script, 200 "Pardon Our Interruption" interstitial |
-| Kasada | `429` with Kasada script markers |
-| F5 Shape | `istlWasHere` interstitial page |
-| AWS WAF | `aws-waf-token` cookie, `AwsWafIntegration` script |
-| ACW (Alibaba) | `acw_sc__v2` challenge script |
-| TMD | TMD session validation pattern |
-| Amazon | CAPTCHA page with `amzn` markers |
-| Arkose / FunCaptcha | `arkoselabs.com` or `funcaptcha` markers |
-| GeeTest v4 | `initGeetest4`, `gcaptcha4.geetest.com`, `gt4.js` |
-| hCaptcha | `hcaptcha.com` script, `h-captcha` div |
-| reCAPTCHA | `google.com/recaptcha` script, `g-recaptcha` div |
-| Vercel | Vercel bot protection challenge |
-| Generic JS | Unclassified JavaScript challenges |
+| WAF | Detection | Solved by |
+|-----|-----------|-----------|
+| Cloudflare | `cf-mitigated` header, managed challenge HTML | browser |
+| Akamai | `_abck` cookie patterns, sensor script references | browser |
+| DataDome | `datadome` cookie, challenge page markers | browser |
+| PerimeterX / HUMAN | `_px` cookies, captcha div, press-and-hold | browser |
+| Imperva / Incapsula | `reese84`/`___utmvc` cookie, `_Incapsula_Resource` script, 200 "Pardon Our Interruption" interstitial | inline (native-TLS) + browser under load |
+| Kasada | `429` with Kasada script markers | browser |
+| F5 Shape | `istlWasHere` interstitial page | browser |
+| AWS WAF | `aws-waf-token` cookie, `AwsWafIntegration` script | browser |
+| ACW (Alibaba) | `acw_sc__v2` challenge script | inline |
+| TMD | TMD session validation pattern | inline (+ browser slider) |
+| Amazon | CAPTCHA page with `amzn` markers | inline |
+| Arkose / FunCaptcha | `arkoselabs.com` or `funcaptcha` markers | **detect-only** (no solver; the generic browser fallback can't pass FunCaptcha) |
+| GeeTest v4 | `initGeetest4`, `gcaptcha4.geetest.com`, `gt4.js` | browser |
+| hCaptcha | `hcaptcha.com` script, `h-captcha` div | browser |
+| reCAPTCHA | `google.com/recaptcha` script, `g-recaptcha` div | browser (**v2 only** - no v3 token minting) |
+| Vercel | Vercel bot protection challenge | browser (generic JS wait) |
+| Generic JS | Unclassified JavaScript challenges | browser (generic JS wait) |
 
 When a challenge is detected, wafer escalates automatically:
 1. Inline solving (ACW, Amazon, TMD - no browser needed)

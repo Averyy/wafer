@@ -381,6 +381,8 @@ bind cookies to TLS fingerprints). Recommended for `BrowserSolver` users.
 Thread-safe (per-domain locks, atomic writes via temp file + rename). Multiple
 threads can share the same `cache_dir` path safely. Multiple processes sharing
 the same path may lose updates under concurrent writes to the same domain.
+Cookie files are written `0o600` and a wafer-created `cache_dir` is `0o700`
+(owner-only), since they hold WAF-clearance and auth tokens.
 
 ---
 
@@ -486,16 +488,25 @@ one of these strings:
 "tmd"          - Alibaba TMD (solved inline, no browser needed)
 "amazon"       - Amazon CAPTCHA (solved inline, no browser needed)
 "vercel"       - Vercel bot protection
-"arkose"       - Arkose Labs / FunCaptcha
+"arkose"       - Arkose Labs / FunCaptcha (no dedicated solver; not solvable)
 "geetest"      - GeeTest v4
 "hcaptcha"     - hCaptcha
 "recaptcha"    - reCAPTCHA v2
 "generic_js"   - unclassified JS challenge
 ```
 
-Some challenges (Cloudflare, AWS WAF, Kasada, Vercel, hCaptcha, reCAPTCHA,
-generic_js) require a browser solver - TLS fingerprint rotation alone cannot
-help. Pass a `BrowserSolver` to the session to handle these automatically.
+Some challenges (Cloudflare, DataDome, AWS WAF, Kasada, Vercel, hCaptcha,
+reCAPTCHA, generic_js) require a browser solver - TLS fingerprint rotation alone
+cannot help. Pass a `BrowserSolver` to the session to handle these automatically.
+
+Detection != solving. `"arkose"` has NO dedicated solver: without a
+`browser_solver` it raises `ChallengeDetected`; with one it falls through to a
+generic browser JS-wait that does NOT solve interactive FunCaptcha - so treat
+Arkose as unsolved and handle it yourself. `"recaptcha"` solving is v2 only
+(checkbox/image grid in the browser); wafer does NOT mint reCAPTCHA v3 score
+tokens. `"vercel"`/`"generic_js"` also get the generic browser JS-wait (no
+dedicated solver, but it passes their passive JS checks). The inline trio
+(`acw`, `tmd`, `amazon`) needs no browser at all.
 
 ---
 

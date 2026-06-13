@@ -1,8 +1,12 @@
 """Tests for cookie cache."""
 
 import json
+import os
+import stat
 import threading
 import time
+
+import pytest
 
 from wafer._cookies import (
     CookieCache,
@@ -714,3 +718,55 @@ class TestCookieCacheConcurrency:
         loaded = cache.load("e.com")
         names = {c["name"] for c in loaded}
         assert len(names) == per_thread * 2
+
+
+# ---------------------------------------------------------------------------
+# File permissions -- cookie files hold WAF-clearance / auth tokens
+# ---------------------------------------------------------------------------
+
+
+class TestCookieFilePermissions:
+    @pytest.mark.skipif(
+        os.name == "nt", reason="POSIX file modes not applicable on Windows"
+    )
+    def test_cookie_file_is_owner_only(self, tmp_path):
+        cache = CookieCache(cache_dir=str(tmp_path / "cc"))
+        cache.save(
+            "example.com",
+            [
+                {
+                    "name": "cf_clearance",
+                    "value": "secret",
+                    "domain": "example.com",
+                    "path": "/",
+                    "expires": _FUTURE,
+                }
+            ],
+        )
+        files = list((tmp_path / "cc").glob("*.json"))
+        assert files, "expected a cookie file to be written"
+        for f in files:
+            mode = stat.S_IMODE(os.stat(f).st_mode)
+            assert mode == 0o600, f"{f.name} mode {oct(mode)} != 0o600"
+
+    @pytest.mark.skipif(
+        os.name == "nt", reason="POSIX dir modes not applicable on Windows"
+    )
+    def test_wafer_created_cache_dir_is_owner_only(self, tmp_path):
+        # wafer creates the leaf dir on first write -> should be 0o700.
+        cache_dir = tmp_path / "newcc"
+        cache = CookieCache(cache_dir=str(cache_dir))
+        cache.save(
+            "example.com",
+            [
+                {
+                    "name": "a",
+                    "value": "1",
+                    "domain": "example.com",
+                    "path": "/",
+                    "expires": _FUTURE,
+                }
+            ],
+        )
+        mode = stat.S_IMODE(os.stat(cache_dir).st_mode)
+        assert mode == 0o700, f"cache dir mode {oct(mode)} != 0o700"

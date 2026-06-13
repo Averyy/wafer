@@ -284,13 +284,25 @@ class CookieCache:
                 pass
 
     def _write_atomic(self, domain: str, entries: list[dict]) -> None:
-        """Atomic write: temp file + rename (same filesystem = atomic on POSIX)."""
-        self._cache_dir.mkdir(parents=True, exist_ok=True)
+        """Atomic write: temp file + rename (same filesystem = atomic on POSIX).
+
+        Cookie files hold WAF-clearance and auth tokens, so each file is
+        written 0o600 (owner-only) and the cache dir is created 0o700, so
+        other local users can neither read the values nor enumerate the
+        cached domains.
+        """
+        # mode=0o700 only applies when wafer creates the dir; a pre-existing
+        # dir the caller set up intentionally is left untouched.
+        self._cache_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         path = self._domain_path(domain)
         fd, tmp_path = tempfile.mkstemp(
             dir=self._cache_dir, suffix=".tmp"
         )
         try:
+            # mkstemp already creates 0o600; set it explicitly so the
+            # owner-only guarantee survives any future change here (POSIX).
+            if hasattr(os, "fchmod"):
+                os.fchmod(fd, 0o600)
             with os.fdopen(fd, "w") as f:
                 json.dump(entries, f, indent=2)
             os.rename(tmp_path, path)
