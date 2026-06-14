@@ -1,5 +1,8 @@
 """Tests for fingerprint management and sec-ch-ua generation."""
 
+import os
+
+import pytest
 from wreq import Emulation
 
 from wafer._fingerprint import (
@@ -188,6 +191,11 @@ class TestSessionFingerprint:
         assert hasattr(s, "_fingerprint")
         assert s.emulation == Emulation.Chrome147
 
+    @pytest.mark.live
+    @pytest.mark.skipif(
+        os.environ.get("WAFER_LIVE") != "1",
+        reason="live network test; set WAFER_LIVE=1 to run",
+    )
     def test_session_sends_sec_ch_ua(self):
         from wafer import SyncSession
 
