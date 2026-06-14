@@ -433,6 +433,7 @@ When all rotations are exhausted, wafer either raises or returns the response de
 | 429 | Raises `RateLimited` | Returns response |
 | 5xx / empty 200 | Returns response | Returns response |
 | Connection error | Raises `ConnectionFailed` | Raises `ConnectionFailed` |
+| Server hang past total `timeout` | Raises `WaferTimeout` | Raises `WaferTimeout` |
 
 Callers using default mode should catch `ChallengeDetected` and `RateLimited` in addition to checking `raise_for_status()`:
 

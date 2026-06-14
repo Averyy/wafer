@@ -461,13 +461,15 @@ Default mode (`max_rotations > 0`):
 - 403 + challenge detected -> raises `ChallengeDetected` after exhausting rotations
 - 429 without challenge -> raises `RateLimited` after exhausting rotations
 - 200 with empty body -> retries; if the host already served a real body this session, also rotates to a fresh identity (within `max_rotations`); raises `EmptyResponse` once retries+rotations are exhausted (see "Reputation-burn guard")
-- Connection error -> raises `ConnectionFailed` after exhausting retries
+- Connection error (refused/reset/TLS failure) -> raises `ConnectionFailed` after exhausting retries
+- Server hang past the total `timeout` deadline -> raises `WaferTimeout` (a wreq-layer timeout is always bounded by your budget and surfaced as `WaferTimeout`, never `ConnectionFailed`)
 - 5xx -> returns response after exhausting retries
 - Other 4xx (400, 401, 404, etc.) -> returns response immediately (no retry)
 
 No-rotation mode (`max_rotations = 0`, including `.bulk()`):
 - 403, 429, challenge, empty 200 -> returns response (never raises for these)
 - Connection error -> still raises `ConnectionFailed`
+- Server hang past the total `timeout` deadline -> still raises `WaferTimeout`
 - Other 4xx, 5xx -> same as default (returns response)
 
 ### Rotation escalation
