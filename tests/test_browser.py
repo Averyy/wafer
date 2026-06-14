@@ -3038,11 +3038,12 @@ class TestBrowserSolveTimeout:
         assert 0 < solver.timeouts[0] <= 5
 
     @patch("time.sleep")
-    def test_solve_no_request_timeout_uses_solver_default_sync(
+    def test_solve_bounded_by_session_timeout_sync(
         self, mock_sleep
     ):
-        """Without a per-request timeout the solve gets None, so the
-        BrowserSolver's own solve_timeout default applies."""
+        """The session timeout is a total deadline, so a browser solve with
+        no per-request timeout is bounded by the remaining session budget
+        (~30s) rather than running unbounded on the solver's own default."""
         solver = _RecordingSolver()
         cf_resp = MockResponse(
             403,
@@ -3053,7 +3054,7 @@ class TestBrowserSolveTimeout:
             [cf_resp], max_rotations=0, browser_solver=solver
         )
         session.get("https://example.com/page")
-        assert solver.timeouts == [None]
+        assert solver.timeouts[0] == pytest.approx(30.0, abs=1.0)
 
     @pytest.mark.asyncio
     async def test_solve_timeout_clamped_to_request_deadline_async(self):

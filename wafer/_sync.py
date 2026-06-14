@@ -518,17 +518,20 @@ class SyncSession(BaseSession):
         if params:
             url = self._apply_params(url, params)
 
-        # Per-request timeout → overall deadline for retry loop
+        # `timeout=` is the TOTAL budget for the whole call - every retry,
+        # rotation, and browser solve - whether it is passed per-request or
+        # taken from the session default. It is always a hard deadline; use
+        # `attempt_timeout=` to bound each individual try so retries/rotations
+        # fire instead of one hung attempt eating the whole budget.
         if req_timeout is not None:
             timeout_secs = (
                 req_timeout.total_seconds()
                 if hasattr(req_timeout, "total_seconds")
                 else float(req_timeout)
             )
-            deadline = start_time + timeout_secs
         else:
             timeout_secs = self.timeout.total_seconds()
-            deadline = None  # no per-request deadline
+        deadline = start_time + timeout_secs
 
         # Per-attempt timeout: bounds each individual wreq attempt so
         # retries/rotations can fire within the total budget. The
@@ -780,10 +783,13 @@ class SyncSession(BaseSession):
                         time.sleep(delay)
                         continue
                     if attempt_timed_out:
+                        # Report the explicit per-request total budget if one
+                        # was set, else the per-attempt cap that exhausted us
+                        # (a session-default timeout is not the headline here).
                         raise WaferTimeout(
                             current_url,
                             timeout_secs
-                            if deadline is not None
+                            if req_timeout is not None
                             else attempt_secs,
                         ) from e
                     raise ConnectionFailed(current_url, str(e)) from e

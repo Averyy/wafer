@@ -151,12 +151,16 @@ class TestSyncAttemptTimeout:
         session.get(URL, attempt_timeout=7.5)
         assert wreq_timeout_of(mock, 2) == datetime.timedelta(seconds=7.5)
 
-    def test_no_attempt_timeout_no_wreq_timeout_kwarg(self, mock_sleep):
-        """No timeout= and no attempt_timeout= -> wreq gets no timeout
-        kwarg (client-level session timeout applies), as before."""
+    def test_session_timeout_bounds_attempt(self, mock_sleep):
+        """No per-request timeout= and no attempt_timeout=: the session
+        timeout is now a total deadline, so each attempt is clamped to the
+        remaining budget and wreq gets a timeout kwarg of ~the session
+        timeout (30s)."""
         session, mock = make_sync_session([ok()])
         session.get(URL)
-        assert "timeout" not in mock.request_log[0][2]
+        t = mock.request_log[0][2].get("timeout")
+        assert t is not None
+        assert t.total_seconds() == pytest.approx(30.0, abs=1.0)
 
 
 @patch("wafer._sync.time.sleep")

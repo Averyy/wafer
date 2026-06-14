@@ -135,12 +135,11 @@ SyncSession(
 
     # Timeouts (int, float seconds, or datetime.timedelta)
     connect_timeout=10,   # default: 10s
-    timeout=30,           # default: 30s. SESSION-level timeout is the default
-                          # per-attempt bound (the wreq client timeout); it does
-                          # NOT cap total time across retries/rotations. A
-                          # PER-REQUEST timeout= IS the total budget for the whole
-                          # call (see Per-request kwargs). For a hard total ceiling,
-                          # pass timeout= per request.
+    timeout=30,           # default: 30s. The TOTAL budget for the whole call -
+                          # all retries, rotations, and browser solves - whether
+                          # set here or per-request. NOT per-attempt like
+                          # requests/httpx. One hanging attempt can eat the whole
+                          # budget unless you also set attempt_timeout=.
     attempt_timeout=None, # default: None (no per-attempt cap). Caps each individual
                           # attempt so retries/rotations fire while a server hangs.
                           # Overridable per-request.
@@ -251,7 +250,7 @@ session.mint_recaptcha_v3(sitekey: str, action: str, *, origin=None, referer=Non
 
 - `headers: dict[str, str]` - merged over session headers AND embed mode headers (per-request wins over both)
 - `params: dict[str, str]` - appended to URL as query string
-- `timeout: int | float | timedelta` - TOTAL deadline for the whole call, covering ALL retries, rotations, and any browser solve (including time spent waiting on a shared solver). **This differs from requests/httpx, where `timeout=` bounds each attempt.** Without `attempt_timeout`, one hanging attempt may consume the entire budget, so `max_retries`/`max_rotations` never fire. Each attempt is clamped to the remaining budget. Without a `timeout`, a browser solve falls back to the solver's own `solve_timeout`.
+- `timeout: int | float | timedelta` - TOTAL deadline for the whole call, covering ALL retries, rotations, and any browser solve (including time spent waiting on a shared solver). Identical to the session-level `timeout` (both are a total budget). **This differs from requests/httpx, where `timeout=` bounds each attempt.** Without `attempt_timeout`, one hanging attempt may consume the entire budget, so `max_retries`/`max_rotations` never fire. Each attempt is clamped to the remaining budget, and the browser solve is bounded by the remaining budget too (the session-default `timeout` applies when none is passed per-request), on top of the solver's own `solve_timeout`.
 - `attempt_timeout: int | float | timedelta` - caps each INDIVIDUAL attempt (overrides the session-level `attempt_timeout` for this call). An attempt that hits this cap is a retryable failure: the loop retries, then consumes rotation budget (fresh TLS identity - hangs are often fingerprint-linked WAF tarpits), until budgets or the total `timeout` deadline are exhausted, then raises `WaferTimeout`. With `attempt_timeout` alone (no `timeout`), the total is unbounded and attempts are limited only by `max_retries`/`max_rotations`. Canonical combo:
 
 ```python
@@ -744,7 +743,7 @@ solver = BrowserSolver(
     headless=False,       # default: False. Headful recommended for stealth
     idle_timeout=300.0,   # default: 300s. Close browser after N seconds idle
     solve_timeout=30.0,   # default: 30s. Max seconds per solve attempt.
-                          # A per-request timeout= on the session call
+                          # The call's timeout= (session default or per-request)
                           # caps this further (whichever is smaller wins).
 )
 
@@ -1067,13 +1066,14 @@ logging.getLogger("wafer").setLevel(logging.DEBUG)
     different host, the token is dropped (Fetch spec). Make two explicit
     requests if you need to send auth to both origins.
 
-17. **A per-request `timeout=` is the TOTAL retry-loop budget, not per-attempt.**
-    Unlike requests/httpx, where `timeout=` bounds each attempt, a per-request
-    `timeout=` caps the WHOLE call - all retries, rotations, and browser solves.
-    One hanging attempt can eat the entire budget so `max_retries`/`max_rotations`
-    never fire. Pass `attempt_timeout=` to bound each individual try:
-    `session.get(url, timeout=60, attempt_timeout=15)` on a
-    `SyncSession(max_rotations=3)` gives up to 4 bounded tries (rotating
-    between them) inside a 60s total budget. (A SESSION-level `timeout=` is only
-    the default per-attempt bound and does NOT cap total time - pass a
-    per-request `timeout=` for a hard total ceiling.)
+17. **`timeout=` is the TOTAL budget, not per-attempt.** Unlike requests/httpx,
+    where `timeout=` bounds each attempt, wafer's `timeout=` caps the WHOLE call -
+    all retries, rotations, and browser solves - whether set on the session or
+    per-request (both behave identically). One hanging attempt can eat the entire
+    budget so `max_retries`/`max_rotations` never fire. Pass `attempt_timeout=` to
+    bound each individual try: `session.get(url, timeout=60, attempt_timeout=15)`
+    on a `SyncSession(max_rotations=3)` gives up to 4 bounded tries (rotating
+    between them) inside a 60s total budget. The default `timeout=30` is now a
+    hard 30s ceiling on the whole call (it used to be a per-attempt default that
+    let the total run several times over) - raise it if your flow needs retries
+    plus a browser solve.

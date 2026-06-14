@@ -91,11 +91,12 @@ session = SyncSession(
     emulation=None,  # or wreq.Emulation.Chrome147
 
     # Timeouts (float seconds or timedelta)
-    timeout=30,                                    # float/int seconds. A SESSION
-                                                   # timeout is the default per-attempt
-                                                   # bound; it does NOT cap total time
-                                                   # across retries. A PER-REQUEST
-                                                   # timeout= IS the total budget.
+    timeout=30,                                    # float/int seconds. The TOTAL
+                                                   # budget for the whole call (all
+                                                   # retries, rotations, browser
+                                                   # solves), session or per-request.
+                                                   # Use attempt_timeout= to bound
+                                                   # each individual try.
     connect_timeout=datetime.timedelta(seconds=10),  # or timedelta
     attempt_timeout=None,  # default None (no per-attempt cap). Caps each individual
                            # attempt so retries/rotations can fire while a server
@@ -516,8 +517,8 @@ from wafer.browser import BrowserSolver
 solver = BrowserSolver(
     headless=False,       # headful for best stealth
     idle_timeout=300.0,   # close browser after 5min idle
-    solve_timeout=30.0,   # max time per solve attempt; a per-request
-                          # timeout= on the call caps it lower
+    solve_timeout=30.0,   # max time per solve attempt; the call's timeout=
+                          # (session default or per-request) caps it lower
 )
 
 # Use with a session -automatic fallback after rotation exhaustion
