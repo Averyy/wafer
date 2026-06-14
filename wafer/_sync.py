@@ -158,9 +158,22 @@ class SyncSession(BaseSession):
         )
 
     def _try_inline_solve(
-        self, challenge: ChallengeType | None, body: str, url: str
+        self,
+        challenge: ChallengeType | None,
+        body: str,
+        url: str,
+        deadline: float | None = None,
     ) -> bool:
         """Attempt inline challenge solving. Returns True if solved."""
+        # Bound any solver sub-request (Amazon submit, TMD homepage warm) by
+        # the caller's remaining budget so a slow response can't overshoot the
+        # overall timeout. ACW is pure computation -- no sub-request, no clamp.
+        sub_timeout = None
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            sub_timeout = datetime.timedelta(seconds=remaining)
         if challenge == ChallengeType.ACW:
             cookie_value = solve_acw(body)
             if cookie_value:
@@ -189,17 +202,24 @@ class SyncSession(BaseSession):
             target = parse_amazon_captcha(body, url)
             if target:
                 try:
+                    sub_kw = (
+                        {"timeout": sub_timeout}
+                        if sub_timeout is not None
+                        else {}
+                    )
                     if target["method"] == "POST":
                         solve_resp = self._client.post(
                             target["url"],
                             form=target["params"],
                             headers={"Referer": url},
+                            **sub_kw,
                         )
                     else:
                         solve_resp = self._client.get(
                             target["url"],
                             params=target["params"] or None,
                             headers={"Referer": url},
+                            **sub_kw,
                         )
                     self._cache_response_cookies(
                         target["url"], solve_resp
@@ -217,7 +237,14 @@ class SyncSession(BaseSession):
         elif challenge == ChallengeType.TMD:
             homepage = tmd_homepage_url(url)
             try:
-                homepage_resp = self._client.get(homepage)
+                homepage_resp = self._client.get(
+                    homepage,
+                    **(
+                        {"timeout": sub_timeout}
+                        if sub_timeout is not None
+                        else {}
+                    ),
+                )
                 self._cache_response_cookies(homepage, homepage_resp)
                 logger.info("TMD session warmed via %s", homepage)
                 return True
@@ -557,9 +584,20 @@ class SyncSession(BaseSession):
                 )
             domain = extract_domain(url) or url
             if self._rate_limiter:
-                self._rate_limiter.wait_sync(domain)
+                self._rate_limiter.wait_sync(
+                    domain,
+                    max_wait=(
+                        deadline - time.monotonic()
+                        if deadline is not None
+                        else None
+                    ),
+                )
             logger.debug("%s %s (Opera Mini)", method, url)
-            timeout = timeout_secs
+            # Single request, no retries -- bound it by the remaining total
+            # budget (the rate-limit wait above may have eaten some of it).
+            timeout = deadline - time.monotonic()
+            if timeout <= 0:
+                raise WaferTimeout(url, timeout_secs)
             status, resp_headers, text, final_url, set_cookies = (
                 self._om_identity.request(
                     url, headers=extra_headers, timeout=timeout,
@@ -602,7 +640,14 @@ class SyncSession(BaseSession):
 
             # Rate limiting: wait if too soon since last request to this domain
             if self._rate_limiter:
-                self._rate_limiter.wait_sync(domain)
+                self._rate_limiter.wait_sync(
+                    domain,
+                    max_wait=(
+                        deadline - time.monotonic()
+                        if deadline is not None
+                        else None
+                    ),
+                )
 
             # Sticky native-TLS: this host was proven to need OpenSSL
             # (Imperva fingerprints wreq's BoringSSL stack and challenges it
@@ -637,7 +682,7 @@ class SyncSession(BaseSession):
                         "Native-TLS retry %d/%d for %s in %.1fs",
                         native_retries, NATIVE_MAX_RETRIES, current_url, delay,
                     )
-                    time.sleep(delay)
+                    time.sleep(self._clamp_delay(delay, deadline))
                     continue
                 if native_resp is None:
                     raise ConnectionFailed(
@@ -714,15 +759,23 @@ class SyncSession(BaseSession):
             try:
                 resp = self._client.request(m, current_url, **kwargs)
             except Exception as e:
-                # An attempt bounded by attempt_timeout that hits the
-                # wreq-layer timeout is retryable by design: the
-                # per-attempt cap exists precisely so retries/rotations
-                # can fire instead of one hung attempt eating the whole
-                # budget. The loop-top deadline check still bounds the
-                # total time.
-                attempt_timed_out = (
-                    attempt_secs is not None
-                    and isinstance(e, wreq.exceptions.TimeoutError)
+                # Every attempt now carries a timeout kwarg -- attempt_timeout
+                # if set, else the remaining-budget clamp -- so any wreq
+                # TimeoutError stems from OUR deadline, not the network. Treat
+                # it as retryable (the per-attempt cap exists precisely so
+                # retries/rotations fire instead of one hung attempt eating the
+                # whole budget) and, when finally giving up, surface it as a
+                # WaferTimeout rather than a bare ConnectionFailed. The loop-top
+                # deadline check still bounds the total time.
+                attempt_timed_out = isinstance(
+                    e, wreq.exceptions.TimeoutError
+                )
+                # The wall-clock limit this attempt actually ran under (for
+                # logging); attempt_limit is the min(cap, remaining) bound.
+                timed_out_after = (
+                    attempt_limit
+                    if attempt_limit is not None
+                    else timeout_secs
                 )
                 if not state.can_retry:
                     # Normal retries exhausted. A timed-out attempt may
@@ -747,10 +800,10 @@ class SyncSession(BaseSession):
                             logger.debug(
                                 "Attempt timed out after %.1fs, retired "
                                 "session, retrying in %.1fs",
-                                attempt_secs,
+                                timed_out_after,
                                 delay,
                             )
-                            time.sleep(delay)
+                            time.sleep(self._clamp_delay(delay, deadline))
                             continue
                         pinned = (
                             self._fingerprint is not None
@@ -775,22 +828,29 @@ class SyncSession(BaseSession):
                         logger.debug(
                             "Attempt timed out after %.1fs, rotated "
                             "(rotation %d/%d), retrying in %.1fs",
-                            attempt_secs,
+                            timed_out_after,
                             state.rotation_retries,
                             state.max_rotations,
                             delay,
                         )
-                        time.sleep(delay)
+                        time.sleep(self._clamp_delay(delay, deadline))
                         continue
                     if attempt_timed_out:
-                        # Report the explicit per-request total budget if one
-                        # was set, else the per-attempt cap that exhausted us
-                        # (a session-default timeout is not the headline here).
+                        # Report the attempt cap only when IT -- not the total
+                        # deadline -- was the binding limit and no explicit
+                        # per-request total was given; otherwise the total
+                        # budget is the headline. attempt_limit == attempt_secs
+                        # means the cap (not the deadline) bounded this try.
+                        attempt_cap_bound = (
+                            attempt_secs is not None
+                            and attempt_limit is not None
+                            and attempt_limit == attempt_secs
+                        )
                         raise WaferTimeout(
                             current_url,
-                            timeout_secs
-                            if req_timeout is not None
-                            else attempt_secs,
+                            attempt_secs
+                            if (req_timeout is None and attempt_cap_bound)
+                            else timeout_secs,
                         ) from e
                     raise ConnectionFailed(current_url, str(e)) from e
                 state.use_retry()
@@ -803,7 +863,7 @@ class SyncSession(BaseSession):
                     "Connection error, retry %d/%d in %.1fs: %s",
                     state.normal_retries, state.max_retries, delay, e,
                 )
-                time.sleep(delay)
+                time.sleep(self._clamp_delay(delay, deadline))
                 continue
 
             status = resp.status.as_int()
@@ -925,7 +985,7 @@ class SyncSession(BaseSession):
                     "Body decode error, retry %d/%d in %.1fs: %s",
                     state.normal_retries, state.max_retries, delay, e,
                 )
-                time.sleep(delay)
+                time.sleep(self._clamp_delay(delay, deadline))
                 continue
 
             # 5xx → backoff + normal retry
@@ -949,7 +1009,7 @@ class SyncSession(BaseSession):
                     "%d server error, retry %d/%d in %.1fs",
                     status, state.normal_retries, state.max_retries, delay,
                 )
-                time.sleep(delay)
+                time.sleep(self._clamp_delay(delay, deadline))
                 continue
 
             # Challenge detection (HTML responses only — WAF challenges
@@ -1047,7 +1107,7 @@ class SyncSession(BaseSession):
                     "429 rate limited, waiting %.1fs (rotation %d/%d)",
                     delay, state.rotation_retries, state.max_rotations,
                 )
-                time.sleep(delay)
+                time.sleep(self._clamp_delay(delay, deadline))
                 continue
 
             # Challenge or bare 403 → try inline solver, then rotate
@@ -1065,7 +1125,7 @@ class SyncSession(BaseSession):
                     challenge is not None
                     and state.inline_solves < state.max_inline_solves
                     and self._try_inline_solve(
-                        challenge, body, current_url
+                        challenge, body, current_url, deadline
                     )
                 ):
                     state.inline_solves += 1
@@ -1083,7 +1143,7 @@ class SyncSession(BaseSession):
                         state.max_inline_solves,
                         delay,
                     )
-                    time.sleep(delay)
+                    time.sleep(self._clamp_delay(delay, deadline))
                     continue
 
                 # Imperva: try the native-TLS (OpenSSL) bypass before
@@ -1306,7 +1366,7 @@ class SyncSession(BaseSession):
                     self.max_rotations,
                     delay,
                 )
-                time.sleep(delay)
+                time.sleep(self._clamp_delay(delay, deadline))
                 continue
 
             # 200 with empty text body → normal retry (skip for binary)
@@ -1362,7 +1422,7 @@ class SyncSession(BaseSession):
                             self.max_rotations,
                             delay,
                         )
-                        time.sleep(delay)
+                        time.sleep(self._clamp_delay(delay, deadline))
                         continue
                     raise EmptyResponse(
                         current_url,
@@ -1386,7 +1446,7 @@ class SyncSession(BaseSession):
                     "Empty 200 body, retry %d/%d in %.1fs",
                     state.normal_retries, state.max_retries, delay,
                 )
-                time.sleep(delay)
+                time.sleep(self._clamp_delay(delay, deadline))
                 continue
 
             # Success — reset failure counter, pin fingerprint, track URL

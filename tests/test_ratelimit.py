@@ -397,7 +397,12 @@ class TestSyncRateLimitIntegration:
             rate_limiter=rl,
         )
         session.get("https://example.com")
-        rl.wait_sync.assert_called_once_with("example.com")
+        # The session now also passes a deadline-derived max_wait so rate-limit
+        # spacing can't overshoot the total timeout; assert the domain plus a
+        # bounded max_wait kwarg.
+        rl.wait_sync.assert_called_once()
+        assert rl.wait_sync.call_args.args == ("example.com",)
+        assert "max_wait" in rl.wait_sync.call_args.kwargs
 
     def test_rate_limiter_records_after_response(self, mock_sleep):
         rl = RateLimiter(min_interval=1.0, jitter=0.0)
@@ -471,7 +476,7 @@ class TestAsyncSessionRetirement:
         rl = RateLimiter(min_interval=1.0, jitter=0.0)
         called = False
 
-        async def mock_wait(domain):
+        async def mock_wait(domain, max_wait=None):
             nonlocal called
             called = True
             return 0.0

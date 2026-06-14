@@ -37,9 +37,16 @@ class RateLimiter:
         """Record that a request was sent to this domain."""
         self._last_request[domain] = time.monotonic()
 
-    def wait_sync(self, domain: str) -> float:
-        """Block until it's safe to send a request. Returns delay applied."""
+    def wait_sync(self, domain: str, max_wait: float | None = None) -> float:
+        """Block until it's safe to send a request. Returns delay applied.
+
+        ``max_wait`` clamps the sleep so rate-limit spacing never holds a
+        caller past its overall ``timeout=`` deadline; the total budget
+        takes precedence over the configured interval.
+        """
         delay = self._delay_for(domain)
+        if max_wait is not None:
+            delay = min(delay, max(0.0, max_wait))
         if delay > 0:
             logger.debug(
                 "Rate limiter: waiting %.2fs for %s", delay, domain
@@ -47,11 +54,20 @@ class RateLimiter:
             time.sleep(delay)
         return delay
 
-    async def wait_async(self, domain: str) -> float:
-        """Async wait until it's safe to send a request. Returns delay applied."""
+    async def wait_async(
+        self, domain: str, max_wait: float | None = None
+    ) -> float:
+        """Async wait until it's safe to send a request. Returns delay applied.
+
+        ``max_wait`` clamps the sleep so rate-limit spacing never holds a
+        caller past its overall ``timeout=`` deadline; the total budget
+        takes precedence over the configured interval.
+        """
         import asyncio
 
         delay = self._delay_for(domain)
+        if max_wait is not None:
+            delay = min(delay, max(0.0, max_wait))
         if delay > 0:
             logger.debug(
                 "Rate limiter: waiting %.2fs for %s", delay, domain

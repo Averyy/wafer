@@ -1088,6 +1088,20 @@ class BaseSession:
         return base + penalty
 
     @staticmethod
+    def _clamp_delay(delay: float, deadline: float | None) -> float:
+        """Clamp a retry/rotation sleep so it never overshoots the deadline.
+
+        Every retry, rotation, backoff, and Retry-After sleep is routed
+        through here so a single hostile response (e.g. ``429 Retry-After:
+        3600``) or a slow rate-limit interval can never hold a caller past
+        its total ``timeout=`` budget. Returns 0.0 once the deadline is
+        reached, letting the loop-top deadline check raise ``WaferTimeout``.
+        """
+        if deadline is not None:
+            delay = min(delay, max(0.0, deadline - time.monotonic()))
+        return delay
+
+    @staticmethod
     def _apply_params(url: str, params: dict[str, str] | None) -> str:
         """Append query parameters to a URL.
 

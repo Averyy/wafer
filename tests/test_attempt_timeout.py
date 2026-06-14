@@ -350,6 +350,83 @@ class TestAsyncTimeoutAlonePreserved:
         assert client.request_count == 1
 
 
+class TestSessionTimeoutIsTotalBudget:
+    """The unification: a session-level ``timeout=`` is the TOTAL budget for
+    the whole call (every retry/rotation), not a per-attempt default.
+
+    These run WITHOUT a class-level ``@patch`` on ``time.sleep`` (or with a
+    fake clock) on purpose: patching ``wafer._sync.time.sleep`` no-ops the
+    shared ``time`` module, so ``BudgetEatingClient``'s own sleeps would also
+    vanish and the budget would never actually be consumed -- making any
+    elapsed-time assertion vacuous (the trap that sank an earlier draft).
+    """
+
+    def test_session_timeout_no_attempt_cap_raises_wafer_timeout(self):
+        """max_retries=0, no attempt_timeout, server hangs: the deadline-
+        clamped wreq timeout must surface as WaferTimeout, not the bare
+        ConnectionFailed it used to (the deadline is always set now)."""
+        session, _ = make_sync_session(
+            [ok()], max_retries=0, max_rotations=0
+        )
+        session.timeout = datetime.timedelta(seconds=0.05)
+        client = BudgetEatingClient()
+        session._client = client
+        with pytest.raises(WaferTimeout) as exc_info:
+            session.get(URL)  # no per-request timeout, no attempt_timeout
+        assert client.request_count == 1
+        assert exc_info.value.timeout_secs == pytest.approx(0.05)
+
+    def test_deadline_bound_reports_total_not_attempt_cap(self):
+        """timeout < attempt_timeout: the deadline (not the larger cap) binds
+        each try, so an exhausted call reports the total budget, not the cap."""
+        session, _ = make_sync_session(
+            [ok()], attempt_timeout=15, max_retries=0, max_rotations=0
+        )
+        session.timeout = datetime.timedelta(seconds=0.05)
+        client = BudgetEatingClient()
+        session._client = client
+        with pytest.raises(WaferTimeout) as exc_info:
+            session.get(URL)
+        # The 15s attempt cap never bound the try -- the 0.05s deadline did.
+        assert exc_info.value.timeout_secs == pytest.approx(0.05)
+
+    def test_session_timeout_caps_total_across_retries(self):
+        """Multiple bounded attempts fire under a session total budget, and
+        the DEADLINE -- not the retry count -- ends the loop, reporting the
+        total. Real sleeps consume the real budget (a class-level time.sleep
+        patch would no-op them); only calculate_backoff is neutralized so the
+        inter-attempt backoff doesn't swallow the whole 0.1s in one gulp and
+        the multiple attempts stay observable."""
+        session, _ = make_sync_session(
+            [ok()], attempt_timeout=0.02, max_retries=50, max_rotations=0
+        )
+        session.timeout = datetime.timedelta(seconds=0.1)
+        client = BudgetEatingClient()
+        session._client = client
+        with patch("wafer._sync.calculate_backoff", lambda *a, **k: 0.0):
+            with pytest.raises(WaferTimeout) as exc_info:
+                session.get(URL)
+        # ~5 bounded 0.02s attempts fit in the 0.1s budget; far under the 50
+        # retries, proving the deadline (not exhaustion) ended the loop.
+        assert client.request_count >= 3
+        assert client.request_count < 50
+        assert exc_info.value.timeout_secs == pytest.approx(0.1)
+
+    async def test_session_timeout_caps_total_across_retries_async(self):
+        session, _ = make_async_session(
+            [ok()], attempt_timeout=0.02, max_retries=50, max_rotations=0
+        )
+        session.timeout = datetime.timedelta(seconds=0.1)
+        client = AsyncBudgetEatingClient()
+        session._client = client
+        with patch("wafer._async.calculate_backoff", lambda *a, **k: 0.0):
+            with pytest.raises(WaferTimeout) as exc_info:
+                await session.get(URL)
+        assert client.request_count >= 3
+        assert client.request_count < 50
+        assert exc_info.value.timeout_secs == pytest.approx(0.1)
+
+
 class TestConstructorNormalization:
     """Session-level attempt_timeout is normalized like timeout."""
 

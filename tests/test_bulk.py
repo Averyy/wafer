@@ -239,7 +239,7 @@ class TestInlineSolveWithZeroRotations:
             responses, max_rotations=0
         )
         # Mock the inline solver to succeed
-        session._try_inline_solve = lambda c, b, u: True
+        session._try_inline_solve = lambda c, b, u, deadline=None: True
         resp = session.get("https://example.com/api")
         assert resp.status_code == 200
         assert resp.text == "real content"
