@@ -93,10 +93,11 @@ session = SyncSession(
     # Timeouts (float seconds or timedelta)
     timeout=30,                                    # float/int seconds. The TOTAL
                                                    # budget for the whole call (all
-                                                   # retries, rotations, browser
-                                                   # solves), session or per-request.
-                                                   # Use attempt_timeout= to bound
-                                                   # each individual try.
+                                                   # retries, rotations, backoff/
+                                                   # rate-limit/Retry-After waits,
+                                                   # browser solves), session or
+                                                   # per-request. attempt_timeout=
+                                                   # bounds each individual try.
     connect_timeout=datetime.timedelta(seconds=10),  # or timedelta
     attempt_timeout=None,  # default None (no per-attempt cap). Caps each individual
                            # attempt so retries/rotations can fire while a server
@@ -383,7 +384,7 @@ session = SyncSession(
 )
 ```
 
-Both sync and async sessions block/await until the rate limit allows the next request.
+Both sync and async sessions block/await until the rate limit allows the next request. The wait is capped by the call's total `timeout=`, so rate-limit spacing never holds a request past its deadline (the total budget wins; a too-tight `timeout` raises `WaferTimeout` rather than over-waiting).
 
 ## Retry and Rotation
 
