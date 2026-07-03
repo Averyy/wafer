@@ -625,11 +625,10 @@ class BaseSession:
             family = self._profile.value
         else:
             family = None
-        profile_name = self._profile.value if self._profile else None
         return {
             "user_agent": ua,
             "family": family,
-            "emulation": profile_name,
+            "emulation": self._serving_emulation_repr(),
             "sec_ch_ua": None,
             "sec_ch_ua_mobile": None,
             "sec_ch_ua_platform": None,
@@ -646,10 +645,14 @@ class BaseSession:
         Stamped on every WaferResponse as ``resp.emulation`` so callers can
         diagnose which fingerprint served a 403/regression. For Emulation
         sessions it's ``repr(Emulation.XxxNNN)``; for Safari/Dart/Opera Mini
-        it's the profile name.
+        it's the profile name. A default Chrome session that ROTATED onto
+        the ladder's Safari rung has _safari_identity set but _profile None
+        -- still report "safari" for it.
         """
         if self._fingerprint is not None:
             return repr(self._fingerprint.current)
+        if self._safari_identity is not None:
+            return Profile.SAFARI.value
         if self._profile is not None:
             return self._profile.value
         return None

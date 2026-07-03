@@ -235,6 +235,47 @@ class TestOperaMiniIdentity:
         assert len(locales) >= 3
 
 
+class TestTimeoutClassification:
+    def test_connect_timeout_raises_wafer_timeout(self):
+        """urllib wraps CONNECT-phase timeouts in URLError(reason=
+        TimeoutError); they must surface as WaferTimeout (total-budget
+        rule), not ConnectionFailed."""
+        import urllib.error
+
+        import pytest
+
+        from wafer._errors import WaferTimeout
+
+        identity = OperaMiniIdentity()
+
+        class TimingOutOpener:
+            def open(self, req, timeout=None):
+                raise urllib.error.URLError(TimeoutError("timed out"))
+
+        identity._opener = TimingOutOpener()
+        with pytest.raises(WaferTimeout):
+            identity.request("http://example.com/")
+
+    def test_non_timeout_urlerror_raises_connection_failed(self):
+        import urllib.error
+
+        import pytest
+
+        from wafer._errors import ConnectionFailed
+
+        identity = OperaMiniIdentity()
+
+        class RefusingOpener:
+            def open(self, req, timeout=None):
+                raise urllib.error.URLError(
+                    ConnectionRefusedError("connection refused")
+                )
+
+        identity._opener = RefusingOpener()
+        with pytest.raises(ConnectionFailed):
+            identity.request("http://example.com/")
+
+
 class TestApplyParams:
     """Test BaseSession._apply_params (params= kwarg support)."""
 
@@ -309,14 +350,14 @@ class TestOperaMiniSetCookie:
         thread.start()
         try:
             identity = OperaMiniIdentity()
-            status, headers, text, final_url, set_cookies = (
+            status, headers, body_bytes, final_url, set_cookies = (
                 identity.request(f"http://127.0.0.1:{port}/x")
             )
             assert status == 200
             assert set_cookies == ["a=1; Path=/", "b=2; Path=/; HttpOnly"]
             # the flat dict joins duplicates instead of last-wins overwrite
             assert headers["set-cookie"] == "a=1; Path=/; b=2; Path=/; HttpOnly"
-            assert "hi" in text
+            assert b"hi" in body_bytes
         finally:
             srv.shutdown()
             thread.join(timeout=5)
@@ -330,7 +371,7 @@ class TestOperaMiniSetCookie:
             return (
                 200,
                 {"set-cookie": "a=1; Path=/; b=2; Path=/"},
-                "<html>ok</html>",
+                b"<html>ok</html>",
                 url,
                 ["a=1; Path=/", "b=2; Path=/"],
             )
@@ -339,6 +380,47 @@ class TestOperaMiniSetCookie:
         resp = session.get("https://example.com")
         assert resp.cookies == {"a": "1", "b": "2"}
         assert resp.get_all("set-cookie") == ["a=1; Path=/", "b=2; Path=/"]
+
+    def test_sync_session_legacy_charset_decoded(self):
+        from wafer import SyncSession
+
+        session = SyncSession(profile=Profile.OPERA_MINI)
+        body = "<html>привет</html>".encode("windows-1251")
+
+        def fake_request(url, *, headers=None, timeout=30.0, max_size=None):
+            return (
+                200,
+                {"content-type": "text/html; charset=windows-1251"},
+                body,
+                url,
+                [],
+            )
+
+        session._om_identity.request = fake_request
+        resp = session.get("https://example.com")
+        # content is the true body bytes, not a lossy utf-8 re-encode
+        assert resp.content == body
+        # text resolves the declared charset instead of hardcoding utf-8
+        assert "привет" in resp.text
+
+    def test_sync_session_binary_body_byte_exact(self):
+        from wafer import SyncSession
+
+        session = SyncSession(profile=Profile.OPERA_MINI)
+        body = bytes(range(256)) * 4
+
+        def fake_request(url, *, headers=None, timeout=30.0, max_size=None):
+            return (
+                200,
+                {"content-type": "application/octet-stream"},
+                body,
+                url,
+                [],
+            )
+
+        session._om_identity.request = fake_request
+        resp = session.get("https://example.com/blob")
+        assert resp.content == body
 
     def test_async_session_cookies_all_preserved(self):
         import asyncio
@@ -351,7 +433,7 @@ class TestOperaMiniSetCookie:
             return (
                 200,
                 {"set-cookie": "a=1; Path=/; b=2; Path=/"},
-                "<html>ok</html>",
+                b"<html>ok</html>",
                 url,
                 ["a=1; Path=/", "b=2; Path=/"],
             )

@@ -779,3 +779,15 @@ class TestResponseEmulationStamp:
 
         s = SyncSession(profile=Profile.SAFARI)
         assert s._serving_emulation_repr() == "safari"
+
+    def test_serving_emulation_repr_after_safari_rung(self):
+        """Default Chrome session rotated onto the ladder's Safari rung
+        (_profile is None) still stamps "safari", not None."""
+        from wafer import SyncSession
+
+        s = SyncSession()
+        s._switch_to_safari()
+        assert s._serving_emulation_repr() == "safari"
+        env = s.fingerprint_envelope()
+        assert env["family"] == "safari"
+        assert env["emulation"] == "safari"

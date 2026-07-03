@@ -464,6 +464,56 @@ def test_sync_native_response_too_large_propagates():
     assert ei.value.limit == 500
 
 
+def test_sync_native_wafer_timeout_propagates():
+    """A WaferTimeout from the native transport must propagate, not be
+    swallowed into a None that burns backoff sleeps (or surfaces later as
+    ConnectionFailed). The native per-hop timeout is the remaining total
+    budget, so a timeout there means the deadline is spent."""
+    from wafer import WaferTimeout
+
+    class RaisingTransport:
+        def request(self, *a, **k):
+            raise WaferTimeout(URL, 5.0)
+
+        def add_cookies(self, cookies):
+            pass
+
+    # Pin the host so the request routes straight to native.
+    session, _ = make_sync_session([], max_rotations=0)
+    session._native_tls_domains.add("api2.realtor.ca")
+    session._native_tls = RaisingTransport()
+    with pytest.raises(WaferTimeout):
+        session.get(URL, headers=HDRS)
+
+
+def test_native_redirect_chain_bounded_by_total_timeout():
+    """The transport's ``timeout`` bounds the WHOLE redirect chain: a
+    redirecting tarpit must raise WaferTimeout once the budget is spent,
+    not run max_redirects hops at the full timeout each."""
+    import time as _time
+
+    from wafer import WaferTimeout
+    from wafer._native_tls import NativeTLSTransport
+
+    transport = NativeTLSTransport()
+    hop_timeouts = []
+
+    def fake_send(method, url, headers, body, timeout, max_size):
+        hop_timeouts.append(timeout)
+        _time.sleep(0.05)
+        return 302, {"location": "https://example.com/next"}, b"", []
+
+    transport._send = fake_send
+    with pytest.raises(WaferTimeout):
+        transport.request(
+            "GET", "https://example.com/", {}, timeout=0.12
+        )
+    # The budget allowed ~3 hops, well under the 11-hop redirect cap,
+    # and each hop saw a strictly shrinking share of the budget.
+    assert len(hop_timeouts) < 11
+    assert hop_timeouts == sorted(hop_timeouts, reverse=True)
+
+
 def test_sync_native_multi_set_cookie_preserved():
     """Native-TLS responses keep EVERY Set-Cookie (reese84 + incap_ses_*),
     not just the first one of the '; '-joined header dict."""

@@ -140,6 +140,7 @@ class TestWaferResponse:
             resp.raise_for_status()
         assert exc_info.value.status_code == 404
         assert exc_info.value.url == "https://example.com/missing"
+        assert exc_info.value.response is resp
 
     def test_raise_for_status_500(self):
         resp = WaferResponse(

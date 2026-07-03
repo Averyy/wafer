@@ -186,6 +186,17 @@ class TestReturnOnEmptyWithZeroRetries:
         with pytest.raises(EmptyResponse):
             session.get("https://example.com/api")
 
+    def test_bulk_config_returns_empty_response(self):
+        """.bulk() config (max_retries=1, max_rotations=0) + empty 200 →
+        returns response after the retry, never raises."""
+        responses = [MockResponse(200, body="")] * 3
+        session, _ = make_sync_session(
+            responses, max_retries=1, max_rotations=0
+        )
+        resp = session.get("https://example.com/api")
+        assert resp.status_code == 200
+        assert resp.text == ""
+
 
 # ---------------------------------------------------------------------------
 # Step 5: rotate_every
@@ -286,6 +297,18 @@ class TestAsyncReturnOnEmptyWithZeroRetries:
         responses = [MockResponse(200, body="")]
         session, _ = make_async_session(
             responses, max_retries=0
+        )
+        resp = await session.get("https://example.com/api")
+        assert resp.status_code == 200
+        assert resp.text == ""
+
+    @pytest.mark.asyncio
+    async def test_bulk_config_returns_empty_response(self):
+        """Async: .bulk() config (max_retries=1, max_rotations=0) + empty
+        200 → returns response after the retry, never raises."""
+        responses = [MockResponse(200, body="")] * 3
+        session, _ = make_async_session(
+            responses, max_retries=1, max_rotations=0
         )
         resp = await session.get("https://example.com/api")
         assert resp.status_code == 200

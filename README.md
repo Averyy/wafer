@@ -49,7 +49,7 @@ resp.content       # bytes -true wire body, decompressed but otherwise exact
                    #         (NOT a utf-8 re-encode of .text; safe for binary)
 resp.headers       # dict[str, str] -lowercase keys
 resp.url           # str -final URL after redirects
-resp.history       # list[HistoryEntry] -one (status_code, url) per followed
+resp.history       # list of (status_code, url) named tuples -one per followed
                    #   redirect hop, in order; [] when not redirected
 resp.cookies       # dict[str, str] -cookies set by THIS response (name -> value,
                    #   attributes dropped); per-response, not the session jar
@@ -174,7 +174,7 @@ session.request("PATCH", url, **kwargs)
 # ... all standard HTTP methods (GET, POST, PUT, DELETE, HEAD, OPTIONS, PATCH, TRACE)
 ```
 
-Per-request kwargs: `headers`, `params`, `json`, `form`, `body`, `timeout`, `multipart`.
+Per-request kwargs: `headers`, `params`, `json`, `form`, `body`, `multipart`, `timeout`, `attempt_timeout`, `max_response_size`.
 
 ## TLS Fingerprinting
 
@@ -536,7 +536,7 @@ if result:
 
 Uses [Patchright](https://github.com/Kaliiiiiiiiii-Vinyzu/patchright-python) (patched Playwright) with real system Chrome for maximum stealth. Persistent browser instance with idle timeout. Thread-safe.
 
-Supports: Cloudflare (managed + Turnstile), Akamai, DataDome (VM PoW + puzzle slider + slide-right + audio captcha), PerimeterX (including press-and-hold), Imperva, Kasada, F5 Shape, AWS WAF, GeeTest v4 (slide puzzle), Alibaba Baxia (slider), hCaptcha (checkbox), reCAPTCHA v2 (checkbox + image grid via EfficientNet + D-FINE), and generic JS challenges.
+Supports: Cloudflare (managed + Turnstile), Akamai, DataDome (WASM PoW auto-resolve + confirm click; bails out on interactive captchas -DD rejects CDP-dispatched input), PerimeterX (including press-and-hold), Imperva, Kasada, F5 Shape, AWS WAF, GeeTest v4 (slide puzzle), Alibaba Baxia (slider), hCaptcha (checkbox), reCAPTCHA v2 (checkbox + image grid via EfficientNet + D-FINE), and generic JS challenges.
 
 ### Solving on an origin page (`solve_origin`)
 
@@ -691,11 +691,11 @@ wafer/
   _sync.py          # SyncSession -wraps wreq.blocking.Client
   _async.py         # AsyncSession -wraps wreq.Client
   _response.py      # WaferResponse wrapper
-  _challenge.py     # Challenge detection (16 WAF types)
+  _challenge.py     # Challenge detection (17 WAF types)
   _solvers.py       # Inline solvers (ACW, Amazon, TMD)
   _cookies.py       # JSON disk cache with TTL and LRU
   _fingerprint.py   # Emulation profiles, sec-ch-ua generation
-  _profiles.py      # Profile enum (OPERA_MINI, SAFARI)
+  _profiles.py      # Profile enum (OPERA_MINI, SAFARI, DART)
   _opera_mini.py    # Opera Mini identity generation + stdlib HTTP transport
   _safari.py        # Safari 26 identity -TLS options, H2 options, headers
   _dart.py          # Dart 3.11 (Flutter) identity -TLS options, headers

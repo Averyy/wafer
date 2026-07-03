@@ -235,7 +235,7 @@ class WaferResponse:
         from wafer._errors import WaferHTTPError
 
         if not self.ok:
-            raise WaferHTTPError(self.status_code, self.url)
+            raise WaferHTTPError(self.status_code, self.url, response=self)
 
     def get_all(self, key: str) -> list[str]:
         """Return all values for a header key (e.g. individual Set-Cookie entries).

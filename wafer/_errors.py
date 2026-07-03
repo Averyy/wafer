@@ -107,11 +107,16 @@ class WaferTimeout(WaferError, TimeoutError):
 
 
 class WaferHTTPError(WaferError):
-    """HTTP error raised by raise_for_status()."""
+    """HTTP error raised by raise_for_status().
 
-    def __init__(self, status_code: int, url: str):
+    ``response`` carries the ``WaferResponse`` that
+    ``raise_for_status()`` was called on, else None.
+    """
+
+    def __init__(self, status_code: int, url: str, response=None):
         self.status_code = status_code
         self.url = url
+        self.response = response
         super().__init__(
             f"HTTP {status_code} at {url}"
         )

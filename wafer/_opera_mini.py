@@ -302,13 +302,16 @@ class OperaMiniIdentity:
         headers: dict[str, str] | None = None,
         timeout: float = 30.0,
         max_size: int | None = None,
-    ) -> tuple[int, dict[str, str], str, str, list[str]]:
+    ) -> tuple[int, dict[str, str], bytes, str, list[str]]:
         """Send an HTTP GET via stdlib urllib (bypasses wreq).
 
-        Returns (status_code, headers_dict, body_text, final_url,
-        set_cookies). final_url reflects the actual URL after any
-        redirects (for SSRF checks). set_cookies holds the individual
-        Set-Cookie header values (the flat headers_dict joins
+        Returns (status_code, headers_dict, body_bytes, final_url,
+        set_cookies). body_bytes is the decompressed body — the caller
+        builds a WaferResponse with text=None so charset resolution
+        happens lazily (header/meta-tag aware, not hardcoded UTF-8) and
+        binary bodies survive byte-exact. final_url reflects the actual
+        URL after any redirects (for SSRF checks). set_cookies holds the
+        individual Set-Cookie header values (the flat headers_dict joins
         multi-value headers with "; ", which is lossy for Set-Cookie).
         Uses system OpenSSL for TLS — no Chrome header leakage,
         more realistic fingerprint for Opera Mini proxy.
@@ -339,6 +342,14 @@ class OperaMiniIdentity:
 
             raise WaferTimeout(url, timeout) from e
         except urllib.error.URLError as e:
+            # urllib surfaces CONNECT-phase timeouts as URLError(reason=
+            # TimeoutError) rather than raising socket.timeout directly
+            # (only read timeouts do). Unwrap so a hang past the budget is
+            # WaferTimeout, never ConnectionFailed (total-budget rule).
+            if isinstance(e.reason, TimeoutError):
+                from wafer._errors import WaferTimeout
+
+                raise WaferTimeout(url, timeout) from e
             from wafer._errors import ConnectionFailed
 
             raise ConnectionFailed(url, str(e.reason)) from e
@@ -422,7 +433,6 @@ class OperaMiniIdentity:
                 except zlib.error:
                     continue  # try raw deflate, then return raw bytes
 
-        text = raw.decode("utf-8", errors="replace")
         resp_headers: dict[str, str] = {}
         set_cookies: list[str] = []
         for k, v in resp.headers.items():
@@ -434,4 +444,4 @@ class OperaMiniIdentity:
                 resp_headers[kl] + "; " + v if kl in resp_headers else v
             )
         final_url = resp.url or url
-        return resp.status, resp_headers, text, final_url, set_cookies
+        return resp.status, resp_headers, raw, final_url, set_cookies

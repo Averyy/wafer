@@ -208,11 +208,11 @@ class TestOperaMiniCap:
         port, stop = _serve(_handler(b"<html>ok</html>"))
         try:
             ident = OperaMiniIdentity()
-            status, _, text, _, _ = ident.request(
+            status, _, body, _, _ = ident.request(
                 f"http://127.0.0.1:{port}/x", max_size=10_000
             )
             assert status == 200
-            assert "ok" in text
+            assert b"ok" in body
         finally:
             stop()
 
@@ -260,11 +260,11 @@ class TestOperaMiniCap:
         port, stop = _serve(_handler(raw))
         try:
             ident = OperaMiniIdentity()
-            status, _, text, _, _ = ident.request(
+            status, _, body, _, _ = ident.request(
                 f"http://127.0.0.1:{port}/x"
             )
             assert status == 200
-            assert len(text) == 50_000
+            assert len(body) == 50_000
         finally:
             stop()
 

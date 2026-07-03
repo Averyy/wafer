@@ -31,6 +31,7 @@ import io
 import logging
 import socket
 import ssl
+import time
 import zlib
 from http.cookiejar import Cookie, CookieJar
 from urllib.parse import urljoin, urlparse
@@ -220,7 +221,8 @@ class NativeTLSTransport:
         headers with ``"; "``, which is lossy for Set-Cookie).
 
         ``headers`` is sent as-is after ``Host`` (caller sanitizes via
-        ``sanitize_headers``). Follows redirects when configured. Raises
+        ``sanitize_headers``). Follows redirects when configured;
+        ``timeout`` bounds the whole redirect chain, not each hop. Raises
         ``WaferTimeout``/``ConnectionFailed`` on network errors; non-2xx
         HTTP responses are returned normally (not raised).
 
@@ -230,21 +232,28 @@ class NativeTLSTransport:
         too (gzip-bomb safe). ``ResponseTooLarge`` is raised when exceeded.
         ``None`` (default) = no cap, behavior byte-identical to before.
         """
-        from wafer._errors import TooManyRedirects
+        from wafer._errors import TooManyRedirects, WaferTimeout
 
         method = method.upper()
         # One initial request + up to max_redirects follow-ups, aligned with
         # the session's redirect budget (the wreq path uses the same cap).
         max_hops = (self._max_redirects + 1) if self._follow_redirects else 1
+        # ``timeout`` bounds the WHOLE redirect chain, not each hop: a
+        # redirecting tarpit must not stretch the caller's budget by
+        # max_redirects x timeout.
+        deadline = time.monotonic() + timeout
         requested = url
         status: int = 0
         resp_headers: dict[str, str] = {}
         raw = b""
         set_cookies: list[str] = []
         for _hop in range(max_hops):
+            hop_timeout = deadline - time.monotonic()
+            if hop_timeout <= 0:
+                raise WaferTimeout(url, timeout)
             requested = url
             status, resp_headers, raw, set_cookies = self._send(
-                method, requested, headers, body, timeout, max_size
+                method, requested, headers, body, hop_timeout, max_size
             )
             if (
                 self._follow_redirects

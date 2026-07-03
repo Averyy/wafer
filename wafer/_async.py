@@ -490,10 +490,14 @@ class AsyncSession(BaseSession):
                     method, url, headers, body, timeout, max_size,
                 )
             )
-        except (ResponseTooLarge, TooManyRedirects):
-            # Hard limits (size cap, redirect loop), not transport hiccups:
-            # propagate rather than swallowing into a None (which would fall
-            # back to the wreq path and silently bypass the limit).
+        except (ResponseTooLarge, TooManyRedirects, WaferTimeout):
+            # Hard limits (size cap, redirect loop, total-budget timeout),
+            # not transport hiccups: propagate rather than swallowing into a
+            # None (which would fall back to the wreq path and silently
+            # bypass the limit). The native per-hop timeout IS the remaining
+            # total budget, so a WaferTimeout here means the deadline is
+            # spent -- surfacing it matches the wreq-path rule (hang past
+            # the deadline -> WaferTimeout, never ConnectionFailed).
             raise
         except Exception:
             logger.warning(
@@ -611,7 +615,7 @@ class AsyncSession(BaseSession):
             if timeout <= 0:
                 raise WaferTimeout(url, timeout_secs)
             loop = asyncio.get_event_loop()
-            status, resp_headers, text, final_url, set_cookies = (
+            status, resp_headers, body_bytes, final_url, set_cookies = (
                 await loop.run_in_executor(
                     None,
                     lambda: self._om_identity.request(
@@ -624,8 +628,8 @@ class AsyncSession(BaseSession):
                 self._rate_limiter.record(domain)
             return WaferResponse(
                 status_code=status,
-                content=text.encode("utf-8"),
-                text=text,
+                content=body_bytes,
+                text=None,
                 headers=resp_headers,
                 url=final_url,
                 elapsed=time.monotonic() - start_time,
@@ -1410,12 +1414,13 @@ class AsyncSession(BaseSession):
                 and not body.strip()
             ):
                 if not state.can_retry:
-                    # max_retries=0 / .bulk(): the documented contract is to
-                    # RETURN the empty-200 response, never to rotate. This must
-                    # be checked BEFORE the 200-capable rotation branch below,
-                    # which would otherwise rotate a max_retries=0 caller that
-                    # still has rotation budget.
-                    if self.max_retries == 0:
+                    # max_retries=0 or max_rotations=0 (.bulk()): the
+                    # documented contract is to RETURN the empty-200 response,
+                    # never to rotate — matching the 429/challenge no-rotation
+                    # gates. This must be checked BEFORE the 200-capable
+                    # rotation branch below, which would otherwise rotate a
+                    # max_retries=0 caller that still has rotation budget.
+                    if self.max_retries == 0 or self.max_rotations == 0:
                         return self._make_response(
                             status_code=status,
                             content=raw_content,

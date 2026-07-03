@@ -438,16 +438,16 @@ WaferError (base)
   +- TokenMintFailed      .stage: str | None ("anchor"|"reload"|"apijs"), .status_code: int | None
   +- ResponseTooLarge     .url: str, .size: int (bytes seen when cap hit), .limit: int (the cap)
   +- WaferTimeout         .url: str, .timeout_secs: float  (also inherits TimeoutError)
-  +- WaferHTTPError       .status_code: int, .url: str  (raised by raise_for_status())
+  +- WaferHTTPError       .status_code: int, .url: str, .response: WaferResponse | None  (raised by raise_for_status())
 ```
 
 `except WaferError` catches everything including WaferTimeout.
 
-`ChallengeDetected`, `RateLimited`, and `EmptyResponse` carry the final
-`WaferResponse` as `e.response` (body, headers, status of the blocked reply) -
-read `e.response.text` / `e.response.headers` instead of string-matching
-`str(e)`. It can be None in edge cases where no response was in hand, so
-check before dereferencing. Caution: `e.response` may be a full WAF challenge
+`ChallengeDetected`, `RateLimited`, `EmptyResponse`, and `WaferHTTPError`
+carry the final `WaferResponse` as `e.response` (body, headers, status of the
+blocked reply) - read `e.response.text` / `e.response.headers` instead of
+string-matching `str(e)`. It can be None in edge cases where no response was
+in hand, so check before dereferencing. Caution: `e.response` may be a full WAF challenge
 page with embedded tokens/sensor data - do not log its body or headers
 unscrubbed.
 
@@ -462,7 +462,7 @@ Default mode (`max_rotations > 0`):
 - 429 without challenge -> raises `RateLimited` after exhausting rotations
 - 200 with empty body -> retries; if the host already served a real body this session, also rotates to a fresh identity (within `max_rotations`); raises `EmptyResponse` once retries+rotations are exhausted (see "Reputation-burn guard")
 - Connection error (refused/reset/TLS failure) -> raises `ConnectionFailed` after exhausting retries
-- Server hang past the total `timeout` deadline -> raises `WaferTimeout` (a wreq-layer timeout is always bounded by your budget and surfaced as `WaferTimeout`, never `ConnectionFailed`)
+- Server hang past the total `timeout` deadline -> raises `WaferTimeout` (a timeout on any transport - the wreq path, the native-TLS Imperva bypass, or the Opera Mini path, whether during connect or read - is always bounded by your budget and surfaced as `WaferTimeout`, never `ConnectionFailed`)
 - 5xx -> returns response after exhausting retries
 - Other 4xx (400, 401, 404, etc.) -> returns response immediately (no retry)
 
@@ -797,7 +797,8 @@ The solver is thread-safe and reuses a single browser instance with idle timeout
 Solves are serialized on an internal lock; a caller waiting for a busy solver
 gives up once its own timeout budget is exhausted (it does not block forever),
 so one slow solve can't stall other callers past their request deadlines.
-Supports: Cloudflare, Akamai, DataDome (WASM PoW auto-resolve only), PerimeterX
+Supports: Cloudflare, Akamai, DataDome (WASM PoW auto-resolve + confirm click
+only; bails on interactive captchas), PerimeterX
 (press-and-hold), Imperva, Kasada, F5 Shape, AWS WAF, GeeTest v4 (slide),
 Baxia (slider), hCaptcha, reCAPTCHA v2 (checkbox + image grid via local ONNX
 models), generic JS.
@@ -1018,7 +1019,8 @@ logging.getLogger("wafer").setLevel(logging.DEBUG)
     `e.response`). An empty 200 from a host that already served a real body this
     session is treated as an identity-hot signal and also rotates to a fresh
     fingerprint (within `max_rotations`) before raising. If you want the
-    response object returned instead, use `.bulk()` or set `max_retries=0`.
+    response object returned instead, use `.bulk()` or set `max_retries=0`
+    or `max_rotations=0`.
 
 13. **Set `rate_limit` for repeated requests.** Defaults to `0.0` (disabled).
     Without it, requests fire back-to-back. A semaphore limits concurrency,
