@@ -12,6 +12,7 @@ from wreq import Method
 from wafer._base import (
     BaseSession,
     _aread_body_capped,
+    _canonicalize_url_host,
     _CapExceeded,
     _content_length_over_cap,
     _decode_headers,
@@ -776,10 +777,19 @@ class AsyncSession(BaseSession):
                     seconds=attempt_limit
                 )
 
-            # Make the request
+            # Make the request. When a resolve pin is set, canonicalize the
+            # URL host (lowercase + trailing-dot strip) so wreq's DnsOptions -
+            # which matches its map against the URL host verbatim - can't miss
+            # the pin on a mixed-case/trailing-dot host and fall through to
+            # real DNS (the SSRF-rebinding hole). No-op when unpinned.
+            wreq_url = (
+                _canonicalize_url_host(current_url)
+                if self._resolve
+                else current_url
+            )
             try:
                 resp = await self._client.request(
-                    m, current_url, **kwargs
+                    m, wreq_url, **kwargs
                 )
             except Exception as e:
                 # Every attempt now carries a timeout kwarg -- attempt_timeout

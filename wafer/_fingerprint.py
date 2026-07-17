@@ -235,6 +235,8 @@ _CHROME_BUILDS: dict[int, tuple[int, int]] = {
     145: (7632, 46),
     146: (7680, 31),
     147: (7727, 24),
+    148: (7778, 217),
+    149: (7827, 201),
 }
 
 # Fallback for versions outside the lookup table.
@@ -281,6 +283,10 @@ _EDGE_BUILDS: dict[int, tuple[int, int]] = {
     145: (3800, 58),
     146: (3856, 109),  # wire-verified: the build wreq's Edge146 UA emits
     147: (3912, 51),   # wire-verified: the build wreq's Edge147 UA emits
+    148: (3967, 96),   # Edge 148 stable (MS Edge update API); wreq's Edge148
+                       # UA is reduced to 148.0.0.0 so the build can't be
+                       # wire-read - the full build lives only in wafer's
+                       # generated full-version-list, which needs a real one.
 }
 
 # Linear-approximation fallback for Edge majors not in the table (same
@@ -667,8 +673,8 @@ def emulation_for_version(version: int) -> Emulation | None:
 # Pinned to concrete members (not auto-discovered) so the ladder is
 # deterministic and so a wreq bump that adds a newer member is a conscious
 # update (mirrors DEFAULT_EMULATION). Refresh alongside DEFAULT_EMULATION.
-FIREFOX_LADDER_EMULATION = Emulation.Firefox149
-EDGE_LADDER_EMULATION = Emulation.Edge147
+FIREFOX_LADDER_EMULATION = Emulation.Firefox151
+EDGE_LADDER_EMULATION = Emulation.Edge148
 
 # The deterministic family escalation order. "chrome" is the implicit start
 # (the default family); the loop walks the *remaining* rungs in this order

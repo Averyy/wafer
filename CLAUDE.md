@@ -46,7 +46,7 @@ Wraps wreq **0.12.0+** (the `Emulation` API, formerly rnet). See `docs/ref-wreq.
 - No `from __future__ import annotations`
 - Logging via `logging.getLogger("wafer")`, never print()
 - wreq's `Emulation` enum is the source of truth for browser fingerprints
-- Always default to the newest Chrome `Emulation` profile available (currently Chrome147)
+- Always default to the newest Chrome `Emulation` profile available (currently Chrome149)
 - Solver docs live in `docs/ref-*.md` -one per WAF type
 - Mousse changes must update both `wafer/browser/mousse/README.md` and `README.md`
 - **Keep `llms.txt` up to date.** It is the implementation guide for LLMs helping users write code that uses wafer (not for contributors). When adding/changing public API, session params, response fields, error types, challenge types, profiles, or browser solver features, update `llms.txt` to match. Rules for what belongs:

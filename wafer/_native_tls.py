@@ -157,6 +157,7 @@ class NativeTLSTransport:
         follow_redirects: bool = True,
         proxy_url: str | None = None,
         max_redirects: int = 10,
+        resolve: dict[str, list[str]] | None = None,
     ):
         self._ctx = ssl.create_default_context()
         self._jar = CookieJar()
@@ -165,6 +166,62 @@ class NativeTLSTransport:
         # Hop budget for the native redirect chain. Aligned with the session
         # ``max_redirects`` so the bypass and the wreq path agree.
         self._max_redirects = max_redirects
+        # SSRF-safe DNS pinning (host->IPs). This transport does its own
+        # getaddrinfo (wreq's dns_options does nothing here), so it must honor
+        # the pin itself: connect the socket to the pinned IP while the TLS
+        # wrap still passes server_hostname=<host> for correct SNI/cert. Not
+        # applied through a proxy tunnel (the socket goes to the proxy, which
+        # resolves the target itself), matching where the wreq path's pin also
+        # doesn't run. Keys are canonicalized here too (BaseSession already
+        # hands over canonical keys, but this makes the contract self-enforcing
+        # so a direct construction with a mixed-case/IDN key can't silently
+        # miss the pin and fall open to real DNS).
+        from wafer._base import _canonical_host
+
+        self._resolve: dict[str, list[str]] = {
+            _canonical_host(h): v for h, v in (resolve or {}).items()
+        }
+
+    def _pin_socket(self, conn, host: str, port: int) -> None:
+        """Pin ``conn``'s socket to a resolve-mapped IP, keeping SNI on host.
+
+        No-op when ``host`` is not in the resolve map. When it is, we redirect
+        only the socket's connect target to the pinned IP by shadowing the
+        connection's ``_create_connection`` with a closure; ``conn.host`` is
+        left as the hostname, so ``HTTPSConnection.connect`` still wraps the
+        socket with ``server_hostname=<host>`` (correct SNI + cert check) and
+        the ``Host`` header (built from the hostname) is unchanged. This closes
+        the DNS-rebinding window on the native path: the socket goes to the
+        exact pre-validated IP, never a re-resolved one.
+        """
+        from wafer._base import _canonical_host
+
+        pinned = self._resolve.get(_canonical_host(host))
+        if not pinned:
+            return
+        # Pre-validated IPs (fetchaller vets each as public before handing them
+        # over). Tried in order so a dead first entry fails over to the rest,
+        # matching the wreq path instead of hard-failing on pinned[0].
+        pinned_ips = [str(a) for a in pinned]
+
+        def _connect_to_pinned(address, timeout=None, source_address=None):
+            # http.client calls this as (address, self.timeout, source_address).
+            # Ignore the hostname-based address entirely; dial the pinned IPs.
+            last_err = None
+            for ip in pinned_ips:
+                try:
+                    return socket.create_connection(
+                        (ip, port), timeout, source_address
+                    )
+                except OSError as exc:
+                    last_err = exc
+            raise last_err
+
+        # Shadow the class-level staticmethod on this instance. Since it is a
+        # plain function stored on the instance (not via the descriptor
+        # protocol), ``conn._create_connection(...)`` calls it without passing
+        # ``self`` -matching the staticmethod contract http.client expects.
+        conn._create_connection = _connect_to_pinned
 
     def add_cookies(self, cookies: list[dict]) -> None:
         """Seed the jar from Playwright-style cookie dicts.
@@ -332,8 +389,10 @@ class NativeTLSTransport:
                 )
         elif secure:
             conn = conn_cls(host, port, context=self._ctx, timeout=timeout)
+            self._pin_socket(conn, host, port)
         else:
             conn = conn_cls(host, port, timeout=timeout)
+            self._pin_socket(conn, host, port)
 
         logger.debug("Native-TLS %s %s", method, url)
         try:

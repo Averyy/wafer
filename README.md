@@ -66,7 +66,7 @@ resp.rotations      # int -fingerprint rotations used (403/challenge)
 resp.inline_solves  # int -inline challenge solves used (ACW, Amazon, TMD)
 resp.challenge_type # str | None -WAF challenge type if detected
 resp.emulation      # str | None -the identity that served this response, for
-                    #   diagnosing a 403 (e.g. "Profile.Chrome147", "safari")
+                    #   diagnosing a 403 (e.g. "Profile.Chrome149", "safari")
 ```
 
 To read the session's *accumulated* cookie state (not just one response's
@@ -88,7 +88,7 @@ from wafer import SyncSession, AsyncSession
 
 session = SyncSession(
     # TLS fingerprint (defaults to newest Chrome)
-    emulation=None,  # or wreq.Emulation.Chrome147
+    emulation=None,  # or wreq.Emulation.Chrome149
 
     # Timeouts (float seconds or timedelta)
     timeout=30,                                    # float/int seconds. The TOTAL
@@ -186,7 +186,7 @@ session = SyncSession()
 
 # Specific profile
 from wreq import Emulation
-session = SyncSession(emulation=Emulation.Chrome147)
+session = SyncSession(emulation=Emulation.Chrome149)
 ```
 
 The `sec-ch-ua` header is auto-generated to match the emulated Chrome version using the same GREASE algorithm as Chromium source.
@@ -237,7 +237,7 @@ wafer.sec_ch_ua(147, brand="Microsoft Edge")  # Edge brand
 wafer.full_version(147)                       # "147.0.7727.24"
 wafer.emulation_family(Emulation.Edge147)     # "edge"
 wafer.emulation_is_mobile(Emulation.SafariIos26_2)  # True
-wafer.build_fingerprint_envelope(Emulation.Chrome147, user_agent="...")  # full dict
+wafer.build_fingerprint_envelope(Emulation.Chrome149, user_agent="...")  # full dict
 ```
 
 On a 403 or challenge, wafer automatically rotates across browser families (Chrome -> Firefox -> Safari -> Edge), swapping the header envelope to match each TLS fingerprint. This is far more effective than cycling between Chrome versions, which share one Chromium reputation pool. See [Retry and Rotation](#retry-and-rotation).
@@ -414,7 +414,7 @@ The rung you reach is bounded by `max_rotations`: the **full** Chrome->Firefox->
 ```python
 from wreq import Emulation
 session = SyncSession(
-    fingerprint_pool=[Emulation.Chrome147, Emulation.Firefox149, Emulation.Edge147],
+    fingerprint_pool=[Emulation.Chrome149, Emulation.Firefox151, Emulation.Edge148],
     max_rotations=6,  # bound how many pool steps one request may take
 )
 ```

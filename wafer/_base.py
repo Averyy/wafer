@@ -103,7 +103,7 @@ else:
     )
 
 # Default to newest Chrome emulation profile
-DEFAULT_EMULATION = Emulation.Chrome147
+DEFAULT_EMULATION = Emulation.Chrome149
 
 DEFAULT_HEADERS = {
     "Accept": (
@@ -280,6 +280,72 @@ def _extract_location(header_map) -> str:
     return str(raw)
 
 
+def _canonical_host(host: str) -> str:
+    """Normalize a hostname for resolve-map keys and lookups.
+
+    Hostnames are case-insensitive (RFC 3986 s3.2.2) and a trailing dot
+    denotes the same name, so ``Example.COM.`` and ``example.com`` are one
+    host. Both the stored pin keys and every lookup (wreq URL host + native
+    path) run through this so the pin can't be silently missed on a
+    case/dot variant -which would fall through to real DNS and reopen the
+    SSRF window the pin exists to close.
+
+    IDN hosts are folded to their punycode (IDNA/ToASCII) form, matching what
+    wreq puts on the wire, so a Unicode pin key isn't silently missed either.
+    Already-ASCII hosts (incl. underscore/`xn--` labels the IDNA codec rejects
+    or leaves alone) fall back to the lowercased form -no behavior change.
+
+    Uses Python's stdlib IDNA (IDNA2003), which is weaker than UTS-46 (e.g. it
+    folds `faß` -> `fass`). This is applied to BOTH the pin key and the request
+    URL host, so the two never diverge and the pin can't miss inside wafer (the
+    security-critical property; empirically verified). The only residual is a
+    narrow FUNCTIONAL one: an exotic IDN a UTS-46 caller resolved differently
+    would fail CLOSED here (cert mismatch on the wrong-cased host), never open.
+    A stronger IDNA needs the `idna` PyPI lib; not worth a dep for this.
+    """
+    h = host.strip().rstrip(".").lower()
+    try:
+        h = h.encode("idna").decode("ascii")
+    except (UnicodeError, ValueError):
+        pass  # already-ASCII or un-encodable: keep the lowercased form
+    return h
+
+
+def _canonicalize_url_host(url: str) -> str:
+    """Return ``url`` with only its hostname canonicalized (see _canonical_host).
+
+    wreq's DnsOptions matches the resolve map against the URL's host
+    *verbatim* (case- and trailing-dot-sensitive), while the pin keys are
+    stored canonical. So the host in the URL handed to wreq must be
+    canonicalized too, or a mixed-case/trailing-dot request host bypasses the
+    pin. Scheme, userinfo, port, path, query, and fragment are preserved
+    byte-for-byte; IPv6 literals (no DNS host to pin) are returned unchanged.
+
+    Note: ``urlparse(...).hostname`` already lowercases, so the raw ``netloc``
+    is split by hand to see the host's original case and detect a difference.
+    """
+    parsed = urlparse(url)
+    netloc = parsed.netloc
+    if not netloc:
+        return url
+    if "@" in netloc:
+        userinfo, hostport = netloc.rsplit("@", 1)
+        userinfo += "@"
+    else:
+        userinfo, hostport = "", netloc
+    if hostport.startswith("["):  # IPv6 literal: no DNS host to pin
+        return url
+    if ":" in hostport:
+        host, portpart = hostport.rsplit(":", 1)
+        portpart = f":{portpart}"
+    else:
+        host, portpart = hostport, ""
+    canon = _canonical_host(host)
+    if canon == host:
+        return url
+    return parsed._replace(netloc=f"{userinfo}{canon}{portpart}").geturl()
+
+
 class BaseSession:
     """Shared logic for sync and async sessions. No I/O."""
 
@@ -309,6 +375,7 @@ class BaseSession:
         safari_locale: str = "us",
         fingerprint_pool: list | None = None,
         max_response_size: int | None = None,
+        resolve: dict[str, list[str]] | None = None,
     ):
         self._profile = profile
         # Optional byte cap on response bodies. None (default) = no cap,
@@ -512,6 +579,51 @@ class BaseSession:
         # call that doesn't pass an explicit v=, so the api.js fetch
         # happens at most once per mode per session.
         self._recaptcha_v: dict[str, str] = {}
+
+        # SSRF-safe DNS pinning: a pre-validated host->IP map. wafer connects
+        # the socket to exactly these IPs while TLS SNI + cert validation still
+        # key on the original hostname, closing the TOCTOU rebinding window
+        # between a caller's public-IP check and wafer's connect. Passed
+        # through to wreq's DnsOptions on the wreq path (see
+        # _build_client_kwargs) and honored by the native-TLS path (see
+        # _native_transport). Keys are canonicalized (_canonical_host: case /
+        # trailing-dot / IDNA) and the request URL host is canonicalized the
+        # same way before dispatch, so a case/dot/IDN variant of the host can't
+        # miss the pin and fall through to real DNS. IPs are validated up front
+        # so a later _rebuild_client (fingerprint rotation) can never raise on
+        # a bad address. An explicitly listed host with no IPs is a caller bug
+        # that would silently reopen the hole, so it raises rather than
+        # falling through to real DNS.
+        self._resolve: dict[str, list[str]] = {}
+        if resolve:
+            # A proxy resolves the target host itself, so the pin would be
+            # silently ignored through one (both transports skip pinning when
+            # a proxy is set). For an SSRF guard that is a fail-open: refuse
+            # the unsatisfiable contract loudly instead of pretending to pin.
+            if proxy:
+                raise ValueError(
+                    "resolve= (SSRF DNS pinning) cannot be combined with a "
+                    "proxy: the proxy resolves the target host, so the pin "
+                    "would be silently ignored. Pass one or the other."
+                )
+            from ipaddress import ip_address
+
+            for host, addrs in resolve.items():
+                norm = _canonical_host(host)
+                if not norm:
+                    raise ValueError("resolve host must be a non-empty string")
+                # Materialize before the empty check so a single-use iterable
+                # (generator) can't slip past it and store [] -which would
+                # silently fall through to real DNS and reopen the hole.
+                addrs = list(addrs)
+                if not addrs:
+                    raise ValueError(
+                        f"resolve[{host!r}] has no IP addresses; a pinned "
+                        "host must map to at least one IP"
+                    )
+                for a in addrs:
+                    ip_address(a)  # validate now; raises ValueError if bad
+                self._resolve[norm] = addrs
 
         # Native-TLS fallback (urllib/OpenSSL) for WAFs that fingerprint
         # the BoringSSL stack wreq is built on (Imperva/Incapsula). Lazily
@@ -1242,6 +1354,20 @@ class BaseSession:
             kwargs["tls_verify"] = _SYSTEM_CERT_STORE
         if self._proxy is not None:
             kwargs["proxies"] = [self._proxy]
+        if self._resolve:
+            # SSRF DNS pinning. Applies to all three fingerprint branches
+            # (Dart / Safari / Chrome) and, because this runs on every
+            # _rebuild_client(), survives fingerprint rotation/retirement
+            # for free. dns_options is orthogonal to emulation/TLS options,
+            # so the anti-detection fingerprint is untouched.
+            from ipaddress import ip_address
+
+            from wreq import DnsOptions
+
+            opts = DnsOptions()
+            for host, addrs in self._resolve.items():
+                opts.add_resolve(host, [ip_address(a) for a in addrs])
+            kwargs["dns_options"] = opts
         return kwargs
 
     @contextlib.contextmanager
@@ -1344,6 +1470,7 @@ class BaseSession:
                 follow_redirects=self.follow_redirects,
                 proxy_url=self._proxy_url,
                 max_redirects=self.max_redirects,
+                resolve=self._resolve,
             )
         return self._native_tls
 
@@ -1367,7 +1494,7 @@ class BaseSession:
         if self._fingerprint is not None:
             major = chrome_version(self._fingerprint.current)
         if major is None:
-            major = chrome_version(DEFAULT_EMULATION) or 147
+            major = chrome_version(DEFAULT_EMULATION) or 149
         return host_user_agent(major)
 
     def _native_prepare(

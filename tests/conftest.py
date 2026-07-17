@@ -338,6 +338,7 @@ def make_sync_session(responses, **session_kwargs):
     session._recaptcha_v = {}
     session._native_tls = None
     session._native_tls_domains = set()
+    session._resolve = session_kwargs.get("resolve", None) or {}
     session._proxy = None
     session._proxy_url = None
     session._rotate_every = session_kwargs.get("rotate_every", None)
@@ -425,6 +426,7 @@ def make_async_session(responses, **session_kwargs):
     session._recaptcha_v = {}
     session._native_tls = None
     session._native_tls_domains = set()
+    session._resolve = session_kwargs.get("resolve", None) or {}
     session._proxy = None
     session._proxy_url = None
     session._rotate_every = session_kwargs.get("rotate_every", None)

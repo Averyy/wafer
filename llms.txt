@@ -115,15 +115,15 @@ Both support context managers (`with` / `async with`).
 
 ```python
 SyncSession(
-    # TLS identity (any wreq Emulation profile). Default: Emulation.Chrome147 (newest).
+    # TLS identity (any wreq Emulation profile). Default: Emulation.Chrome149 (newest).
     # Non-Chrome families get a matching HTTP header envelope automatically:
-    #   Emulation.Edge147    -> Chromium headers, sec-ch-ua brand "Microsoft Edge"
-    #   Emulation.Firefox149 -> Firefox Accept/Accept-Language, NO sec-ch-ua
+    #   Emulation.Edge148    -> Chromium headers, sec-ch-ua brand "Microsoft Edge"
+    #   Emulation.Firefox151 -> Firefox Accept/Accept-Language, NO sec-ch-ua
     # See "Fingerprint Identity". On 403/challenge, rotation escalates ACROSS
     # families (Chrome -> Firefox -> Safari -> Edge) before cycling versions -
     # see "Rotation escalation". A non-Chrome starting emulation just changes
     # the starting family; the same cross-family ladder still applies.
-    emulation: wreq.Emulation | None = None,  # default: Emulation.Chrome147 (newest)
+    emulation: wreq.Emulation | None = None,  # default: Emulation.Chrome149 (newest)
 
     # Non-Chrome profiles (overrides emulation)
     profile: Profile | None = None,           # Profile.OPERA_MINI, Profile.SAFARI, or Profile.DART
@@ -189,6 +189,12 @@ SyncSession(
 
     # Proxy
     proxy: str | None = None,   # "socks5://user:pass@host:port", "http://...", etc.
+
+    # DNS pinning (SSRF guard): pre-validated host -> list of IP strings.
+    # Socket connects to these IPs; TLS SNI + cert still key on the hostname.
+    # Construction-only (no per-request form); an empty IP list raises;
+    # combining with proxy= raises (a proxy resolves the host, voiding the pin).
+    resolve: dict[str, list[str]] | None = None,
 
     # Embed mode (both modes select a random Referer from embed_referers)
     embed: str | None = None,           # "xhr", "xhr-jquery", or "iframe"
@@ -310,8 +316,8 @@ resp.inline_solves  # int (inline challenge solves)
 resp.challenge_type # str | None (e.g. "cloudflare", "datadome")
 resp.emulation      # str | None - the identity that SERVED this response, for
                     # diagnosing a 403/regression. For Emulation sessions it's the
-                    # wreq profile repr, e.g. "Profile.Chrome147" / "Profile.Edge147"
-                    # / "Profile.Firefox149"; for non-Emulation profiles it's the
+                    # wreq profile repr, e.g. "Profile.Chrome149" / "Profile.Edge148"
+                    # / "Profile.Firefox151"; for non-Emulation profiles it's the
                     # profile name ("safari", "dart", "opera_mini"). Reflects the
                     # CURRENT identity, so after a rotation it shows the one that
                     # actually served (not the session's original).
@@ -330,10 +336,10 @@ derived from the chosen `emulation`:
 
 - **Chrome** (default): full sec-ch-ua client hints, brand `"Google Chrome"`,
   Chrome navigation `Accept`.
-- **Edge** (`emulation=Emulation.Edge147`): Chromium, so Chrome-like headers and
+- **Edge** (`emulation=Emulation.Edge148`): Chromium, so Chrome-like headers and
   the SAME navigation `Accept`, but the sec-ch-ua brand is `"Microsoft Edge"`.
   UA is wreq's Edge UA.
-- **Firefox** (`emulation=Emulation.Firefox149`): sends **NO** sec-ch-ua client
+- **Firefox** (`emulation=Emulation.Firefox151`): sends **NO** sec-ch-ua client
   hints at all, a Firefox `Accept`
   (`text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8`) and
   `Accept-Language: en-US,en;q=0.5`. UA is wreq's Firefox UA.

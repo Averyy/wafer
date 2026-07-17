@@ -545,7 +545,7 @@ class TestSyncRetryLoop:
 class TestFingerprintPool:
     """Opt-in pool replaces the default ladder as the rotation source."""
 
-    POOL = [Emulation.Chrome147, Emulation.Firefox149, Emulation.Edge147]
+    POOL = [Emulation.Chrome149, Emulation.Firefox151, Emulation.Edge148]
 
     def test_pool_cycles_through_identities(self, mock_sleep):
         # Each rotation steps to the next pool member (not the family ladder).
@@ -561,7 +561,7 @@ class TestFingerprintPool:
         )
         resp = session.get("https://example.com")
         assert resp.status_code == 200
-        # Landed on pool[2] = Edge147 after two rotations.
+        # Landed on pool[2] = Edge148 after two rotations.
         assert emulation_family(session._fingerprint.current) == "edge"
         # Safari ladder rung is never used in pool mode.
         assert session._safari_identity is None
@@ -570,7 +570,7 @@ class TestFingerprintPool:
         # Rotating to the Firefox pool member must swap to Firefox headers.
         session, mock = make_sync_session(
             [
-                MockResponse(403, body="Denied"),  # -> pool[1] = Firefox149
+                MockResponse(403, body="Denied"),  # -> pool[1] = Firefox151
                 MockResponse(200, body="OK"),
             ],
             fingerprint_pool=self.POOL,
@@ -607,7 +607,7 @@ class TestFingerprintPool:
         # _rotation_delay penalty climbs above the flat 1.0s.
         for r in range(1, len(self.POOL) + 1):
             session._advance_rotation(r)
-        # Back on pool[0] (Chrome147) which now has 1 strike -> penalty 2.0.
+        # Back on pool[0] (Chrome149) which now has 1 strike -> penalty 2.0.
         assert emulation_family(session._fingerprint.current) == "chrome"
         assert session._rotation_delay() == 2.0
 
@@ -626,8 +626,8 @@ class TestFingerprintPool:
             max_rotations=5,
             max_failures=None,
         )
-        # pool[1] = Firefox149 already has 1 strike -> incoming penalty 2.0.
-        session._pool_strikes[repr(Emulation.Firefox149)] = 1
+        # pool[1] = Firefox151 already has 1 strike -> incoming penalty 2.0.
+        session._pool_strikes[repr(Emulation.Firefox151)] = 1
         session.get("https://example.com")
         # Landed on pool[1].
         assert emulation_family(session._fingerprint.current) == "firefox"
@@ -1002,9 +1002,9 @@ class TestAsyncRetryLoop:
                 MockResponse(200, body="OK"),
             ],
             fingerprint_pool=[
-                Emulation.Chrome147,
-                Emulation.Firefox149,
-                Emulation.Edge147,
+                Emulation.Chrome149,
+                Emulation.Firefox151,
+                Emulation.Edge148,
             ],
             max_rotations=5,
             max_failures=None,
