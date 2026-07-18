@@ -712,7 +712,7 @@ These are all automatic. Do not write code to handle these yourself:
 
 ## Challenge Types
 
-Wafer detects 17 WAF/challenge types automatically. When a challenge cannot be
+Wafer detects 18 WAF/challenge types automatically. When a challenge cannot be
 solved, `ChallengeDetected.challenge_type` and `resp.challenge_type` contain
 one of these strings:
 
@@ -728,6 +728,7 @@ one of these strings:
 "acw"          - Alibaba Cloud WAF (solved inline, no browser needed)
 "tmd"          - Alibaba TMD (solved inline, no browser needed)
 "amazon"       - Amazon CAPTCHA (solved inline, no browser needed)
+"reddit"       - Reddit cold-session JSON gate (solved inline, no browser needed)
 "vercel"       - Vercel bot protection
 "arkose"       - Arkose Labs / FunCaptcha (no dedicated solver; not solvable)
 "geetest"      - GeeTest v4
@@ -748,8 +749,11 @@ v2 only (checkbox/image grid in the browser). reCAPTCHA **v3** is different: it'
 a score token, not a visible challenge, and is minted browser-free via
 `session.mint_recaptcha_v3(...)` (see "reCAPTCHA v3 token minting").
 `"vercel"`/`"generic_js"` also get the generic browser JS-wait (no
-dedicated solver, but it passes their passive JS checks). The inline trio
-(`acw`, `tmd`, `amazon`) needs no browser at all.
+dedicated solver, but it passes their passive JS checks). The inline set
+(`acw`, `tmd`, `amazon`, `reddit`) needs no browser at all. Reddit's solver
+fetches `https://old.reddit.com/` once to establish the anonymous cookie jar,
+then retries the original request; `cache_dir` persists both cookie-setting
+response legs so later processes can start warm.
 
 ---
 

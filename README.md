@@ -282,7 +282,7 @@ Safari is particularly effective against DataDome, which heavily fingerprints th
 
 ## Challenge Detection
 
-Wafer detects 17 WAF challenge types from response status, headers, and body.
+Wafer detects 18 WAF challenge types from response status, headers, and body.
 **Detection is not the same as solving** - the "Solved by" column shows how each
 type is actually handled: `inline` (over HTTP, no browser), `browser` (needs a
 configured `browser_solver`), or `detect-only` (raises `ChallengeDetected`; no
@@ -301,6 +301,7 @@ solver - you must handle it yourself).
 | ACW (Alibaba) | `acw_sc__v2` challenge script | inline |
 | TMD | TMD session validation pattern | inline (+ browser slider) |
 | Amazon | CAPTCHA page with `amzn` markers | inline |
+| Reddit | cold-session JSON block template | inline (HTML cookie warm-up) |
 | Arkose / FunCaptcha | `arkoselabs.com` or `funcaptcha` markers | **detect-only** (no solver; the generic browser fallback can't pass FunCaptcha) |
 | GeeTest v4 | `initGeetest4`, `gcaptcha4.geetest.com`, `gt4.js` | browser |
 | hCaptcha | `hcaptcha.com` script, `h-captcha` div | browser |
@@ -309,7 +310,7 @@ solver - you must handle it yourself).
 | Generic JS | Unclassified JavaScript challenges | browser (generic JS wait) |
 
 When a challenge is detected, wafer escalates automatically:
-1. Inline solving (ACW, Amazon, TMD - no browser needed)
+1. Inline solving (ACW, Amazon, TMD, Reddit - no browser needed)
 2. For Imperva, a native OpenSSL transport that TLS-fingerprinting sites
    free-pass (no browser - see [Imperva bypass](#imperva--incapsula-no-browser-bypass))
 3. Browser solver if configured (JS challenges: Cloudflare, DataDome, reCAPTCHA,
@@ -319,11 +320,15 @@ When a challenge is detected, wafer escalates automatically:
 
 ## Inline Solvers
 
-Three challenge types are solved without a browser:
+Four challenge types are solved without a browser:
 
 - **ACW (Alibaba Cloud WAF)** -Extracts the obfuscated cookie value from the challenge page JavaScript, computes the XOR-shuffle, and sets the `acw_sc__v2` cookie.
 - **Amazon CAPTCHA** -Parses the captcha form and submits it programmatically.
 - **TMD (Alibaba TMD)** -Warms the session by fetching the homepage to establish a valid TMD session token.
+- **Reddit JSON API** -On the cold-session block page, fetches one
+  `old.reddit.com` HTML page to establish anonymous cookies, then replays the
+  original JSON request. With `cache_dir`, both cookie-setting response legs
+  are persisted for fresh processes.
 
 These run automatically during the retry loop.
 

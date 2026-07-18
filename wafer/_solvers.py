@@ -151,3 +151,21 @@ def tmd_homepage_url(url: str) -> str:
     """Get homepage URL for TMD session warming."""
     parsed = urlparse(url)
     return f"{parsed.scheme}://{parsed.netloc}/"
+
+
+# ── Reddit JSON session bootstrap ────────────────────────────────────────────
+
+
+def reddit_warmup_url(url: str) -> str | None:
+    """Return Reddit's anonymous-cookie bootstrap page for a Reddit URL.
+
+    The fixed ``old.reddit.com`` HTML origin avoids the separate JavaScript
+    verification page currently served by ``www.reddit.com`` to some cold
+    clients. It sets Domain=reddit.com cookies, so the resulting jar applies
+    to www, old, and api hosts. Reject non-Reddit inputs so a copied block page
+    cannot make wafer issue an unrelated cross-origin request.
+    """
+    host = (urlparse(url).hostname or "").rstrip(".").lower()
+    if host == "reddit.com" or host.endswith(".reddit.com"):
+        return "https://old.reddit.com/"
+    return None

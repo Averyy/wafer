@@ -29,6 +29,7 @@ class ChallengeType(enum.Enum):
     ACW = "acw"
     TMD = "tmd"
     AMAZON = "amazon"
+    REDDIT = "reddit"
     VERCEL = "vercel"
     ARKOSE = "arkose"
     GEETEST = "geetest"
@@ -222,6 +223,19 @@ def detect_challenge(
     if status_code == 200 and "/_____tmd_____/punish" in body:
         logger.info("Challenge detected: tmd")
         return ChallengeType.TMD
+
+    # Reddit JSON API cold-session gate. The API returns its normal, large
+    # Shreddit block template until a same-session HTML navigation establishes
+    # the anonymous browser cookies. This is deliberately structural + textual
+    # rather than a broad "blocked" match: ordinary Reddit 403 pages must not
+    # be turned into a session-warming loop.
+    if (
+        status_code == 403
+        and "theme-beta" in body[:256].lower()
+        and "you've been blocked by network security" in body.lower()
+    ):
+        logger.info("Challenge detected: reddit")
+        return ChallengeType.REDDIT
 
     # Amazon rate-limit captcha — status 200, small body, "Continue shopping"
     if status_code == 200 and len(body) < 50_000:

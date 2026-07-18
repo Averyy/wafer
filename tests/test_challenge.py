@@ -610,11 +610,38 @@ class TestTMD:
         assert detect_challenge(200, {}, body) == ChallengeType.TMD
 
     def test_tmd_only_on_200(self):
-        """TMD detection only on 200 status."""
+        """TMD detection only applies to status 200."""
         body = '<html>/_____tmd_____/punish</html>'
-        # On 403 it should fall through to generic_js if there's a script tag
-        assert detect_challenge(200, {}, body) == ChallengeType.TMD
+        assert detect_challenge(403, {}, body) is None
 
+
+# ---------------------------------------------------------------------------
+# Reddit cold-session JSON gate
+# ---------------------------------------------------------------------------
+
+
+class TestReddit:
+    _BODY = (
+        "<body class=theme-beta><div><style>:root{--rem360:22.5rem}</style>"
+        "You've been blocked by network security.</div></body>"
+    )
+
+    def test_reddit_json_gate(self):
+        assert (
+            detect_challenge(403, {}, self._BODY)
+            == ChallengeType.REDDIT
+        )
+
+    def test_reddit_gate_requires_403(self):
+        assert detect_challenge(200, {}, self._BODY) is None
+
+    def test_reddit_gate_requires_structural_marker(self):
+        body = "<body>You've been blocked by network security.</body>"
+        assert detect_challenge(403, {}, body) is None
+
+    def test_reddit_gate_requires_block_copy(self):
+        body = "<body class=theme-beta><main>Normal page</main></body>"
+        assert detect_challenge(403, {}, body) is None
 
 # ---------------------------------------------------------------------------
 # Amazon

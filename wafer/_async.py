@@ -50,6 +50,7 @@ from wafer._response import HistoryEntry, WaferResponse, resolve_charset
 from wafer._retry import RetryState, calculate_backoff, parse_retry_after
 from wafer._solvers import (
     parse_amazon_captcha,
+    reddit_warmup_url,
     solve_acw,
     tmd_homepage_url,
 )
@@ -167,7 +168,7 @@ class AsyncSession(BaseSession):
         deadline: float | None = None,
     ) -> bool:
         """Attempt inline challenge solving. Returns True if solved."""
-        # Bound any solver sub-request (Amazon submit, TMD homepage warm) by
+        # Bound any solver sub-request (Amazon submit, TMD/Reddit warm-up) by
         # the caller's remaining budget so a slow response can't overshoot the
         # overall timeout. ACW is pure computation -- no sub-request, no clamp.
         sub_timeout = None
@@ -256,6 +257,29 @@ class AsyncSession(BaseSession):
             except Exception:
                 logger.debug(
                     "TMD homepage fetch failed", exc_info=True
+                )
+
+        elif challenge == ChallengeType.REDDIT:
+            warmup = reddit_warmup_url(url)
+            if warmup is None:
+                return False
+            try:
+                warmup_resp = await self._client.get(
+                    warmup,
+                    **(
+                        {"timeout": sub_timeout}
+                        if sub_timeout is not None
+                        else {}
+                    ),
+                )
+                if not 200 <= warmup_resp.status.as_int() < 300:
+                    return False
+                await self._cache_response_cookies(warmup, warmup_resp)
+                logger.info("Reddit session warmed via %s", warmup)
+                return True
+            except Exception:
+                logger.debug(
+                    "Reddit session warm-up failed", exc_info=True
                 )
 
         return False
@@ -663,6 +687,7 @@ class AsyncSession(BaseSession):
         current_url = url
 
         browser_attempted_type: str | None = None
+        reddit_warmup_attempted = False
         native_attempted = False
         native_retries = 0
         redirects_followed = 0
@@ -1178,10 +1203,28 @@ class AsyncSession(BaseSession):
                 # state before raising)
                 should_retire = self._record_failure(domain)
 
+                # Reddit's gate response establishes half of the anonymous
+                # cookie set (csv/edgebucket); persist that leg alongside the
+                # HTML warm-up cookies so cache_dir survives a process restart.
+                if (
+                    challenge == ChallengeType.REDDIT
+                    and not reddit_warmup_attempted
+                ):
+                    await self._cache_response_cookies(current_url, resp)
+
                 # Try inline solver first (no fingerprint rotation,
-                # does NOT consume rotation budget — separate cap)
+                # does NOT consume rotation budget — separate cap). Reddit
+                # gets exactly one warm-up + replay; repeating the same
+                # navigation cannot improve a failed bootstrap.
+                inline_allowed = (
+                    challenge != ChallengeType.REDDIT
+                    or not reddit_warmup_attempted
+                )
+                if challenge == ChallengeType.REDDIT:
+                    reddit_warmup_attempted = True
                 if (
                     challenge is not None
+                    and inline_allowed
                     and state.inline_solves < state.max_inline_solves
                     and await self._try_inline_solve(
                         challenge, body, current_url, deadline

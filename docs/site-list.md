@@ -319,7 +319,7 @@ Wafer has **no Arkose Labs solver**. Arkose presents 3D puzzle CAPTCHAs (rotate,
 | `ssense.com` | Riskified | pass | 2026-02-21: 200 521KB via TLS |
 | `tiktok.com` | In-house (custom VM) | pass | 2026-02-21: 200 306KB via TLS. Redirects to /explore. Custom VM-based anti-bot |
 | `temu.com` | In-house (custom) | pass | 2026-02-21: 200 601KB via TLS. HMAC-signed headers on deeper pages |
-| `reddit.com` | DataDome + in-house | pass | 2026-02-21: 200 621KB via TLS. DD not triggered on homepage; aggressive on old.reddit.com |
+| `reddit.com`, `old.reddit.com/*.json`, `api.reddit.com` | DataDome + in-house session gate | pass | 2026-07-18: Cold JSON requests return a 403 Shreddit block page until an HTML navigation establishes `loid`/`session_tracker` alongside `csv`/`edgebucket`. Wafer detects the gate, warms once via `old.reddit.com`, persists both cookie legs when `cache_dir` is set, and replays JSON successfully. `www.reddit.com` may independently serve a 200 JS verification page, so the warm-up intentionally uses old Reddit. |
 | `facebook.com/marketplace/` | In-house (Meta) | pass | 2026-02-21: 200 1.2MB via TLS. Login-walled for most data |
 | `artists.spotify.com` | In-house (Spotify) | pass | 2026-02-21: 200 336KB via TLS. Redirects to /home. Login-walled |
 
