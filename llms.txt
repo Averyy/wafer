@@ -320,7 +320,10 @@ resp.emulation      # str | None - the identity that SERVED this response, for
                     # / "Profile.Firefox151"; for non-Emulation profiles it's the
                     # profile name ("safari", "dart", "opera_mini"). Reflects the
                     # CURRENT identity, so after a rotation it shows the one that
-                    # actually served (not the session's original).
+                    # actually served (not the session's original). This is the TLS
+                    # profile only; after a browser solve it may report a lower
+                    # Chrome major than the wire User-Agent/sec-ch-ua (see
+                    # fingerprint_envelope()).
 ```
 
 `resp.headers` is a plain `dict[str, str]` with lowercase keys. Use `.items()`,
@@ -406,6 +409,11 @@ still `"opera"`. For non-Emulation profiles (Safari/Dart/Opera Mini) only
 `user_agent` / `family` / `emulation` are populated (`family` is `"safari"` /
 `"dart"` / `"opera_mini"`).
 
+The values always reflect what is actually on the wire; feed them to tooling
+as returned. After a browser solve, `emulation` (the TLS profile) may be a lower
+Chrome major than `user_agent` / `sec_ch_ua` / `full_version_list` (which follow
+the solving browser's version); do not reconcile them to a single version.
+
 ### Module-level fingerprint helpers
 
 ```python
@@ -424,10 +432,15 @@ wafer.emulation_family(emulation) -> str | None
 wafer.emulation_is_mobile(emulation) -> bool
 # True for a mobile Emulation (iOS/iPad Safari, Android Firefox); False for desktop.
 
-wafer.build_fingerprint_envelope(emulation, user_agent: str | None = None) -> dict
+wafer.build_fingerprint_envelope(emulation, user_agent: str | None = None, *,
+                                 ch_major_version: int | None = None,
+                                 ch_full_version: str | None = None) -> dict
 # Same dict shape as session.fingerprint_envelope(), for an arbitrary Emulation
 # (without a session). user_agent is the UA you intend to send (wreq sets it from
 # the Emulation); pass it so the envelope is complete.
+# ch_major_version / ch_full_version override the client-hint version and full
+# build independently of `emulation` (Chrome family only; ignored for others).
+# Leave None to use the Emulation's own version.
 ```
 
 ---
@@ -762,7 +775,10 @@ resp = session.get("https://protected-site.com")  # auto-solves challenges
 # Manual solve:
 result: SolveResult | None = solver.solve(url, challenge_type)
 # result.cookies: list[dict] - browser cookies
-# result.user_agent: str - browser's real User-Agent
+# result.user_agent: str - browser's User-Agent (version-reduced, e.g.
+#   "...Chrome/150.0.0.0...")
+# result.browser_version: str | None - browser's full build (e.g.
+#   "150.0.7871.125"); the version-reduced user_agent hides it
 # result.extras: dict | None - WAF-specific data
 # result.response: CapturedResponse | None - passthrough content (see below)
 # Imperva on an API host (e.g. api2.example.com): a top-level browser nav to an

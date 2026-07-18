@@ -307,6 +307,11 @@ class SolveResult:
     user_agent: str
     extras: dict | None = None
     response: CapturedResponse | None = None
+    # Real full Chrome version of the solving browser (e.g. "150.0.7871.125"),
+    # from browser.version. The UA is version-reduced ("Chrome/150.0.0.0"), so
+    # this carries the true build the session needs to reproduce the browser's
+    # sec-ch-ua-full-version-list when replaying UA/CH-bound WAF cookies.
+    browser_version: str | None = None
 
 
 @dataclass
@@ -1330,6 +1335,7 @@ class BrowserSolver:
                         user_agent=self._browser_ua or "",
                         extras=None,
                         response=captured,
+                        browser_version=self._browser_version,
                     )
 
                 # No JS stealth injection needed.  The launch flag
@@ -1586,6 +1592,7 @@ class BrowserSolver:
                     user_agent=self._browser_ua or "",
                     extras=extras,
                     response=captured,
+                    browser_version=self._browser_version,
                 )
 
             except Exception:

@@ -1,6 +1,7 @@
 """Tests for fingerprint management and sec-ch-ua generation."""
 
 import os
+import re
 
 import pytest
 from wreq import Emulation
@@ -183,6 +184,94 @@ class TestFingerprintManager:
         assert headers_before["sec-ch-ua"] != headers_after["sec-ch-ua"]
 
 
+class TestPinToBrowser:
+    """After a browser solve, replay must match the solving browser's exact
+    UA + client-hint version, even when it is newer than any wreq Emulation
+    (Patchright's Chromium is often ahead of wreq). See pin_to_browser."""
+
+    _UA_150 = (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
+    )
+
+    def test_newer_browser_pins_newest_emulation(self):
+        # Browser Chrome150 has no wreq profile -> pin the newest (149) for TLS.
+        fm = FingerprintManager(initial=Emulation.Chrome149)
+        fm.pin_to_browser(self._UA_150, 150, "150.0.7871.125")
+        assert fm.pinned
+        assert fm.current == Emulation.Chrome149  # newest available TLS shape
+
+    def test_exact_version_pins_that_emulation(self):
+        # A browser version wreq DOES have pins that exact emulation.
+        fm = FingerprintManager(initial=Emulation.Chrome149)
+        ua147 = self._UA_150.replace("150.0.0.0", "147.0.0.0")
+        fm.pin_to_browser(ua147, 147, "147.0.7727.24")
+        assert fm.current == Emulation.Chrome147
+
+    def test_ua_override_reflects_browser(self):
+        fm = FingerprintManager(initial=Emulation.Chrome149)
+        fm.pin_to_browser(self._UA_150, 150, "150.0.7871.125")
+        assert fm.ua_override == self._UA_150
+
+    def test_sec_ch_ua_uses_browser_version_not_emulation(self):
+        # TLS emulation is Chrome149 but the hints must say 150 (cookie-bound).
+        fm = FingerprintManager(initial=Emulation.Chrome149)
+        fm.pin_to_browser(self._UA_150, 150, "150.0.7871.125")
+        headers = fm.sec_ch_ua_headers()
+        assert '"150"' in headers["sec-ch-ua"]
+        assert '"149"' not in headers["sec-ch-ua"]
+
+    def test_full_version_list_brands_share_real_build(self):
+        # Real Chrome sends the same build for "Chromium" and "Google Chrome".
+        fm = FingerprintManager(initial=Emulation.Chrome149)
+        fm.pin_to_browser(self._UA_150, 150, "150.0.7871.125")
+        fvl = fm.sec_ch_ua_headers()["sec-ch-ua-full-version-list"]
+        builds = re.findall(r'"(?:Chromium|Google Chrome)";v="([^"]+)"', fvl)
+        assert builds == ["150.0.7871.125", "150.0.7871.125"]
+
+    def test_pin_to_browser_prevents_rotation(self):
+        fm = FingerprintManager(initial=Emulation.Chrome149)
+        fm.pin_to_browser(self._UA_150, 150, "150.0.7871.125")
+        fm.rotate()
+        assert fm.current == Emulation.Chrome149  # unchanged: pinned
+
+    def test_reset_clears_all_overrides(self):
+        fm = FingerprintManager(initial=Emulation.Chrome149)
+        fm.pin_to_browser(self._UA_150, 150, "150.0.7871.125")
+        fm.reset()
+        assert fm.ua_override is None
+        assert fm.ch_version_override is None
+        assert fm.ch_full_version_override is None
+        # sec-ch-ua falls back to the emulation version
+        assert '"149"' in fm.sec_ch_ua_headers()["sec-ch-ua"]
+
+    def test_missing_full_version_falls_back_to_major(self):
+        # No real build available (e.g. UA-only) -> still sends coherent hints.
+        fm = FingerprintManager(initial=Emulation.Chrome149)
+        fm.pin_to_browser(self._UA_150, 150, None)
+        headers = fm.sec_ch_ua_headers()
+        assert '"150"' in headers["sec-ch-ua"]
+        assert headers["sec-ch-ua-full-version-list"]  # non-empty
+
+    def test_newer_browser_warns_about_version_skew(self, caplog):
+        # A browser newer than any wreq profile must not fail silently.
+        fm = FingerprintManager(initial=Emulation.Chrome149)
+        with caplog.at_level("WARNING", logger="wafer"):
+            fm.pin_to_browser(self._UA_150, 150, "150.0.7871.125")
+        assert any(
+            "150" in r.message and "wreq Emulation" in r.message
+            for r in caplog.records
+        )
+
+    def test_exact_match_does_not_warn(self, caplog):
+        # A browser wreq DOES have must not emit the skew warning.
+        fm = FingerprintManager(initial=Emulation.Chrome149)
+        ua149 = self._UA_150.replace("150.0.0.0", "149.0.0.0")
+        with caplog.at_level("WARNING", logger="wafer"):
+            fm.pin_to_browser(ua149, 149, "149.0.7827.201")
+        assert not any("wreq Emulation" in r.message for r in caplog.records)
+
+
 class TestSessionFingerprint:
     def test_session_has_fingerprint_manager(self):
         from wafer import SyncSession
@@ -234,6 +323,37 @@ class TestSessionFingerprint:
         # Per-request delta should NOT include sec-ch-ua (already correct)
         built = s._build_headers("https://example.com")
         assert "sec-ch-ua" not in built
+
+    def test_browser_solve_override_reaches_client_headers(self):
+        """After a browser solve, the client sends the browser's exact UA +
+        client hints so UA/CH-bound cookies (cf_clearance) validate."""
+        from wafer import SyncSession
+
+        ua150 = (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/150.0.0.0 Safari/537.36"
+        )
+        s = SyncSession()
+        s._fingerprint.pin_to_browser(ua150, 150, "150.0.7871.125")
+        client_kwargs = s._build_client_kwargs()
+        headers = client_kwargs["headers"]
+        # TLS emulation stays at the newest wreq profile...
+        assert client_kwargs["emulation"] == Emulation.Chrome149
+        # ...but the wire identity is the solving browser's Chrome150.
+        assert headers["User-Agent"] == ua150
+        assert '"150"' in headers["sec-ch-ua"]
+        assert "150.0.7871.125" in headers["sec-ch-ua-full-version-list"]
+        assert s.fingerprint_envelope()["user_agent"] == ua150
+
+    def test_user_supplied_ua_wins_over_solve_override(self):
+        """An explicit session User-Agent is not clobbered by a solve."""
+        from wafer import SyncSession
+
+        s = SyncSession(headers={"User-Agent": "custom-ua"})
+        s._fingerprint.pin_to_browser("browser-ua", 150, "150.0.7871.125")
+        headers = s._build_client_kwargs()["headers"]
+        assert headers["User-Agent"] == "custom-ua"
 
 
 class TestEmulationFamily:
@@ -463,6 +583,51 @@ class TestFingerprintEnvelope:
             b["brand"] == "Google Chrome"
             for b in env["user_agent_data"]["brands"]
         )
+
+    def test_envelope_honors_browser_solve_override(self):
+        # A browser solve pins Chrome149's TLS but presents Chrome150 hints;
+        # the envelope snapshot must match the wire, not the Emulation default.
+        env = build_fingerprint_envelope(
+            Emulation.Chrome149,
+            "ua150",
+            ch_major_version=150,
+            ch_full_version="150.0.7871.125",
+        )
+        assert env["emulation"] == "Profile.Chrome149"  # TLS profile unchanged
+        assert '"150"' in env["sec_ch_ua"]
+        assert '"149"' not in env["sec_ch_ua"]
+        assert "150.0.7871.125" in env["full_version_list"]
+        fvl = env["user_agent_data"]["fullVersionList"]
+        chrome = [b for b in fvl if b["brand"] == "Google Chrome"]
+        assert chrome and chrome[0]["version"] == "150.0.7871.125"
+
+    def test_envelope_without_override_unchanged(self):
+        # Regression: default (no override) still reflects the Emulation.
+        env = build_fingerprint_envelope(Emulation.Chrome149, "ua")
+        assert '"149"' in env["sec_ch_ua"]
+
+    def test_envelope_lone_full_version_override_dropped(self):
+        # A full-build override without its major would desync major vs build;
+        # supplied alone it must be ignored (falls back to the Emulation build).
+        env = build_fingerprint_envelope(
+            Emulation.Chrome149, "ua", ch_full_version="150.0.7871.125"
+        )
+        assert '"149"' in env["sec_ch_ua"]
+        assert "150.0.7871.125" not in env["full_version_list"]
+
+    def test_envelope_override_ignored_for_non_chrome(self):
+        # The overrides are Chrome-only (wafer's solver is always Chromium).
+        # An Edge emulation must ignore them and keep Edge's distinct build,
+        # never collapsing "Microsoft Edge" and "Chromium" to one build.
+        env = build_fingerprint_envelope(
+            Emulation.Edge147,
+            "ua",
+            ch_major_version=150,
+            ch_full_version="150.0.7871.125",
+        )
+        assert "150" not in env["sec_ch_ua"]
+        assert '"Microsoft Edge";v="147"' in env["sec_ch_ua"]
+        assert "150.0.7871.125" not in env["full_version_list"]
 
     def test_edge_envelope_brand(self):
         env = build_fingerprint_envelope(Emulation.Edge147)

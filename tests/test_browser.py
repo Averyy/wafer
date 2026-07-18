@@ -507,6 +507,134 @@ class TestSyncBrowserSolveIntegration:
         assert repr(session._fingerprint.current) == "Profile.Chrome133"
 
     @patch("time.sleep")
+    def test_browser_solve_version_skew_pins_newest(self, mock_sleep):
+        """Regression: a browser NEWER than any wreq Emulation (Patchright
+        Chromium ahead of wreq) must still pin + override the UA/hints, not
+        silently no-op. This is the miata.net "clearance doesn't stick" bug."""
+        cf_resp = MockResponse(
+            403,
+            {"cf-mitigated": "challenge"},
+            "<html>Just a moment...</html>",
+        )
+        ok_resp = MockResponse(200, body="<html>Real</html>")
+
+        ua = (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/150.0.0.0 Safari/537.36"
+        )
+        browser_result = SolveResult(
+            cookies=[
+                {
+                    "name": "cf_clearance",
+                    "value": "x",
+                    "domain": ".example.com",
+                    "path": "/",
+                    "expires": -1,
+                }
+            ],
+            user_agent=ua,
+            browser_version="150.0.7871.125",
+        )
+        mock_solver = MockBrowserSolver(result=browser_result)
+
+        session, _ = make_sync_session(
+            [cf_resp, ok_resp],
+            max_rotations=0,
+            browser_solver=mock_solver,
+            use_cookie_jar=True,
+        )
+
+        session.get("https://example.com/page")
+        # TLS pins the newest available wreq profile (no Chrome150 in wreq)...
+        assert repr(session._fingerprint.current) == "Profile.Chrome149"
+        assert session._fingerprint.pinned is True
+        # ...but the wire identity follows the real browser (Chrome150).
+        assert session._fingerprint.ua_override == ua
+        env = session.fingerprint_envelope()
+        assert env["user_agent"] == ua
+        assert '"150"' in env["sec_ch_ua"]
+        assert "150.0.7871.125" in env["full_version_list"]
+
+    @patch("time.sleep")
+    def test_imperva_solve_leaves_fingerprint_unpinned(self, mock_sleep):
+        """Imperva's earned token rides an unpinned wreq/native path, so an
+        Imperva browser solve must NOT pin/override the fingerprint (the pin
+        block is deliberately skipped for Imperva)."""
+        from wafer._challenge import ChallengeType
+
+        browser_result = SolveResult(
+            cookies=[
+                {
+                    "name": "reese84",
+                    "value": "tok",
+                    "domain": ".example.com",
+                    "path": "/",
+                    "expires": -1,
+                }
+            ],
+            user_agent="Mozilla/5.0 Chrome/150.0.0.0 Safari/537.36",
+            browser_version="150.0.7871.125",
+        )
+        mock_solver = MockBrowserSolver(result=browser_result)
+        session, _ = make_sync_session(
+            [MockResponse(200, body="ok")],
+            browser_solver=mock_solver,
+            use_cookie_jar=True,
+        )
+
+        session._try_browser_solve(
+            ChallengeType.IMPERVA,
+            "https://api2.example.com/listing",
+            embedder="https://www.example.com/",
+            replay={"method": "GET", "body": None, "content_type": None},
+        )
+        # Imperva must leave the fingerprint untouched: no pin, no UA override.
+        assert session._fingerprint.pinned is False
+        assert session._fingerprint.ua_override is None
+
+    @patch("time.sleep")
+    def test_browser_solve_full_version_from_ua_fallback(self, mock_sleep):
+        """When SolveResult.browser_version is None, the full build is extracted
+        from the UA (chrome_full_version_from_ua) so the hints still carry it."""
+        cf_resp = MockResponse(
+            403,
+            {"cf-mitigated": "challenge"},
+            "<html>Just a moment...</html>",
+        )
+        ok_resp = MockResponse(200, body="<html>Real</html>")
+
+        ua = (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/150.0.7871.125 Safari/537.36"
+        )
+        browser_result = SolveResult(
+            cookies=[
+                {
+                    "name": "cf_clearance",
+                    "value": "x",
+                    "domain": ".example.com",
+                    "path": "/",
+                    "expires": -1,
+                }
+            ],
+            user_agent=ua,
+            browser_version=None,  # force the UA-extraction fallback
+        )
+        mock_solver = MockBrowserSolver(result=browser_result)
+        session, _ = make_sync_session(
+            [cf_resp, ok_resp],
+            max_rotations=0,
+            browser_solver=mock_solver,
+            use_cookie_jar=True,
+        )
+
+        session.get("https://example.com/page")
+        env = session.fingerprint_envelope()
+        assert "150.0.7871.125" in env["full_version_list"]
+
+    @patch("time.sleep")
     def test_browser_solve_with_cookie_cache(
         self, mock_sleep, tmp_path
     ):
@@ -1064,6 +1192,132 @@ class TestAsyncBrowserSolveIntegration:
         resp = await session.get("https://example.com/page")
         assert resp.status_code == 200
         assert len(mock_client.cookie_jar.added) >= 1
+
+    @patch("asyncio.sleep")
+    async def test_browser_solve_version_skew_pins_newest(self, mock_sleep):
+        """Async parity for the version-skew pin fix (browser newer than any
+        wreq Emulation still pins newest + overrides UA/hints)."""
+        cf_resp = MockResponse(
+            403,
+            {"cf-mitigated": "challenge"},
+            "<html>Just a moment...</html>",
+        )
+        ok_resp = MockResponse(200, body="<html>Real</html>")
+
+        ua = (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/150.0.0.0 Safari/537.36"
+        )
+        browser_result = SolveResult(
+            cookies=[
+                {
+                    "name": "cf_clearance",
+                    "value": "x",
+                    "domain": ".example.com",
+                    "path": "/",
+                    "expires": -1,
+                }
+            ],
+            user_agent=ua,
+            browser_version="150.0.7871.125",
+        )
+        mock_solver = MockBrowserSolver(result=browser_result)
+
+        session, _ = make_async_session(
+            [cf_resp, ok_resp],
+            max_rotations=0,
+            browser_solver=mock_solver,
+            use_cookie_jar=True,
+        )
+
+        await session.get("https://example.com/page")
+        assert repr(session._fingerprint.current) == "Profile.Chrome149"
+        assert session._fingerprint.pinned is True
+        assert session._fingerprint.ua_override == ua
+        env = session.fingerprint_envelope()
+        assert '"150"' in env["sec_ch_ua"]
+        assert "150.0.7871.125" in env["full_version_list"]
+
+    @patch("asyncio.sleep")
+    async def test_imperva_solve_leaves_fingerprint_unpinned(
+        self, mock_sleep
+    ):
+        """Async parity for the Imperva pin-skip (the guard is duplicated in
+        _async.py, so it needs its own test)."""
+        from wafer._challenge import ChallengeType
+
+        browser_result = SolveResult(
+            cookies=[
+                {
+                    "name": "reese84",
+                    "value": "tok",
+                    "domain": ".example.com",
+                    "path": "/",
+                    "expires": -1,
+                }
+            ],
+            user_agent="Mozilla/5.0 Chrome/150.0.0.0 Safari/537.36",
+            browser_version="150.0.7871.125",
+        )
+        mock_solver = MockBrowserSolver(result=browser_result)
+        session, _ = make_async_session(
+            [MockResponse(200, body="ok")],
+            browser_solver=mock_solver,
+            use_cookie_jar=True,
+        )
+
+        await session._try_browser_solve(
+            ChallengeType.IMPERVA,
+            "https://api2.example.com/listing",
+            embedder="https://www.example.com/",
+            replay={"method": "GET", "body": None, "content_type": None},
+        )
+        assert session._fingerprint.pinned is False
+        assert session._fingerprint.ua_override is None
+
+    @patch("asyncio.sleep")
+    async def test_browser_solve_full_version_from_ua_fallback(
+        self, mock_sleep
+    ):
+        """When SolveResult.browser_version is None, the full build is extracted
+        from the UA (chrome_full_version_from_ua) so the hints still carry it."""
+        cf_resp = MockResponse(
+            403,
+            {"cf-mitigated": "challenge"},
+            "<html>Just a moment...</html>",
+        )
+        ok_resp = MockResponse(200, body="<html>Real</html>")
+
+        ua = (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/150.0.7871.125 Safari/537.36"
+        )
+        browser_result = SolveResult(
+            cookies=[
+                {
+                    "name": "cf_clearance",
+                    "value": "x",
+                    "domain": ".example.com",
+                    "path": "/",
+                    "expires": -1,
+                }
+            ],
+            user_agent=ua,
+            browser_version=None,  # force the UA-extraction fallback
+        )
+        mock_solver = MockBrowserSolver(result=browser_result)
+        session, _ = make_async_session(
+            [cf_resp, ok_resp],
+            max_rotations=0,
+            browser_solver=mock_solver,
+            use_cookie_jar=True,
+        )
+
+        await session.get("https://example.com/page")
+        env = session.fingerprint_envelope()
+        assert "150.0.7871.125" in env["full_version_list"]
 
 
 # ---------------------------------------------------------------------------

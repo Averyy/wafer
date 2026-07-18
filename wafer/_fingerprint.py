@@ -720,6 +720,15 @@ class FingerprintManager:
         self._current = initial
         self._pinned = False
         self._rotation_index = 0
+        # Identity overrides set after a browser solve (pin_to_browser).
+        # They let the replayed UA + client hints match the EXACT Chrome
+        # version of the solving browser even when wreq has no matching
+        # Emulation (Patchright's Chromium is often newer than wreq's newest
+        # profile), so UA/CH-bound WAF cookies (cf_clearance, DataDome)
+        # validate on the wreq replay. ``None`` = use the Emulation defaults.
+        self._ua_override: str | None = None
+        self._ch_version_override: int | None = None
+        self._ch_full_version_override: str | None = None
 
     @property
     def current(self) -> Emulation:
@@ -729,11 +738,89 @@ class FingerprintManager:
     def pinned(self) -> bool:
         return self._pinned
 
+    @property
+    def ua_override(self) -> str | None:
+        """User-Agent to send instead of the Emulation default, or None.
+
+        Set by :meth:`pin_to_browser` so a browser-solved session replays
+        the solving browser's exact UA (WAF clearance cookies are UA-bound).
+        """
+        return self._ua_override
+
+    @property
+    def ch_version_override(self) -> int | None:
+        """Client-hint major version to present, or None for the Emulation's.
+
+        Set by :meth:`pin_to_browser`; lets diagnostics/tooling read the
+        version actually on the wire when it differs from the TLS profile.
+        """
+        return self._ch_version_override
+
+    @property
+    def ch_full_version_override(self) -> str | None:
+        """Client-hint full build to present, or None for the Emulation's."""
+        return self._ch_full_version_override
+
     def pin(self) -> None:
         """Pin current fingerprint (cookies are bound to this TLS identity)."""
         if not self._pinned:
             self._pinned = True
             logger.debug("Fingerprint pinned to %s", self._current)
+
+    def pin_to_browser(
+        self,
+        user_agent: str,
+        major_version: int,
+        full_version: str | None = None,
+    ) -> None:
+        """Align the replay identity to a browser that just solved a challenge.
+
+        WAF clearance cookies (Cloudflare ``cf_clearance``, DataDome, ...) are
+        bound to the solving browser's TLS shape AND its User-Agent +
+        client-hint version. This pins the TLS emulation to the closest
+        available Chrome profile (exact match if wreq has it, else the newest)
+        and records the browser's EXACT UA + client-hint version so the cookie
+        validates when replayed over wreq.
+
+        Patchright's bundled Chromium is often NEWER than wreq's newest
+        Emulation (e.g. Chrome 150 vs Chrome 149). Adjacent Chrome majors are
+        wire-identical on JA4/H2, so pinning Chrome 149's TLS while presenting
+        Chrome 150's UA + hints is coherent to a WAF -- and necessary, because
+        replaying the freshly minted cookie under the wrong UA is rejected on
+        the very first request (the whole reason a solve "doesn't stick").
+        """
+        exact = emulation_for_version(major_version)
+        self._current = exact or CHROME_PROFILES[0][1]
+        self._pinned = True
+        self._rotation_index = 0
+        self._ua_override = user_agent
+        self._ch_version_override = major_version
+        self._ch_full_version_override = full_version
+        if exact is None:
+            # The solving browser (Patchright's Chromium) is NEWER than any wreq
+            # Emulation. Handled: TLS pins the newest profile (JA4/H2 identical
+            # across adjacent Chrome majors) and the UA/hints follow the real
+            # browser, so cookie replay still works. Surfaced at WARNING so the
+            # skew is visible (it used to fail silently) -- bump DEFAULT_EMULATION
+            # + _CHROME_BUILDS once wreq ships this Chrome profile so the TLS
+            # shape tracks it too. See CLAUDE.md wreq-upgrade steps.
+            newest = emulation_major_version(self._current)
+            logger.warning(
+                "Solving browser is Chrome %s but newest wreq Emulation is "
+                "Chrome %s; pinning %s TLS with the browser's real Chrome %s "
+                "UA/hints (cookie replay works; update wreq to close the gap)",
+                major_version,
+                newest,
+                self._current,
+                major_version,
+            )
+        else:
+            logger.debug(
+                "Fingerprint pinned to browser: emulation=%s ua_version=%s (%s)",
+                self._current,
+                major_version,
+                full_version or "reduced",
+            )
 
     def rotate(self) -> Emulation:
         """Rotate to a different Chrome profile. Returns the new Emulation.
@@ -755,10 +842,13 @@ class FingerprintManager:
         return self._current
 
     def reset(self, emulation: Emulation | None = None) -> None:
-        """Full identity reset: new fingerprint, clear pinning."""
+        """Full identity reset: new fingerprint, clear pinning and overrides."""
         self._current = emulation or CHROME_PROFILES[0][1]
         self._pinned = False
         self._rotation_index = 0
+        self._ua_override = None
+        self._ch_version_override = None
+        self._ch_full_version_override = None
         logger.debug("Fingerprint reset to %s", self._current)
 
     def sec_ch_ua_headers(self) -> dict[str, str]:
@@ -778,13 +868,30 @@ class FingerprintManager:
         """
         family = emulation_family(self._current)
         brand = _FAMILY_BRAND.get(family) if family else None
-        ver = emulation_major_version(self._current)
+        # After a browser solve the client-hint version follows the solving
+        # browser (pin_to_browser), which may be newer than any wreq profile.
+        ver = (
+            self._ch_version_override
+            if self._ch_version_override is not None
+            else emulation_major_version(self._current)
+        )
         # Firefox/Safari (brand None) and unknown profiles send no hints.
         if brand is None or ver is None:
             return {}
         # The primary brand's full version is family-specific: Edge ships its
         # own build, so the "Microsoft Edge" brand must NOT carry Chrome's.
-        brand_full = _brand_full_version(family, ver)
+        brand_full = (
+            self._ch_full_version_override
+            if self._ch_full_version_override is not None
+            else _brand_full_version(family, ver)
+        )
+        # After a Chrome browser solve the override IS the real browser.version,
+        # so the "Chromium" brand must carry that exact build too (real Chrome
+        # sends the same build for "Chromium" and "Google Chrome"). None leaves
+        # the Chromium build to the static table. Only Chrome sets the override
+        # (pin_to_browser always pins a Chrome emulation); Edge keeps its
+        # distinct-build behaviour.
+        chromium_full = self._ch_full_version_override
         return {
             # Low-entropy (always sent by Chromium browsers)
             "sec-ch-ua": generate_sec_ch_ua(ver, brand=brand),
@@ -796,7 +903,10 @@ class FingerprintManager:
             "sec-ch-ua-full-version": f'"{brand_full}"',
             "sec-ch-ua-full-version-list": (
                 generate_sec_ch_ua_full_version_list(
-                    ver, brand=brand, brand_full_version=brand_full
+                    ver,
+                    brand=brand,
+                    full_version_override=chromium_full,
+                    brand_full_version=brand_full,
                 )
             ),
             "sec-ch-ua-model": '""',
@@ -810,7 +920,11 @@ class FingerprintManager:
 
 
 def build_fingerprint_envelope(
-    emulation: Emulation, user_agent: str | None = None,
+    emulation: Emulation,
+    user_agent: str | None = None,
+    *,
+    ch_major_version: int | None = None,
+    ch_full_version: str | None = None,
 ) -> dict:
     """Build the coherent client-identity envelope for an Emulation profile.
 
@@ -818,6 +932,11 @@ def build_fingerprint_envelope(
     on the wire for ``emulation``, kept consistent with
     ``FingerprintManager.sec_ch_ua_headers`` (same builders, same brand,
     same host entropy).
+
+    ``ch_major_version`` / ``ch_full_version`` override the client-hint
+    version (and full build) independently of ``emulation``. wafer sets them
+    after a browser solve so the envelope reflects the solving browser's real
+    version even when it is newer than any wreq Emulation (Chrome family only).
 
     Keys (always present):
 
@@ -847,7 +966,23 @@ def build_fingerprint_envelope(
     """
     family = emulation_family(emulation)
     brand = _FAMILY_BRAND.get(family) if family else None
-    ver = emulation_major_version(emulation)
+    # The version overrides exist for the Chrome browser solver only (wafer's
+    # solver is always Chromium). Ignore them for any other family so a caller
+    # can't produce an incoherent Edge envelope (Edge ships a build distinct
+    # from Chromium, so an override would wrongly collapse the two brands).
+    if family != "chrome":
+        ch_major_version = None
+        ch_full_version = None
+    # A full-build override without its major would desync the sec-ch-ua major
+    # from the full-version-list build; the two are meant to be supplied together
+    # (pin_to_browser always does). Drop a lone full-version override.
+    if ch_major_version is None:
+        ch_full_version = None
+    ver = (
+        ch_major_version
+        if ch_major_version is not None
+        else emulation_major_version(emulation)
+    )
     is_mobile = emulation_is_mobile(emulation)
 
     envelope: dict = {
@@ -870,9 +1005,19 @@ def build_fingerprint_envelope(
     if brand is None or ver is None:
         return envelope
 
-    brand_full = _brand_full_version(family, ver)
+    brand_full = (
+        ch_full_version
+        if ch_full_version is not None
+        else _brand_full_version(family, ver)
+    )
+    # Chrome browser-solve override: "Chromium" carries the same real build as
+    # "Google Chrome" (see sec_ch_ua_headers). None keeps the static table.
+    chromium_full = ch_full_version
     full_version_list = generate_sec_ch_ua_full_version_list(
-        ver, brand=brand, brand_full_version=brand_full
+        ver,
+        brand=brand,
+        full_version_override=chromium_full,
+        brand_full_version=brand_full,
     )
     envelope.update(
         {

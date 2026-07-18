@@ -686,6 +686,10 @@ class BaseSession:
             if k.lower() == "user-agent" and v:
                 return v
         if self._fingerprint is not None:
+            # A browser solve pins the solving browser's exact UA (see
+            # FingerprintManager.pin_to_browser); it's what's on the wire.
+            if self._fingerprint.ua_override:
+                return self._fingerprint.ua_override
             return emulation_user_agent(self._fingerprint.current)
         return None
 
@@ -724,7 +728,15 @@ class BaseSession:
         """
         ua = self._serving_user_agent()
         if self._fingerprint is not None:
-            env = build_fingerprint_envelope(self._fingerprint.current, ua)
+            # Pass any browser-solve override so the snapshot matches the wire
+            # (a solve pins the browser's real version, newer than the TLS
+            # profile) rather than the Emulation's default client hints.
+            env = build_fingerprint_envelope(
+                self._fingerprint.current,
+                ua,
+                ch_major_version=self._fingerprint.ch_version_override,
+                ch_full_version=self._fingerprint.ch_full_version_override,
+            )
             return env
         # Non-Emulation identity profile (Safari / Dart / Opera Mini). Each
         # is its own "family"; use the Profile value so it matches the
@@ -783,6 +795,15 @@ class BaseSession:
         """
         headers = dict(self.headers)
         if self._fingerprint is not None:
+            # After a browser solve, replay the solving browser's exact UA so
+            # UA-bound WAF cookies (cf_clearance, ...) validate. wreq derives
+            # the UA from the Emulation unless a User-Agent header is set, so
+            # inject it here. A user-supplied UA (in self.headers) still wins.
+            ua_override = self._fingerprint.ua_override
+            if ua_override and not any(
+                k.lower() == "user-agent" for k in headers
+            ):
+                headers["User-Agent"] = ua_override
             headers.update(self._fingerprint.sec_ch_ua_headers())
 
         if self._embed:

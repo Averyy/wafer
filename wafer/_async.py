@@ -40,7 +40,10 @@ from wafer._errors import (
     TooManyRedirects,
     WaferTimeout,
 )
-from wafer._fingerprint import chrome_version_from_ua, emulation_for_version
+from wafer._fingerprint import (
+    chrome_full_version_from_ua,
+    chrome_version_from_ua,
+)
 from wafer._native_tls import NATIVE_MAX_RETRIES
 from wafer._profiles import Profile
 from wafer._response import HistoryEntry, WaferResponse, resolve_charset
@@ -373,17 +376,30 @@ class AsyncSession(BaseSession):
                 cookies=target_cookies,
             )
 
-        # Match emulation to browser's Chrome version and pin it.
-        # Cookies are TLS-bound — rotation away from the matched
-        # fingerprint would invalidate them.
-        # Skip for Safari — keep Safari TLS identity after browser solve.
-        if self._fingerprint is not None:
+        # Align the replay identity to the browser that solved and pin it.
+        # WAF clearance cookies are bound to the solving browser's TLS shape
+        # AND its UA/client-hints (Cloudflare cf_clearance, DataDome), so wafer
+        # pins the closest Chrome emulation (for the TLS shape) and replays the
+        # browser's EXACT UA + sec-ch-ua version. Patchright's Chromium is often
+        # newer than wreq's newest Emulation (e.g. Chrome 150 vs 149); adjacent
+        # Chrome majors are wire-identical on JA4/H2, so this is coherent — and
+        # required, or the freshly minted cookie is rejected on the first replay
+        # and the session rotates away from the identity the cookie belongs to.
+        # Skip Imperva (its token rides an unpinned wreq/native path — see
+        # below) and Safari (self._fingerprint is None; keep the Safari TLS).
+        if (
+            self._fingerprint is not None
+            and challenge != ChallengeType.IMPERVA
+        ):
             chrome_ver = chrome_version_from_ua(result.user_agent)
             if chrome_ver:
-                em = emulation_for_version(chrome_ver)
-                if em:
-                    self._fingerprint.reset(em)
-                    self._fingerprint.pin()
+                full_ver = (
+                    result.browser_version
+                    or chrome_full_version_from_ua(result.user_agent)
+                )
+                self._fingerprint.pin_to_browser(
+                    result.user_agent, chrome_ver, full_ver
+                )
 
         # Rebuild client (rehydrates cookies from cache)
         self._rebuild_client()
