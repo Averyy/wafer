@@ -1,7 +1,7 @@
 # TODO: Replace the Old Reddit session bootstrap
 
-Status: wafer phase W1 implemented and validated on 2026-07-26. Release and the
-fetchaller dependency update in phase W2 remain pending.
+Status: wafer phase W1 implemented and validated on 2026-07-26, then released
+as `v0.3.4`. The fetchaller dependency update in phase W2 remains pending.
 
 Related fetchaller plan:
 [`../fetchaller-mcp/todo-newreddit.md`](../fetchaller-mcp/todo-newreddit.md)
@@ -592,4 +592,5 @@ still depends on the Old Reddit warmup.
 - [x] `llms.txt` updated.
 - [x] Ruff passes.
 - [x] Full pytest passes (1,195 passed, 6 skipped).
+- [x] Wafer `v0.3.4` released.
 - [ ] Fetchaller dependency is updated to the tested wafer version.
