@@ -15,7 +15,6 @@ from tests.conftest import (
 from wafer._solvers import (
     _is_amazon_domain,
     parse_amazon_captcha,
-    reddit_warmup_url,
     solve_acw,
     tmd_homepage_url,
 )
@@ -252,38 +251,6 @@ class TestTMDHomepageUrl:
 
 
 # ---------------------------------------------------------------------------
-# Reddit session warm-up URL
-# ---------------------------------------------------------------------------
-
-
-class TestRedditWarmupUrl:
-    @pytest.mark.parametrize(
-        "url",
-        [
-            "https://reddit.com/r/python.json",
-            "https://www.reddit.com/r/python/hot.json",
-            "https://old.reddit.com/r/python/hot.json",
-            "https://api.reddit.com/r/python/hot",
-            "https://API.Reddit.COM./r/python/hot",
-        ],
-    )
-    def test_reddit_hosts_use_old_reddit(self, url):
-        assert reddit_warmup_url(url) == "https://old.reddit.com/"
-
-    @pytest.mark.parametrize(
-        "url",
-        [
-            "https://reddit.com.evil.test/r/python.json",
-            "https://notreddit.com/r/python.json",
-            "https://example.com/?next=reddit.com",
-            "not-a-url",
-        ],
-    )
-    def test_non_reddit_hosts_rejected(self, url):
-        assert reddit_warmup_url(url) is None
-
-
-# ---------------------------------------------------------------------------
 # Retry Loop Integration (Sync)
 # ---------------------------------------------------------------------------
 
@@ -307,15 +274,6 @@ _AMAZON_BODY = """
 _TMD_BODY = (
     "<html><body>/_____tmd_____/punish redirect</body></html>"
 )
-
-# Reddit's large Shreddit block template is abbreviated to its two stable
-# detection signals. The real response is ~190KB; size is not part of the
-# signature.
-_REDDIT_BODY = (
-    "<body class=theme-beta><div><style>:root{--rem360:22.5rem}</style>"
-    "You've been blocked by network security.</div></body>"
-)
-
 
 class TestACWSolverIntegration:
     @patch("wafer._sync.time.sleep")
@@ -441,6 +399,34 @@ class TestAmazonSolverIntegration:
         assert "ref=cs_503_link" in mock.request_log[1][1]
 
     @patch("wafer._sync.time.sleep")
+    def test_amazon_get_form_fields_are_encoded_in_url(self, mock_sleep):
+        body = """
+        <html><body>
+        <p>Amazon verification</p>
+        <form method="GET" action="https://www.amazon.com/ref=cs">
+          <input type="hidden" name="token" value="xyz">
+          <button>Continue shopping</button>
+        </form>
+        </body></html>
+        """
+        responses = [
+            MockResponse(200, {}, body),
+            MockResponse(200, {}, ""),
+            MockResponse(200, {}, "<html>product page</html>"),
+        ]
+        session, mock = make_sync_session(responses)
+
+        resp = session.get(
+            "https://www.amazon.com/dp/B0D1XD1ZV3"
+        )
+
+        assert resp.status_code == 200
+        assert mock.request_log[1][1] == (
+            "https://www.amazon.com/ref=cs?token=xyz"
+        )
+        assert "params" not in mock.request_log[1][2]
+
+    @patch("wafer._sync.time.sleep")
     def test_amazon_non_amazon_domain_not_solved(self, mock_sleep):
         """Amazon captcha with non-Amazon URL should not be solved inline."""
         # Body looks like Amazon but URL is not Amazon
@@ -493,107 +479,6 @@ class TestTMDSolverIntegration:
         assert mock.request_log[1][1] == "https://example.com/"
 
 
-class TestRedditSolverIntegration:
-    @patch("wafer._sync.time.sleep")
-    def test_reddit_session_warming(self, mock_sleep):
-        responses = [
-            MockResponse(
-                403,
-                {
-                    "content-type": "text/html",
-                    "set-cookie": (
-                        "csv=2; Max-Age=63072000; Domain=.reddit.com; Path=/"
-                    ),
-                },
-                _REDDIT_BODY,
-            ),
-            MockResponse(
-                200,
-                {
-                    "set-cookie": (
-                        "loid=anon; Max-Age=63072000; "
-                        "Domain=reddit.com; Path=/"
-                    ),
-                },
-                "<html>old reddit</html>",
-            ),
-            MockResponse(
-                200,
-                {"content-type": "application/json"},
-                '{"kind":"Listing"}',
-            ),
-        ]
-        session, mock = make_sync_session(responses)
-
-        resp = session.get(
-            "https://old.reddit.com/r/homelab/hot.json?limit=1"
-        )
-
-        assert resp.status_code == 200
-        assert resp.json()["kind"] == "Listing"
-        assert resp.inline_solves == 1
-        assert resp.rotations == 0
-        assert mock.request_count == 3
-        assert mock.request_log[1][1] == "https://old.reddit.com/"
-
-    @patch("wafer._sync.time.sleep")
-    def test_reddit_warmup_is_attempted_only_once(self, mock_sleep):
-        responses = [
-            MockResponse(403, {"content-type": "text/html"}, _REDDIT_BODY),
-            MockResponse(200, {}, "<html>old reddit</html>"),
-            MockResponse(403, {"content-type": "text/html"}, _REDDIT_BODY),
-            MockResponse(200, {"content-type": "application/json"}, "{}"),
-        ]
-        session, mock = make_sync_session(responses, max_rotations=1)
-
-        resp = session.get("https://api.reddit.com/r/homelab/hot")
-
-        assert resp.status_code == 200
-        assert resp.inline_solves == 1
-        assert resp.rotations == 1
-        assert sum(
-            url == "https://old.reddit.com/"
-            for _, url, _ in mock.request_log
-        ) == 1
-
-    @patch("wafer._sync.time.sleep")
-    def test_reddit_persists_both_cookie_legs(
-        self, mock_sleep, tmp_path
-    ):
-        from wafer._cookies import CookieCache
-
-        responses = [
-            MockResponse(
-                403,
-                {
-                    "content-type": "text/html",
-                    "set-cookie": (
-                        "csv=2; Max-Age=63072000; Domain=.reddit.com; Path=/"
-                    ),
-                },
-                _REDDIT_BODY,
-            ),
-            MockResponse(
-                200,
-                {
-                    "set-cookie": (
-                        "loid=anon; Max-Age=63072000; "
-                        "Domain=reddit.com; Path=/"
-                    ),
-                },
-                "<html>old reddit</html>",
-            ),
-            MockResponse(200, {"content-type": "application/json"}, "{}"),
-        ]
-        cache = CookieCache(str(tmp_path))
-        session, _ = make_sync_session(responses, cookie_cache=cache)
-
-        session.get("https://old.reddit.com/r/homelab/hot.json?limit=1")
-
-        names = {c["name"] for c in cache.load("old.reddit.com")}
-        assert names == {"csv", "loid"}
-
-
 class TestACWSolverIntegrationAsync:
     @pytest.mark.asyncio
     @patch("wafer._async.asyncio.sleep")
@@ -636,33 +521,6 @@ class TestTMDSolverIntegrationAsync:
         assert body == "<html>real content</html>"
         assert mock.request_count == 3
         assert mock.request_log[1][1] == "https://example.com/"
-
-
-class TestRedditSolverIntegrationAsync:
-    @pytest.mark.asyncio
-    @patch("wafer._async.asyncio.sleep")
-    async def test_reddit_session_warming(self, mock_sleep):
-        responses = [
-            MockResponse(403, {"content-type": "text/html"}, _REDDIT_BODY),
-            MockResponse(200, {}, "<html>old reddit</html>"),
-            MockResponse(
-                200,
-                {"content-type": "application/json"},
-                '{"kind":"Listing"}',
-            ),
-        ]
-        session, mock = make_async_session(responses)
-
-        resp = await session.get(
-            "https://old.reddit.com/r/homelab/hot.json?limit=1"
-        )
-
-        assert resp.status_code == 200
-        assert resp.json()["kind"] == "Listing"
-        assert resp.inline_solves == 1
-        assert resp.rotations == 0
-        assert mock.request_count == 3
-        assert mock.request_log[1][1] == "https://old.reddit.com/"
 
 
 # ---------------------------------------------------------------------------

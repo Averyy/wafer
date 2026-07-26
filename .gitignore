@@ -19,6 +19,7 @@ venv/
 .vscode/
 .idea/
 .claude/
+.codex-dobby/
 
 # OS
 .DS_Store
@@ -35,4 +36,3 @@ inprogress.md
 
 # Playwright MCP
 .playwright-mcp/
-

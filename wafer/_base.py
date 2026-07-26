@@ -1237,6 +1237,37 @@ class BaseSession:
             delay = min(delay, max(0.0, deadline - time.monotonic()))
         return delay
 
+    def _clear_cached_cookies(self, domain: str) -> None:
+        """Clear cached cookies for an identity rotation.
+
+        Most sites use one cache file per request host. Reddit is different:
+        a JSON gate may originate on ``api``/``old`` while its verification
+        cookies are earned on ``www`` and stored in the canonical
+        ``reddit.com`` namespace. Clear every Reddit namespace together so a
+        rebuilt client never rehydrates cookies earned by the old fingerprint.
+        """
+        if self._cookie_cache is None:
+            return
+        normalized = (domain or "").rstrip(".").lower()
+        domains = {domain}
+        if (
+            normalized == "reddit.com"
+            or normalized.endswith(".reddit.com")
+        ):
+            domains.add("reddit.com")
+            try:
+                for cached in self._cookie_cache.list_domains():
+                    host = cached.rstrip(".").lower()
+                    if host == "reddit.com" or host.endswith(".reddit.com"):
+                        domains.add(cached)
+            except Exception:
+                logger.debug(
+                    "Failed to enumerate Reddit cookie cache",
+                    exc_info=True,
+                )
+        for cached in domains:
+            self._cookie_cache.clear(cached)
+
     @staticmethod
     def _apply_params(url: str, params: dict[str, str] | None) -> str:
         """Append query parameters to a URL.

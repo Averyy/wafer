@@ -751,9 +751,12 @@ a score token, not a visible challenge, and is minted browser-free via
 `"vercel"`/`"generic_js"` also get the generic browser JS-wait (no
 dedicated solver, but it passes their passive JS checks). The inline set
 (`acw`, `tmd`, `amazon`, `reddit`) needs no browser at all. Reddit's solver
-fetches `https://old.reddit.com/` once to establish the anonymous cookie jar,
-then retries the original request; `cache_dir` persists both cookie-setting
-response legs so later processes can start warm.
+performs the logged-out New Reddit verification at `https://www.reddit.com/`
+in the same TLS session, then retries the original request; `cache_dir`
+persists the durable cookie-setting response legs so later processes can start
+warm. Explicit `old.reddit.com` requests are fetched normally, but wafer never
+selects Old Reddit automatically or uses it as a fallback. A login wall from
+an explicit Old Reddit request is returned normally.
 
 ---
 

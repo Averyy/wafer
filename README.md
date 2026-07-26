@@ -325,10 +325,12 @@ Four challenge types are solved without a browser:
 - **ACW (Alibaba Cloud WAF)** -Extracts the obfuscated cookie value from the challenge page JavaScript, computes the XOR-shuffle, and sets the `acw_sc__v2` cookie.
 - **Amazon CAPTCHA** -Parses the captcha form and submits it programmatically.
 - **TMD (Alibaba TMD)** -Warms the session by fetching the homepage to establish a valid TMD session token.
-- **Reddit JSON API** -On the cold-session block page, fetches one
-  `old.reddit.com` HTML page to establish anonymous cookies, then replays the
-  original JSON request. With `cache_dir`, both cookie-setting response legs
-  are persisted for fresh processes.
+- **Reddit JSON API** -On the cold-session block page, performs New Reddit's
+  logged-out verification at `https://www.reddit.com/` in the same TLS
+  session, then replays the original JSON request. With `cache_dir`, every
+  durable cookie-setting leg is persisted for fresh processes. Explicit
+  `old.reddit.com` URLs are fetched as requested, but Old Reddit is never
+  selected automatically or used as a fallback.
 
 These run automatically during the retry loop.
 

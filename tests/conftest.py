@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from urllib.parse import urlparse
 
 from wafer._base import (
     DEFAULT_CONNECT_TIMEOUT,
@@ -38,13 +39,19 @@ class MockHeaderMap:
     - get_all() returns list of all values for a key
     """
 
-    def __init__(self, data: dict[str, str] | None = None):
+    def __init__(
+        self,
+        data: dict[str, str | list[str]] | None = None,
+    ):
         self._raw: dict[bytes, list[bytes]] = {}
         for k, v in (data or {}).items():
             bk = k.lower().encode("ascii")
             if bk not in self._raw:
                 self._raw[bk] = []
-            self._raw[bk].append(v.encode("utf-8"))
+            values = v if isinstance(v, list) else [v]
+            self._raw[bk].extend(
+                value.encode("utf-8") for value in values
+            )
 
     def keys(self):
         return list(self._raw.keys())
@@ -106,7 +113,7 @@ class MockResponse:
     def __init__(
         self,
         status_code: int,
-        headers: dict[str, str] | None = None,
+        headers: dict[str, str | list[str]] | None = None,
         body: str = "",
         content_length: int | None = None,
     ):
@@ -137,7 +144,7 @@ class AsyncMockResponse:
     def __init__(
         self,
         status_code: int,
-        headers: dict[str, str] | None = None,
+        headers: dict[str, str | list[str]] | None = None,
         body: str = "",
         content_length: int | None = None,
     ):
@@ -159,14 +166,71 @@ class AsyncMockResponse:
         return json.loads(self._body)
 
 
+class MockCookie:
+    def __init__(self, name, value, domain, path, secure):
+        self.name = name
+        self.value = value
+        self.domain = domain
+        self.path = path
+        self.secure = secure
+
+
 class MockJar:
-    """Mock cookie jar that records add() calls."""
+    """Small wreq-like jar that records and resolves cookies."""
 
     def __init__(self):
         self.added = []
+        self._cookies: dict[tuple[str, str, str], MockCookie] = {}
 
     def add(self, cookie_str, url):
         self.added.append((cookie_str, url))
+        parts = [part.strip() for part in cookie_str.split(";")]
+        name, separator, value = parts[0].partition("=")
+        if not separator or not name:
+            return
+        parsed = urlparse(url)
+        domain = parsed.hostname or ""
+        path = "/"
+        secure = False
+        for part in parts[1:]:
+            attr, attr_separator, attr_value = part.partition("=")
+            attr = attr.strip().lower()
+            if attr == "domain" and attr_separator:
+                domain = attr_value.strip().lstrip(".").lower()
+            elif attr == "path" and attr_separator:
+                path = attr_value.strip() or "/"
+            elif attr == "secure":
+                secure = True
+        self._cookies[(domain, path, name)] = MockCookie(
+            name, value, domain, path, secure
+        )
+
+    def get(self, name, url):
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
+        request_path = parsed.path or "/"
+        candidates = [
+            cookie
+            for (_, _, cookie_name), cookie in self._cookies.items()
+            if cookie_name == name
+            and (
+                host == cookie.domain
+                or host.endswith("." + cookie.domain)
+            )
+            and request_path.startswith(cookie.path)
+            and (not cookie.secure or parsed.scheme == "https")
+        ]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda cookie: len(cookie.path))
+
+    def get_all(self):
+        return list(self._cookies.values())
+
+
+def _install_response_cookies(cookie_jar, response, url):
+    for raw in response.headers.get_all("set-cookie"):
+        cookie_jar.add(raw.decode("utf-8"), url)
 
 
 class MockClient:
@@ -198,6 +262,7 @@ class MockClient:
         self.request_log.append((method, url, kwargs))
         if isinstance(resp, Exception):
             raise resp
+        _install_response_cookies(self.cookie_jar, resp, url)
         return resp
 
     def get(self, url, **kwargs):
@@ -232,6 +297,7 @@ class AsyncMockClient:
         self.request_log.append((method, url, kwargs))
         if isinstance(resp, Exception):
             raise resp
+        _install_response_cookies(self.cookie_jar, resp, url)
         return resp
 
     async def get(self, url, **kwargs):
@@ -257,13 +323,18 @@ def to_async_responses(responses):
         if isinstance(r, (Exception, AsyncMockResponse)):
             result.append(r)
         else:
-            # Reconstruct flat headers dict from MockHeaderMap
+            # Preserve repeated header values, especially Set-Cookie.
             headers = {}
             for bk, vals in r.headers._raw.items():
-                headers[bk.decode()] = vals[0].decode()
+                headers[bk.decode()] = [
+                    value.decode() for value in vals
+                ]
             result.append(
                 AsyncMockResponse(
-                    r.status.as_int(), headers, r._body,
+                    r.status.as_int(),
+                    headers,
+                    r._body,
+                    content_length=r.content_length,
                 )
             )
     return result
@@ -432,6 +503,10 @@ def make_async_session(responses, **session_kwargs):
     session._rotate_every = session_kwargs.get("rotate_every", None)
     session._request_count = 0
     session._rotate_lock = asyncio.Lock()
+    session._reddit_bootstrap_lock = asyncio.Lock()
+    session._reddit_bootstrap_generation = 0
+    session._reddit_bootstrap_client_generation = None
+    session._client_generation = 0
     profile = session_kwargs.get("profile", None)
     session._profile = profile
     session._om_identity = None

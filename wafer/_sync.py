@@ -48,8 +48,15 @@ from wafer._profiles import Profile
 from wafer._response import HistoryEntry, WaferResponse, resolve_charset
 from wafer._retry import RetryState, calculate_backoff, parse_retry_after
 from wafer._solvers import (
+    REDDIT_CACHE_DOMAIN,
+    REDDIT_GATE_MAX_BYTES,
+    REDDIT_VERIFICATION_MAX_BYTES,
     parse_amazon_captcha,
-    reddit_warmup_url,
+    parse_reddit_verification,
+    reddit_cookie_names,
+    reddit_has_cookie_evidence,
+    reddit_solve_origin,
+    reddit_submission_url,
     solve_acw,
     tmd_homepage_url,
 )
@@ -97,12 +104,17 @@ class SyncSession(BaseSession):
                 exc_info=True,
             )
 
-    def _cache_response_cookies(self, url: str, resp) -> None:
+    def _cache_response_cookies(
+        self,
+        url: str,
+        resp,
+        cache_domain: str | None = None,
+    ) -> None:
         """Write-through: save Set-Cookie headers to disk cache."""
         if self._cookie_cache is None:
             return
         try:
-            domain = extract_domain(url)
+            domain = cache_domain or extract_domain(url)
             if not domain:
                 return
             raw_cookies = resp.headers.get_all("set-cookie")
@@ -152,7 +164,7 @@ class SyncSession(BaseSession):
         if self._fingerprint is not None:
             self._fingerprint.reset()
         if self._cookie_cache:
-            self._cookie_cache.clear(domain)
+            self._clear_cached_cookies(domain)
         self._client = wreq.blocking.Client(**self._build_client_kwargs())
         self._hydrate_jar_from_cache()
         self._domain_failures.pop(domain, None)
@@ -162,6 +174,120 @@ class SyncSession(BaseSession):
             self.emulation,
         )
 
+    @staticmethod
+    def _reddit_subrequest_kwargs(
+        url: str,
+        deadline: float | None,
+        total_timeout: float,
+    ) -> dict:
+        if deadline is None:
+            return {}
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise WaferTimeout(url, total_timeout)
+        return {
+            "timeout": datetime.timedelta(seconds=remaining)
+        }
+
+    def _try_reddit_bootstrap(
+        self,
+        url: str,
+        deadline: float | None,
+        total_timeout: float,
+    ) -> bool:
+        """Establish New Reddit's anonymous cookie jar on this client."""
+        origin = reddit_solve_origin(url)
+        if origin is None:
+            return False
+        try:
+            verification_resp = self._client.get(
+                origin,
+                **self._reddit_subrequest_kwargs(
+                    url, deadline, total_timeout
+                ),
+            )
+            verification_cookies = verification_resp.headers.get_all(
+                "set-cookie"
+            )
+            self._cache_response_cookies(
+                origin,
+                verification_resp,
+                cache_domain=REDDIT_CACHE_DOMAIN,
+            )
+            if not 200 <= verification_resp.status.as_int() < 300:
+                logger.debug(
+                    "Reddit bootstrap failed due to verification status"
+                )
+                return False
+            if reddit_has_cookie_evidence(
+                reddit_cookie_names(verification_cookies)
+            ):
+                logger.info("Reddit anonymous cookies established")
+                return True
+
+            logger.info("Reddit verification page fetched")
+            try:
+                verification_body = _read_body_capped(
+                    verification_resp,
+                    REDDIT_VERIFICATION_MAX_BYTES,
+                ).decode("utf-8")
+            except (_CapExceeded, UnicodeDecodeError):
+                logger.debug(
+                    "Reddit bootstrap failed due to verification structure"
+                )
+                return False
+            verification = parse_reddit_verification(
+                verification_body
+            )
+            if verification is None:
+                logger.debug(
+                    "Reddit bootstrap failed due to verification structure"
+                )
+                return False
+
+            # Build the query into the URL. Raw wreq requests silently ignore
+            # requests-style params=, and the solved URL must never be logged.
+            submission_url = reddit_submission_url(verification)
+            solved_resp = self._client.get(
+                submission_url,
+                **self._reddit_subrequest_kwargs(
+                    url, deadline, total_timeout
+                ),
+            )
+            solved_cookies = solved_resp.headers.get_all("set-cookie")
+            # Use the safe fixed origin for persistence so the solved query
+            # cannot appear in cache logs or metadata.
+            self._cache_response_cookies(
+                origin,
+                solved_resp,
+                cache_domain=REDDIT_CACHE_DOMAIN,
+            )
+            if not 200 <= solved_resp.status.as_int() < 300:
+                logger.debug(
+                    "Reddit bootstrap failed due to submission status"
+                )
+                return False
+            if not reddit_has_cookie_evidence(
+                reddit_cookie_names(solved_cookies)
+            ):
+                logger.debug(
+                    "Reddit bootstrap failed due to cookie evidence"
+                )
+                return False
+            logger.info("Reddit verification submitted")
+            logger.info("Reddit anonymous cookies established")
+            # Do not consume the normal New Reddit homepage body.
+            return True
+        except WaferTimeout:
+            raise
+        except Exception:
+            # Never attach exc_info here: wreq exceptions may contain the
+            # solved query URL, including its token and solution.
+            if deadline is not None and time.monotonic() >= deadline:
+                raise WaferTimeout(url, total_timeout) from None
+            logger.debug("Reddit bootstrap failed during transport")
+            return False
+
     def _try_inline_solve(
         self,
         challenge: ChallengeType | None,
@@ -170,7 +296,7 @@ class SyncSession(BaseSession):
         deadline: float | None = None,
     ) -> bool:
         """Attempt inline challenge solving. Returns True if solved."""
-        # Bound any solver sub-request (Amazon submit, TMD/Reddit warm-up) by
+        # Bound any solver sub-request (Amazon submit, TMD/Reddit bootstrap) by
         # the caller's remaining budget so a slow response can't overshoot the
         # overall timeout. ACW is pure computation -- no sub-request, no clamp.
         sub_timeout = None
@@ -220,9 +346,11 @@ class SyncSession(BaseSession):
                             **sub_kw,
                         )
                     else:
+                        target_url = self._apply_params(
+                            target["url"], target["params"]
+                        )
                         solve_resp = self._client.get(
-                            target["url"],
-                            params=target["params"] or None,
+                            target_url,
                             headers={"Referer": url},
                             **sub_kw,
                         )
@@ -256,29 +384,6 @@ class SyncSession(BaseSession):
             except Exception:
                 logger.debug(
                     "TMD homepage fetch failed", exc_info=True
-                )
-
-        elif challenge == ChallengeType.REDDIT:
-            warmup = reddit_warmup_url(url)
-            if warmup is None:
-                return False
-            try:
-                warmup_resp = self._client.get(
-                    warmup,
-                    **(
-                        {"timeout": sub_timeout}
-                        if sub_timeout is not None
-                        else {}
-                    ),
-                )
-                if not 200 <= warmup_resp.status.as_int() < 300:
-                    return False
-                self._cache_response_cookies(warmup, warmup_resp)
-                logger.info("Reddit session warmed via %s", warmup)
-                return True
-            except Exception:
-                logger.debug(
-                    "Reddit session warm-up failed", exc_info=True
                 )
 
         return False
@@ -671,7 +776,7 @@ class SyncSession(BaseSession):
         current_url = url
 
         browser_attempted_type: str | None = None
-        reddit_warmup_attempted = False
+        reddit_bootstrap_attempted = False
         native_attempted = False
         native_retries = 0
         redirects_followed = 0
@@ -870,7 +975,7 @@ class SyncSession(BaseSession):
                         # through _advance_rotation keeps self.headers coherent
                         # with the TLS identity for non-Chrome sessions.
                         if self._cookie_cache and not pinned:
-                            self._cookie_cache.clear(domain)
+                            self._clear_cached_cookies(domain)
                         if not pinned:
                             self._advance_rotation(state.rotation_retries)
                         self._rebuild_client()
@@ -991,11 +1096,24 @@ class SyncSession(BaseSession):
                 or state.rotation_retries > 0
                 or browser_attempted_type is not None
             )
+            content_type = headers.get("content-type", "")
+            reddit_gate_probe = (
+                max_response_size is not None
+                and status == 403
+                and reddit_solve_origin(current_url) is not None
+                and _is_challengeable_content_type(content_type)
+            )
+            body_read_cap = max_response_size
+            if reddit_gate_probe:
+                body_read_cap = max(
+                    max_response_size,
+                    REDDIT_GATE_MAX_BYTES,
+                )
 
             # Response-size cap: short-circuit on a declared Content-Length
             # over the cap before reading the body at all.
-            if max_response_size is not None:
-                declared = _content_length_over_cap(resp, max_response_size)
+            if body_read_cap is not None:
+                declared = _content_length_over_cap(resp, body_read_cap)
                 if declared is not None:
                     raise ResponseTooLarge(
                         current_url, declared, max_response_size
@@ -1011,10 +1129,10 @@ class SyncSession(BaseSession):
                 headers.get("content-type", "")
             )
             try:
-                if max_response_size is not None:
+                if body_read_cap is not None:
                     # Streamed early-abort: stop the moment the running total
                     # passes the cap, never buffering the whole oversize body.
-                    raw_content = _read_body_capped(resp, max_response_size)
+                    raw_content = _read_body_capped(resp, body_read_cap)
                 else:
                     raw_content = resp.bytes()
                 if is_binary:
@@ -1074,7 +1192,6 @@ class SyncSession(BaseSession):
             #   challenge markers in cookies/headers but browser-solving
             #   the API URL itself can't work (renders raw JSON).
             # - Opera Mini / Dart -- non-browser profiles.
-            content_type = headers.get("content-type", "")
             challenge = (
                 detect_challenge(status, headers, body)
                 if body is not None
@@ -1082,6 +1199,16 @@ class SyncSession(BaseSession):
                 and _is_challengeable_content_type(content_type)
                 else None
             )
+            if (
+                max_response_size is not None
+                and len(raw_content) > max_response_size
+                and challenge != ChallengeType.REDDIT
+            ):
+                raise ResponseTooLarge(
+                    current_url,
+                    len(raw_content),
+                    max_response_size,
+                )
 
             # 429 without detected challenge → rate limit retry
             if status == 429 and challenge is None:
@@ -1142,7 +1269,7 @@ class SyncSession(BaseSession):
                         and self._fingerprint.pinned
                     )
                     if self._cookie_cache and not pinned:
-                        self._cookie_cache.clear(domain)
+                        self._clear_cached_cookies(domain)
                     if not pinned:
                         # Cross-family ladder (or fingerprint_pool when set).
                         # rotation 1 = fresh TLS session on the same family;
@@ -1176,30 +1303,49 @@ class SyncSession(BaseSession):
 
                 # Reddit's gate response establishes half of the anonymous
                 # cookie set (csv/edgebucket); persist that leg alongside the
-                # HTML warm-up cookies so cache_dir survives a process restart.
+                # verification cookies so cache_dir survives a process restart.
                 if (
                     challenge == ChallengeType.REDDIT
-                    and not reddit_warmup_attempted
+                    and not reddit_bootstrap_attempted
                 ):
-                    self._cache_response_cookies(current_url, resp)
+                    self._cache_response_cookies(
+                        current_url,
+                        resp,
+                        cache_domain=REDDIT_CACHE_DOMAIN,
+                    )
 
                 # Try inline solver first (no fingerprint rotation,
                 # does NOT consume rotation budget — separate cap). Reddit
-                # gets exactly one warm-up + replay; repeating the same
+                # gets exactly one bootstrap + replay; repeating the same
                 # navigation cannot improve a failed bootstrap.
                 inline_allowed = (
                     challenge != ChallengeType.REDDIT
-                    or not reddit_warmup_attempted
+                    or not reddit_bootstrap_attempted
                 )
                 if challenge == ChallengeType.REDDIT:
-                    reddit_warmup_attempted = True
+                    reddit_bootstrap_attempted = True
+                inline_solved = False
                 if (
+                    challenge == ChallengeType.REDDIT
+                    and inline_allowed
+                    and state.inline_solves < state.max_inline_solves
+                ):
+                    inline_solved = self._try_reddit_bootstrap(
+                        current_url,
+                        deadline,
+                        timeout_secs,
+                    )
+                elif (
                     challenge is not None
                     and inline_allowed
                     and state.inline_solves < state.max_inline_solves
-                    and self._try_inline_solve(
+                ):
+                    inline_solved = self._try_inline_solve(
                         challenge, body, current_url, deadline
                     )
+                if (
+                    challenge is not None
+                    and inline_solved
                 ):
                     state.inline_solves += 1
                     delay = calculate_backoff(
@@ -1419,7 +1565,7 @@ class SyncSession(BaseSession):
                         and self._fingerprint.pinned
                     )
                     if self._cookie_cache and not pinned:
-                        self._cookie_cache.clear(domain)
+                        self._clear_cached_cookies(domain)
                     if not pinned:
                         # Cross-family ladder (or fingerprint_pool when set).
                         # rotation 1 = fresh TLS session on the same family;
@@ -1483,7 +1629,7 @@ class SyncSession(BaseSession):
                             and self._fingerprint.pinned
                         )
                         if self._cookie_cache and not pinned:
-                            self._cookie_cache.clear(domain)
+                            self._clear_cached_cookies(domain)
                         if not pinned:
                             self._advance_rotation(state.rotation_retries)
                         self._rebuild_client()
