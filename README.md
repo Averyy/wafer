@@ -73,11 +73,18 @@ To read the session's *accumulated* cookie state (not just one response's
 Set-Cookie headers), use `session.get_cookie(name, url)`:
 
 ```python
-# Scoped to url's host: exact-host cookies first, then parent-domain cookies
-# (Domain=.example.com matches www.example.com). Covers every transport the
-# session uses. Secure cookies are only returned for https:// URLs. None if
-# absent; never raises.
+# Scoped to url by RFC 6265 rules. A Domain cookie (Set-Cookie carried
+# Domain=.example.com) is returned for www.example.com; a host-only cookie
+# (Set-Cookie omitted Domain) only on the exact host it was set on, so one set
+# on www.example.com is not visible at api.example.com. Path must match too,
+# and the longest matching path wins. Covers every transport the session uses.
+# Secure cookies are only returned for https:// URLs. None if absent; never
+# raises.
 cf = session.get_cookie("cf_clearance", "https://example.com")
+
+# Value-free jar inspection for diagnosing a protected flow (no cookie values):
+scopes = session.cookie_scope_summary("https://example.com")
+# -> [{"name": ..., "domain": ..., "path": ..., "secure": ...}, ...]
 ```
 
 ## Session Configuration

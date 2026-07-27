@@ -50,6 +50,10 @@ Grid type auto-detected via DOM: `.rc-imageselect-table-44` = 4x4, `.rc-imagesel
 
 Unknown keywords log a warning and reload.
 
+## Detection gating
+
+HTTP-layer detection only fires on **403/429** responses. A 200 page that merely embeds a reCAPTCHA widget is not a challenge - gating on the marker alone would classify every contact form and login page as one. A site that serves reCAPTCHA behind a 200 therefore never reaches the solver via `detect_challenge`; exercising the solver against such a page (including Google's own `api2/demo`, which returns 200) means calling `wait_for_recaptcha(solver, page, timeout_ms)` directly.
+
 ## Models
 
 Two ONNX models from HuggingFace (`Averyyyyyy/wafer-models`), downloaded on first use via `huggingface_hub`. Not bundled in pip package.
@@ -58,6 +62,8 @@ Two ONNX models from HuggingFace (`Averyyyyyy/wafer-models`), downloaded on firs
 - **DET** (`wafer_det_s.onnx`, ~42 MB): D-FINE-S, COCO object detector, confidence threshold 0.25
 
 Models loaded independently - one can work without the other. First inference has ~2-3s warmup (background thread). All `session.run()` calls wrapped in `_inference_lock` for thread safety.
+
+Loading runs on a daemon thread so a cold install cannot pin BrowserSolver's single worker. The waiting solve holds back part of its budget (`min(10s, half the remaining deadline)`) rather than waiting to the deadline: models returned with no time left to use them are useless, and the loader keeps running either way, so the next challenge still gets warm models. Deployments that must not pay this on the first challenge should call `preload_recaptcha_models(timeout=...)` (returns bool) or `preflight_recaptcha_models(timeout=...)` (raises) at startup.
 
 If `onnxruntime` or `huggingface_hub` not installed, or download fails: solver returns False, challenge escalation continues normally. No exception raised.
 

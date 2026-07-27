@@ -180,7 +180,10 @@ SyncSession(
 
     # Rate limiting (per session, per hostname - "example.com" and "api.example.com" are separate.
     # Two sessions hitting the same host enforce their limits independently.)
-    rate_limit: float = 0.0,    # min seconds between requests to same hostname
+    rate_limit: float = 0.0,    # min seconds between requests to same hostname.
+                                # 0.0 disables it; None is not accepted and a
+                                # non-numeric or negative value raises at
+                                # construction.
     rate_jitter: float = 0.0,   # random 0..jitter added to interval
 
     # TLS session rotation
@@ -241,13 +244,26 @@ session.add_cookie(raw_set_cookie: str, url: str) -> None
 
 # Cookie read access (sync on both SyncSession and AsyncSession - not a coroutine):
 session.get_cookie(name: str, url: str) -> str | None
-# Reads the session's accumulated cookie state, scoped to url's host: exact-host
-# cookies first, then parent-domain cookies (Domain=.example.com matches
-# www.example.com). Covers every transport the session uses (the normal jar,
-# the native-TLS Imperva-bypass jar, the Opera Mini jar). Cookies with the
-# Secure flag are only returned when url is https:// - pass the https URL if
-# you expect a Secure cookie (most WAF cookies are Secure). Returns None when
-# the cookie is absent - never raises, works on all profiles.
+# Reads the session's accumulated cookie state, scoped to url by RFC 6265
+# rules. A Domain cookie (Set-Cookie carried Domain=.example.com) is returned
+# for www.example.com; a host-only cookie (Set-Cookie omitted Domain) is
+# returned only on the exact host it was set on, so a cookie from
+# www.example.com is not visible at api.example.com. The cookie's Path must
+# also match url's path, and when several stored cookies share a name the
+# longest matching path wins. Covers every transport the session uses (the
+# normal jar, the native-TLS Imperva-bypass jar, the Opera Mini jar). Cookies
+# with the Secure flag are only returned when url is https:// - pass the https
+# URL if you expect a Secure cookie (most WAF cookies are Secure). A cookie
+# placed in the jar by something other than this session's own traffic has no
+# recorded host-only bit, so it resolves on its exact host but is not offered
+# to a subdomain. Returns None when the cookie is absent - never raises, works
+# on all profiles.
+
+session.cookie_scope_summary(url: str) -> list[dict]
+# Value-free inspection of the wreq jar for diagnosing a protected flow: up to
+# 32 entries of {"name": str, "domain": str, "path": str, "secure": bool}.
+# Cookie values are never included. Returns [] for profiles with no wreq jar
+# (Opera Mini) and never raises.
 
 # Browser-free reCAPTCHA v3 token minting (sync on SyncSession; coroutine on AsyncSession):
 session.mint_recaptcha_v3(sitekey: str, action: str, *, origin=None, referer=None,

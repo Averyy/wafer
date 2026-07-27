@@ -38,6 +38,20 @@ Registered via `Page.addScriptToEvaluateOnNewDocument` (requires `Page.enable` f
 
 Applied to both `MouseEvent.prototype` and `PointerEvent.prototype`.
 
+The replacement is authorized only by `_probe_screenxy_patch`, a real-input
+probe that clicks a button and compares the observed `screenX/Y` against
+`clientX/Y + window.screenX/Y + chrome height`. It is a `Function.prototype.toString`-visible
+override, so it is installed only when the probe positively shows the bug.
+
+Three outcomes: `screen == client` installs it; the additive relation holds
+and it stays off; anything else leaves it off with a warning. That third case
+is real, not hypothetical - headless Chrome 150 on macOS reports
+`client=(100,100) screen=(122,209) window=(22,22) chrome_y=0`, where the Y
+offset is unexplained by `window.screenY`/`outerHeight`. Treating that as
+fatal disabled every headless solve, so it must stay non-fatal: the
+coordinates are still offset from the client origin, which is the case the
+patch exists to repair.
+
 ## CDP Scripts (headless only)
 
 Self-guards with `navigator.platform === 'MacIntel'` and `outerWidth > innerWidth` check - only activates on macOS headless. Uses `outerWidth > innerWidth` (not `!==`) because `outerWidth === 0` during early document load on cross-origin navigation.
