@@ -2,6 +2,35 @@
 
 Every override BrowserSolver applies to Patchright/Chrome, organized by mechanism. Includes research log of failed approaches at the end.
 
+## CDP init scripts do not execute - re-applied on navigation (2026-07-27)
+
+Measured against Patchright with system Chrome 150.0.7871.182 on macOS.
+`Page.addScriptToEvaluateOnNewDocument` accepts the registration and returns
+an identifier, and the CDP session is live (`Runtime.evaluate` works on the
+same session), but the registered script never executes -- verified with a
+script whose only job was to set `window.__probe`, which stayed `undefined`
+across two navigations. `page.add_init_script()` and
+`context.add_init_script()` are not alternatives: both break navigation
+outright under Patchright.
+
+`Frame.evaluate` does work, so `BrowserSolver._install_init_script_fallback`
+re-applies the same scripts on `framenavigated`. One navigation is one fresh
+document, so each script runs exactly once per document. This lands just
+after document-start rather than before it, so a WAF that fingerprints at
+document-start could still read pre-patch values; it is a fallback for an
+injection that was otherwise doing nothing at all.
+
+Effect, measured on the same page: `outerWidth/innerWidth/colorDepth/screenY`
+goes from `1366/1366/24/22` (a plain headless signature) to
+`1538/1536/30/56`. `_verify_headless_patches` logs a warning if the values
+still look unpatched after navigation, so a future regression is loud rather
+than silent.
+
+Headless Alibaba Baxia before and after is the end-to-end proof: the slider
+solved either way, but before the fallback it earned no target-scoped `x5sec`
+three rounds running and ended in `ChallengeDetected`, and after it earns
+clearance on the first solve and the burst completes 18/18 200s.
+
 ## Launch Args
 
 Passed to `chromium.launch(args=[...])`.

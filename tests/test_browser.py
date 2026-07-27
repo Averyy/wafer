@@ -9561,3 +9561,130 @@ class TestRecaptchaModelWaitBudget:
         cls, det = grid._ensure_models_before(started + 60)
         assert cls is not None and det is not None
         assert time.monotonic() - started < 0.5
+
+
+class TestHeadlessPatchVerification:
+    """A silently-inert fingerprint patch must not fail a solve unexplained."""
+
+    def _page(self, outer, inner, depth):
+        page = MagicMock()
+        page.evaluate.return_value = [outer, inner, depth]
+        del page._wafer_patch_checked
+        return page
+
+    def test_warns_when_headless_patches_did_not_apply(self, caplog):
+        solver = BrowserSolver(headless=True)
+        try:
+            page = self._page(1366, 1366, 24)
+            with caplog.at_level(logging.WARNING, logger="wafer"):
+                solver._verify_headless_patches(page)
+            assert "did not apply" in caplog.text
+            assert "headless=False" in caplog.text
+        finally:
+            solver.close(timeout=5)
+
+    def test_silent_when_patches_took_effect(self, caplog):
+        solver = BrowserSolver(headless=True)
+        try:
+            page = self._page(1368, 1366, 30)
+            with caplog.at_level(logging.WARNING, logger="wafer"):
+                solver._verify_headless_patches(page)
+            assert "did not apply" not in caplog.text
+        finally:
+            solver.close(timeout=5)
+
+    def test_headed_is_never_warned_about(self, caplog):
+        """Headed Chrome is natively correct; the patches are not needed."""
+        solver = BrowserSolver(headless=False)
+        try:
+            page = self._page(1366, 1366, 24)
+            with caplog.at_level(logging.WARNING, logger="wafer"):
+                solver._verify_headless_patches(page)
+            assert caplog.text == "" or "did not apply" not in caplog.text
+            page.evaluate.assert_not_called()
+        finally:
+            solver.close(timeout=5)
+
+    def test_check_runs_once_per_page(self, caplog):
+        solver = BrowserSolver(headless=True)
+        try:
+            page = self._page(1366, 1366, 24)
+            with caplog.at_level(logging.WARNING, logger="wafer"):
+                solver._verify_headless_patches(page)
+                solver._verify_headless_patches(page)
+            assert caplog.text.count("did not apply") == 1
+        finally:
+            solver.close(timeout=5)
+
+
+class TestInitScriptFallback:
+    """CDP init scripts register and then never run under Patchright.
+
+    _setup_headless_patches registers via Page.addScriptToEvaluateOnNewDocument,
+    which returns an identifier and silently never executes, leaving every
+    fingerprint patch inert. Frame.evaluate does work, so the same scripts are
+    re-applied on navigation.
+    """
+
+    def test_scripts_are_reapplied_on_main_frame_navigation(self):
+        solver = BrowserSolver(headless=True)
+        try:
+            page = MagicMock()
+            main = MagicMock()
+            page.main_frame = main
+            handlers = {}
+            page.on.side_effect = lambda ev, fn: handlers.__setitem__(ev, fn)
+
+            solver._install_init_script_fallback(page, ["SCRIPT_A", "SCRIPT_B"])
+            handlers["framenavigated"](main)
+
+            assert [c.args[0] for c in main.evaluate.call_args_list] == [
+                "SCRIPT_A",
+                "SCRIPT_B",
+            ]
+        finally:
+            solver.close(timeout=5)
+
+    def test_subframes_are_left_alone(self):
+        """Only the main frame; OOPIFs have their own patch path."""
+        solver = BrowserSolver(headless=True)
+        try:
+            page = MagicMock()
+            page.main_frame = MagicMock()
+            other = MagicMock()
+            handlers = {}
+            page.on.side_effect = lambda ev, fn: handlers.__setitem__(ev, fn)
+
+            solver._install_init_script_fallback(page, ["SCRIPT"])
+            handlers["framenavigated"](other)
+
+            other.evaluate.assert_not_called()
+        finally:
+            solver.close(timeout=5)
+
+    def test_no_listener_registered_when_there_is_nothing_to_apply(self):
+        solver = BrowserSolver(headless=True)
+        try:
+            page = MagicMock()
+            solver._install_init_script_fallback(page, [])
+            page.on.assert_not_called()
+        finally:
+            solver.close(timeout=5)
+
+    def test_a_failing_script_does_not_stop_the_rest(self):
+        solver = BrowserSolver(headless=True)
+        try:
+            page = MagicMock()
+            main = MagicMock()
+            page.main_frame = main
+            main.evaluate.side_effect = [RuntimeError("boom"), None]
+            handlers = {}
+            page.on.side_effect = lambda ev, fn: handlers.__setitem__(ev, fn)
+
+            solver._install_init_script_fallback(page, ["A", "B"])
+            handlers["framenavigated"](main)  # must not raise
+
+            # B still applied despite A raising: they patch unrelated surfaces.
+            assert [c.args[0] for c in main.evaluate.call_args_list] == ["A", "B"]
+        finally:
+            solver.close(timeout=5)

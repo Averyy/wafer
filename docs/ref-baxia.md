@@ -14,7 +14,12 @@ for 12/12 200s. One of those runs logged `Baxia result remained pending after
 release` and still succeeded, which is the intended contract: widget state is
 an intermediate signal and the authoritative `x5sec` check decides. Note a
 single cold request usually passes with no challenge at all, so exercising the
-solver requires a burst. System Chrome uses
+solver requires a burst. **Headless verified too** (2026-07-27): an
+18-query burst solved on the first challenge and returned 18/18 200s. This
+only works because the headless fingerprint patches are now re-applied on
+navigation; while they were inert the slider still solved but earned no
+target-scoped `x5sec` for three consecutive rounds. See the status note at
+the top of `docs/ref-headless.md`. System Chrome uses
 `--disable-blink-features=AutomationControlled`. The browser and wafer's
 transport client hints must carry the same four-part Chrome version; startup
 achieves that by pinning wafer's UA and hints onto the installed browser, so a

@@ -1522,6 +1522,74 @@ class BrowserSolver:
         cdp.on("Network.dataReceived", data_received)
         return state
 
+    def _install_init_script_fallback(self, page, scripts: list) -> None:
+        """Re-apply fingerprint scripts on navigation when CDP injection is inert.
+
+        ``Page.addScriptToEvaluateOnNewDocument`` returns an identifier and
+        then never executes under Patchright, silently turning every script
+        registered alongside it into a no-op. ``Frame.evaluate`` does work, so
+        re-apply there on each navigation.
+
+        This lands just after document-start rather than before it, so it is a
+        fallback for an injection that is otherwise doing nothing at all, not
+        a replacement for real init-time injection. One navigation is one
+        fresh document, so each script is applied exactly once per document
+        and needs no idempotency check.
+        """
+
+        if not scripts:
+            return
+
+        def _reapply(frame) -> None:
+            try:
+                if frame is not page.main_frame:
+                    return
+            except Exception:
+                return
+            # Applied independently: these patch unrelated surfaces, so one
+            # failing must not deprive the page of the others.
+            for source in scripts:
+                try:
+                    frame.evaluate(source)
+                except Exception:
+                    logger.debug("Init-script fallback failed", exc_info=True)
+
+        page.on("framenavigated", _reapply)
+
+    def _verify_headless_patches(self, page) -> None:
+        """Warn when the registered init scripts did not actually run.
+
+        ``Page.addScriptToEvaluateOnNewDocument`` returns an identifier and
+        then silently never executes under some Patchright builds, which
+        makes every fingerprint patch below a no-op. Headed Chrome does not
+        care -- its values are already native-correct -- but headless keeps
+        ``outerWidth == innerWidth`` and ``colorDepth == 24``, which is a
+        plain headless signature. Surface it once per page instead of letting
+        a solve fail for reasons nothing logs.
+        """
+
+        if not self._headless or getattr(page, "_wafer_patch_checked", False):
+            return
+        page._wafer_patch_checked = True  # type: ignore[attr-defined]
+        try:
+            state = page.evaluate(
+                "() => [window.outerWidth, window.innerWidth, screen.colorDepth]"
+            )
+            outer, inner, depth = state
+        except Exception:
+            return
+        if outer == inner or depth == 24:
+            logger.warning(
+                "Headless fingerprint patches did not apply "
+                "(outerWidth=%s innerWidth=%s colorDepth=%s); the CDP init "
+                "script registered but never ran, so this browser is "
+                "identifiable as headless. Prefer headless=False for "
+                "challenge solving.",
+                outer,
+                inner,
+                depth,
+            )
+
     def _setup_headless_patches(
         self,
         page,
@@ -1554,6 +1622,12 @@ class BrowserSolver:
         cdp = page.context.new_cdp_session(page)
         cdp.send("Page.enable")
 
+        # Mirrored below into _install_init_script_fallback: the CDP
+        # registration can be accepted and never executed, so the same set has
+        # to be re-applied on navigation. Kasada/Akamai stay excluded there
+        # too, for the same toString-detection reason as the headless block.
+        fallback_scripts = []
+
         # Native-correct Chrome keeps its original event descriptors. Only a
         # real-input probe can authorize the compatibility replacement.
         if self._needs_screenxy_patch:
@@ -1563,6 +1637,7 @@ class BrowserSolver:
                     "source": _SCREENXY_FIX_SCRIPT,
                 },
             )
+            fallback_scripts.append(_SCREENXY_FIX_SCRIPT)
 
         if self._headless:
             # Kasada's ips.js and Akamai's behavioral challenge JS
@@ -1577,6 +1652,7 @@ class BrowserSolver:
                         "source": _HEADLESS_FIX_SCRIPT,
                     },
                 )
+                fallback_scripts.append(_HEADLESS_FIX_SCRIPT)
 
             # On macOS, --force-color-profile=scrgb-linear already
             # makes (color: 10), (dynamic-range: high), and
@@ -1616,6 +1692,9 @@ class BrowserSolver:
         # Do NOT detach the CDP session - that removes registered
         # scripts.  GC-safe: Playwright's channel registry keeps it
         # alive for the page's lifetime.
+
+        self._install_init_script_fallback(page, fallback_scripts)
+
 
     @staticmethod
     def _apply_ua_metadata(
@@ -2592,6 +2671,7 @@ class BrowserSolver:
                         "Browser navigation timeout/error (%s)",
                         type(exc).__name__,
                     )
+                self._verify_headless_patches(page)
                 if size_guard["exceeded"]:
                     raise ResponseTooLarge(
                         url,
