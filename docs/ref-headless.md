@@ -31,6 +31,24 @@ solved either way, but before the fallback it earned no target-scoped `x5sec`
 three rounds running and ended in `ChallengeDetected`, and after it earns
 clearance on the first solve and the burst completes 18/18 200s.
 
+**Headless is not uniformly fixed.** Measured 2026-07-27, fresh solver per
+target:
+
+| WAF | headless result |
+|---|---|
+| Cloudflare | 200 in 11.8s |
+| Kasada | 200 / 687KB in 12.7s |
+| Alibaba Baxia | solves first challenge, 18/18 200s |
+| **DataDome** | **fails** -- `ChallengeDetected`, and `_verify_headless_patches` reports `outerWidth=1440 innerWidth=1440 colorDepth=24` |
+
+DataDome is the case the after-document-start limitation actually bites: its
+`tag.js` fingerprints at document start, so it reads the pre-patch values
+before `framenavigated` fires. The WAFs that fingerprint later see the patched
+window. Use `headless=False` for DataDome; headed passes it in ~6s.
+
+Closing that gap needs injection that genuinely runs before first script
+execution, which is the thing Patchright is currently preventing.
+
 ## Launch Args
 
 Passed to `chromium.launch(args=[...])`.
