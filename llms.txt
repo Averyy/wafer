@@ -73,6 +73,7 @@ from wafer import (
     WaferResponse,     # response object
     Profile,           # enum: OPERA_MINI, SAFARI, IOS_SAFARI, DART
     DEFAULT_HEADERS,   # dict[str, str] - default Accept/Accept-Language/etc headers
+    __version__,       # str - installed version ("0.0.0" if not installed)
     # Fingerprint helpers (supported public surface - do NOT reach into
     # wafer._fingerprint; these are the stable path):
     sec_ch_ua,                 # build a sec-ch-ua header value (see below)
@@ -258,6 +259,22 @@ session.get_cookie(name: str, url: str) -> str | None
 # recorded host-only bit, so it resolves on its exact host but is not offered
 # to a subdomain. Returns None when the cookie is absent - never raises, works
 # on all profiles.
+
+# Manual browser-state acquisition. Both need a browser_solver= on the session
+# and return False without one. Sync returns bool; async returns a coroutine.
+session.browser_prime(url: str, *, timeout=None, max_response_size=None) -> bool
+# Visits url in the browser solver on purpose, then imports and persists the
+# browser state scoped to that origin. Use it to warm an origin before the
+# real request instead of waiting for a challenge to be detected.
+session.browser_solve_challenge(url: str, challenge_type: str, *,
+                                timeout=None, max_response_size=None) -> bool
+# Solves a challenge you have already identified, navigating url directly
+# rather than the session's solve_origin. challenge_type is one of the
+# resp.challenge_type values listed under "Challenge types"; an unrecognized
+# value returns False rather than raising.
+# True from either means browser state was earned and imported, NOT that your
+# application request succeeded: reissue that request yourself and validate
+# the result. timeout defaults to the session timeout; <= 0 returns False.
 
 session.cookie_scope_summary(url: str) -> list[dict]
 # Value-free inspection of the wreq jar for diagnosing a protected flow: up to
