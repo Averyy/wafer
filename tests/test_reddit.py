@@ -20,6 +20,7 @@ from wafer._errors import WaferTimeout
 from wafer._solvers import (
     REDDIT_CACHE_DOMAIN,
     REDDIT_SOLVE_ORIGIN,
+    is_reddit_verification,
     parse_reddit_verification,
     reddit_cookie_names,
     reddit_has_cookie_evidence,
@@ -28,6 +29,7 @@ from wafer._solvers import (
 
 _JSON_URL = "https://api.reddit.com/r/homelab/hot"
 _OLD_JSON_URL = "https://old.reddit.com/r/homelab/hot.json?limit=1"
+_HTML_URL = "https://www.reddit.com/r/homelab/"
 _TOKEN = "t" * 64
 _SEED = "AbC123xYz987LmNo"
 
@@ -123,6 +125,25 @@ def _async_solved_response():
     return _AsyncUnreadableResponse(200, _SOLVED_HEADERS)
 
 
+class _RecordingBrowserSolver:
+    proxy_server = None
+    browser_identity = None
+
+    def __init__(self):
+        self.calls = []
+
+    def solve(self, url, challenge_type=None, **kwargs):
+        self.calls.append((url, challenge_type, kwargs))
+        return None
+
+    async def asolve(self, url, challenge_type=None, **kwargs):
+        self.calls.append((url, challenge_type, kwargs))
+        return None
+
+    def close(self):
+        pass
+
+
 def _assert_submission_url(url):
     parsed = urlparse(url)
     assert f"{parsed.scheme}://{parsed.netloc}{parsed.path}" == (
@@ -172,6 +193,17 @@ class TestRedditVerificationParser:
             "token": _TOKEN,
             "jsc_orig_r": "",
         }
+
+    def test_direct_same_origin_path_is_detection_only(self):
+        html = _verification_html(action="/r/homelab/")
+
+        assert is_reddit_verification(html)
+        assert parse_reddit_verification(html) is None
+
+    def test_cross_origin_action_is_never_a_verification(self):
+        html = _verification_html(action="https://evil.test/")
+
+        assert not is_reddit_verification(html)
 
     def test_safe_field_order_and_escaped_root_action_are_accepted(self):
         html = _verification_html(action="&#47;")
@@ -246,6 +278,74 @@ class TestRedditVerificationParser:
 
 
 class TestRedditBootstrapSync:
+    @patch("wafer._sync.time.sleep")
+    def test_cold_html_verification_bootstraps_then_replays_original(
+        self, mock_sleep
+    ):
+        real_html = "<html><title>homelab</title><main>real</main></html>"
+        responses = [
+            MockResponse(
+                200,
+                {"content-type": "text/html"},
+                _verification_html(),
+            ),
+            MockResponse(200, {}, _verification_html()),
+            _solved_response(),
+            MockResponse(
+                200,
+                {"content-type": "text/html"},
+                real_html,
+            ),
+        ]
+        session, mock = make_sync_session(
+            responses,
+            max_rotations=0,
+        )
+
+        resp = session.get(_HTML_URL)
+
+        assert resp.status_code == 200
+        assert resp.text == real_html
+        assert resp.inline_solves == 1
+        assert resp.rotations == 0
+        assert [entry[1] for entry in mock.request_log[:2]] == [
+            _HTML_URL,
+            REDDIT_SOLVE_ORIGIN,
+        ]
+        _assert_submission_url(mock.request_log[2][1])
+        assert mock.request_log[3][1] == _HTML_URL
+
+    @patch("wafer._sync.time.sleep")
+    def test_cold_html_gate_can_exceed_final_response_cap(
+        self, mock_sleep
+    ):
+        real_html = "<html>ok</html>"
+        responses = [
+            MockResponse(
+                200,
+                {"content-type": "text/html"},
+                _verification_html(),
+                content_length=len(_verification_html()),
+            ),
+            MockResponse(200, {}, _verification_html()),
+            _solved_response(),
+            MockResponse(
+                200,
+                {"content-type": "text/html"},
+                real_html,
+            ),
+        ]
+        session, _ = make_sync_session(
+            responses,
+            max_response_size=len(real_html),
+            max_rotations=0,
+        )
+
+        resp = session.get(_HTML_URL)
+
+        assert resp.text == real_html
+        assert len(resp.content) <= len(real_html)
+
     @patch("wafer._sync.time.sleep")
     def test_cold_old_json_uses_new_reddit_then_replays_original(
         self, mock_sleep
@@ -322,6 +422,64 @@ class TestRedditBootstrapSync:
             url == REDDIT_SOLVE_ORIGIN
             for _, url, _ in mock.request_log
         ) == 1
+
+    @patch("wafer._sync.time.sleep")
+    def test_failed_exact_bootstrap_never_falls_back_to_browser(
+        self,
+        mock_sleep,
+    ):
+        solver = _RecordingBrowserSolver()
+        session, mock = make_sync_session(
+            [
+                _gate_response(),
+                MockResponse(
+                    200,
+                    {"content-type": "text/html"},
+                    "<html>not a valid verification</html>",
+                ),
+            ],
+            max_rotations=0,
+            browser_solver=solver,
+        )
+
+        resp = session.get(_JSON_URL)
+
+        assert resp.status_code == 403
+        assert resp.text == _REDDIT_GATE_BODY
+        assert resp.challenge_type == "reddit"
+        assert mock.request_count == 2
+        assert solver.calls == []
+
+    @patch("wafer._sync.time.sleep")
+    def test_failed_exact_bootstrap_preserves_transport_rotation(
+        self,
+        mock_sleep,
+    ):
+        solver = _RecordingBrowserSolver()
+        session, _ = make_sync_session(
+            [
+                _gate_response(),
+                MockResponse(
+                    200,
+                    {"content-type": "text/html"},
+                    "<html>not a valid verification</html>",
+                ),
+                MockResponse(
+                    200,
+                    {"content-type": "application/json"},
+                    "{}",
+                ),
+            ],
+            max_rotations=1,
+            browser_solver=solver,
+        )
+
+        resp = session.get(_JSON_URL)
+
+        assert resp.status_code == 200
+        assert resp.json() == {}
+        assert resp.rotations == 1
+        assert solver.calls == []
 
     @patch("wafer._sync.time.sleep")
     def test_submission_requires_response_cookie_evidence(
@@ -527,6 +685,76 @@ class TestRedditBootstrapSync:
 class TestRedditBootstrapAsync:
     @pytest.mark.asyncio
     @patch("wafer._async.asyncio.sleep")
+    async def test_cold_html_verification_bootstraps_then_replays_original(
+        self, mock_sleep
+    ):
+        real_html = "<html><title>homelab</title><main>real</main></html>"
+        responses = [
+            MockResponse(
+                200,
+                {"content-type": "text/html"},
+                _verification_html(),
+            ),
+            MockResponse(200, {}, _verification_html()),
+            _async_solved_response(),
+            MockResponse(
+                200,
+                {"content-type": "text/html"},
+                real_html,
+            ),
+        ]
+        session, mock = make_async_session(
+            responses,
+            max_rotations=0,
+        )
+
+        resp = await session.get(_HTML_URL)
+
+        assert resp.status_code == 200
+        assert resp.text == real_html
+        assert resp.inline_solves == 1
+        assert resp.rotations == 0
+        assert [entry[1] for entry in mock.request_log[:2]] == [
+            _HTML_URL,
+            REDDIT_SOLVE_ORIGIN,
+        ]
+        _assert_submission_url(mock.request_log[2][1])
+        assert mock.request_log[3][1] == _HTML_URL
+
+    @pytest.mark.asyncio
+    @patch("wafer._async.asyncio.sleep")
+    async def test_cold_html_gate_can_exceed_final_response_cap(
+        self, mock_sleep
+    ):
+        real_html = "<html>ok</html>"
+        responses = [
+            MockResponse(
+                200,
+                {"content-type": "text/html"},
+                _verification_html(),
+                content_length=len(_verification_html()),
+            ),
+            MockResponse(200, {}, _verification_html()),
+            _async_solved_response(),
+            MockResponse(
+                200,
+                {"content-type": "text/html"},
+                real_html,
+            ),
+        ]
+        session, _ = make_async_session(
+            responses,
+            max_response_size=len(real_html),
+            max_rotations=0,
+        )
+
+        resp = await session.get(_HTML_URL)
+
+        assert resp.text == real_html
+        assert len(resp.content) <= len(real_html)
+
+    @pytest.mark.asyncio
+    @patch("wafer._async.asyncio.sleep")
     async def test_cold_json_uses_new_reddit_and_does_not_read_submit_body(
         self, mock_sleep
     ):
@@ -552,6 +780,66 @@ class TestRedditBootstrapAsync:
         assert mock.request_log[1][1] == REDDIT_SOLVE_ORIGIN
         _assert_submission_url(mock.request_log[2][1])
         assert mock.request_log[3][1] == _JSON_URL
+
+    @pytest.mark.asyncio
+    @patch("wafer._async.asyncio.sleep")
+    async def test_failed_exact_bootstrap_never_falls_back_to_browser(
+        self,
+        mock_sleep,
+    ):
+        solver = _RecordingBrowserSolver()
+        session, mock = make_async_session(
+            [
+                _async_gate_response(),
+                AsyncMockResponse(
+                    200,
+                    {"content-type": "text/html"},
+                    "<html>not a valid verification</html>",
+                ),
+            ],
+            max_rotations=0,
+            browser_solver=solver,
+        )
+
+        resp = await session.get(_JSON_URL)
+
+        assert resp.status_code == 403
+        assert resp.text == _REDDIT_GATE_BODY
+        assert resp.challenge_type == "reddit"
+        assert mock.request_count == 2
+        assert solver.calls == []
+
+    @pytest.mark.asyncio
+    @patch("wafer._async.asyncio.sleep")
+    async def test_failed_exact_bootstrap_preserves_transport_rotation(
+        self,
+        mock_sleep,
+    ):
+        solver = _RecordingBrowserSolver()
+        session, _ = make_async_session(
+            [
+                _async_gate_response(),
+                AsyncMockResponse(
+                    200,
+                    {"content-type": "text/html"},
+                    "<html>not a valid verification</html>",
+                ),
+                AsyncMockResponse(
+                    200,
+                    {"content-type": "application/json"},
+                    "{}",
+                ),
+            ],
+            max_rotations=1,
+            browser_solver=solver,
+        )
+
+        resp = await session.get(_JSON_URL)
+
+        assert resp.status_code == 200
+        assert resp.json() == {}
+        assert resp.rotations == 1
+        assert solver.calls == []
 
     @pytest.mark.asyncio
     async def test_lock_wait_uses_request_deadline(self):

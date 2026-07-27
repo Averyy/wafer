@@ -9,7 +9,26 @@ import onnxruntime as ort
 import timm
 import torch
 
-NUM_CLASSES = 14
+try:
+    from classes import CLS_NAMES, NUM_CLASSES
+except ModuleNotFoundError:
+    from training.recaptcha.classes import CLS_NAMES, NUM_CLASSES
+
+SIZE_TO_MODEL = {
+    "s": "efficientnet_b0",
+    "x": "efficientnet_b1",
+}
+
+
+def validate_checkpoint_contract(checkpoint: dict, size: str) -> None:
+    """Reject output-index or architecture/name mismatches before export."""
+
+    if checkpoint["num_classes"] != NUM_CLASSES or tuple(
+        checkpoint.get("classes", ())
+    ) != CLS_NAMES:
+        raise ValueError("Checkpoint classes do not match production index contract")
+    if checkpoint["model_name"] != SIZE_TO_MODEL[size]:
+        raise ValueError("Checkpoint architecture does not match requested size")
 
 
 def verify_cls(onnx_path: Path):
@@ -22,7 +41,9 @@ def verify_cls(onnx_path: Path):
         outputs = sess.run(None, {input_name: dummy})
         shape = outputs[0].shape
         expected = (batch, NUM_CLASSES)
-        assert shape == expected, f"cls shape mismatch: got {shape}, expected {expected}"
+        assert shape == expected, (
+            f"cls shape mismatch: got {shape}, expected {expected}"
+        )
         print(f"  cls batch={batch}: {shape} OK")
 
 
@@ -33,6 +54,7 @@ def export_cls(checkpoint_path: Path, size: str, deliver_dir: Path | None):
 
     model_name = ckpt["model_name"]
     num_classes = ckpt["num_classes"]
+    validate_checkpoint_contract(ckpt, size)
     val_acc = ckpt.get("val_acc", "unknown")
     print(f"  model={model_name}, num_classes={num_classes}, val_acc={val_acc}")
 
@@ -43,7 +65,9 @@ def export_cls(checkpoint_path: Path, size: str, deliver_dir: Path | None):
     onnx_path = checkpoint_path.parent / f"wafer_cls_{size}.onnx"
     dummy = torch.randn(1, 3, 224, 224)
     torch.onnx.export(
-        model, dummy, str(onnx_path),
+        model,
+        dummy,
+        str(onnx_path),
         opset_version=17,
         input_names=["input"],
         output_names=["output"],
@@ -65,10 +89,17 @@ def export_cls(checkpoint_path: Path, size: str, deliver_dir: Path | None):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--cls-model", required=True, help="Path to cls best.pth.tar")
-    parser.add_argument("--size", default="s", choices=["s", "x"],
-                        help="Model size suffix for naming (default: s)")
-    parser.add_argument("--deliver", action="store_true",
-                        help="Copy ONNX files to wafer/browser/models/")
+    parser.add_argument(
+        "--size",
+        default="s",
+        choices=["s", "x"],
+        help="Model size suffix for naming (default: s)",
+    )
+    parser.add_argument(
+        "--deliver",
+        action="store_true",
+        help="Copy ONNX files to wafer/browser/models/",
+    )
     args = parser.parse_args()
 
     cls_pt = Path(args.cls_model)
@@ -77,7 +108,12 @@ def main():
 
     deliver_dir = None
     if args.deliver:
-        deliver_dir = Path(__file__).resolve().parent.parent.parent / "wafer" / "browser" / "models"
+        deliver_dir = (
+            Path(__file__).resolve().parent.parent.parent
+            / "wafer"
+            / "browser"
+            / "models"
+        )
         deliver_dir.mkdir(parents=True, exist_ok=True)
 
     export_cls(cls_pt, args.size, deliver_dir)

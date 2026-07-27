@@ -41,8 +41,37 @@ def cookie_domain_matches(cookie_domain: str, registrable: str) -> bool:
     Boundary-aware: ``realtor.ca`` and ``api2.realtor.ca`` match
     ``realtor.ca``; ``evil-realtor.ca`` does not.
     """
-    d = (cookie_domain or "").lstrip(".")
-    return bool(registrable) and (d == registrable or d.endswith("." + registrable))
+    d = (cookie_domain or "").lstrip(".").rstrip(".").lower()
+    registrable = (registrable or "").rstrip(".").lower()
+    return bool(registrable) and (
+        d == registrable or d.endswith("." + registrable)
+    )
+
+
+def browser_cookie_matches_host(cookie_domain: str, host: str) -> bool:
+    """Whether a Playwright cookie is allowed on ``host``.
+
+    Chromium represents Domain cookies with a leading dot and host-only cookies
+    without one. Preserve that distinction: a host-only cookie from
+    ``www.example.com`` must not be promoted to ``api.example.com``, and a
+    Domain cookie for ``.www.example.com`` does not cover that API sibling.
+
+    A cookie with no domain fails closed. ``BrowserContext.cookies()`` always
+    populates it, but ``browser_solver`` is a duck-typed extension point, and
+    a custom solver's domain-less cookie must not be silently rebound to the
+    target host and persisted under it.
+    """
+
+    if not cookie_domain:
+        return False
+    domain_cookie = cookie_domain.startswith(".")
+    domain = cookie_domain.lstrip(".").rstrip(".").lower()
+    host = (host or "").rstrip(".").lower()
+    if not domain or not host:
+        return False
+    if not domain_cookie:
+        return host == domain
+    return host == domain or host.endswith("." + domain)
 
 
 def _parse_cookie_name(raw: str) -> str | None:
@@ -81,6 +110,50 @@ def _parse_cookie_expires(raw: str) -> float:
             pass
 
     return 0.0
+
+
+def _default_cookie_path(url: str) -> str:
+    """Return RFC 6265's default-path for a cookie-setting request URL."""
+
+    path = urlparse(url).path
+    if not path or not path.startswith("/") or path.count("/") <= 1:
+        return "/"
+    return path.rsplit("/", 1)[0] or "/"
+
+
+def _cookie_identity(entry: dict) -> tuple[str, str, str]:
+    """Return the RFC cookie identity: name, domain, and path."""
+
+    raw = str(entry.get("raw", ""))
+    attributes: dict[str, str] = {}
+    for part in raw.split(";")[1:]:
+        key, separator, value = part.strip().partition("=")
+        if separator:
+            attributes[key.lower()] = value.strip()
+
+    parsed = urlparse(str(entry.get("url", "")))
+    domain = str(
+        entry.get("domain")
+        or attributes.get("domain")
+        or parsed.hostname
+        or ""
+    ).lstrip(".").lower()
+    path_value = entry.get("path")
+    if path_value is None:
+        path_value = attributes.get("path")
+    path = str(path_value or "")
+    if not path.startswith("/"):
+        path = _default_cookie_path(str(entry.get("url", "")))
+    return str(entry.get("name", "")), domain, path
+
+
+def _numeric_timestamp(entry: dict, key: str) -> float:
+    """Read a persisted timestamp without trusting cache-file JSON types."""
+
+    try:
+        return float(entry.get(key, 0))
+    except (TypeError, ValueError):
+        return 0.0
 
 
 class CookieCache:
@@ -124,7 +197,13 @@ class CookieCache:
                     "Corrupt cookie file for %s, ignoring", domain
                 )
                 return []
-            return data
+            valid = [entry for entry in data if isinstance(entry, dict)]
+            if len(valid) != len(data):
+                logger.warning(
+                    "Corrupt cookie entries for %s, ignoring invalid values",
+                    domain,
+                )
+            return valid
         except (json.JSONDecodeError, OSError) as e:
             logger.warning(
                 "Failed to load cookies for %s: %s", domain, e
@@ -137,7 +216,7 @@ class CookieCache:
         now = time.time()
         valid = []
         for e in entries:
-            expires = e.get("expires", 0)
+            expires = _numeric_timestamp(e, "expires")
             if expires == 0:
                 # Session cookie (no max-age/expires) - skip, these
                 # should not survive across process restarts.
@@ -151,10 +230,15 @@ class CookieCache:
         return valid
 
     def _get_domain_lock(self, domain: str) -> threading.Lock:
+        # Lock by the actual filename, not the unsanitized caller input.
+        # Domains such as IPv6 literals contain ":" and aliases such as
+        # "a/b" collide after _domain_path() sanitization; sharing the path
+        # must also mean sharing the lock.
+        lock_key = self._domain_path(domain).name
         with self._lock_lock:
-            if domain not in self._domain_locks:
-                self._domain_locks[domain] = threading.Lock()
-            return self._domain_locks[domain]
+            if lock_key not in self._domain_locks:
+                self._domain_locks[lock_key] = threading.Lock()
+            return self._domain_locks[lock_key]
 
     def save(self, domain: str, cookies: list[dict]) -> None:
         """Save cookies with merge, TTL compaction, and LRU eviction."""
@@ -176,30 +260,32 @@ class CookieCache:
         with self._get_domain_lock(domain):
             existing = self._load_raw(domain)
 
-            by_name: dict[str, dict] = {}
+            by_identity: dict[tuple[str, str, str], dict] = {}
             for e in existing:
-                name = e.get("name", "")
-                if name:
-                    by_name[name] = e
+                identity = _cookie_identity(e)
+                if identity[0]:
+                    by_identity[identity] = e
 
             for c in cookies:
                 c.setdefault("last_used", now)
-                name = c.get("name", "")
-                if name:
-                    by_name[name] = c
+                identity = _cookie_identity(c)
+                if identity[0]:
+                    by_identity[identity] = c
 
-            merged = list(by_name.values())
+            merged = list(by_identity.values())
 
             # TTL compaction - drop session cookies (expires=0) and expired
             merged = [
                 e
                 for e in merged
-                if e.get("expires", 0) > now
+                if _numeric_timestamp(e, "expires") > now
             ]
 
             # LRU eviction
             if len(merged) > self._max_entries:
-                merged.sort(key=lambda c: c.get("last_used", 0))
+                merged.sort(
+                    key=lambda c: _numeric_timestamp(c, "last_used")
+                )
                 evicted = len(merged) - self._max_entries
                 merged = merged[evicted:]
                 logger.warning(
@@ -239,13 +325,14 @@ class CookieCache:
 
     def clear(self, domain: str) -> None:
         """Delete cookie cache for a domain."""
-        path = self._domain_path(domain)
-        try:
-            path.unlink(missing_ok=True)
-        except OSError as e:
-            logger.warning(
-                "Failed to clear cookies for %s: %s", domain, e
-            )
+        with self._get_domain_lock(domain):
+            path = self._domain_path(domain)
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as e:
+                logger.warning(
+                    "Failed to clear cookies for %s: %s", domain, e
+                )
 
     def list_domains(self) -> list[str]:
         """List all domains with cached cookies."""
@@ -263,26 +350,28 @@ class CookieCache:
             return
         stale_threshold = now - 86400  # 24 hours
         for path in self._cache_dir.glob("*.json"):
-            try:
-                if path.stat().st_mtime > stale_threshold:
-                    continue
-                with open(path) as f:
-                    entries = json.load(f)
-                if not isinstance(entries, list) or not entries:
-                    path.unlink(missing_ok=True)
-                    continue
-                has_valid = any(
-                    e.get("expires", 0) > now
-                    for e in entries
-                )
-                if not has_valid:
-                    path.unlink(missing_ok=True)
-                    logger.debug(
-                        "Swept expired cookie file: %s",
-                        path.stem,
+            with self._get_domain_lock(path.stem):
+                try:
+                    if path.stat().st_mtime > stale_threshold:
+                        continue
+                    with open(path) as f:
+                        entries = json.load(f)
+                    if not isinstance(entries, list) or not entries:
+                        path.unlink(missing_ok=True)
+                        continue
+                    has_valid = any(
+                        isinstance(e, dict)
+                        and _numeric_timestamp(e, "expires") > now
+                        for e in entries
                     )
-            except (json.JSONDecodeError, OSError):
-                pass
+                    if not has_valid:
+                        path.unlink(missing_ok=True)
+                        logger.debug(
+                            "Swept expired cookie file: %s",
+                            path.stem,
+                        )
+                except (json.JSONDecodeError, OSError):
+                    pass
 
     def _write_atomic(self, domain: str, entries: list[dict]) -> None:
         """Atomic write: temp file + rename (same filesystem = atomic on POSIX).
@@ -306,7 +395,18 @@ class CookieCache:
                 os.fchmod(fd, 0o600)
             with os.fdopen(fd, "w") as f:
                 json.dump(entries, f, indent=2)
-            os.rename(tmp_path, path)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, path)
+            if os.name != "nt":
+                dir_flags = os.O_RDONLY
+                if hasattr(os, "O_DIRECTORY"):
+                    dir_flags |= os.O_DIRECTORY
+                dir_fd = os.open(self._cache_dir, dir_flags)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
         except Exception:
             try:
                 os.unlink(tmp_path)

@@ -4,10 +4,10 @@ from enum import Enum
 
 
 class Profile(Enum):
-    """HTTP-layer identity profiles.
+    """Named non-default client identities.
 
-    Profiles control HTTP headers (User-Agent, Accept, custom headers)
-    independently of the TLS-layer Emulation.
+    Profiles select a coherent header and transport identity where a wreq
+    Emulation alone is not the right abstraction.
 
     Chrome is the default (no profile needed). Profiles exist for
     non-Chrome HTTP identities that serve a specific purpose.
@@ -18,4 +18,5 @@ class Profile(Enum):
     """
     OPERA_MINI = "opera_mini"
     SAFARI = "safari"
+    IOS_SAFARI = "ios_safari"
     DART = "dart"

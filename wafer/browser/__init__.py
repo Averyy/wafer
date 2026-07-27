@@ -2,6 +2,10 @@
 
 from email.utils import formatdate
 
+from wafer.browser._recaptcha_grid import (
+    preflight_recaptcha_models,
+    preload_recaptcha_models,
+)
 from wafer.browser._solver import (
     BrowserSolver,
     CapturedResponse,
@@ -19,8 +23,12 @@ def format_cookie_str(cookie: dict) -> str:
          "sameSite": str}
     """
     parts = [f"{cookie['name']}={cookie['value']}"]
-    if cookie.get("domain"):
-        parts.append(f"Domain={cookie['domain']}")
+    domain = cookie.get("domain", "")
+    # Chromium reports Domain cookies with a leading dot and host-only cookies
+    # without one. Omitting Domain for the latter preserves host-only scope when
+    # the cookie is imported into the transport jar.
+    if domain.startswith("."):
+        parts.append(f"Domain={domain}")
     if cookie.get("path"):
         parts.append(f"Path={cookie['path']}")
     expires = cookie.get("expires", -1)
@@ -44,4 +52,6 @@ __all__ = [
     "InterceptResult",
     "SolveResult",
     "format_cookie_str",
+    "preflight_recaptcha_models",
+    "preload_recaptcha_models",
 ]

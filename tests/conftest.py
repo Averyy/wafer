@@ -384,6 +384,7 @@ def make_sync_session(responses, **session_kwargs):
     session._pool_index = 0
     session._pool_strikes = {}
     session._cookie_cache = session_kwargs.get("cookie_cache", None)
+    session._cookie_scopes = {}
     session._rate_limiter = session_kwargs.get("rate_limiter", None)
     session._domain_failures = {}
     session._last_url = {}
@@ -418,15 +419,27 @@ def make_sync_session(responses, **session_kwargs):
     session._profile = profile
     session._om_identity = None
     session._safari_identity = None
+    session._ios_safari_identity = None
     session._dart_identity = None
     session._safari_locale = "us"
-    session._tried_safari = profile in (Profile.SAFARI, Profile.DART)
+    session._tried_safari = profile in (
+        Profile.SAFARI,
+        Profile.IOS_SAFARI,
+        Profile.DART,
+    )
 
     if profile is Profile.DART:
         from wafer._dart import DartIdentity
 
         session._dart_identity = DartIdentity()
         session.headers = session._dart_identity.client_headers()
+        session._chrome_headers = None
+        session._fingerprint = None
+    elif profile is Profile.IOS_SAFARI:
+        from wafer._ios import IOSSafariIdentity
+
+        session._ios_safari_identity = IOSSafariIdentity()
+        session.headers = session._ios_safari_identity.client_headers()
         session._chrome_headers = None
         session._fingerprint = None
 
@@ -472,6 +485,7 @@ def make_async_session(responses, **session_kwargs):
     session._pool_index = 0
     session._pool_strikes = {}
     session._cookie_cache = session_kwargs.get("cookie_cache", None)
+    session._cookie_scopes = {}
     session._rate_limiter = session_kwargs.get("rate_limiter", None)
     session._domain_failures = {}
     session._last_url = {}
@@ -511,15 +525,27 @@ def make_async_session(responses, **session_kwargs):
     session._profile = profile
     session._om_identity = None
     session._safari_identity = None
+    session._ios_safari_identity = None
     session._dart_identity = None
     session._safari_locale = "us"
-    session._tried_safari = profile in (Profile.SAFARI, Profile.DART)
+    session._tried_safari = profile in (
+        Profile.SAFARI,
+        Profile.IOS_SAFARI,
+        Profile.DART,
+    )
 
     if profile is Profile.DART:
         from wafer._dart import DartIdentity
 
         session._dart_identity = DartIdentity()
         session.headers = session._dart_identity.client_headers()
+        session._chrome_headers = None
+        session._fingerprint = None
+    elif profile is Profile.IOS_SAFARI:
+        from wafer._ios import IOSSafariIdentity
+
+        session._ios_safari_identity = IOSSafariIdentity()
+        session.headers = session._ios_safari_identity.client_headers()
         session._chrome_headers = None
         session._fingerprint = None
 

@@ -295,7 +295,11 @@ def reddit_has_cookie_evidence(names) -> bool:
     return "loid" in names and bool({"token_v2", "csv"} & names)
 
 
-def _validated_reddit_action(action: str) -> str | None:
+def _validated_reddit_action(
+    action: str,
+    *,
+    allow_same_origin_path: bool = False,
+) -> str | None:
     try:
         parsed = urlparse(urljoin(REDDIT_SOLVE_ORIGIN, action))
         port = parsed.port
@@ -305,7 +309,13 @@ def _validated_reddit_action(action: str) -> str | None:
         parsed.scheme != "https"
         or (parsed.hostname or "").rstrip(".").lower() != "www.reddit.com"
         or port not in (None, 443)
-        or parsed.path != "/"
+        or (
+            parsed.path != "/"
+            and not (
+                allow_same_origin_path
+                and parsed.path.startswith("/")
+            )
+        )
         or parsed.params
         or parsed.query
         or parsed.fragment
@@ -313,11 +323,16 @@ def _validated_reddit_action(action: str) -> str | None:
         or parsed.password is not None
     ):
         return None
+    if allow_same_origin_path:
+        return parsed.geturl()
     return REDDIT_SOLVE_ORIGIN
 
 
-def parse_reddit_verification(body: str) -> RedditVerification | None:
-    """Parse the recognized logged-out verification without executing JS."""
+def _parse_reddit_verification(
+    body: str,
+    *,
+    allow_same_origin_path: bool,
+) -> RedditVerification | None:
     parser = _RedditDocumentParser()
     try:
         parser.feed(body)
@@ -332,7 +347,10 @@ def parse_reddit_verification(body: str) -> RedditVerification | None:
     form = parser.forms[0]
     if form.get("invalid") or form.get("method") != "GET":
         return None
-    action_url = _validated_reddit_action(form.get("action", ""))
+    action_url = _validated_reddit_action(
+        form.get("action", ""),
+        allow_same_origin_path=allow_same_origin_path,
+    )
     if action_url is None:
         return None
 
@@ -378,6 +396,25 @@ def parse_reddit_verification(body: str) -> RedditVerification | None:
         for field in fields
     )
     return RedditVerification(action_url=action_url, fields=solved_fields)
+
+
+def parse_reddit_verification(body: str) -> RedditVerification | None:
+    """Parse the fixed-origin verification used by the bootstrap submit."""
+    return _parse_reddit_verification(
+        body,
+        allow_same_origin_path=False,
+    )
+
+
+def is_reddit_verification(body: str) -> bool:
+    """Recognize a direct Reddit verification for any same-origin path."""
+    return (
+        _parse_reddit_verification(
+            body,
+            allow_same_origin_path=True,
+        )
+        is not None
+    )
 
 
 def reddit_submission_url(verification: RedditVerification) -> str:

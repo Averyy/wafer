@@ -71,12 +71,13 @@ from wafer import (
     SyncSession,       # synchronous session
     AsyncSession,      # async session (same API; request methods are coroutines)
     WaferResponse,     # response object
-    Profile,           # enum: OPERA_MINI, SAFARI, DART
+    Profile,           # enum: OPERA_MINI, SAFARI, IOS_SAFARI, DART
     DEFAULT_HEADERS,   # dict[str, str] - default Accept/Accept-Language/etc headers
     # Fingerprint helpers (supported public surface - do NOT reach into
     # wafer._fingerprint; these are the stable path):
     sec_ch_ua,                 # build a sec-ch-ua header value (see below)
     full_version,              # real Chrome full version for a major (e.g. "147.0.7727.24")
+    chrome_full_version,       # exact Chrome version for an Emulation, or None
     emulation_family,          # classify a wreq.Emulation into a browser family
     emulation_is_mobile,       # True if an Emulation is a mobile profile
     build_fingerprint_envelope,# coherent identity dict for any Emulation
@@ -126,11 +127,13 @@ SyncSession(
     emulation: wreq.Emulation | None = None,  # default: Emulation.Chrome149 (newest)
 
     # Non-Chrome profiles (overrides emulation)
-    profile: Profile | None = None,           # Profile.OPERA_MINI, Profile.SAFARI, or Profile.DART
-    safari_locale: str = "us",                # "us" or "ca" (only used with Profile.SAFARI)
+    profile: Profile | None = None,           # OPERA_MINI, SAFARI, IOS_SAFARI, or DART
+    safari_locale: str = "us",                # "us" or "ca" (SAFARI and IOS_SAFARI)
 
     # Custom headers (replaces DEFAULT_HEADERS entirely if provided).
-    # Prefer per-request headers= kwarg for one-off overrides.
+    # Prefer per-request headers= kwarg for one-off overrides. Header names are
+    # matched case-insensitively, so a per-request "accept" replaces the
+    # session's "Accept" rather than being sent alongside it.
     headers: dict[str, str] | None = None,
 
     # Timeouts (int, float seconds, or datetime.timedelta)
@@ -318,7 +321,8 @@ resp.emulation      # str | None - the identity that SERVED this response, for
                     # diagnosing a 403/regression. For Emulation sessions it's the
                     # wreq profile repr, e.g. "Profile.Chrome149" / "Profile.Edge148"
                     # / "Profile.Firefox151"; for non-Emulation profiles it's the
-                    # profile name ("safari", "dart", "opera_mini"). Reflects the
+                    # profile name ("safari", "ios_safari", "dart",
+                    # "opera_mini"). Reflects the
                     # CURRENT identity, so after a rotation it shows the one that
                     # actually served (not the session's original). This is the TLS
                     # profile only; after a browser solve it may report a lower
@@ -373,6 +377,11 @@ no client hints. wreq has **no mobile Chromium profile**, so wafer never sends
 `sec-ch-ua-mobile: ?1` (that hint is Chromium-only, and there is no mobile
 Chromium identity to attach it to).
 
+For the capture-accurate iPhone identity, prefer
+`profile=Profile.IOS_SAFARI` over a built-in `SafariIos*` emulation. The
+dedicated profile is wire-verified against Safari 26.5.2 and reports
+`is_mobile: True`.
+
 Pass any wreq profile as `emulation=` and the matching envelope is applied
 automatically - you do NOT set headers yourself. (Passing your own `headers=`
 replaces the whole envelope, including the auto sec-ch-ua - see "headers="
@@ -390,14 +399,14 @@ reaching into `wafer._fingerprint`. Always returns these keys:
 {
   "user_agent": str | None,        # the UA wreq sends for this profile
   "family": str | None,            # "chrome"|"edge"|"firefox"|"opera"|"safari"|"dart"|"opera_mini"|None
-  "emulation": str | None,         # "Profile.Chrome147" (Emulation) or "safari"/"dart"/"opera_mini"
+  "emulation": str | None,         # "Profile.Chrome147" or "safari"/"ios_safari"/"dart"/"opera_mini"
   "sec_ch_ua": str | None,         # low-entropy hint; None for Firefox/Safari/Opera (see below)
   "sec_ch_ua_mobile": str | None,  # "?0" or None
   "sec_ch_ua_platform": str | None,# e.g. '"macOS"' or None
   "full_version_list": str | None, # Sec-CH-UA-Full-Version-List value or None
   "platform_version": str | None,  # Sec-CH-UA-Platform-Version value or None
   "user_agent_data": dict | None,  # navigator.userAgentData shape; None for Firefox/Safari/Opera
-  "is_mobile": bool,               # True for a mobile Emulation (iOS/iPad Safari, Android Firefox)
+  "is_mobile": bool,               # True for mobile Emulation or Profile.IOS_SAFARI
 }
 ```
 
@@ -405,9 +414,10 @@ Only Chrome and Edge populate the client-hint fields. Firefox and Safari send
 no client hints at all. Opera IS Chromium, but wreq's own Opera profile already
 puts accurate Opera sec-ch-ua on the wire, so wafer's envelope leaves the
 client-hint fields `None` for Opera (it doesn't re-derive them) -- `family` is
-still `"opera"`. For non-Emulation profiles (Safari/Dart/Opera Mini) only
+still `"opera"`. For non-Emulation profiles (Safari/iOS Safari/Dart/Opera Mini) only
 `user_agent` / `family` / `emulation` are populated (`family` is `"safari"` /
-`"dart"` / `"opera_mini"`).
+`"dart"` / `"opera_mini"`); `Profile.IOS_SAFARI` also reports
+`is_mobile: True`.
 
 The values always reflect what is actually on the wire; feed them to tooling
 as returned. After a browser solve, `emulation` (the TLS profile) may be a lower
@@ -425,6 +435,10 @@ wafer.sec_ch_ua(major_version: int, brand: str = "Google Chrome") -> str
 
 wafer.full_version(major: int) -> str
 # Real Chrome full version (MAJOR.0.BUILD.PATCH), e.g. full_version(147) -> "147.0.7727.24".
+
+wafer.chrome_full_version(emulation) -> str | None
+# Exact four-part Chrome version wafer emits for that Emulation's
+# high-entropy client hints. Returns None for non-Chrome profiles.
 
 wafer.emulation_family(emulation) -> str | None
 # Classify a wreq.Emulation: "chrome" | "edge" | "firefox" | "opera" | "safari" | None.
@@ -509,7 +523,7 @@ The deterministic ladder (starting from the default Chrome family):
 4. **Edge** (rotation 4) - `Emulation.Edge147`: Chromium TLS but the `"Microsoft Edge"` sec-ch-ua brand + Edge build.
 5. **Chrome version cycling** (rotation 5+) - returns to the Chrome family and cycles Chrome versions on subsequent rotations.
 
-The rung you reach is bounded by `max_rotations`: the full Chrome->Firefox->Safari->Edge ladder needs `max_rotations>=4` (Safari needs `>=3`, Edge `>=4`, Chrome-version cycling `>=5`). With the **default `max_rotations=2`** you get exactly one cross-family jump (a fresh Chrome session, then Firefox) before wafer raises. The default is deliberately low: a higher rotation budget burns more identities against the same host and worsens its reputation, so raise it only when you actually need deeper escalation. A **pinned** fingerprint (after a browser solve matched the emulation to the solving browser) does NOT rotate - its cookies are bound to that identity. A session started on a non-Chrome `emulation=` walks the same ladder skipping its own starting family; `profile=` identities (Safari/Dart/Opera Mini) keep their existing special-casing and are not forced into the ladder.
+The rung you reach is bounded by `max_rotations`: the full Chrome->Firefox->Safari->Edge ladder needs `max_rotations>=4` (Safari needs `>=3`, Edge `>=4`, Chrome-version cycling `>=5`). With the **default `max_rotations=2`** you get exactly one cross-family jump (a fresh Chrome session, then Firefox) before wafer raises. The default is deliberately low: a higher rotation budget burns more identities against the same host and worsens its reputation, so raise it only when you actually need deeper escalation. A **pinned** fingerprint (after a browser solve matched the emulation to the solving browser) does NOT rotate - its cookies are bound to that identity. A session started on a non-Chrome `emulation=` walks the same ladder skipping its own starting family; `profile=` identities (Safari/iOS Safari/Dart/Opera Mini) keep their existing special-casing and are not forced into the ladder.
 
 ### Fingerprint pool
 
@@ -529,7 +543,7 @@ WITHOUT retiring the whole session on N strikes.
   model. `max_rotations` still bounds the number of rotations per request.
 - **Emulation-only.** Pool entries are wreq `Emulation` profiles
   (`[Emulation.Chrome147, Emulation.Firefox149, Emulation.Edge147]`). A pool is
-  ignored for `profile=` (Safari/Dart/Opera Mini) sessions.
+  ignored for `profile=` (Safari/iOS Safari/Dart/Opera Mini) sessions.
 
 ```python
 from wreq import Emulation
@@ -673,6 +687,26 @@ capabilities and trade-offs.
 - `safari_locale=` param: `"us"` (default) or `"ca"`
 - More effective than Chrome against DataDome (less commonly spoofed TLS)
 
+### iOS Safari (`profile=Profile.IOS_SAFARI`)
+
+- TLS + HTTP/2 fingerprint captured from real iPhone Safari 26.5.2
+- Exact UA: `Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.5.2 Mobile/15E148 Safari/604.1`
+- JA3 hash: `ecdf4f49dd59effc439639da29186671`
+- JA4: `t13d2013h2_a09f3c656075_7f0f34a4126d`
+- HTTP/2 fingerprint: `2:0;3:100;4:2097152;9:1|10420225|0|m,s,a,p`
+- The `CPU iPhone OS 18_7` / `Version/26.5.2` combination is intentional and
+  wire-verified; do not normalize one token to the other
+- No Client Hints; `fingerprint_envelope()` reports family `"safari"`,
+  emulation `"ios_safari"`, and `is_mobile: True`
+- No fingerprint rotation (the captured mobile identity remains fixed)
+- Browser solving is rejected at construction: wafer's solver is desktop
+  Chromium and its cookies cannot be replayed coherently under mobile Safari
+- Imperva's native-OpenSSL fallback is disabled because it would replace the
+  captured mobile ClientHello while retaining the iPhone UA
+- `safari_locale=` selects `"us"` (default) or `"ca"`
+- Challenge detection, retries, cookies, redirects, proxies, rate limiting,
+  and embed headers remain available
+
 ### Dart (`profile=Profile.DART`)
 
 - TLS fingerprint matches real Dart 3.11 (dart:io) / Flutter BoringSSL
@@ -726,9 +760,9 @@ one of these strings:
 "shape"        - F5 Shape
 "awswaf"       - AWS WAF
 "acw"          - Alibaba Cloud WAF (solved inline, no browser needed)
-"tmd"          - Alibaba TMD (solved inline, no browser needed)
+"tmd"          - Alibaba TMD (inline warm-up; browser for Baxia/reCAPTCHA)
 "amazon"       - Amazon CAPTCHA (solved inline, no browser needed)
-"reddit"       - Reddit cold-session JSON gate (solved inline, no browser needed)
+"reddit"       - Reddit cold-session JSON/HTML gate (solved inline, no browser needed)
 "vercel"       - Vercel bot protection
 "arkose"       - Arkose Labs / FunCaptcha (no dedicated solver; not solvable)
 "geetest"      - GeeTest v4
@@ -751,8 +785,9 @@ a score token, not a visible challenge, and is minted browser-free via
 `"vercel"`/`"generic_js"` also get the generic browser JS-wait (no
 dedicated solver, but it passes their passive JS checks). The inline set
 (`acw`, `tmd`, `amazon`, `reddit`) needs no browser at all. Reddit's solver
-performs the logged-out New Reddit verification at `https://www.reddit.com/`
-in the same TLS session, then retries the original request; `cache_dir`
+recognizes both the large JSON block and direct 200 verification HTML, performs
+the logged-out New Reddit verification at `https://www.reddit.com/` in the same
+TLS session, then retries the original request; `cache_dir`
 persists the durable cookie-setting response legs so later processes can start
 warm. Explicit `old.reddit.com` requests are fetched normally, but wafer never
 selects Old Reddit automatically or uses it as a fallback. A login wall from
@@ -765,7 +800,22 @@ an explicit Old Reddit request is returned normally.
 Requires `pip install wafer-py[browser]`. Uses Patchright (patched Playwright).
 
 ```python
-from wafer.browser import BrowserSolver, SolveResult, InterceptResult
+from wafer.browser import (
+    BrowserSolver,
+    InterceptResult,
+    SolveResult,
+    preflight_recaptcha_models,
+    preload_recaptcha_models,
+)
+
+# Optional startup/release preflight for deployments that require reCAPTCHA
+# image-grid support. Downloads the immutable, library-pinned classifier and
+# detector revisions when absent, loads both ONNX sessions, and returns True
+# only when both are ready. timeout= bounds the caller's wait; a timed-out
+# first preparation continues in one shared daemon loader for later reuse.
+models_ready = preload_recaptcha_models(timeout=60.0)
+# Raising deployment gate: returns None only when both pinned models loaded.
+preflight_recaptcha_models(timeout=60.0)
 
 solver = BrowserSolver(
     headless=False,       # default: False. Headful recommended for stealth
@@ -773,7 +823,35 @@ solver = BrowserSolver(
     solve_timeout=30.0,   # default: 30s. Max seconds per solve attempt.
                           # The call's timeout= (session default or per-request)
                           # caps this further (whichever is smaller wins).
+    proxy=None,           # optional HTTP(S)/SOCKS5 proxy for every Chromium
+                          # connection; use the same proxy= on the session.
+    egress_guard_proxy=None,
+                          # optional unauthenticated loopback SOCKS5 security
+                          # guard for browser-only destination filtering. This
+                          # is not an upstream identity proxy and does not need
+                          # a matching Session(proxy=).
 )
+# Read-only, non-blocking lifecycle signal. True only while the launched Chrome
+# process remains connected; it clears on disconnect, idle close, and close().
+assert solver.runtime_ready is False
+# Startup checks the browser's four-part version against
+# chrome_full_version(DEFAULT_EMULATION). A difference is logged and accepted,
+# not rejected: Chrome auto-updates ahead of the newest available emulation, so
+# the installed browser is authoritative and the session's User-Agent and
+# client hints are pinned onto it. An unreadable binary, or one that does not
+# report a Chrome version, still raises.
+# Automatic session solves reserve 10% of the remaining total request timeout
+# (capped at 5s) for cookie injection and the protected-request replay; the
+# timeout passed into BrowserSolver is reduced by that reserve.
+# TMD/Baxia uses one recorded drag per punishment document. If the remaining
+# request budget can fund them, automatic solving uses up to three fresh
+# browser contexts, splits browser time fairly among them, and excludes recent
+# rejected drag recordings across contexts. It reserves up to 15 seconds for
+# authoritative native-HTTP replay. Short budgets use one viable context
+# instead of several underfunded attempts. When the response body carries an
+# issued punishment URL selecting Google reCAPTCHA (AliExpress MTop answers an
+# API call that way), one long context is used instead: its image rounds
+# belong to a single-use document that a fresh context would discard.
 
 # Automatic usage (pass to session):
 session = SyncSession(browser_solver=solver)
@@ -821,6 +899,28 @@ result: InterceptResult | None = solver.intercept_iframe(
 # (or let idle_timeout shut the browser down):
 solver.close()
 ```
+
+When a session has both `proxy=` and `browser_solver=`, wafer configures an
+unstarted `BrowserSolver` with the same HTTP(S) or SOCKS5 proxy. If the browser
+is already running with a different proxy, or a custom solver cannot prove it
+uses the session proxy, session construction fails closed so browser challenge
+solving cannot bypass the configured egress path. SOCKS4 session proxies are
+not supported by `BrowserSolver`.
+
+When the URL is supplied by an untrusted caller, `resolve=` protects wafer's
+wreq/native transports but cannot pin Chromium's independent DNS/network stack.
+Configure `BrowserSolver(egress_guard_proxy=...)` with a local SOCKS5
+egress-filtering proxy that validates and numerically pins every destination
+(including redirects and subresources). A hostname-only Playwright route check
+is not sufficient against DNS rebinding. An ordinary `BrowserSolver(proxy=...)`
+is an upstream identity proxy and must match `Session(proxy=...)`; it is a
+separate contract from the local browser-only guard. With either browser proxy
+configured, wafer disables QUIC and non-proxied WebRTC UDP so
+browser-controlled traffic cannot bypass the TCP proxy. Browser navigation
+targets themselves are restricted to credential-free HTTP(S) URLs.
+The egress guard decides destination policy while Chromium retains its built-in
+unsafe-port restrictions. A guard should not assume only ports 80/443:
+legitimate public challenge pages may use nonstandard ports such as 8080/8443.
 
 The solver is thread-safe and reuses a single browser instance with idle timeout.
 Solves are serialized on an internal lock; a caller waiting for a busy solver
@@ -1000,7 +1100,7 @@ logging.getLogger("wafer").setLevel(logging.DEBUG)
 ## Common Mistakes
 
 1. **Do not pass `emulation=` and `profile=` together.** Profile overrides emulation.
-   Chrome is the default when neither is set. Dart and Safari use custom TlsOptions,
+   Chrome is the default when neither is set. Dart, Safari, and iOS Safari use custom TlsOptions,
    not wreq Emulation.
 
 2. **`resp.headers` is a plain `dict[str, str]` with lowercase keys.** Use

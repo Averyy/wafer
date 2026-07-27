@@ -249,6 +249,10 @@ class TestTMDHomepageUrl:
             "https://example.com:8443/page"
         ) == "https://example.com:8443/"
 
+    def test_preserves_alibaba_api_origin(self):
+        assert tmd_homepage_url(
+            "https://acs.aliexpress.com/h5/mtop.api/1.0/?data=x"
+        ) == "https://acs.aliexpress.com/"
 
 # ---------------------------------------------------------------------------
 # Retry Loop Integration (Sync)

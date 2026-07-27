@@ -23,15 +23,445 @@ import asyncio
 import csv
 import importlib.resources
 import io
+import ipaddress
 import logging
 import math
+import os
+import queue
 import random
+import re
+import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import (
+    Future,
+)
+from concurrent.futures import (
+    TimeoutError as FutureTimeoutError,
+)
 from dataclasses import dataclass, field
+from urllib.parse import unquote, urlparse
+
+from wafer._cookies import browser_cookie_matches_host
+from wafer._errors import ResponseTooLarge
+from wafer._fingerprint import chrome_full_version
 
 logger = logging.getLogger("wafer")
+
+
+class _DaemonSerialExecutor:
+    """One cancellable-at-process-exit worker without executor atexit joins.
+
+    Patchright objects are thread-affine, so BrowserSolver needs a stable
+    single worker. ``ThreadPoolExecutor`` registers every non-daemon worker
+    with CPython's private interpreter-exit join registry; after a bounded
+    ``close(timeout=...)`` that registry can still hold a process hostage.
+    This deliberately tiny serial executor owns a daemon worker instead.
+    Normal close joins it; a timed-out close abandons only process-local
+    browser work and cannot prevent a container/interpreter from exiting.
+    """
+
+    def __init__(self, thread_name_prefix: str) -> None:
+        self._queue: queue.SimpleQueue = queue.SimpleQueue()
+        self._closed = False
+        self._lock = threading.Lock()
+        self._thread = threading.Thread(
+            target=self._run,
+            name=thread_name_prefix,
+            daemon=True,
+        )
+        self._thread.start()
+
+    def submit(self, callback, /, *args, **kwargs) -> Future:
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("BrowserSolver is closed")
+            future = Future()
+            self._queue.put((future, callback, args, kwargs))
+            return future
+
+    def _run(self) -> None:
+        while True:
+            item = self._queue.get()
+            if item is None:
+                return
+            future, callback, args, kwargs = item
+            if not future.set_running_or_notify_cancel():
+                continue
+            try:
+                future.set_result(callback(*args, **kwargs))
+            except BaseException as exc:
+                future.set_exception(exc)
+
+    def shutdown(self, wait: bool = True) -> None:
+        with self._lock:
+            if not self._closed:
+                self._closed = True
+                self._queue.put(None)
+        if wait:
+            self._thread.join()
+
+
+def _system_chrome_executable() -> str | None:
+    """Return a usable branded Chrome binary for Patchright's chrome channel."""
+
+    if sys.platform == "darwin":
+        candidates = [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        ]
+    elif sys.platform == "win32":
+        program_files = os.environ.get("PROGRAMFILES", r"C:\Program Files")
+        program_files_x86 = os.environ.get(
+            "PROGRAMFILES(X86)", r"C:\Program Files (x86)"
+        )
+        local_app_data = os.environ.get("LOCALAPPDATA", "")
+        candidates = [
+            os.path.join(
+                program_files, "Google", "Chrome", "Application", "chrome.exe"
+            ),
+            os.path.join(
+                program_files_x86,
+                "Google",
+                "Chrome",
+                "Application",
+                "chrome.exe",
+            ),
+        ]
+        if local_app_data:
+            candidates.append(
+                os.path.join(
+                    local_app_data,
+                    "Google",
+                    "Chrome",
+                    "Application",
+                    "chrome.exe",
+                )
+            )
+    else:
+        candidates = [
+            "/opt/google/chrome/chrome",
+            "/usr/bin/google-chrome",
+            "/usr/bin/google-chrome-stable",
+        ]
+    for candidate in candidates:
+        if os.access(candidate, os.R_OK | os.X_OK):
+            return candidate
+    return None
+
+
+_CHROME_VERSION_RE = re.compile(
+    r"(?:Google Chrome(?: for Testing)?|Chromium|Chrome)\s+"
+    r"(\d+\.\d+\.\d+\.\d+)(?:\s|$)"
+)
+
+
+def _browser_executable_version(path: str, timeout: float | None = None) -> str:
+    """Return Chrome's exact version, rejecting unusable binaries."""
+
+    if not os.access(path, os.R_OK | os.X_OK):
+        raise RuntimeError("Browser executable is not a readable, executable file")
+    try:
+        result = subprocess.run(
+            [path, "--version"],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError("Could not determine browser executable version") from exc
+    output = f"{result.stdout}\n{result.stderr}"
+    match = _CHROME_VERSION_RE.search(output)
+    if result.returncode != 0 or match is None:
+        raise RuntimeError("Browser executable did not report a Chrome version")
+    return match.group(1)
+
+
+# Hard ceiling on a single top-level navigation inside a solve. A page that
+# has not reached domcontentloaded by then is stalled, and the solver needs the
+# rest of the budget far more than the navigation does.
+_MAX_NAVIGATION_MS = 60_000
+
+
+def _navigation_budget_ms(deadline: float) -> int:
+    """Bound one navigation so it cannot consume the whole solve deadline."""
+
+    remaining_ms = max(0.0, deadline - time.monotonic()) * 1000
+    return max(1, int(min(remaining_ms * 0.5, _MAX_NAVIGATION_MS)))
+
+
+def _valid_browser_url(value: str) -> bool:
+    """Whether a value is structurally safe for a browser navigation."""
+
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 8192
+        or any(ord(char) <= 0x20 or ord(char) == 0x7F for char in value)
+    ):
+        return False
+    try:
+        parsed = urlparse(value)
+        port = parsed.port
+    except (TypeError, ValueError):
+        return False
+    return (
+        parsed.scheme in {"http", "https"}
+        and bool(parsed.hostname)
+        and parsed.username is None
+        and parsed.password is None
+        and port != 0
+    )
+
+
+def _cookie_structure(cookies: list[dict]) -> list[dict[str, object]]:
+    """Return a bounded, value-free cookie diagnostic summary."""
+
+    return [
+        {
+            "name": str(cookie.get("name", "")),
+            "domain": str(cookie.get("domain", "")),
+            "path": str(cookie.get("path", "/")),
+            "secure": bool(cookie.get("secure", False)),
+            "same_site": str(cookie.get("sameSite", "")),
+        }
+        for cookie in cookies[:16]
+    ]
+
+
+def _sleep_before_deadline(deadline: float, maximum: float) -> bool:
+    """Sleep for a positive bounded interval without crossing a deadline."""
+
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return False
+    time.sleep(min(maximum, remaining))
+    return True
+
+
+_REDDIT_BROWSER_CHALLENGE_RE = re.compile(
+    r"blocked by network security|reddit\s*-\s*please wait for verification",
+    re.IGNORECASE,
+)
+
+
+def _is_passthrough_challenge_html(html: str) -> bool:
+    """Reject known challenge bodies before browser passthrough capture."""
+
+    head = html[:10000].lower()
+    return (
+        "kpsdk" in head
+        or "captcha-delivery" in head
+        or ("akamai" in head and "_abck" in head)
+        or "perimeterx" in head
+        or "px-captcha" in head
+        or "reese84" in head
+        or "just a moment" in head
+        or "cf_chl" in head
+        or "challenge-platform" in head
+        or "chl_page" in head
+        # Reddit's network-security copy can occur near the end of a ~190 KiB
+        # Shreddit response, so it must not be limited to the generic 10 KiB
+        # marker prefix.
+        or _REDDIT_BROWSER_CHALLENGE_RE.search(html) is not None
+    )
+
+
+_TMD_MTOP_RETRY_URL = "https://acs.aliexpress.com/h5/mtop.aliexpress.pdp.pc.query/1.0/"
+
+
+def _tmd_retry_target(challenge_url: str) -> str | None:
+    """Return the exact application URL that a TMD cookie must unlock.
+
+    BrowserSolver is normally called with the application URL whose 200 body
+    contains the TMD redirect, not with the eventual ACS punishment URL.  In
+    that case the immutable application URL is itself the retry target.
+
+    When a caller does supply an ACS punishment URL, AliExpress retries its
+    native MTop endpoint and Alibaba retries the strict callback embedded in
+    that issued URL. A punishment URL with no safe same-family callback fails
+    closed.
+    """
+
+    try:
+        parsed = urlparse(challenge_url)
+        port = parsed.port
+    except (TypeError, ValueError):
+        return None
+    host = (parsed.hostname or "").lower()
+    if (
+        parsed.scheme != "https"
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in (None, 443)
+    ):
+        return None
+    if host == "aliexpress.com" or host.endswith(".aliexpress.com"):
+        family = "aliexpress.com"
+    elif host == "alibaba.com" or host.endswith(".alibaba.com"):
+        family = "alibaba.com"
+    else:
+        return None
+
+    # Reuse Baxia's single strict parser so callback validation cannot drift
+    # between the inner drag evidence and this outer replay-scope gate.
+    from wafer.browser._drag import (
+        _expected_baxia_callback,
+        _expected_baxia_punish_path,
+    )
+
+    is_punishment = _expected_baxia_punish_path(parsed.path, family)
+    if not is_punishment:
+        native_mtop = urlparse(_TMD_MTOP_RETRY_URL)
+        if (
+            family == "aliexpress.com"
+            and host == (native_mtop.hostname or "")
+            and parsed.path == native_mtop.path
+        ):
+            return parsed._replace(fragment="").geturl()
+        # ACS is challenge infrastructure, never an application retry target.
+        # A non-punishment ACS URL cannot prove that a cookie unlocks the
+        # caller's Alibaba/AliExpress operation.
+        if host in {"acs.alibaba.com", "acs.aliexpress.com"}:
+            return None
+        return parsed._replace(fragment="").geturl()
+
+    callback = _expected_baxia_callback(challenge_url)
+    if callback is None:
+        return None
+    callback_host = (urlparse(callback).hostname or "").lower()
+    if not (callback_host == family or callback_host.endswith(f".{family}")):
+        return None
+    if family == "aliexpress.com":
+        return _TMD_MTOP_RETRY_URL
+    return callback
+
+
+def _tmd_cookie_applies(cookie: dict, retry_url: str = _TMD_MTOP_RETRY_URL) -> bool:
+    """Apply browser cookie scope rules to an exact application retry."""
+
+    try:
+        target = urlparse(retry_url)
+        host = (target.hostname or "").lower()
+        request_path = target.path or "/"
+        domain = str(cookie.get("domain", ""))
+        path = str(cookie.get("path", "/")) or "/"
+        expires = cookie.get("expires", cookie.get("expirationDate", 0))
+        expiry = float(expires) if expires not in (None, "") else 0.0
+    except (TypeError, ValueError):
+        return False
+    if not domain or not browser_cookie_matches_host(domain, host):
+        return False
+    if not request_path.startswith(path):
+        return False
+    if not path.endswith("/") and len(request_path) > len(path):
+        if request_path[len(path)] != "/":
+            return False
+    # Playwright reports non-persistent session cookies as -1/0. Positive
+    # timestamps are Unix seconds and must still cover the retry.
+    return expiry <= 0 or expiry > time.time()
+
+
+def _has_tmd_x5sec_clearance(
+    cookies: list[dict], retry_url: str = _TMD_MTOP_RETRY_URL
+) -> bool:
+    """Require x5sec scoped to the exact native MTop retry URL."""
+
+    return any(
+        cookie.get("name") == "x5sec"
+        and isinstance(cookie.get("value"), str)
+        and bool(cookie["value"])
+        and _tmd_cookie_applies(cookie, retry_url)
+        for cookie in cookies
+    )
+
+
+def _tmd_x5sec_signatures(
+    cookies: list[dict], retry_url: str = _TMD_MTOP_RETRY_URL
+) -> set[tuple[str, str, str]]:
+    """Internal x5sec identity set; values are never logged."""
+
+    signatures: set[tuple[str, str, str]] = set()
+    for cookie in cookies:
+        if cookie.get("name") != "x5sec":
+            continue
+        value = cookie.get("value")
+        if not isinstance(value, str) or not value:
+            continue
+        if _tmd_cookie_applies(cookie, retry_url):
+            domain = str(cookie.get("domain", "")).lstrip(".").lower()
+            path = str(cookie.get("path", "/")) or "/"
+            signatures.add((domain, path, value))
+    return signatures
+
+
+def _valid_proxy_url(value: str) -> bool:
+    if (
+        not isinstance(value, str)
+        or not value
+        or any(ord(char) <= 0x20 or ord(char) == 0x7F for char in value)
+    ):
+        return False
+    try:
+        parsed = urlparse(value)
+        port = parsed.port
+    except (TypeError, ValueError):
+        return False
+    return (
+        parsed.scheme in {"http", "https", "socks5"}
+        and bool(parsed.hostname)
+        and port not in {None, 0}
+        and parsed.path in {"", "/"}
+        and not parsed.params
+        and not parsed.query
+        and not parsed.fragment
+    )
+
+
+def _valid_egress_guard_url(value: str) -> bool:
+    """A browser-only guard must be an unauthenticated loopback SOCKS5 hop."""
+
+    if not _valid_proxy_url(value):
+        return False
+    parsed = urlparse(value)
+    if (
+        parsed.scheme != "socks5"
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        return False
+    try:
+        return ipaddress.ip_address(parsed.hostname or "").is_loopback
+    except ValueError:
+        return False
+
+
+def _proxy_identity(value: str) -> tuple[str, str, int, str | None, str | None]:
+    """Canonical fields used to compare proxy configurations safely."""
+
+    parsed = urlparse(value)
+    return (
+        parsed.scheme.lower(),
+        (parsed.hostname or "").rstrip(".").lower(),
+        parsed.port or 0,
+        unquote(parsed.username) if parsed.username is not None else None,
+        unquote(parsed.password) if parsed.password is not None else None,
+    )
+
+
+def _playwright_proxy(value: str) -> dict[str, str]:
+    """Convert a validated proxy URL to Playwright's structured shape."""
+
+    scheme, host, port, username, password = _proxy_identity(value)
+    display_host = f"[{host}]" if ":" in host else host
+    proxy = {"server": f"{scheme}://{display_host}:{port}"}
+    if username is not None:
+        proxy["username"] = username
+    if password is not None:
+        proxy["password"] = password
+    return proxy
+
 
 # ---------------------------------------------------------------------------
 # Stealth: no JS injection needed.
@@ -175,7 +605,12 @@ _SCREENXY_FIX_SCRIPT = r"""(function () {
 })();"""
 
 
-def patch_frame_screenxy(frame) -> None:
+def patch_frame_screenxy(
+    frame,
+    *,
+    needs_patch: bool = True,
+    timeout_ms: int | None = None,
+) -> None:
     """Inject screenXY fix into a cross-origin frame.
 
     With site isolation enabled (the default), CDP init scripts only
@@ -183,8 +618,16 @@ def patch_frame_screenxy(frame) -> None:
     captcha-delivery, Baxia, etc.) need the fix injected directly
     so CDP mouse events have correct screenX/screenY values.
     """
+    if not needs_patch:
+        return
     try:
-        frame.evaluate(_SCREENXY_FIX_SCRIPT)
+        if timeout_ms is None:
+            frame.evaluate(_SCREENXY_FIX_SCRIPT)
+        elif timeout_ms > 0:
+            frame.locator("html").evaluate(
+                _SCREENXY_FIX_SCRIPT,
+                timeout=timeout_ms,
+            )
     except Exception:
         pass
 
@@ -210,12 +653,12 @@ def patch_frame_headless(frame) -> None:
 # Direction -> approximate angle (radians) for atan2(dy, dx) from start->target.
 # Used as fallback when metadata lacks start/end coordinates.
 _DIRECTION_ANGLES: dict[str, float] = {
-    "to_center_from_ul": 0.57,   # down-right
-    "to_center_from_ur": 2.55,   # down-left
-    "to_center_from_l": 0.12,    # right, slightly down
+    "to_center_from_ul": 0.57,  # down-right
+    "to_center_from_ur": 2.55,  # down-left
+    "to_center_from_l": 0.12,  # right, slightly down
     "to_center_from_bl": -0.40,  # up-right
     "to_center_from_br": -2.72,  # up-left
-    "to_lower_from_ul": 0.85,    # steep down-right
+    "to_lower_from_ul": 0.85,  # steep down-right
 }
 
 
@@ -231,13 +674,9 @@ def _parse_metadata(line: str) -> dict[str, str]:
     return meta
 
 
-def _parse_csv_rows(
-    text: str, fields: tuple[str, ...]
-) -> list[dict[str, float]]:
+def _parse_csv_rows(text: str, fields: tuple[str, ...]) -> list[dict[str, float]]:
     """Parse CSV text (skipping ``#`` comment lines) into a list of dicts."""
-    clean = "\n".join(
-        line for line in text.splitlines() if not line.startswith("#")
-    )
+    clean = "\n".join(line for line in text.splitlines() if not line.startswith("#"))
     rows: list[dict[str, float]] = []
     reader = csv.DictReader(io.StringIO(clean))
     for row in reader:
@@ -335,7 +774,7 @@ class BrowserSolver:
     the wreq session.
 
     Must run headful (headless = 16.7% bypass rate in benchmarks).
-    Uses system Chrome via channel="chrome" for best stealth.
+    Uses an exact-version Chrome executable for browser/TLS identity parity.
     """
 
     def __init__(
@@ -343,6 +782,9 @@ class BrowserSolver:
         headless: bool = False,
         idle_timeout: float = 300.0,
         solve_timeout: float = 30.0,
+        proxy: str | None = None,
+        egress_guard_proxy: str | None = None,
+        executable_path: str | os.PathLike[str] | None = None,
     ):
         try:
             import patchright  # noqa: F401
@@ -356,10 +798,48 @@ class BrowserSolver:
         self._solve_timeout = solve_timeout
         self._playwright = None
         self._browser = None
-        self._lock = threading.Lock()
+        # Reentrant because a custom worker callback may close the solver
+        # while it already owns the browser-operation lock.
+        self._lock = threading.RLock()
         self._last_used: float = 0.0
         self._browser_ua: str | None = None
         self._browser_version: str | None = None
+        self._runtime_ready = threading.Event()
+        # Determined with real Patchright input before the first site page.
+        # ``None`` means no browser has been probed yet; after probing it is
+        # immutable for this solver's configured executable.
+        self._needs_screenxy_patch: bool | None = None
+        # A transport session can read this while the browser worker is busy.
+        # Publish one immutable pair at a time; never take the long-lived
+        # browser-operation lock in that read path.
+        self._identity_snapshot: tuple[str, str] | None = None
+        self._identity_lock = threading.Lock()
+        if proxy is not None and not _valid_proxy_url(proxy):
+            raise ValueError("proxy must be a valid HTTP(S) or SOCKS5 proxy URL")
+        if egress_guard_proxy is not None and not _valid_egress_guard_url(
+            egress_guard_proxy
+        ):
+            raise ValueError(
+                "egress_guard_proxy must be an unauthenticated loopback SOCKS5 URL"
+            )
+        if proxy is not None and egress_guard_proxy is not None:
+            raise ValueError("proxy and egress_guard_proxy cannot be combined")
+        self._proxy_server = proxy
+        self._egress_guard_proxy = egress_guard_proxy
+        if executable_path is not None:
+            executable_path = os.fspath(executable_path)
+            if not executable_path:
+                raise ValueError("executable_path must not be empty")
+        self._executable_path = executable_path
+        # Patchright's synchronous Playwright objects are greenlet-bound to
+        # the thread that created them. Every public browser operation,
+        # including preflight and close, must therefore use one dedicated
+        # worker for this solver's entire lifetime.
+        self._executor = _DaemonSerialExecutor("wafer-browser")
+        self._executor_lock = threading.Lock()
+        self._executor_closed = False
+        self._close_future = None
+        self._worker_ident: int | None = None
         # Recording caches (lazy-loaded on first PX encounter)
         self._idle_recordings: list[dict] | None = None
         self._path_recordings: list[dict] | None = None
@@ -368,70 +848,206 @@ class BrowserSolver:
         self._slide_recordings: list[dict] | None = None
         self._browse_recordings: list[dict] | None = None
         self._grid_recordings: list[dict] | None = None
+        # TMD rejects a trajectory, not merely a browser context. Preserve a
+        # bounded cross-context history so transport-level fresh-context
+        # retries never replay the exact recording that just failed.
+        self._baxia_recent_drag_recordings: list[str] = []
 
-    _browser_installed = False
+    @property
+    def proxy_server(self) -> str | None:
+        """Upstream proxy shared with the wafer HTTP session."""
 
-    def _ensure_browser_installed(self) -> None:
-        """Auto-install patchright browser binaries if missing."""
-        if BrowserSolver._browser_installed:
+        return self._proxy_server
+
+    @property
+    def egress_guard_proxy(self) -> str | None:
+        """Browser-only local egress guard, not an upstream identity proxy."""
+
+        return self._egress_guard_proxy
+
+    @property
+    def browser_identity(self) -> tuple[str, str] | None:
+        """The already-preflighted browser UA and full Chrome version.
+
+        This accessor deliberately performs no browser I/O.  A session can
+        therefore consume it while it is being constructed, before its first
+        protected HTTP request, without changing BrowserSolver lifecycle or
+        issuing an unexpected navigation.  ``None`` means this solver has not
+        completed a usable preflight (or has since been closed).
+        """
+
+        # This deliberately does not touch ``_lock``: a challenge may own it
+        # for its full solve timeout, while a first HTTP request still needs
+        # the already-established identity. Tuple replacement is atomic, and
+        # the tiny lock makes that publication contract explicit without
+        # waiting on any browser I/O.
+        with self._identity_lock:
+            return self._identity_snapshot
+
+    @property
+    def runtime_ready(self) -> bool:
+        """Whether the preflighted Chrome process is currently connected."""
+
+        return self._runtime_ready.is_set()
+
+    def _publish_browser_identity(self) -> None:
+        """Atomically publish the browser identity once both fields exist."""
+
+        if not self._browser_ua or not self._browser_version:
             return
-        import subprocess
+        snapshot = (self._browser_ua, self._browser_version)
+        with self._identity_lock:
+            self._identity_snapshot = snapshot
 
-        from patchright._impl._driver import (
-            compute_driver_executable,
-            get_driver_env,
-        )
+    def _clear_browser_identity(self) -> None:
+        with self._identity_lock:
+            self._identity_snapshot = None
 
-        driver = compute_driver_executable()
-        env = get_driver_env()
-        logger.debug("Running patchright install chromium...")
-        try:
-            result = subprocess.run(
-                [*driver, "install", "chromium"],
-                capture_output=True,
-                text=True,
-                env=env,
-                timeout=60,
+    def configure_proxy(self, proxy: str) -> None:
+        """Configure browser-wide proxying before Chromium is launched."""
+
+        if not _valid_proxy_url(proxy):
+            raise ValueError("proxy must be a valid HTTP(S) or SOCKS5 proxy URL")
+        with self._lock:
+            if self._browser is not None:
+                raise RuntimeError(
+                    "browser proxy must be configured before browser launch"
+                )
+            if self._egress_guard_proxy is not None:
+                raise RuntimeError(
+                    "an upstream proxy cannot be combined with the browser egress guard"
+                )
+            self._proxy_server = proxy
+
+    def configure_egress_guard(self, proxy: str) -> None:
+        """Configure a browser-only local SOCKS5 guard before launch."""
+
+        if not _valid_egress_guard_url(proxy):
+            raise ValueError(
+                "egress guard must be an unauthenticated loopback SOCKS5 URL"
             )
-        except subprocess.TimeoutExpired:
-            # When using channel="chrome" (system Chrome), the
-            # downloaded Chromium binary isn't needed. Log and
-            # continue - launch() will fail later if it really
-            # was required.
-            logger.warning(
-                "patchright install chromium timed out after 60s, "
-                "continuing (system Chrome may still work)"
-            )
-            BrowserSolver._browser_installed = True
-            return
-        if result.returncode != 0:
+        with self._lock:
+            if self._browser is not None:
+                raise RuntimeError(
+                    "browser egress guard must be configured before launch"
+                )
+            if self._proxy_server is not None:
+                raise RuntimeError(
+                    "browser egress guard cannot be combined with an upstream proxy"
+                )
+            self._egress_guard_proxy = proxy
+
+    def proxy_matches(self, proxy: str | None) -> bool:
+        """Whether *proxy* names the browser's exact configured egress."""
+
+        if proxy is None or self._proxy_server is None:
+            return proxy is None and self._proxy_server is None
+        if not _valid_proxy_url(proxy):
+            return False
+        return _proxy_identity(proxy) == _proxy_identity(self._proxy_server)
+
+    _browser_installed: set[tuple[str, str]] = set()
+    _browser_install_lock = threading.Lock()
+
+    def _expected_browser_version(self) -> str:
+        """Return the exact Chrome version used by wafer's transport hints."""
+
+        # Keep browser identity tied to the public default rather than a
+        # nearby installed Chrome.  A local import avoids a cycle while this
+        # module is first imported.
+        from wafer._base import DEFAULT_EMULATION
+
+        expected = chrome_full_version(DEFAULT_EMULATION)
+        if expected is None:
+            raise RuntimeError("wafer default emulation is not Chrome")
+        return expected
+
+    def _browser_executable(self) -> str:
+        """Resolve the caller-pinned or branded Chrome executable."""
+
+        if self._executable_path is not None:
+            return self._executable_path
+        chrome = _system_chrome_executable()
+        if chrome is None:
             raise RuntimeError(
-                "Failed to install patchright browser binaries. "
-                "Install manually with: patchright install chromium\n"
-                f"{result.stderr}"
+                "No executable branded Google Chrome was found. Configure "
+                "BrowserSolver(executable_path=...) with the exact Chrome "
+                "version selected by wafer's emulation."
             )
-        logger.debug("patchright browsers ready")
-        BrowserSolver._browser_installed = True
+        return chrome
 
-    def _ensure_browser(self) -> None:
+    def _ensure_browser_installed(self, deadline: float | None = None) -> None:
+        """Validate the exact Chrome version before Patchright launches it."""
+
+        chrome = self._browser_executable()
+        expected = self._expected_browser_version()
+        cache_key = (os.path.realpath(chrome), expected)
+        if cache_key in BrowserSolver._browser_installed:
+            return
+        if deadline is None:
+            BrowserSolver._browser_install_lock.acquire()
+        else:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not BrowserSolver._browser_install_lock.acquire(
+                timeout=remaining
+            ):
+                raise TimeoutError("Browser install check exceeded solve timeout")
+        try:
+            # Another solver may have completed installation while this one
+            # waited for the process-wide installer lock.
+            if cache_key in BrowserSolver._browser_installed:
+                return
+            timeout = None
+            if deadline is not None:
+                timeout = deadline - time.monotonic()
+                if timeout <= 0:
+                    raise TimeoutError("Browser version check exceeded solve timeout")
+            # _browser_executable_version already rejects an unreadable or
+            # non-Chrome binary, so `actual` is a real Chrome version here.
+            #
+            # Do NOT require it to equal the emulation's build. Chrome
+            # auto-updates and wreq's newest Emulation lags it, so an equality
+            # gate makes every solver path dead on an ordinary machine the
+            # week Chrome ships an update. Agreement between the browser and
+            # wafer's transport hints is still required -- it is achieved the
+            # other way round, by FingerprintManager.pin_to_browser() moving
+            # wafer onto the installed browser's exact UA/client hints. That
+            # is the documented design for this skew.
+            actual = _browser_executable_version(chrome, timeout)
+            if actual != expected:
+                logger.warning(
+                    "Installed Chrome %s differs from wafer's default emulation "
+                    "Chrome %s; transport identity will be pinned to the "
+                    "installed browser (bump DEFAULT_EMULATION/_CHROME_BUILDS "
+                    "once wreq ships this Chrome so the TLS shape tracks it too)",
+                    actual,
+                    expected,
+                )
+            else:
+                logger.debug(
+                    "Validated exact Chrome %s executable at %s", actual, chrome
+                )
+            BrowserSolver._browser_installed.add(cache_key)
+        finally:
+            BrowserSolver._browser_install_lock.release()
+
+    def _ensure_browser(self, deadline: float | None = None) -> None:
         """Launch browser if not running or if idle too long."""
         now = time.monotonic()
 
         if self._browser is not None:
-            if (
-                self._last_used > 0
-                and (now - self._last_used) > self._idle_timeout
-            ):
+            if self._last_used > 0 and (now - self._last_used) > self._idle_timeout:
                 logger.debug(
                     "Browser idle timeout (%.0fs), closing",
                     now - self._last_used,
                 )
-                self._close_browser()
+                self._close_browser(preserve_identity=True)
             elif self._browser.is_connected():
+                self._runtime_ready.set()
                 return
             else:
                 logger.debug("Browser disconnected, relaunching")
-                self._close_browser()
+                self._close_browser(preserve_identity=True)
 
         try:
             from patchright.sync_api import sync_playwright
@@ -441,17 +1057,37 @@ class BrowserSolver:
                 "Install with: pip install wafer-py[browser]"
             ) from None
 
-        self._ensure_browser_installed()
+        self._ensure_browser_installed(deadline)
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError("Browser startup exceeded solve timeout")
 
         launch_args = [
             "--disable-blink-features=AutomationControlled",
-            # Force real GPU instead of SwiftShader.  Without this,
-            # WebGL exposes "SwiftShader" as the renderer - a dead
-            # giveaway for automated browsers.  Metal on macOS,
-            # ANGLE+GL on Linux/Windows.
             "--enable-gpu",
-            "--use-gl=angle",
         ]
+        if sys.platform == "linux":
+            # Pin ANGLE to Mesa's OpenGL backend. Its automatic Linux backend
+            # selection can resolve to ``gl=none`` under Xvfb, making WebGL
+            # disappear entirely even though the image includes Mesa DRI.
+            launch_args.extend(
+                [
+                    "--use-gl=angle",
+                    "--use-angle=gl",
+                    "--ignore-gpu-blocklist",
+                ]
+            )
+        else:
+            launch_args.append("--use-gl=angle")
+        if self._proxy_server or self._egress_guard_proxy:
+            # The configured proxy is TCP-only. Disable page-controlled UDP
+            # paths that could otherwise bypass it. These switches are omitted
+            # for direct browsers so their launch fingerprint stays unchanged.
+            launch_args.extend(
+                [
+                    "--disable-quic",
+                    "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+                ]
+            )
         if sys.platform == "darwin":
             launch_args.append("--use-angle=metal")
 
@@ -480,29 +1116,72 @@ class BrowserSolver:
                 # Chrome on macOS reports 8-bit sRGB, and WAFs like
                 # Kasada cross-check CSS computed styles against
                 # screen.colorDepth to detect headless.
-                launch_args.append(
-                    "--force-color-profile=scrgb-linear"
-                )
+                launch_args.append("--force-color-profile=scrgb-linear")
+        elif sys.platform.startswith("linux"):
+            # Headful challenge browsers run under a real window manager.
+            # Start with the conventional maximized desktop state so screen,
+            # outer-window, and viewport geometry form one coherent envelope;
+            # JWM's generic tiled placement otherwise opens Chrome at half of
+            # the Xvfb screen despite there being no user-selected split.
+            launch_args.append("--start-maximized")
 
         try:
             logger.debug("Starting playwright driver...")
             self._playwright = sync_playwright().start()
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError("Playwright startup exceeded solve timeout")
             logger.debug("Launching Chrome (headless=%s)...", self._headless)
-            self._browser = self._playwright.chromium.launch(
-                channel="chrome",
-                headless=self._headless,
-                args=launch_args,
-                ignore_default_args=ignored,
-                timeout=30000,
+            launch_timeout = 30000
+            if deadline is not None:
+                launch_timeout = min(
+                    launch_timeout,
+                    max(1, int((deadline - time.monotonic()) * 1000)),
+                )
+            launch_kwargs = {
+                # ``channel='chrome'`` may resolve a different local binary
+                # than the one validated above.  Pin the executable directly.
+                "executable_path": self._browser_executable(),
+                "headless": self._headless,
+                "args": launch_args,
+                "ignore_default_args": ignored,
+                "timeout": launch_timeout,
+            }
+            browser_proxy = self._egress_guard_proxy or self._proxy_server
+            if browser_proxy:
+                launch_kwargs["proxy"] = _playwright_proxy(browser_proxy)
+            self._browser = self._playwright.chromium.launch(**launch_kwargs)
+            self._browser.on(
+                "disconnected",
+                lambda *_args: self._runtime_ready.clear(),
             )
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError("Browser launch exceeded solve timeout")
         except Exception:
-            self._close_browser()
+            self._close_browser(preserve_identity=True)
             raise
+
+        launched_version = self._browser.version
+        expected_version = self._expected_browser_version()
+        if launched_version != expected_version:
+            # Same contract as _ensure_browser_installed: the launched browser
+            # is authoritative and wafer's hints are pinned onto it below via
+            # _publish_browser_identity -> pin_to_browser. Refusing to run
+            # would strand every solver behind a routine Chrome update.
+            logger.warning(
+                "Launched Chrome %s differs from wafer's default emulation "
+                "Chrome %s; pinning transport identity to the launched browser",
+                launched_version,
+                expected_version,
+            )
 
         # Capture the real Chrome full version (e.g. "145.0.7632.117")
         # for CDP metadata.  The UA string is reduced to MAJOR.0.0.0
         # so we can't extract the full version from there.
-        self._browser_version = self._browser.version
+        # Keep one configured envelope across an idle/disconnect relaunch.
+        # Existing HTTP sessions may already be pinned to it; republishing a
+        # newly installed Chrome version would split that identity mid-session.
+        if self._browser_version is None:
+            self._browser_version = launched_version
 
         # Headless Chrome exposes "HeadlessChrome" in the UA string,
         # which WAF fingerprinting (Kasada, DataDome, etc.) detects
@@ -510,20 +1189,142 @@ class BrowserSolver:
         # we create uses the corrected value.
         if self._headless:
             probe = self._browser.new_page()
-            raw_ua = probe.evaluate("navigator.userAgent")
-            probe.close()
+            try:
+                raw_ua = probe.evaluate("navigator.userAgent")
+            finally:
+                # Without this the page leaks whenever evaluate() raises, and
+                # the half-initialised browser is then handed to callers.
+                try:
+                    probe.close()
+                except Exception:
+                    logger.debug("Could not close UA probe page", exc_info=True)
             if "HeadlessChrome" in raw_ua:
-                self._browser_ua = raw_ua.replace(
-                    "HeadlessChrome", "Chrome"
-                )
+                self._browser_ua = raw_ua.replace("HeadlessChrome", "Chrome")
             else:
                 self._browser_ua = raw_ua
 
-        self._last_used = now
+        self._publish_browser_identity()
+        self._runtime_ready.set()
+
+        self._last_used = time.monotonic()
         logger.info("Browser launched (headless=%s)", self._headless)
 
-    def _close_browser(self) -> None:
+    def _capture_preflight_identity(self) -> None:
+        """Capture headed Chrome's reduced UA without navigating anywhere."""
+
+        if self._browser is None:
+            return
+        if self._browser_ua is not None:
+            self._publish_browser_identity()
+            return
+        context = None
+        try:
+            # ``about:blank`` is local and creates no network traffic.  Use a
+            # normal context so the observed UA is exactly what solves use.
+            context = self._create_context()
+            page = context.new_page()
+            ua = page.evaluate("navigator.userAgent")
+            if isinstance(ua, str) and ua:
+                self._browser_ua = ua
+                self._publish_browser_identity()
+            else:
+                logger.warning("Browser preflight did not return a user agent")
+        finally:
+            if context is not None:
+                try:
+                    context.close()
+                except Exception:
+                    logger.debug(
+                        "Could not close browser preflight context",
+                        exc_info=True,
+                    )
+
+    def _probe_screenxy_patch(self) -> None:
+        """Measure CDP input coordinates before deciding whether to patch JS.
+
+        Replacing native MouseEvent/PointerEvent descriptors is observable to
+        challenge code, so it is permitted only when a real Patchright click
+        proves this browser has Chromium's historical screen-coordinate bug.
+        This uses an about:blank context and makes no network request.
+        """
+
+        if self._needs_screenxy_patch is not None:
+            return
+        context = None
+        try:
+            context = self._create_context()
+            page = context.new_page()
+            page.set_content(
+                "<button id='probe' style='width:240px;height:240px'>probe</button>"
+            )
+            # Patchright's set_content does not reliably execute inline
+            # scripts under headed Xvfb/JWM. Install the listener through the
+            # page evaluation protocol, then exercise genuine mouse input.
+            page.evaluate(
+                "() => { window.__waferScreenXY=null;"
+                "document.addEventListener('click', e => "
+                "window.__waferScreenXY={clientX:e.clientX,clientY:e.clientY,"
+                "screenX:e.screenX,screenY:e.screenY,windowX:window.screenX,"
+                "windowY:window.screenY,chromeY:window.outerHeight-window.innerHeight},"
+                "{once:true}); }"
+            )
+            page.mouse.click(100, 100)
+            observed = page.evaluate("window.__waferScreenXY")
+            if not isinstance(observed, dict):
+                raise RuntimeError("Browser screen-coordinate probe produced no event")
+            try:
+                client_x = float(observed["clientX"])
+                client_y = float(observed["clientY"])
+                screen_x = float(observed["screenX"])
+                screen_y = float(observed["screenY"])
+                window_x = float(observed["windowX"])
+                window_y = float(observed["windowY"])
+                chrome_y = float(observed["chromeY"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    "Browser screen-coordinate probe returned invalid values"
+                ) from exc
+            if screen_x == client_x and screen_y == client_y:
+                self._needs_screenxy_patch = True
+                logger.warning("Browser requires screen-coordinate compatibility patch")
+                return
+            if (
+                abs(screen_x - (client_x + window_x)) <= 1
+                and abs(screen_y - (client_y + window_y + chrome_y)) <= 1
+            ):
+                self._needs_screenxy_patch = False
+                logger.debug("Browser has native-correct screen coordinates")
+                return
+            # Neither shape matched. The coordinates are still offset from the
+            # client origin (the broken case above is already excluded), so
+            # only the magnitude is unexplained -- headless Chrome on macOS
+            # reports an event screenY that window.screenY/outerHeight do not
+            # account for. Do NOT fail the solver over it, and do NOT inject
+            # the compatibility script: it is a Function.prototype.toString
+            # visible override that only a positive probe may authorize.
+            self._needs_screenxy_patch = False
+            logger.warning(
+                "Browser screen-coordinate probe was inconclusive "
+                "(client=%s,%s screen=%s,%s window=%s,%s chrome_y=%s); "
+                "leaving native coordinates unpatched",
+                client_x,
+                client_y,
+                screen_x,
+                screen_y,
+                window_x,
+                window_y,
+                chrome_y,
+            )
+        finally:
+            if context is not None:
+                try:
+                    context.close()
+                except Exception:
+                    logger.debug("Could not close screen-coordinate probe context")
+
+    def _close_browser(self, *, preserve_identity: bool = False) -> None:
         """Shut down browser and playwright."""
+        self._runtime_ready.clear()
         if self._browser:
             try:
                 self._browser.close()
@@ -536,8 +1337,10 @@ class BrowserSolver:
             except Exception:
                 pass
             self._playwright = None
-        self._browser_ua = None
-        self._browser_version = None
+        if not preserve_identity:
+            self._browser_ua = None
+            self._browser_version = None
+            self._clear_browser_identity()
 
     def _create_context(self):
         """Create a new browser context with realistic settings."""
@@ -547,7 +1350,8 @@ class BrowserSolver:
             # and DPR explicitly.
             viewport = random.choice(_VIEWPORTS)
             kwargs["viewport"] = {
-                "width": viewport[0], "height": viewport[1],
+                "width": viewport[0],
+                "height": viewport[1],
             }
             # macOS Retina displays are always DPR 2.  Non-Retina
             # Macs are extinct.  Linux/Windows default to 1.
@@ -566,8 +1370,163 @@ class BrowserSolver:
             kwargs["user_agent"] = self._browser_ua
         return self._browser.new_context(**kwargs)
 
+    @staticmethod
+    def _bounded_page_content(page, max_size: int | None) -> str:
+        """Serialize the DOM only when it fits the caller's response budget."""
+
+        try:
+            if max_size is None:
+                return page.content()
+            char_length = page.evaluate(
+                "() => document.documentElement"
+                " ? document.documentElement.outerHTML.length : 0"
+            )
+            if not isinstance(char_length, (int, float)):
+                return ""
+            if char_length <= 0 or char_length > max_size:
+                return ""
+            html = page.content()
+            if len(html.encode("utf-8")) > max_size:
+                return ""
+            return html
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _install_navigation_size_limit(page, max_size: int | None) -> dict[str, object]:
+        """Stop an oversized main-document transfer before it is downloaded.
+
+        The DOM serialization check runs after navigation and therefore cannot
+        protect memory or bandwidth while Chrome is receiving the response.
+        CDP reports decoded and encoded byte deltas for each request, allowing
+        the main document to be stopped as soon as either representation
+        exceeds the response budget.
+        """
+
+        state: dict[str, object] = {
+            "exceeded": False,
+            "documents": set(),
+            "sizes": {},
+            "size": 0,
+            "main_frame_id": None,
+        }
+        if max_size is None:
+            return state
+
+        limit = max_size
+        cdp = page.context.new_cdp_session(page)
+        cdp.send("Network.enable")
+        try:
+            frame_tree = cdp.send("Page.getFrameTree")
+            if isinstance(frame_tree, dict):
+                frame = frame_tree.get("frameTree", {}).get("frame", {})
+                frame_id = frame.get("id") if isinstance(frame, dict) else None
+                if isinstance(frame_id, str) and frame_id:
+                    state["main_frame_id"] = frame_id
+        except Exception:
+            # The post-navigation DOM check still enforces the cap. Avoid
+            # guessing that an iframe is the main response when frame identity
+            # is unavailable.
+            logger.debug(
+                "Could not resolve browser main-frame identity",
+                exc_info=True,
+            )
+
+        def stop_loading(observed_size: int) -> None:
+            if state["exceeded"]:
+                return
+            state["size"] = observed_size
+            state["exceeded"] = True
+            try:
+                cdp.send("Page.stopLoading")
+            except Exception:
+                logger.debug(
+                    "Could not stop oversized browser navigation",
+                    exc_info=True,
+                )
+
+        def request_started(params: dict) -> None:
+            if params.get("type") != "Document":
+                return
+            request_id = params.get("requestId")
+            if not request_id:
+                return
+            main_frame_id = state["main_frame_id"]
+            frame_id = params.get("frameId")
+            if main_frame_id is not None and frame_id != main_frame_id:
+                return
+            if main_frame_id is None and frame_id is not None:
+                # Real CDP events always identify their frame. If the frame-tree
+                # query failed, do not guess which identified frame is top-level;
+                # the post-navigation DOM check remains authoritative. Events
+                # without frameId are retained as a compatibility fallback for
+                # older/mocked protocol implementations.
+                return
+            documents = state["documents"]
+            sizes = state["sizes"]
+            assert isinstance(documents, set)
+            assert isinstance(sizes, dict)
+            # With an authoritative frame ID, track every main-frame navigation:
+            # WAF challenge pages frequently auto-reload into the final response
+            # under a new request ID. Only the unknown-frame compatibility
+            # fallback is restricted to its first Document.
+            if main_frame_id is None and documents:
+                return
+            documents.add(request_id)
+            sizes.setdefault(request_id, {"decoded": 0, "encoded": 0})
+
+        def response_received(params: dict) -> None:
+            request_id = params.get("requestId")
+            documents = state["documents"]
+            assert isinstance(documents, set)
+            if request_id not in documents:
+                return
+            headers = params.get("response", {}).get("headers", {})
+            for key, value in headers.items():
+                if str(key).lower() != "content-length":
+                    continue
+                try:
+                    declared = int(value)
+                    if declared > limit:
+                        stop_loading(declared)
+                except (TypeError, ValueError):
+                    pass
+                break
+
+        def data_received(params: dict) -> None:
+            request_id = params.get("requestId")
+            documents = state["documents"]
+            sizes = state["sizes"]
+            assert isinstance(documents, set)
+            assert isinstance(sizes, dict)
+            if request_id not in documents or state["exceeded"]:
+                return
+            totals = sizes.setdefault(request_id, {"decoded": 0, "encoded": 0})
+            try:
+                decoded = max(int(params.get("dataLength", 0) or 0), 0)
+            except (TypeError, ValueError):
+                decoded = 0
+            try:
+                encoded = max(int(params.get("encodedDataLength", 0) or 0), 0)
+            except (TypeError, ValueError):
+                encoded = 0
+            totals["decoded"] += decoded
+            totals["encoded"] += encoded
+            observed = max(totals["decoded"], totals["encoded"])
+            state["size"] = observed
+            if observed > limit:
+                stop_loading(observed)
+
+        cdp.on("Network.requestWillBeSent", request_started)
+        cdp.on("Network.responseReceived", response_received)
+        cdp.on("Network.dataReceived", data_received)
+        return state
+
     def _setup_headless_patches(
-        self, page, *, challenge_type: str | None = None,
+        self,
+        page,
+        *,
+        challenge_type: str | None = None,
     ) -> None:
         """Register fingerprint patches via CDP.
 
@@ -595,11 +1554,15 @@ class BrowserSolver:
         cdp = page.context.new_cdp_session(page)
         cdp.send("Page.enable")
 
-        # screenXY fix: runs in both headed and headless modes.
-        # Must fire before any page JS to intercept mouse events.
-        cdp.send("Page.addScriptToEvaluateOnNewDocument", {
-            "source": _SCREENXY_FIX_SCRIPT,
-        })
+        # Native-correct Chrome keeps its original event descriptors. Only a
+        # real-input probe can authorize the compatibility replacement.
+        if self._needs_screenxy_patch:
+            cdp.send(
+                "Page.addScriptToEvaluateOnNewDocument",
+                {
+                    "source": _SCREENXY_FIX_SCRIPT,
+                },
+            )
 
         if self._headless:
             # Kasada's ips.js and Akamai's behavioral challenge JS
@@ -608,9 +1571,12 @@ class BrowserSolver:
             # Akamai behavioral refuses to set session cookies.
             # scrgb-linear alone handles the CSS cross-checks.
             if challenge_type not in ("kasada", "akamai"):
-                cdp.send("Page.addScriptToEvaluateOnNewDocument", {
-                    "source": _HEADLESS_FIX_SCRIPT,
-                })
+                cdp.send(
+                    "Page.addScriptToEvaluateOnNewDocument",
+                    {
+                        "source": _HEADLESS_FIX_SCRIPT,
+                    },
+                )
 
             # On macOS, --force-color-profile=scrgb-linear already
             # makes (color: 10), (dynamic-range: high), and
@@ -618,28 +1584,33 @@ class BrowserSolver:
             # remaining gap is color-gamut on non-macOS headless,
             # which CDP Emulation.setEmulatedMedia can patch.
             if sys.platform == "darwin":
-                cdp.send("Emulation.setEmulatedMedia", {
-                    "features": [
-                        {"name": "color-gamut", "value": "p3"},
-                    ],
-                })
+                cdp.send(
+                    "Emulation.setEmulatedMedia",
+                    {
+                        "features": [
+                            {"name": "color-gamut", "value": "p3"},
+                        ],
+                    },
+                )
 
             # Fix navigator.userAgentData + languages.
             ua = self._browser_ua or ""
             if ua:
                 self._apply_ua_metadata(
-                    cdp, ua, self._browser_version,
+                    cdp,
+                    ua,
+                    self._browser_version,
                 )
         else:
             # Headed: fix navigator.languages AND provide
             # userAgentMetadata.  Without metadata, the CDP
             # setUserAgentOverride call strips sec-ch-ua HTTP
             # headers entirely — a strong WAF detection signal.
-            ua = self._browser_ua or page.evaluate(
-                "navigator.userAgent"
-            )
+            ua = self._browser_ua or page.evaluate("navigator.userAgent")
             self._apply_ua_metadata(
-                cdp, ua, self._browser_version,
+                cdp,
+                ua,
+                self._browser_version,
             )
 
         # Do NOT detach the CDP session - that removes registered
@@ -648,7 +1619,9 @@ class BrowserSolver:
 
     @staticmethod
     def _apply_ua_metadata(
-        cdp, ua: str, browser_version: str | None = None,
+        cdp,
+        ua: str,
+        browser_version: str | None = None,
     ) -> None:
         """Set CDP userAgentMetadata so navigator.userAgentData matches.
 
@@ -695,10 +1668,7 @@ class BrowserSolver:
         self._grid_recordings = []
 
         try:
-            rec_dir = (
-                importlib.resources.files("wafer.browser")
-                / "_recordings"
-            )
+            rec_dir = importlib.resources.files("wafer.browser") / "_recordings"
         except Exception:
             logger.debug("Recordings package not found")
             return False
@@ -712,9 +1682,7 @@ class BrowserSolver:
                 text = f.read_text()
                 rows = _parse_csv_rows(text, ("t", "dx", "dy"))
                 if rows:
-                    self._idle_recordings.append(
-                        {"rows": rows, "name": name}
-                    )
+                    self._idle_recordings.append({"rows": rows, "name": name})
         except Exception:
             logger.debug("Failed to load idle recordings", exc_info=True)
 
@@ -749,9 +1717,7 @@ class BrowserSolver:
                 text = f.read_text()
                 rows = _parse_csv_rows(text, ("t", "dx", "dy"))
                 if rows:
-                    self._hold_recordings.append(
-                        {"rows": rows, "name": name}
-                    )
+                    self._hold_recordings.append({"rows": rows, "name": name})
         except Exception:
             logger.debug("Failed to load hold recordings", exc_info=True)
 
@@ -795,20 +1761,16 @@ class BrowserSolver:
                     continue
                 text = f.read_text()
                 meta = _parse_metadata(text.splitlines()[0])
-                rows = _parse_csv_rows(
-                    text, ("t", "dx", "dy", "scroll_y")
-                )
+                rows = _parse_csv_rows(text, ("t", "dx", "dy", "scroll_y"))
                 if rows:
-                    self._browse_recordings.append({
-                        "rows": rows,
-                        "max_scroll": int(
-                            meta.get("max_scroll", "0")
-                        ),
-                        "sections": int(
-                            meta.get("sections", "0")
-                        ),
-                        "name": name,
-                    })
+                    self._browse_recordings.append(
+                        {
+                            "rows": rows,
+                            "max_scroll": int(meta.get("max_scroll", "0")),
+                            "sections": int(meta.get("sections", "0")),
+                            "name": name,
+                        }
+                    )
         except Exception:
             logger.debug("Failed to load browse recordings", exc_info=True)
 
@@ -846,9 +1808,7 @@ class BrowserSolver:
             len(self._browse_recordings),
         )
         return bool(
-            self._idle_recordings
-            and self._path_recordings
-            and self._hold_recordings
+            self._idle_recordings and self._path_recordings and self._hold_recordings
         )
 
     # ------------------------------------------------------------------
@@ -865,9 +1825,7 @@ class BrowserSolver:
     ) -> dict:
         """Pick a recorded path whose direction best matches the move."""
         recordings = pool if pool is not None else self._path_recordings
-        angle = math.atan2(
-            target_y - start_y, target_x - start_x
-        )
+        angle = math.atan2(target_y - start_y, target_x - start_x)
 
         def _angle_diff(rec: dict) -> float:
             diff = abs(rec["angle"] - angle)
@@ -922,11 +1880,10 @@ class BrowserSolver:
         target_x: float,
         target_y: float,
         pool: list[dict] | None = None,
-    ) -> None:
+        deadline: float | None = None,
+    ) -> bool:
         """Replay a recorded human path from start to target."""
-        rec = self._pick_path(
-            start_x, start_y, target_x, target_y, pool=pool
-        )
+        rec = self._pick_path(start_x, start_y, target_x, target_y, pool=pool)
         recording = rec["rows"]
         dx = target_x - start_x
         dy = target_y - start_y
@@ -934,8 +1891,7 @@ class BrowserSolver:
         duration = recording[-1]["t"] * time_scale if recording else 0
 
         logger.info(
-            "Path: %s (%s, %.1fs, %d points) "
-            "(%.0f,%.0f) -> (%.0f,%.0f)",
+            "Path: %s (%s, %.1fs, %d points) (%.0f,%.0f) -> (%.0f,%.0f)",
             rec["name"],
             rec["meta"].get("direction", "?"),
             duration,
@@ -950,15 +1906,26 @@ class BrowserSolver:
         t0 = time.monotonic()
 
         for row in recording:
+            if deadline is not None and time.monotonic() >= deadline:
+                return False
             target_t = row["t"] * time_scale
             elapsed = time.monotonic() - t0
             delay = target_t - elapsed
             if delay > 0:
-                time.sleep(delay)
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return False
+                    time.sleep(min(delay, remaining))
+                    if delay >= remaining:
+                        return False
+                else:
+                    time.sleep(delay)
 
             x = start_x + row["rx"] * dx
             y = start_y + row["ry"] * dy
             page.mouse.move(x, y)
+        return True
 
     def _replay_drag(
         self,
@@ -967,13 +1934,23 @@ class BrowserSolver:
         start_y: float,
         end_x: float,
         end_y: float,
-    ) -> None:
+        deadline: float | None = None,
+        telemetry_label: str | None = None,
+        exclude_recordings: set[str] | None = None,
+        recording_pool_size: int = 3,
+        approach_from: tuple[float, float] | None = None,
+    ) -> bool:
         """Replay a recorded drag from start to end.
 
         Recordings include an optional pre-drag hover phase (natural
         pause near the handle before clicking).  The ``mousedown_t``
         metadata field marks when the click happens — events before it
         are replayed as cursor movement without the button held.
+
+        When ``approach_from`` is supplied, the approach path terminates at
+        the recording's *first hover point*.  Terminating at the eventual
+        mousedown point instead would make recordings whose hover begins a
+        few pixels away teleport from the handle to their first sample.
 
         The recording's ``ry`` values are normalized against the original
         horizontal track width (not vertical displacement).  This preserves
@@ -997,42 +1974,112 @@ class BrowserSolver:
                     pass
             return 0.0
 
-        # Sort by distance similarity, pick randomly from top 3 closest
-        # to add slight variation while keeping the profile realistic.
+        # Sort by distance similarity. Generic drags use the closest three
+        # traces; a full-width slider can request its complete bounded slide
+        # corpus to avoid replaying nearly identical trajectories after a
+        # challenge retry.
         ranked = sorted(
             self._drag_recordings,
             key=lambda r: abs(_drag_dist(r) - target_dist),
         )
-        pool = ranked[: min(3, len(ranked))]
+        pool_size = max(1, int(recording_pool_size))
+        pool = ranked[: min(pool_size, len(ranked))]
+        if exclude_recordings:
+            unused = [
+                recording
+                for recording in pool
+                if recording.get("name") not in exclude_recordings
+            ]
+            if unused:
+                pool = unused
         recording = random.choice(pool)
+        self._last_drag_recording_name = recording.get("name")
         rows = recording["rows"]
+        if not rows:
+            return False
         meta = recording.get("meta", {})
         mousedown_t = float(meta.get("mousedown_t", "0"))
         time_scale = random.uniform(0.85, 1.15)
+        if telemetry_label is not None:
+            # Recording filenames and timing contain no page/request content.
+            logger.info(
+                "%s drag trace: recording=%s time_scale=%.3f",
+                telemetry_label,
+                recording.get("name", "unknown"),
+                time_scale,
+            )
 
-        page.mouse.move(start_x, start_y)
+        first = rows[0]
+        first_x = start_x + first["rx"] * dx
+        first_y = start_y + first["ry"] * abs(dx)
+        if approach_from is not None:
+            if not self._replay_path(
+                page,
+                approach_from[0],
+                approach_from[1],
+                first_x,
+                first_y,
+                deadline=deadline,
+            ):
+                return False
+        else:
+            page.mouse.move(first_x, first_y)
+
         t0 = time.monotonic()
         mouse_down = False
-
-        for row in rows:
-            # Transition from hover to drag at mousedown_t
-            if not mouse_down and row["t"] >= mousedown_t:
-                mouse_down = True
-                page.mouse.down()
-
-            target_t = row["t"] * time_scale
-            elapsed = time.monotonic() - t0
-            delay = target_t - elapsed
-            if delay > 0:
-                time.sleep(delay)
-
-            x = start_x + row["rx"] * dx
-            y = start_y + row["ry"] * abs(dx)
-            page.mouse.move(x, y)
-
-        if not mouse_down:
+        # The first row is the initial cursor sample.  Positioning above
+        # already emitted it, so replay subsequent samples only.  A recording
+        # that presses at t=0 still needs its button transition at this point.
+        if first["t"] >= mousedown_t:
             page.mouse.down()
-        page.mouse.up()
+            mouse_down = True
+
+        try:
+            for row in rows[1:]:
+                if deadline is not None and time.monotonic() >= deadline:
+                    return False
+
+                target_t = row["t"] * time_scale
+                elapsed = time.monotonic() - t0
+                delay = target_t - elapsed
+                if delay > 0:
+                    if deadline is not None:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            return False
+                        time.sleep(min(delay, remaining))
+                        if delay >= remaining:
+                            return False
+                    else:
+                        time.sleep(delay)
+
+                x = start_x + row["rx"] * dx
+                y = start_y + row["ry"] * abs(dx)
+                if mouse_down:
+                    # Slider recordings deliberately contain small natural
+                    # overshoots.  A generic drag can safely preserve those,
+                    # but a full-track Baxia release is validated against the
+                    # raw pointer coordinate as well as the visual handle.
+                    # Keep pre-click hover movement natural, then constrain a
+                    # pressed pointer to the actual slider interval.
+                    x = min(max(x, min(start_x, end_x)), max(start_x, end_x))
+                page.mouse.move(x, y)
+                # A recorded mousedown row is a button event at its recorded
+                # cursor coordinate.  Moving and waiting must happen before
+                # the button transition; pressing before the row's timestamp
+                # creates an artificial stationary hold of up to hundreds of
+                # milliseconds.
+                if not mouse_down and row["t"] >= mousedown_t:
+                    page.mouse.down()
+                    mouse_down = True
+
+            if not mouse_down:
+                page.mouse.down()
+                mouse_down = True
+            return True
+        finally:
+            if mouse_down:
+                page.mouse.up()
 
     # ------------------------------------------------------------------
     # Browse replay (background mouse/scroll during solver waits)
@@ -1129,9 +2176,7 @@ class BrowserSolver:
             scroll_y = row.get("scroll_y", 0)
             if scroll_y:
                 try:
-                    page.mouse.wheel(
-                        0, scroll_y * state.scroll_scale
-                    )
+                    page.mouse.wheel(0, scroll_y * state.scroll_scale)
                 except Exception:
                     pass
 
@@ -1151,19 +2196,101 @@ class BrowserSolver:
 
     def _has_px_challenge(self, page) -> bool:
         from wafer.browser._perimeterx import has_px_challenge
+
         return has_px_challenge(page)
 
     def _find_px_button(self, page, timeout: float = 30.0):
         from wafer.browser._perimeterx import find_px_button
+
         return find_px_button(page, timeout)
 
     def _solve_perimeterx(self, page, timeout_ms: int) -> bool:
         from wafer.browser._perimeterx import solve_perimeterx
+
         return solve_perimeterx(self, page, timeout_ms)
 
     # ------------------------------------------------------------------
     # Solve dispatch
     # ------------------------------------------------------------------
+
+    def _submit_on_worker(self, callback, *args, **kwargs):
+        with self._executor_lock:
+            if self._executor_closed:
+                raise RuntimeError("BrowserSolver is closed")
+
+            def invoke():
+                self._worker_ident = threading.get_ident()
+                return callback(*args, **kwargs)
+
+            return self._executor.submit(invoke)
+
+    def _run_on_worker(self, callback, *args, **kwargs):
+        """Run a Patchright operation on this solver's owning thread."""
+
+        if threading.get_ident() == self._worker_ident:
+            return callback(*args, **kwargs)
+        return self._submit_on_worker(callback, *args, **kwargs).result()
+
+    def _mark_worker_recovering(self, future) -> None:
+        """Make readiness honest until a timed-out worker operation returns."""
+
+        self._runtime_ready.clear()
+
+        def operation_finished(_future) -> None:
+            with self._executor_lock:
+                if self._executor_closed:
+                    return
+            try:
+                connected = self._browser is not None and self._browser.is_connected()
+            except Exception:
+                connected = False
+            if connected:
+                self._runtime_ready.set()
+            else:
+                self._runtime_ready.clear()
+
+        future.add_done_callback(operation_finished)
+
+    def _interrupt_playwright_transport(self) -> bool:
+        """Break a stuck sync protocol call so the serial worker can recover.
+
+        Playwright's sync API exposes no timeout for operations such as
+        ``BrowserContext.cookies``. Terminating its private driver transport
+        disconnects the current browser, which makes the blocked call return;
+        the owning worker then performs its normal cleanup and relaunches a
+        fresh driver on the next operation.
+        """
+
+        try:
+            connection = self._playwright._impl_obj._connection
+            process = connection._transport._proc
+            if process.returncode is not None:
+                return False
+            process.terminate()
+            return True
+        except Exception:
+            return False
+
+    def _recover_timed_out_worker(self, future) -> None:
+        if future.done():
+            return
+        self._mark_worker_recovering(future)
+        interrupted = self._interrupt_playwright_transport()
+        logger.warning(
+            "Browser worker recovery requested (driver_interrupted=%s)",
+            interrupted,
+        )
+
+    def preflight(self) -> None:
+        """Launch Chrome on the solver worker to verify runtime readiness."""
+
+        self._run_on_worker(self._preflight_on_worker)
+
+    def _preflight_on_worker(self) -> None:
+        with self._lock:
+            self._ensure_browser()
+            self._capture_preflight_identity()
+            self._probe_screenxy_patch()
 
     def solve(
         self,
@@ -1172,6 +2299,61 @@ class BrowserSolver:
         timeout: float | None = None,
         embedder: str | None = None,
         replay: dict | None = None,
+        max_size: int | None = None,
+    ) -> SolveResult | None:
+        """Solve on the dedicated worker within one end-to-end deadline."""
+
+        if threading.get_ident() == self._worker_ident:
+            return self._solve_on_worker(
+                url,
+                challenge_type,
+                timeout,
+                embedder,
+                replay,
+                max_size,
+            )
+        if not _valid_browser_url(url) or (
+            embedder is not None and not _valid_browser_url(embedder)
+        ):
+            logger.warning("Refusing invalid browser navigation target")
+            return None
+        solve_timeout = self._solve_timeout if timeout is None else timeout
+        if solve_timeout <= 0:
+            return None
+        deadline = time.monotonic() + solve_timeout
+        future = self._submit_on_worker(
+            self._solve_on_worker,
+            url,
+            challenge_type,
+            solve_timeout,
+            embedder,
+            replay,
+            max_size,
+            _deadline=deadline,
+        )
+        try:
+            return future.result(timeout=solve_timeout)
+        except FutureTimeoutError:
+            cancelled = future.cancel()
+            if not cancelled and not future.done():
+                self._recover_timed_out_worker(future)
+            logger.warning(
+                "Browser solve timed out after %.1fs (challenge_type=%s)",
+                solve_timeout,
+                challenge_type or "unknown",
+            )
+            return None
+
+    def _solve_on_worker(
+        self,
+        url: str,
+        challenge_type: str | None = None,
+        timeout: float | None = None,
+        embedder: str | None = None,
+        replay: dict | None = None,
+        max_size: int | None = None,
+        *,
+        _deadline: float | None = None,
     ) -> SolveResult | None:
         """Solve a WAF challenge by navigating in a real browser.
 
@@ -1197,17 +2379,27 @@ class BrowserSolver:
         solve replays it as a same-site XHR from that page and returns the
         response as a passthrough - bytes identical to a real browser's.
         """
+        if not _valid_browser_url(url) or (
+            embedder is not None and not _valid_browser_url(embedder)
+        ):
+            logger.warning("Refusing invalid browser navigation target")
+            return None
         if timeout is None:
             timeout = self._solve_timeout
+        overall_deadline = (
+            _deadline if _deadline is not None else time.monotonic() + timeout
+        )
+        timeout = min(timeout, overall_deadline - time.monotonic())
         if timeout <= 0:
-            logger.debug("No solve budget left for %s", url)
+            logger.debug(
+                "No solve budget left (challenge_type=%s)",
+                challenge_type or "unknown",
+            )
             return None
         # Absolute deadline for the whole solve, including time spent
         # waiting for the shared solver lock. Navigation and challenge
         # dispatch each clamp to the remaining budget so a single solve
         # can never overshoot the caller's request timeout.
-        overall_deadline = time.monotonic() + timeout
-
         # Bound lock acquisition: a shared BrowserSolver serializes
         # solves, so without a timeout a concurrent solve could block
         # this caller far past its own timeout. If the lock is busy,
@@ -1215,9 +2407,8 @@ class BrowserSolver:
         # of hanging.
         if not self._lock.acquire(timeout=timeout):
             logger.warning(
-                "Browser solve skipped for %s: solver busy "
-                "(waited %.1fs)",
-                url,
+                "Browser solve skipped: solver busy (challenge_type=%s waited=%.1fs)",
+                challenge_type or "unknown",
                 timeout,
             )
             return None
@@ -1226,15 +2417,15 @@ class BrowserSolver:
             # launch a browser we'd have no time to actually use.
             if time.monotonic() >= overall_deadline:
                 logger.debug(
-                    "Solve budget exhausted waiting for lock: %s", url
+                    "Solve budget exhausted waiting for lock (challenge_type=%s)",
+                    challenge_type or "unknown",
                 )
                 return None
             try:
-                self._ensure_browser()
-            except Exception:
-                logger.warning(
-                    "Failed to launch browser", exc_info=True
-                )
+                self._ensure_browser(overall_deadline)
+                self._probe_screenxy_patch()
+            except Exception as exc:
+                logger.warning("Failed to launch browser (%s)", type(exc).__name__)
                 return None
 
             context = None
@@ -1242,19 +2433,21 @@ class BrowserSolver:
                 context = self._create_context()
                 page = context.new_page()
                 self._setup_headless_patches(
-                    page, challenge_type=challenge_type,
+                    page,
+                    challenge_type=challenge_type,
+                )
+                size_guard = self._install_navigation_size_limit(
+                    page, max_size if embedder is None else None
                 )
 
                 if self._browser_ua is None:
-                    self._browser_ua = page.evaluate(
-                        "navigator.userAgent"
-                    )
+                    self._browser_ua = page.evaluate("navigator.userAgent")
+                    self._publish_browser_identity()
                     logger.debug("Browser UA: %s", self._browser_ua)
 
                 logger.info(
-                    "Browser solving %s challenge at %s",
+                    "Browser solving challenge_type=%s",
                     challenge_type or "unknown",
-                    url,
                 )
 
                 # Imperva on an API host: navigate the real origin page
@@ -1274,15 +2467,17 @@ class BrowserSolver:
                         1,
                         int((overall_deadline - time.monotonic()) * 1000),
                     )
-                    solved = solve_imperva_embedder(
-                        self, page, embedder, dispatch_ms
-                    )
+                    solved = solve_imperva_embedder(self, page, embedder, dispatch_ms)
+                    if size_guard["exceeded"]:
+                        raise ResponseTooLarge(
+                            url,
+                            int(size_guard["size"]),
+                            max_size,
+                        )
                     cookies = context.cookies()
                     if not cookies:
                         logger.warning(
-                            "Imperva embedder solve yielded no cookies "
-                            "for %s via %s",
-                            url, embedder,
+                            "Imperva embedder solve yielded no cookies",
                         )
                         return None
 
@@ -1297,7 +2492,13 @@ class BrowserSolver:
                             1,
                             int((overall_deadline - time.monotonic()) * 1000),
                         )
-                        res = imperva_xhr_replay(page, url, replay, rem_ms)
+                        res = imperva_xhr_replay(
+                            page,
+                            url,
+                            replay,
+                            rem_ms,
+                            max_size=max_size,
+                        )
                         # The in-page fetch read the body as text (UTF-8). Only
                         # trust it for text-ish content; a binary body would be
                         # mojibake, so fall back to cookie replay for those.
@@ -1311,13 +2512,14 @@ class BrowserSolver:
                             )
                         ):
                             body = res["body"].encode("utf-8")
+                            if max_size is not None and len(body) > max_size:
+                                raise ResponseTooLarge(url, len(body), max_size)
                             captured = CapturedResponse(
                                 url=url,
                                 status=res["status"],
                                 headers={
                                     "content-type": (
-                                        res.get("content_type")
-                                        or "application/json"
+                                        res.get("content_type") or "application/json"
                                     )
                                 },
                                 body=body,
@@ -1325,9 +2527,10 @@ class BrowserSolver:
 
                     self._last_used = time.monotonic()
                     logger.info(
-                        "Imperva embedder solve for %s via %s "
+                        "Imperva embedder solve "
                         "(%d cookies, solved=%s, passthrough=%s)",
-                        url, embedder, len(cookies), solved,
+                        len(cookies),
+                        solved,
                         captured is not None,
                     )
                     return SolveResult(
@@ -1349,7 +2552,21 @@ class BrowserSolver:
                     from wafer.browser._kasada import (
                         setup_kasada_listener,
                     )
+
                     setup_kasada_listener(page)
+
+                # Snapshot target-scoped TMD clearance before navigation.
+                # A punishment page may mint x5sec or automatically redirect
+                # during ``goto`` itself; taking the baseline afterward would
+                # misclassify that fresh authoritative evidence as pre-existing.
+                tmd_retry_target = (
+                    _tmd_retry_target(url) if challenge_type == "tmd" else None
+                )
+                tmd_x5sec_before = (
+                    _tmd_x5sec_signatures(context.cookies(), tmd_retry_target)
+                    if tmd_retry_target is not None
+                    else set()
+                )
 
                 # Navigate the origin page when one was supplied
                 # (solve_origin / a non-Imperva embedder): the request URL is
@@ -1357,21 +2574,29 @@ class BrowserSolver:
                 # challenge on the real page and let the earned cookies replay
                 # to the API host. Falls back to ``url`` for the normal case.
                 nav_target = embedder or url
-                nav_response = None
                 try:
-                    nav_ms = max(
-                        1,
-                        int((overall_deadline - time.monotonic()) * 1000),
-                    )
-                    nav_response = page.goto(
+                    # Bounded, not the whole budget: a WAF interstitial that
+                    # never fires domcontentloaded would otherwise consume the
+                    # entire solve deadline in navigation and leave nothing for
+                    # the solver -- observed as a 295s DataDome "solve" that
+                    # never logged a single line. A navigation timeout is
+                    # caught below and the solver still runs on what loaded.
+                    nav_ms = _navigation_budget_ms(overall_deadline)
+                    page.goto(
                         nav_target,
                         wait_until="domcontentloaded",
                         timeout=nav_ms,
                     )
-                except Exception:
+                except Exception as exc:
                     logger.debug(
-                        "Browser navigation timeout/error",
-                        exc_info=True,
+                        "Browser navigation timeout/error (%s)",
+                        type(exc).__name__,
+                    )
+                if size_guard["exceeded"]:
+                    raise ResponseTooLarge(
+                        url,
+                        int(size_guard["size"]),
+                        max_size,
                     )
 
                 # WAF-specific wait strategy — clamp to remaining budget
@@ -1380,169 +2605,108 @@ class BrowserSolver:
                     int((overall_deadline - time.monotonic()) * 1000),
                 )
                 solved = self._dispatch_challenge(
-                    page, challenge_type, dispatch_ms
+                    page, challenge_type, dispatch_ms, challenge_url=url
                 )
-
+                if size_guard["exceeded"]:
+                    raise ResponseTooLarge(
+                        url,
+                        int(size_guard["size"]),
+                        max_size,
+                    )
 
                 cookies = context.cookies()
 
+                if challenge_type == "tmd":
+                    # Widget/token delivery is only an intermediate event.
+                    # The authoritative outcome is a new/changed x5sec that
+                    # applies to the exact application retry: AliExpress's
+                    # native MTop endpoint or Alibaba's strict callback from
+                    # the issued punishment URL.  Inspect it after either
+                    # widget outcome because TMD can mint clearance without
+                    # leaving an observable widget token in the page.
+                    widget_solved = solved
+                    x5sec_ready = False
+                    if tmd_retry_target is not None:
+                        clearance_deadline = overall_deadline
+                        while time.monotonic() < clearance_deadline:
+                            if (
+                                _tmd_x5sec_signatures(cookies, tmd_retry_target)
+                                - tmd_x5sec_before
+                            ):
+                                break
+                            if not _sleep_before_deadline(
+                                clearance_deadline,
+                                0.2,
+                            ):
+                                break
+                            cookies = context.cookies()
+                        x5sec_ready = bool(
+                            _tmd_x5sec_signatures(cookies, tmd_retry_target)
+                            - tmd_x5sec_before
+                        )
+                    if os.environ.get("WAFER_TMD_DIAGNOSTICS") == "1":
+                        logger.info(
+                            "TMD diagnostic: widget_solved=%s "
+                            "x5sec_target_new_or_changed=%s "
+                            "cookie_structure=%s",
+                            widget_solved,
+                            x5sec_ready,
+                            _cookie_structure(cookies),
+                        )
+                    solved = x5sec_ready
+                    if not x5sec_ready:
+                        logger.warning(
+                            "TMD challenge produced no new target-scoped "
+                            "x5sec clearance (widget_solved=%s)",
+                            widget_solved,
+                        )
+
                 if not cookies:
                     logger.warning(
-                        "Browser solve yielded no cookies for %s",
-                        url,
+                        "Browser solve yielded no cookies (challenge_type=%s)",
+                        challenge_type or "unknown",
                     )
                     return None
 
                 self._last_used = time.monotonic()
 
-                # Build passthrough response when browser got real
-                # content without solving a challenge (WAF only
-                # challenges non-browser TLS clients)
                 captured = None
-                # Only treat the navigated page as the response when we
-                # navigated the actual request url. With solve_origin (an
-                # embedder), nav_target is a different origin page, so its
-                # body is NOT the API response: skip passthrough, return the
-                # earned cookies, and let the session retry the real url.
-                if (
-                    not solved
-                    and nav_target == url
-                    and nav_response is not None
-                    and 200 <= nav_response.status < 300
-                ):
-                    try:
-                        body = nav_response.body()
-                    except Exception:
-                        body = b""
-                    # nav_response body may be empty after a
-                    # client-side redirect/reload.  Fall back to
-                    # page.content() which reflects the final DOM.
-                    if len(body) <= 1024:
-                        try:
-                            html = page.content()
-                            if len(html) > 1024:
-                                body = html.encode("utf-8")
-                        except Exception:
-                            pass
-                    if len(body) > 1024:
-                        nav_headers = {}
-                        try:
-                            for k, v in nav_response.headers.items():
-                                nav_headers[k] = v
-                        except Exception:
-                            pass
-                        # Preserve individual Set-Cookie values: the flat
-                        # .headers dict collapses duplicates, so a response
-                        # with several Set-Cookie headers loses all but one.
-                        # headers_array() keeps each occurrence separate.
-                        nav_set_cookie = []
-                        try:
-                            for h in nav_response.headers_array():
-                                if h.get("name", "").lower() == "set-cookie":
-                                    nav_set_cookie.append(h.get("value", ""))
-                        except Exception:
-                            pass
-                        captured = CapturedResponse(
-                            url=nav_response.url,
-                            status=nav_response.status,
-                            headers=nav_headers,
-                            body=body,
-                            set_cookie=nav_set_cookie,
-                        )
-                        logger.info(
-                            "Browser passthrough for %s at %s "
-                            "(%d bytes, %d cookies)",
-                            challenge_type or "unknown",
-                            url,
-                            len(body),
-                            len(cookies),
-                        )
-
-                # Auto-resolve passthrough: WAF served a challenge
-                # (nav 403) but the browser resolved it in the
-                # background (WASM PoW, auto-cookie).  The page may
-                # have redirected to real content by now.
-                if not solved and captured is None and nav_target == url:
-                    try:
-                        html = page.content()
-                    except Exception:
-                        html = ""
-                    if len(html) > 1024:
-                        head = html[:10000].lower()
-                        is_challenge = (
-                            "captcha-delivery" in head
-                            or "kpsdk" in head
-                            or "px-captcha" in head
-                            or "reese84" in head
-                            or "just a moment" in head
-                            or "cf_chl" in head
-                            or "challenge-platform" in head
-                            or "chl_page" in head
-                        )
-                        if not is_challenge:
-                            body = html.encode("utf-8")
-                            cookies = context.cookies()
-                            captured = CapturedResponse(
-                                url=page.url,
-                                status=200,
-                                headers={
-                                    "content-type": (
-                                        "text/html; charset=utf-8"
-                                    )
-                                },
-                                body=body,
-                            )
-                            logger.info(
-                                "Browser auto-resolve passthrough "
-                                "for %s at %s (%d bytes, %d cookies)",
-                                challenge_type or "unknown",
-                                page.url,
-                                len(body),
-                                len(cookies),
-                            )
 
                 # Post-solve passthrough: after solving, the page
                 # may auto-reload to real content.  Capture it
                 # when cookie replay is unreliable (TLS-bound).
                 # The browser needs time to redirect after cookie
                 # update, so retry up to 5s for real content.
-                if solved and captured is None and nav_target == url:
+                if (
+                    solved
+                    and challenge_type != "tmd"
+                    and captured is None
+                    and nav_target == url
+                ):
                     # Cap the passthrough wait at the overall deadline so
                     # a near-deadline solve can't overshoot the caller's
                     # request timeout.
-                    passthrough_deadline = min(
-                        overall_deadline, time.monotonic() + 5
-                    )
+                    passthrough_deadline = min(overall_deadline, time.monotonic() + 5)
                     while time.monotonic() < passthrough_deadline:
+                        if size_guard["exceeded"]:
+                            raise ResponseTooLarge(
+                                url,
+                                int(size_guard["size"]),
+                                max_size,
+                            )
                         try:
-                            html = page.content()
+                            html = self._bounded_page_content(
+                                page,
+                                max_size,
+                            )
                         except Exception:
                             html = ""
-                        head = html[:10000].lower()
-                        is_challenge = (
-                            "kpsdk" in head
-                            or "captcha-delivery" in head
-                            or ("akamai" in head and "_abck" in head)
-                            or "perimeterx" in head
-                            or "px-captcha" in head
-                            or "reese84" in head
-                            or "just a moment" in head
-                            or "cf_chl" in head
-                            or "challenge-platform" in head
-                            or "chl_page" in head
-                        )
+                        is_challenge = _is_passthrough_challenge_html(html)
                         # Detect soft-block pages (e.g. F5 Shape
                         # redirects to siteclosed/invitation.html).
                         page_url = page.url.lower()
-                        is_block = (
-                            "invitation" in page_url
-                            or "siteclosed" in page_url
-                        )
-                        if (
-                            len(html) > 1024
-                            and not is_challenge
-                            and not is_block
-                        ):
+                        is_block = "invitation" in page_url or "siteclosed" in page_url
+                        if len(html) > 1024 and not is_challenge and not is_block:
                             body = html.encode("utf-8")
                             # Re-read cookies after redirect —
                             # new page may have set more.
@@ -1550,18 +2714,12 @@ class BrowserSolver:
                             captured = CapturedResponse(
                                 url=page.url,
                                 status=200,
-                                headers={
-                                    "content-type": (
-                                        "text/html; charset=utf-8"
-                                    )
-                                },
+                                headers={"content-type": ("text/html; charset=utf-8")},
                                 body=body,
                             )
                             logger.info(
-                                "%s passthrough at %s "
-                                "(%d bytes, %d cookies)",
+                                "%s passthrough (%d bytes, %d cookies)",
                                 challenge_type or "unknown",
-                                page.url,
                                 len(body),
                                 len(cookies),
                             )
@@ -1570,20 +2728,17 @@ class BrowserSolver:
 
                 if solved:
                     logger.info(
-                        "Browser solved %s challenge at %s "
-                        "(%d cookies)",
+                        "Browser solved challenge_type=%s (cookie_count=%d)",
                         challenge_type or "unknown",
-                        url,
                         len(cookies),
                     )
                 elif captured is None:
                     logger.warning(
-                        "Browser solve timed out for %s at %s, "
-                        "returning %d cookies anyway",
+                        "Browser solve did not reach authoritative success "
+                        "(challenge_type=%s)",
                         challenge_type or "unknown",
-                        url,
-                        len(cookies),
                     )
+                    return None
 
                 extras = getattr(page, "_kasada_result", None)
 
@@ -1595,11 +2750,13 @@ class BrowserSolver:
                     browser_version=self._browser_version,
                 )
 
-            except Exception:
+            except ResponseTooLarge:
+                raise
+            except Exception as exc:
                 logger.warning(
-                    "Browser solve failed for %s",
-                    url,
-                    exc_info=True,
+                    "Browser solve failed (challenge_type=%s error=%s)",
+                    challenge_type or "unknown",
+                    type(exc).__name__,
                 )
                 return None
             finally:
@@ -1612,60 +2769,134 @@ class BrowserSolver:
             self._lock.release()
 
     def _dispatch_challenge(
-        self, page, challenge_type: str | None, timeout_ms: int
+        self,
+        page,
+        challenge_type: str | None,
+        timeout_ms: int,
+        challenge_url: str | None = None,
     ) -> bool:
         """Route to the correct WAF-specific solver."""
         if challenge_type == "cloudflare":
             from wafer.browser._cloudflare import (
                 wait_for_cloudflare,
             )
+
             return wait_for_cloudflare(self, page, timeout_ms)
         elif challenge_type == "akamai":
             from wafer.browser._akamai import wait_for_akamai
+
             return wait_for_akamai(self, page, timeout_ms)
         elif challenge_type == "datadome":
             from wafer.browser._datadome import wait_for_datadome
+
             return wait_for_datadome(self, page, timeout_ms)
         elif challenge_type == "perimeterx":
             from wafer.browser._perimeterx import (
                 solve_perimeterx,
             )
+
             return solve_perimeterx(self, page, timeout_ms)
         elif challenge_type == "awswaf":
             from wafer.browser._awswaf import wait_for_awswaf
+
             return wait_for_awswaf(self, page, timeout_ms)
         elif challenge_type == "kasada":
             from wafer.browser._kasada import wait_for_kasada
+
             return wait_for_kasada(self, page, timeout_ms)
         elif challenge_type == "shape":
             from wafer.browser._shape import wait_for_shape
+
             return wait_for_shape(self, page, timeout_ms)
         elif challenge_type == "imperva":
             from wafer.browser._imperva import wait_for_imperva
+
             return wait_for_imperva(self, page, timeout_ms)
         elif challenge_type == "geetest":
             from wafer.browser._drag import solve_drag
+
             return solve_drag(self, page, timeout_ms)
-        elif challenge_type in ("baxia", "tmd"):
+        elif challenge_type == "reddit":
+            # Reddit's anonymous-session gate has a strict, response-scoped
+            # native-transport bootstrap in SyncSession/AsyncSession. Generic
+            # browser network-idle is not authoritative and can mistake the
+            # Shreddit network-security block for a successful navigation.
+            return False
+        elif challenge_type == "tmd":
+            # AliExpress MTop can issue a TMD punishment URL with
+            # ``action=captcharecaptcha``.  That is a Google reCAPTCHA flow,
+            # not Baxia's slider; forcing it through the slider waits for a
+            # widget that never exists and times out.  Dispatch the explicit
+            # action solely to the reCAPTCHA solver: a failed reCAPTCHA must
+            # be reported, not relabelled as a different challenge type.
+            # The top-level navigation can redirect to TMD's child wrapper,
+            # whose URL omits the original ``action`` parameter.  Prefer the
+            # immutable issued URL supplied to ``solve()`` over the mutable
+            # page URL -- but only when that URL is itself a punishment
+            # document.  wafer is normally invoked with the *application* URL
+            # whose response carried the redirect; that URL never carries an
+            # ``action``, so trusting it unconditionally classified every
+            # normal-flow reCAPTCHA punishment as a slider and waited for a
+            # widget that never exists.
+            from wafer._base import (
+                _tmd_is_punish_url,
+                _tmd_is_recaptcha_challenge,
+            )
+
+            issued_url = challenge_url if _tmd_is_punish_url(challenge_url) else None
+            action_url = issued_url or page.url or challenge_url or ""
+
+            if _tmd_is_recaptcha_challenge(action_url):
+                from wafer.browser._recaptcha import wait_for_recaptcha
+
+                return wait_for_recaptcha(
+                    self,
+                    page,
+                    timeout_ms,
+                    protocol_completion_is_intermediate=True,
+                )
             from wafer.browser._drag import solve_baxia
-            return solve_baxia(self, page, timeout_ms)
+
+            return solve_baxia(self, page, timeout_ms, challenge_url=challenge_url)
+        elif challenge_type == "baxia":
+            from wafer.browser._drag import solve_baxia
+
+            return solve_baxia(self, page, timeout_ms, challenge_url=challenge_url)
         elif challenge_type == "hcaptcha":
             from wafer.browser._hcaptcha import wait_for_hcaptcha
+
             return wait_for_hcaptcha(self, page, timeout_ms)
         elif challenge_type == "recaptcha":
             from wafer.browser._recaptcha import wait_for_recaptcha
+
             return wait_for_recaptcha(self, page, timeout_ms)
         else:
             return self._wait_for_generic(page, timeout_ms)
 
     def _wait_for_generic(self, page, timeout_ms: int) -> bool:
-        """Generic wait: network idle + extra time for JS execution."""
+        """Generic wait: bounded quiescence + extra time for JS execution."""
+        deadline = time.monotonic() + max(timeout_ms, 0) / 1000
         try:
-            page.wait_for_load_state(
-                "networkidle", timeout=timeout_ms
-            )
-            time.sleep(2)
-            return True
+            # "networkidle" must never be given the whole budget. Analytics
+            # beacons, websockets and long-polls mean it can never fire, and
+            # when it consumed everything the settle below was skipped and the
+            # solve reported failure on a page that had already cleared. Cap
+            # it at half the budget and always fall through: the settle is
+            # what actually lets the challenge JS finish.
+            idle_ms = int(max(0.0, deadline - time.monotonic()) * 1000 * 0.5)
+            if idle_ms > 0:
+                try:
+                    page.wait_for_load_state("networkidle", timeout=idle_ms)
+                except Exception:
+                    logger.debug(
+                        "Generic wait: network did not go idle within %dms",
+                        idle_ms,
+                    )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(2.0, remaining))
+            return time.monotonic() <= deadline
         except Exception:
             return False
 
@@ -1678,6 +2909,64 @@ class BrowserSolver:
         embedder_url: str,
         target_domain: str,
         timeout: float | None = None,
+    ) -> InterceptResult | None:
+        """Intercept iframe traffic within one end-to-end deadline."""
+
+        if not _valid_browser_url(embedder_url):
+            logger.warning("Refusing invalid iframe embedder navigation target")
+            return None
+        target_domain = target_domain.lstrip(".").rstrip(".").lower()
+        if (
+            not target_domain
+            or "/" in target_domain
+            or "\\" in target_domain
+            or any(char.isspace() for char in target_domain)
+        ):
+            logger.warning("Refusing invalid iframe target domain")
+            return None
+        if threading.get_ident() == self._worker_ident:
+            return self._intercept_iframe_on_worker(
+                embedder_url,
+                target_domain,
+                timeout,
+            )
+        intercept_timeout = self._solve_timeout if timeout is None else timeout
+        if intercept_timeout <= 0:
+            return None
+        deadline = time.monotonic() + intercept_timeout
+        future = self._submit_on_worker(
+            self._intercept_iframe_on_worker,
+            embedder_url,
+            target_domain,
+            intercept_timeout,
+            _deadline=deadline,
+        )
+        try:
+            return future.result(timeout=intercept_timeout)
+        except FutureTimeoutError:
+            # cancel() cannot stop an already-running task, and after a full
+            # intercept_timeout it is always running. Without recovery the
+            # stalled operation keeps the *serial* worker forever and every
+            # later solve on this solver blocks. Mirror solve()'s handling.
+            cancelled = future.cancel()
+            if not cancelled and not future.done():
+                self._recover_timed_out_worker(future)
+            logger.warning(
+                "Iframe intercept timed out after %.1fs "
+                "(target_domain=%s worker_continues=%s)",
+                intercept_timeout,
+                target_domain,
+                not cancelled and not future.done(),
+            )
+            return None
+
+    def _intercept_iframe_on_worker(
+        self,
+        embedder_url: str,
+        target_domain: str,
+        timeout: float | None = None,
+        *,
+        _deadline: float | None = None,
     ) -> InterceptResult | None:
         """Navigate to an embedder page and capture iframe traffic.
 
@@ -1696,27 +2985,35 @@ class BrowserSolver:
             InterceptResult with cookies and captured responses, or
             None on failure.
         """
+        if not _valid_browser_url(embedder_url):
+            logger.warning("Refusing invalid iframe embedder navigation target")
+            return None
         if timeout is None:
             timeout = self._solve_timeout
-        timeout_ms = int(timeout * 1000)
+        overall_deadline = (
+            _deadline if _deadline is not None else time.monotonic() + timeout
+        )
+        timeout = min(timeout, overall_deadline - time.monotonic())
+        if timeout <= 0:
+            return None
 
         # Bound lock acquisition so a concurrent solve() on the shared
         # solver can't block this intercept past its own timeout.
         if not self._lock.acquire(timeout=max(timeout, 0.0)):
             logger.warning(
-                "Iframe intercept skipped for %s: solver busy "
-                "(waited %.1fs)",
-                embedder_url,
+                "Iframe intercept skipped: solver busy (target_domain=%s waited=%.1fs)",
+                target_domain,
                 timeout,
             )
             return None
         try:
             try:
-                self._ensure_browser()
-            except Exception:
+                self._ensure_browser(overall_deadline)
+                self._probe_screenxy_patch()
+            except Exception as exc:
                 logger.warning(
-                    "Failed to launch browser for iframe intercept",
-                    exc_info=True,
+                    "Failed to launch browser for iframe intercept (%s)",
+                    type(exc).__name__,
                 )
                 return None
 
@@ -1727,9 +3024,8 @@ class BrowserSolver:
                 self._setup_headless_patches(page)
 
                 if self._browser_ua is None:
-                    self._browser_ua = page.evaluate(
-                        "navigator.userAgent"
-                    )
+                    self._browser_ua = page.evaluate("navigator.userAgent")
+                    self._publish_browser_identity()
 
                 captured: list[CapturedResponse] = []
 
@@ -1741,8 +3037,7 @@ class BrowserSolver:
 
                         host = urlparse(url).hostname or ""
                         if not (
-                            host == target_domain
-                            or host.endswith("." + target_domain)
+                            host == target_domain or host.endswith("." + target_domain)
                         ):
                             return
                         # Read body — may fail for redirects/empty
@@ -1770,34 +3065,50 @@ class BrowserSolver:
                 page.on("response", _on_response)
 
                 logger.info(
-                    "Iframe intercept: navigating to %s, "
-                    "capturing %s",
-                    embedder_url,
+                    "Iframe intercept: capturing target_domain=%s",
                     target_domain,
                 )
 
                 try:
+                    # Bounded for the same reason as the solve navigation: a
+                    # stalled embedder must not eat the budget the iframe
+                    # capture and cookie read still need.
                     page.goto(
                         embedder_url,
                         wait_until="domcontentloaded",
-                        timeout=timeout_ms,
+                        timeout=_navigation_budget_ms(overall_deadline),
                     )
-                except Exception:
+                except Exception as exc:
                     logger.debug(
-                        "Iframe intercept navigation timeout/error",
-                        exc_info=True,
+                        "Iframe intercept navigation timeout/error (%s)",
+                        type(exc).__name__,
                     )
 
-                # Wait for network to settle (iframes loading)
-                try:
-                    page.wait_for_load_state(
-                        "networkidle", timeout=timeout_ms
-                    )
-                except Exception:
-                    pass
+                # Wait for network to settle (iframes loading). Bounded to
+                # half the remaining budget: an embedder page that keeps a
+                # connection open never reaches "networkidle", and spending
+                # everything here left nothing for the settle and cookie read
+                # below, so the intercept returned None on a page that had
+                # loaded fine.
+                remaining_ms = int(
+                    max(0.0, overall_deadline - time.monotonic()) * 1000 * 0.5
+                )
+                if remaining_ms > 0:
+                    try:
+                        page.wait_for_load_state("networkidle", timeout=remaining_ms)
+                    except Exception:
+                        logger.debug(
+                            "Iframe intercept: network did not go idle within %dms",
+                            remaining_ms,
+                        )
 
                 # Brief extra settle for late JS
-                time.sleep(1)
+                remaining = overall_deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                time.sleep(min(1.0, remaining))
+                if time.monotonic() > overall_deadline:
+                    return None
 
                 # Extract cookies for target domain
                 all_cookies = context.cookies()
@@ -1805,16 +3116,19 @@ class BrowserSolver:
                     c
                     for c in all_cookies
                     if (
-                        c.get("domain", "").lstrip(".") == target_domain
-                        or c.get("domain", "").endswith("." + target_domain)
+                        c.get("domain", "").lstrip(".").rstrip(".").lower()
+                        == target_domain
+                        or c.get("domain", "")
+                        .rstrip(".")
+                        .lower()
+                        .endswith("." + target_domain)
                     )
                 ]
 
                 self._last_used = time.monotonic()
 
                 logger.info(
-                    "Iframe intercept captured %d responses, "
-                    "%d cookies from %s",
+                    "Iframe intercept captured %d responses, %d cookies from %s",
                     len(captured),
                     len(target_cookies),
                     target_domain,
@@ -1826,11 +3140,11 @@ class BrowserSolver:
                     user_agent=self._browser_ua or "",
                 )
 
-            except Exception:
+            except Exception as exc:
                 logger.warning(
-                    "Iframe intercept failed for %s",
-                    embedder_url,
-                    exc_info=True,
+                    "Iframe intercept failed (target_domain=%s error=%s)",
+                    target_domain,
+                    type(exc).__name__,
                 )
                 return None
             finally:
@@ -1849,6 +3163,7 @@ class BrowserSolver:
         timeout: float | None = None,
         embedder: str | None = None,
         replay: dict | None = None,
+        max_size: int | None = None,
     ) -> "SolveResult | None":
         """Async wrapper around :meth:`solve` - identical args and result.
 
@@ -1858,9 +3173,70 @@ class BrowserSolver:
         manually (``await solver.asolve(url)``) without blocking the loop.
         Pure dispatch - all solve logic lives in :meth:`solve`.
         """
-        return await asyncio.to_thread(
-            self.solve, url, challenge_type, timeout, embedder, replay
+        solve_timeout = self._solve_timeout if timeout is None else timeout
+        if solve_timeout <= 0:
+            return None
+        deadline = time.monotonic() + solve_timeout
+        solve_callable = self.solve
+        base_solve = (
+            getattr(solve_callable, "__func__", None) is BrowserSolver.solve
         )
+
+        def invoke_solve():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            if base_solve:
+                return self._solve_on_worker(
+                    url,
+                    challenge_type,
+                    solve_timeout,
+                    embedder,
+                    replay,
+                    max_size,
+                    _deadline=deadline,
+                )
+            args = (url, challenge_type, solve_timeout, embedder, replay)
+            from wafer._base import _callable_accepts_keyword
+
+            if max_size is None or not _callable_accepts_keyword(
+                solve_callable,
+                "max_size",
+            ):
+                return solve_callable(*args)
+            return solve_callable(*args, max_size=max_size)
+
+        future = self._submit_on_worker(invoke_solve)
+        try:
+            return await asyncio.wait_for(
+                asyncio.wrap_future(future),
+                timeout=solve_timeout,
+            )
+        except asyncio.CancelledError:
+            cancelled = future.cancel()
+            if not cancelled and not future.done():
+                self._recover_timed_out_worker(future)
+            logger.warning(
+                "Browser solve caller cancelled "
+                "(challenge_type=%s worker_continues=%s)",
+                challenge_type or "unknown",
+                not cancelled and not future.done(),
+            )
+            raise
+        except TimeoutError:
+            if time.monotonic() < deadline:
+                raise
+            cancelled = future.cancel()
+            if not cancelled and not future.done():
+                self._recover_timed_out_worker(future)
+            logger.warning(
+                "Browser solve timed out after %.1fs "
+                "(challenge_type=%s worker_continues=%s)",
+                solve_timeout,
+                challenge_type or "unknown",
+                not cancelled and not future.done(),
+            )
+            return None
 
     async def aintercept_iframe(
         self,
@@ -1873,27 +3249,124 @@ class BrowserSolver:
         Dispatches the blocking interception to a thread executor so it can
         be awaited from an event loop without blocking it. Pure dispatch.
         """
-        return await asyncio.to_thread(
-            self.intercept_iframe, embedder_url, target_domain, timeout
+        intercept_timeout = self._solve_timeout if timeout is None else timeout
+        if intercept_timeout <= 0:
+            return None
+        deadline = time.monotonic() + intercept_timeout
+        intercept_callable = self.intercept_iframe
+        base_intercept = (
+            getattr(intercept_callable, "__func__", None)
+            is BrowserSolver.intercept_iframe
         )
 
-    def close(self) -> None:
-        """Shut down browser and release resources."""
-        with self._lock:
-            self._close_browser()
-            logger.debug("BrowserSolver closed")
+        def invoke_intercept():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            if base_intercept:
+                return self._intercept_iframe_on_worker(
+                    embedder_url,
+                    target_domain,
+                    intercept_timeout,
+                    _deadline=deadline,
+                )
+            return intercept_callable(
+                embedder_url,
+                target_domain,
+                intercept_timeout,
+            )
+
+        future = self._submit_on_worker(invoke_intercept)
+        try:
+            return await asyncio.wait_for(
+                asyncio.wrap_future(future),
+                timeout=intercept_timeout,
+            )
+        except asyncio.CancelledError:
+            # Caller cancellation (a request deadline firing, an enclosing
+            # wait_for) leaves the submitted operation running on the serial
+            # worker. asolve() recovers here; without the same handling an
+            # intercept wedges every later solve on this solver.
+            cancelled = future.cancel()
+            if not cancelled and not future.done():
+                self._recover_timed_out_worker(future)
+            logger.warning(
+                "Iframe intercept caller cancelled "
+                "(target_domain=%s worker_continues=%s)",
+                target_domain,
+                not cancelled and not future.done(),
+            )
+            raise
+        except TimeoutError:
+            if time.monotonic() < deadline:
+                raise
+            cancelled = future.cancel()
+            if not cancelled and not future.done():
+                self._recover_timed_out_worker(future)
+            logger.warning(
+                "Iframe intercept timed out after %.1fs (target_domain=%s)",
+                intercept_timeout,
+                target_domain,
+            )
+            return None
+
+    def close(self, timeout: float | None = None) -> bool:
+        """Shut down the browser on its owning thread.
+
+        ``timeout`` bounds waiting when the worker is busy with a challenge.
+        In that case the queued close remains ordered behind the active task,
+        but the caller can continue its shutdown without waiting for an
+        uninterruptible browser operation.  The default preserves the prior
+        synchronous-close behavior for library callers.
+
+        Returns ``True`` when the close completed before the timeout.
+        """
+        if timeout is not None and timeout < 0:
+            raise ValueError("timeout must be non-negative or None")
+        if threading.get_ident() == self._worker_ident:
+            with self._executor_lock:
+                if self._executor_closed:
+                    return bool(self._close_future is None or self._close_future.done())
+                self._executor_closed = True
+            self._close_on_worker()
+            self._executor.shutdown(wait=False)
+            return True
+        with self._executor_lock:
+            future = self._close_future
+            if future is None:
+                if self._executor_closed:
+                    return True
+                future = self._executor.submit(self._close_on_worker)
+                self._close_future = future
+                self._executor_closed = True
+        try:
+            future.result(timeout=timeout)
+        except FutureTimeoutError:
+            # Do not cancel the close: it must run after the task which owns
+            # the browser.  ``wait=False`` makes this a bounded caller wait;
+            # Python will release the worker after that ordered close runs.
+            self._executor.shutdown(wait=False)
+            logger.warning(
+                "BrowserSolver close exceeded %.1fs; continuing shutdown",
+                timeout,
+            )
+            return False
+        self._executor.shutdown(wait=True)
+        return True
+
+    def _close_on_worker(self) -> None:
+        self._worker_ident = threading.get_ident()
+        try:
+            with self._lock:
+                self._close_browser()
+                logger.debug("BrowserSolver closed")
+        finally:
+            # Never let a recycled OS thread ID be mistaken for this closed
+            # solver's owning worker.
+            self._worker_ident = None
 
     def __enter__(self):
         return self
 
     def __exit__(self, *args):
         self.close()
-
-    def __del__(self):
-        # Attempt graceful close without lock (GC finalizer context).
-        # _close_browser uses try/except on every operation so this
-        # is safe even if the browser is mid-operation.
-        try:
-            self._close_browser()
-        except Exception:
-            pass

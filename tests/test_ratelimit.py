@@ -491,3 +491,32 @@ class TestAsyncSessionRetirement:
         with patch("wafer._async.asyncio.sleep", return_value=None):
             await session.get("https://example.com")
         assert called
+
+
+class TestRateLimitValidation:
+    """``rate_limit`` is a float where 0.0 disables it.
+
+    A caller reaching for ``None`` to mean "off" used to get a bare
+    ``TypeError`` from a comparison deep inside ``BaseSession.__init__``,
+    which named neither the parameter nor the expected type.
+    """
+
+    @pytest.mark.parametrize("value", [None, "1.0", True, [], object()])
+    def test_non_numeric_rate_limit_names_the_parameter(self, value):
+        from wafer import SyncSession
+
+        with pytest.raises(TypeError, match="rate_limit must be a number"):
+            SyncSession(rate_limit=value)
+
+    def test_negative_rate_limit_rejected(self):
+        from wafer import SyncSession
+
+        with pytest.raises(ValueError, match="rate_limit must be non-negative"):
+            SyncSession(rate_limit=-1)
+
+    @pytest.mark.parametrize("value", [0, 0.0, 2, 1.5])
+    def test_valid_rate_limits_accepted(self, value):
+        from wafer import SyncSession
+
+        session = SyncSession(rate_limit=value)
+        assert (session._rate_limiter is not None) is (value > 0)

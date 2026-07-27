@@ -2,26 +2,31 @@
 
 import contextlib
 import datetime
+import inspect
 import logging
 import platform
 import random
+import re
 import subprocess
 import time
-from urllib.parse import urlencode, urljoin, urlparse
+from html import unescape
+from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 
 from wreq import CertStore, Emulation, Method
 
 from wafer import _psl
-from wafer._cookies import CookieCache
+from wafer._cookies import CookieCache, _default_cookie_path
 from wafer._dart import DartIdentity
 from wafer._fingerprint import (
     ROTATION_LADDER,
     FingerprintManager,
     build_fingerprint_envelope,
+    chrome_version_from_ua,
     emulation_family,
     emulation_user_agent,
     family_headers,
 )
+from wafer._ios import IOSSafariIdentity
 from wafer._kasada import get_session as get_kasada_session  # noqa: F401
 from wafer._opera_mini import OperaMiniIdentity
 from wafer._profiles import Profile
@@ -29,6 +34,13 @@ from wafer._ratelimit import RateLimiter
 from wafer._safari import SafariIdentity
 
 logger = logging.getLogger("wafer")
+
+_IDENTITY_PROFILES = (
+    Profile.SAFARI,
+    Profile.IOS_SAFARI,
+    Profile.OPERA_MINI,
+    Profile.DART,
+)
 
 _METHOD_MAP: dict[str, Method] = {
     "GET": Method.GET,
@@ -40,6 +52,158 @@ _METHOD_MAP: dict[str, Method] = {
     "PATCH": Method.PATCH,
     "TRACE": Method.TRACE,
 }
+
+
+def _browser_solve_timeout(remaining: float) -> float:
+    """Reserve part of a request deadline for cookie replay after solving.
+
+    A browser result delivered at the exact request deadline is unusable: the
+    caller still has to inject its cookies and retry the protected HTTP
+    request. Keep ten percent, capped at five seconds, outside the solver.
+    """
+
+    if remaining <= 0:
+        return 0.0
+    replay_reserve = min(5.0, remaining * 0.1)
+    return max(0.0, remaining - replay_reserve)
+
+
+_MISSING = object()
+
+# Upper bound on remembered Set-Cookie host-only bits (see _record_cookie_scope).
+# Generous enough that ordinary sessions never evict.
+_MAX_COOKIE_SCOPES = 16384
+
+_TMD_PUNISH_SUFFIX = "/_____tmd_____/punish"
+
+
+def _tmd_is_punish_url(candidate: str | None) -> bool:
+    """Return whether a URL is itself an issued TMD punishment document.
+
+    wafer is normally handed the *application* URL whose response carries the
+    punishment redirect; only a caller that requested a punishment URL
+    directly supplies one here. Classification helpers must know which of the
+    two they hold, because an application URL never carries the issued
+    ``action`` and would otherwise be read as "not reCAPTCHA".
+    """
+
+    if not candidate:
+        return False
+    try:
+        path = urlparse(candidate).path
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(path, str) or not path.startswith("/"):
+        return False
+    return ("/" + path.lstrip("/")).rstrip("/").endswith(_TMD_PUNISH_SUFFIX)
+
+
+_TMD_PUNISH_IN_BODY_RE = re.compile(
+    r"""["'(]?((?:https?:)?//[^\s"'<>()]*)?(/_____tmd_____/punish\?[^\s"'<>()\\]*)""",
+)
+
+
+def _tmd_punish_url_from_body(body: str, base_url: str) -> str | None:
+    """Extract the issued TMD punishment URL carried by a response body.
+
+    MTop answers an API call with the punishment URL already bearing its
+    ``action`` (``captcharecaptcha`` for the Google reCAPTCHA flavour). A
+    plain page navigation only carries a bare redirect and MTop issues the
+    action later, inside the browser -- so this returns None there and the
+    caller keeps its conservative default.
+    """
+
+    if not body:
+        return None
+    match = _TMD_PUNISH_IN_BODY_RE.search(body)
+    if match is None:
+        return None
+    host, path = match.group(1), match.group(2)
+    candidate = f"{host}{path}" if host else path
+    try:
+        resolved = urljoin(base_url, unescape(candidate))
+    except (TypeError, ValueError):
+        return None
+    return resolved if _tmd_is_punish_url(resolved) else None
+
+
+def _tmd_is_recaptcha_challenge(challenge_url: str) -> bool:
+    """Return whether an immutable issued TMD URL selects reCAPTCHA."""
+
+    try:
+        action = parse_qs(
+            urlparse(challenge_url).query,
+            keep_blank_values=True,
+        ).get("action")
+    except (TypeError, ValueError):
+        return False
+    return action == ["captcharecaptcha"]
+
+
+def _tmd_browser_attempt_count(
+    remaining: float,
+    challenge_url: str = "",
+) -> int:
+    """Return how many useful TMD browser contexts fit in *remaining*.
+
+    Baxia punishment documents are disposable and benefit from fresh-context
+    trace retries. An issued reCAPTCHA challenge can require several image
+    rounds in one single-use document, so it must retain one long context.
+    """
+
+    if _tmd_is_recaptcha_challenge(challenge_url):
+        return 1
+    solve_budget = _tmd_browser_solve_timeout(remaining)
+    return min(3, max(1, int(solve_budget // 45.0)))
+
+
+def _browser_attempt_timeout(remaining: float, attempts_left: int) -> float:
+    """Partition solve time fairly while preserving the HTTP replay reserve."""
+
+    if attempts_left <= 0:
+        return 0.0
+    return _browser_solve_timeout(remaining) / attempts_left
+
+
+def _tmd_browser_solve_timeout(remaining: float) -> float:
+    """Reserve a useful native replay attempt after interactive TMD solving."""
+
+    if remaining <= 0:
+        return 0.0
+    replay_reserve = min(15.0, remaining * 0.25)
+    return max(0.0, remaining - replay_reserve)
+
+
+def _tmd_browser_attempt_timeout(remaining: float, attempts_left: int) -> float:
+    """Fairly partition TMD browser time with its larger replay reserve."""
+
+    if attempts_left <= 0:
+        return 0.0
+    return _tmd_browser_solve_timeout(remaining) / attempts_left
+
+
+def _callable_accepts_keyword(callable_obj, keyword: str) -> bool:
+    """Return whether a solver callable supports an optional protocol field.
+
+    Custom browser solvers predate newer BrowserSolver-only keywords. Inspect
+    their established callable contract instead of passing a new keyword and
+    turning a solvable challenge into a ``TypeError``. An uninspectable
+    callable gets the conservative legacy protocol.
+    """
+
+    try:
+        parameters = inspect.signature(callable_obj).parameters
+    except (TypeError, ValueError):
+        return False
+    parameter = parameters.get(keyword)
+    if parameter is not None and parameter.kind in {
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    }:
+        return True
+    return any(
+        item.kind is inspect.Parameter.VAR_KEYWORD for item in parameters.values()
+    )
 
 
 def _to_method(method: str) -> Method:
@@ -60,8 +224,7 @@ def _load_system_cert_store() -> CertStore | None:
                     "find-certificate",
                     "-a",
                     "-p",
-                    "/System/Library/Keychains/"
-                    "SystemRootCertificates.keychain",
+                    "/System/Library/Keychains/SystemRootCertificates.keychain",
                 ],
                 capture_output=True,
             )
@@ -87,9 +250,7 @@ def _load_system_cert_store() -> CertStore | None:
         except ImportError:
             pass
     except Exception:
-        logger.debug(
-            "Failed to load system certs", exc_info=True
-        )
+        logger.debug("Failed to load system certs", exc_info=True)
     return None
 
 
@@ -98,9 +259,7 @@ _SYSTEM_CERT_STORE = _load_system_cert_store()
 if _SYSTEM_CERT_STORE:
     logger.debug("Loaded system CA certificate store")
 else:
-    logger.debug(
-        "No system CA store found; using wreq defaults"
-    )
+    logger.debug("No system CA store found; using wreq defaults")
 
 # Default to newest Chrome emulation profile
 DEFAULT_EMULATION = Emulation.Chrome149
@@ -384,35 +543,34 @@ class BaseSession:
         # per-request ``max_response_size=`` overrides this session value.
         self.max_response_size = max_response_size
         self._om_identity = (
-            OperaMiniIdentity()
-            if profile is Profile.OPERA_MINI
-            else None
+            OperaMiniIdentity() if profile is Profile.OPERA_MINI else None
         )
         self._safari_locale = safari_locale
         self._safari_identity = (
-            SafariIdentity(locale=safari_locale)
-            if profile is Profile.SAFARI
+            SafariIdentity(locale=safari_locale) if profile is Profile.SAFARI else None
+        )
+        self._ios_safari_identity = (
+            IOSSafariIdentity(locale=safari_locale)
+            if profile is Profile.IOS_SAFARI
             else None
         )
-        self._dart_identity = (
-            DartIdentity()
-            if profile is Profile.DART
-            else None
-        )
+        self._dart_identity = DartIdentity() if profile is Profile.DART else None
 
         # Resolve the browser family of the chosen TLS Emulation so a
         # non-Chrome emulation (Firefox/Edge) gets a coherent HTTP header
         # envelope instead of Chrome's DEFAULT_HEADERS. Only meaningful for
-        # Emulation-based profiles (not Safari/Opera Mini/Dart, which carry
-        # their own identity headers).
+        # Emulation-based profiles (not Safari/iOS Safari/Opera Mini/Dart,
+        # which carry their own identity headers).
         self._emulation_family = (
             emulation_family(emulation or DEFAULT_EMULATION)
-            if profile not in (Profile.SAFARI, Profile.OPERA_MINI, Profile.DART)
+            if profile not in _IDENTITY_PROFILES
             else None
         )
 
         if headers is not None:
             self.headers = headers
+        elif self._ios_safari_identity is not None:
+            self.headers = self._ios_safari_identity.client_headers()
         elif self._safari_identity is not None:
             self.headers = self._safari_identity.client_headers()
         elif self._dart_identity is not None:
@@ -432,13 +590,17 @@ class BaseSession:
         # incoherent. When the user passed explicit headers=, the documented
         # full-replace contract wins (we keep their set across rotation so the
         # rotated request still reflects what they asked for). Identity
-        # profiles (Safari/Dart) carry their own headers, so None for them.
+        # profiles (Safari/iOS Safari/Dart) carry their own headers, so None.
         # Did the user pass explicit headers=? If so, the full-replace contract
         # means their set rides every rotated family (vs. swapping to each
         # family's navigation envelope). Tracked so _switch_to_emulation knows
         # whether _chrome_headers holds the user's set or just DEFAULT_HEADERS.
         self._user_headers = headers is not None
-        if self._safari_identity is not None or self._dart_identity is not None:
+        if (
+            self._safari_identity is not None
+            or self._ios_safari_identity is not None
+            or self._dart_identity is not None
+        ):
             self._chrome_headers = None
         elif headers is not None:
             self._chrome_headers = dict(headers)
@@ -450,18 +612,14 @@ class BaseSession:
             else DEFAULT_CONNECT_TIMEOUT
         )
         self.timeout = (
-            _normalize_timeout(timeout)
-            if timeout is not None
-            else DEFAULT_TIMEOUT
+            _normalize_timeout(timeout) if timeout is not None else DEFAULT_TIMEOUT
         )
         # Per-attempt cap: bounds each individual wreq attempt so the
         # retry/rotation machinery can fire within the total budget.
         # None (default) = no per-attempt cap (an attempt may use the
         # whole remaining budget, matching requests/httpx-naive usage).
         self.attempt_timeout = (
-            _normalize_timeout(attempt_timeout)
-            if attempt_timeout is not None
-            else None
+            _normalize_timeout(attempt_timeout) if attempt_timeout is not None else None
         )
         self.max_retries = max_retries
         self.max_rotations = max_rotations
@@ -469,22 +627,20 @@ class BaseSession:
         self.max_redirects = max_redirects
         self.max_failures = max_failures
 
-        if profile in (Profile.SAFARI, Profile.OPERA_MINI, Profile.DART):
-            # Safari/Dart use TlsOptions (not Emulation). Opera Mini
+        if profile in _IDENTITY_PROFILES:
+            # Safari/iOS Safari/Dart use TlsOptions. Opera Mini
             # bypasses wreq entirely. None need FingerprintManager.
             self._fingerprint = None
         else:
-            self._fingerprint = FingerprintManager(
-                emulation or DEFAULT_EMULATION
-            )
+            self._fingerprint = FingerprintManager(emulation or DEFAULT_EMULATION)
 
         # Opt-in fingerprint pool: a fixed list of Emulation identities to
         # rotate through on failure with per-identity backoff, INSTEAD of the
         # default cross-family ladder. When set, a failing identity rests
         # (its backoff multiplier grows) while the next pool member is tried,
         # and the session is NOT retired on N strikes (see _record_failure).
-        # Pools are Emulation-only (no Safari/Dart/Opera Mini); those profiles
-        # ignore the pool. Ignored entirely when None (default ladder applies).
+        # Pools are Emulation-only (no Safari/iOS Safari/Dart/Opera Mini);
+        # those profiles ignore the pool. Ignored entirely when None.
         self._fingerprint_pool = (
             list(fingerprint_pool)
             if fingerprint_pool and self._fingerprint is not None
@@ -496,7 +652,17 @@ class BaseSession:
         # failing rests longer before it is tried again (vs. a flat delay).
         self._pool_strikes: dict[str, int] = {}
 
-        # Per-domain rate limiter
+        # Per-domain rate limiter. Validate rather than let a wrong type fall
+        # into the comparison below as a bare TypeError from deep inside
+        # __init__: "disable this" reads as None to a caller, but the knob is
+        # a float where 0.0 is off.
+        if isinstance(rate_limit, bool) or not isinstance(rate_limit, (int, float)):
+            raise TypeError(
+                "rate_limit must be a number of seconds "
+                f"(0.0 disables it), got {type(rate_limit).__name__}"
+            )
+        if rate_limit < 0:
+            raise ValueError("rate_limit must be non-negative (0.0 disables it)")
         if rate_limit > 0:
             self._rate_limiter: RateLimiter | None = RateLimiter(
                 min_interval=rate_limit,
@@ -507,15 +673,23 @@ class BaseSession:
 
         # Session health: consecutive failure count per domain
         self._domain_failures: dict[str, int] = {}
-        self._tried_safari = profile in (Profile.SAFARI, Profile.DART)
+        self._tried_safari = profile in (
+            Profile.SAFARI,
+            Profile.IOS_SAFARI,
+            Profile.DART,
+        )
 
         # Cookie cache (disk persistence)
         if cache_dir is not None and profile is not Profile.OPERA_MINI:
-            self._cookie_cache: CookieCache | None = CookieCache(
-                cache_dir
-            )
+            self._cookie_cache: CookieCache | None = CookieCache(cache_dir)
         else:
             self._cookie_cache = None
+        # wreq's public Cookie objects do not expose whether a cookie was
+        # host-only (Set-Cookie omitted Domain). Keep that RFC scope bit while
+        # headers are still available so get_cookie() can safely support
+        # parent-domain cookies without leaking host-only cookies to siblings.
+        # Keyed by the RFC cookie identity (name, normalized domain, path).
+        self._cookie_scopes: dict[tuple[str, str, str], bool] = {}
 
         # Referer chain tracking: last URL fetched per domain
         self._last_url: dict[str, str] = {}
@@ -558,6 +732,17 @@ class BaseSession:
         # flag keeps the ownership invariant explicit and future-proof.
         self._browser_solver = browser_solver
         self._owns_solver = False
+        if profile is Profile.IOS_SAFARI and (
+            browser_solver is not None or solve_origin is not None
+        ):
+            raise ValueError(
+                "Browser solving is not supported with Profile.IOS_SAFARI: "
+                "wafer's solver is desktop Chromium, so replaying its cookies "
+                "would break the iOS Safari identity"
+            )
+        if browser_solver is not None:
+            self._align_browser_proxy(proxy)
+            self._align_preflight_browser_identity()
 
         # Per-session origin page for the AUTO-SOLVE browser path. When the
         # session's request URL is a JSON/XHR API that can't be top-navigated
@@ -648,8 +833,7 @@ class BaseSession:
             )
         elif embed_origin:
             logger.info(
-                "Session created in embed mode: origin=%s, "
-                "referers=%d, emulation=%s",
+                "Session created in embed mode: origin=%s, referers=%d, emulation=%s",
                 embed_origin,
                 len(self._embed_referers),
                 self._fingerprint.current,
@@ -659,6 +843,127 @@ class BaseSession:
                 "Session created with emulation=%s, timeout=%s",
                 self._fingerprint.current,
                 self.timeout,
+            )
+
+    def _align_browser_proxy(self, proxy: str | None) -> None:
+        """Require the HTTP and browser solve paths to use one egress.
+
+        WAF cookies are commonly bound to the source IP. Allowing the wreq
+        request through a proxy while Chrome connects directly (or vice versa)
+        both leaks the caller's direct IP and guarantees incoherent replay.
+        """
+
+        solver = self._browser_solver
+        configured = getattr(solver, "proxy_server", None)
+        matches = getattr(solver, "proxy_matches", None)
+
+        if proxy is None:
+            if configured is not None:
+                raise ValueError(
+                    "browser_solver uses a proxy but the session does not; "
+                    "configure the same proxy= on both paths"
+                )
+            return
+
+        if callable(matches) and matches(proxy):
+            return
+        if configured == proxy:
+            return
+        if configured is None:
+            configure = getattr(solver, "configure_proxy", None)
+            if callable(configure):
+                configure(proxy)
+                if callable(matches) and not matches(proxy):
+                    raise ValueError("browser_solver did not accept the session proxy")
+                return
+
+        raise ValueError(
+            "proxy= and browser_solver= must use the same proxy; the solver "
+            "must expose configure_proxy(proxy), or an identical proxy_server, "
+            "so browser solves cannot bypass the session proxy"
+        )
+
+    def _align_preflight_browser_identity(self) -> None:
+        """Pin transport identity to an already-preflighted Chrome instance.
+
+        A protected request can itself issue a challenge and bind that
+        challenge to UA/client hints.  Waiting until a later browser solve to
+        discover Chrome's version means the *first* request advertises wreq's
+        stale default instead.  BrowserSolver preflight records its real
+        headed identity, and this no-I/O accessor lets the initial wreq client
+        use the same UA and client hints from the start.
+
+        Browser challenge cookies are bound to the complete UA/client-hint
+        envelope. An explicit caller UA is valid only when it is exactly the
+        already-preflighted browser UA; otherwise reject the mixed transport
+        rather than replay browser state through a contradictory client.
+        """
+
+        identity = getattr(self._browser_solver, "browser_identity", None)
+        explicit_ua = next(
+            (
+                value
+                for key, value in self.headers.items()
+                if key.lower() == "user-agent"
+            ),
+            None,
+        )
+        if self._fingerprint is None:
+            return
+        if not isinstance(identity, tuple) or len(identity) != 2:
+            if explicit_ua is not None:
+                raise ValueError(
+                    "browser_solver with an explicit User-Agent requires "
+                    "a completed matching browser preflight"
+                )
+            return
+        user_agent, browser_version = identity
+        if not isinstance(user_agent, str) or not isinstance(browser_version, str):
+            return
+        if explicit_ua is not None and explicit_ua != user_agent:
+            raise ValueError(
+                "explicit User-Agent must exactly match the preflighted "
+                "browser_solver identity"
+            )
+        major_version = chrome_version_from_ua(user_agent)
+        if major_version is None:
+            logger.warning(
+                "Ignoring preflight browser identity with no Chrome UA version"
+            )
+            return
+
+        self._fingerprint.pin_to_browser(user_agent, major_version, browser_version)
+        logger.info(
+            "Pre-aligned transport identity to preflight Chrome %s",
+            major_version,
+        )
+
+    def _validate_browser_request_identity(
+        self, extra_headers: dict[str, str] | None
+    ) -> None:
+        """Reject a per-request UA that would split browser replay identity."""
+
+        if self._browser_solver is None or not extra_headers:
+            return
+        request_ua = next(
+            (
+                value
+                for key, value in extra_headers.items()
+                if key.lower() == "user-agent"
+            ),
+            None,
+        )
+        if request_ua is None:
+            return
+        identity = getattr(self._browser_solver, "browser_identity", None)
+        if (
+            not isinstance(identity, tuple)
+            or len(identity) != 2
+            or request_ua != identity[0]
+        ):
+            raise ValueError(
+                "per-request User-Agent must exactly match the preflighted "
+                "browser_solver identity"
             )
 
     @property
@@ -671,20 +976,31 @@ class BaseSession:
     def _serving_user_agent(self) -> str | None:
         """The User-Agent actually serving requests for this session.
 
-        Identity profiles (Safari/Dart/Opera Mini) carry their own UA in
-        self.headers; Emulation-based sessions get the UA from wreq, which
-        we reconstruct from the current Emulation.
+        Identity profiles (Safari/iOS Safari/Dart/Opera Mini) carry their own
+        UA in self.headers; Emulation-based sessions get the UA from wreq,
+        which we reconstruct from the current Emulation.
         """
+        # User-supplied headers fully replace an identity profile's defaults,
+        # so consult the actual header set before the identity object. This
+        # also handles ordinary Emulation sessions with an explicit UA.
+        for k, v in self.headers.items():
+            if k.lower() == "user-agent":
+                return v or None
+        if self._user_headers and self._fingerprint is None:
+            # An identity profile's UA lives only in the headers it installs,
+            # so a caller set that replaced them left no UA on the wire. An
+            # Emulation session is different: wreq still supplies the profile
+            # UA (DEFAULT_HEADERS never carried one), so fall through to it
+            # rather than reporting None for every headers= caller.
+            return None
+        if self._ios_safari_identity is not None:
+            return self._ios_safari_identity.user_agent
         if self._safari_identity is not None:
             return self._safari_identity.user_agent
         if self._dart_identity is not None:
             return self._dart_identity.user_agent
         if self._om_identity is not None:
             return self._om_identity.user_agent
-        # User-supplied headers override (e.g. headers={"User-Agent": ...})
-        for k, v in self.headers.items():
-            if k.lower() == "user-agent" and v:
-                return v
         if self._fingerprint is not None:
             # A browser solve pins the solving browser's exact UA (see
             # FingerprintManager.pin_to_browser); it's what's on the wire.
@@ -707,8 +1023,8 @@ class BaseSession:
         - ``family``: ``"chrome" | "edge" | "firefox" | "opera" |
           "safari" | "dart" | "opera_mini" | None``
         - ``emulation``: ``repr()`` of the Emulation, or the Profile name
-          for Safari/Dart/Opera Mini (e.g. ``"Profile.Chrome147"``,
-          ``"safari"``)
+          for Safari/iOS Safari/Dart/Opera Mini (e.g.
+          ``"Profile.Chrome147"``, ``"ios_safari"``)
         - ``sec_ch_ua`` / ``sec_ch_ua_mobile`` / ``sec_ch_ua_platform``:
           the low-entropy Client Hints. ``None`` for Firefox/Safari (no
           client hints) and for Opera (wreq's Emulation emits accurate
@@ -718,11 +1034,12 @@ class BaseSession:
         - ``user_agent_data``: the ``navigator.userAgentData`` shape Chromium
           exposes (``None`` for Firefox/Safari)
         - ``is_mobile``: ``True`` for a mobile wreq Emulation identity
-          (iOS/iPad Safari, Android Firefox); ``False`` otherwise. Mobile
-          identities still send no ``sec-ch-ua`` (no mobile Chromium profile
-          exists in wreq), so this is the only mobility signal.
+          (iOS/iPad Safari, Android Firefox) or ``Profile.IOS_SAFARI``;
+          ``False`` otherwise. Mobile identities still send no ``sec-ch-ua``
+          (no mobile Chromium profile exists in wreq), so this is the only
+          mobility signal.
 
-        For non-Emulation profiles (Safari/Dart/Opera Mini) only the
+        For non-Emulation profiles (Safari/iOS Safari/Dart/Opera Mini) only the
         ``user_agent``, ``family``, and ``emulation`` fields are populated;
         the Client-Hint fields are ``None`` (those identities send none).
         """
@@ -738,12 +1055,12 @@ class BaseSession:
                 ch_full_version=self._fingerprint.ch_full_version_override,
             )
             return env
-        # Non-Emulation identity profile (Safari / Dart / Opera Mini). Each
-        # is its own "family"; use the Profile value so it matches the
-        # `emulation` field (e.g. "dart", "opera_mini", "safari"). A default
-        # Chrome session that ROTATED to Safari has _safari_identity set but
-        # _profile is None -- still report "safari" for it.
-        if self._safari_identity is not None:
+        # Non-Emulation identity profile (Safari / iOS Safari / Dart /
+        # Opera Mini). Most are their own "family"; both Safari variants use
+        # the "safari" family. A default Chrome session that ROTATED to Safari
+        # has _safari_identity set but _profile is None -- still report
+        # "safari" for it.
+        if self._safari_identity is not None or self._ios_safari_identity is not None:
             family = "safari"
         elif self._profile is not None:
             family = self._profile.value
@@ -759,8 +1076,7 @@ class BaseSession:
             "full_version_list": None,
             "platform_version": None,
             "user_agent_data": None,
-            # Profile.SAFARI / DART / OPERA_MINI are all desktop identities.
-            "is_mobile": False,
+            "is_mobile": self._ios_safari_identity is not None,
         }
 
     def _serving_emulation_repr(self) -> str | None:
@@ -768,13 +1084,15 @@ class BaseSession:
 
         Stamped on every WaferResponse as ``resp.emulation`` so callers can
         diagnose which fingerprint served a 403/regression. For Emulation
-        sessions it's ``repr(Emulation.XxxNNN)``; for Safari/Dart/Opera Mini
-        it's the profile name. A default Chrome session that ROTATED onto
-        the ladder's Safari rung has _safari_identity set but _profile None
-        -- still report "safari" for it.
+        sessions it's ``repr(Emulation.XxxNNN)``; for Safari/iOS
+        Safari/Dart/Opera Mini it's the profile name. A default Chrome
+        session that ROTATED onto the ladder's Safari rung has
+        _safari_identity set but _profile None -- still report "safari".
         """
         if self._fingerprint is not None:
             return repr(self._fingerprint.current)
+        if self._ios_safari_identity is not None:
+            return Profile.IOS_SAFARI.value
         if self._safari_identity is not None:
             return Profile.SAFARI.value
         if self._profile is not None:
@@ -800,9 +1118,7 @@ class BaseSession:
             # the UA from the Emulation unless a User-Agent header is set, so
             # inject it here. A user-supplied UA (in self.headers) still wins.
             ua_override = self._fingerprint.ua_override
-            if ua_override and not any(
-                k.lower() == "user-agent" for k in headers
-            ):
+            if ua_override and not any(k.lower() == "user-agent" for k in headers):
                 headers["User-Agent"] = ua_override
             headers.update(self._fingerprint.sec_ch_ua_headers())
 
@@ -828,9 +1144,7 @@ class BaseSession:
             # jQuery Accept and the X-Requested-With marker (both at client
             # level to avoid HTTP/2 header duplication).
             if self._embed == "xhr-jquery":
-                headers["Accept"] = (
-                    "application/json, text/javascript, */*; q=0.01"
-                )
+                headers["Accept"] = "application/json, text/javascript, */*; q=0.01"
                 headers["X-Requested-With"] = "XMLHttpRequest"
             else:
                 headers["Accept"] = "*/*"
@@ -878,7 +1192,9 @@ class BaseSession:
         return "cross-site"
 
     def _build_headers(
-        self, url: str, extra: dict[str, str] | None = None,
+        self,
+        url: str,
+        extra: dict[str, str] | None = None,
         method: str = "GET",
     ) -> dict[str, str]:
         """Build per-request headers as a delta over client-level headers.
@@ -893,6 +1209,8 @@ class BaseSession:
         setting it to empty string in session headers or per-request
         overrides; empty-string values are stripped at the end.
         """
+        self._validate_browser_request_identity(extra)
+
         # Opera Mini / Dart: identity headers are already at client level
         # (set in _build_client_kwargs). Only return per-request
         # overrides -- returning the full identity here would duplicate
@@ -948,9 +1266,7 @@ class BaseSession:
             # Normal referer chain: auto-set from last URL on same domain
             if "Referer" not in merged and domain in self._last_url:
                 merged["Referer"] = self._last_url[domain]
-                logger.debug(
-                    "Auto-Referer: %s", self._last_url[domain]
-                )
+                logger.debug("Auto-Referer: %s", self._last_url[domain])
 
         # Kasada: CT+CD headers require x-kpsdk-h HMAC to be valid.
         # Without H, sending CT+CD causes server rejection (worse
@@ -962,19 +1278,37 @@ class BaseSession:
         #     merged["x-kpsdk-ct"] = kasada.ct
         #     merged["x-kpsdk-cd"] = generate_cd(kasada.st)
 
-        # Per-request overrides (last to win)
+        # Per-request overrides (last to win). Replace case-insensitively:
+        # HTTP header names are case-insensitive, so a caller passing
+        # ``accept`` against a merged ``Accept`` must REPLACE it. Letting both
+        # survive puts two Accept fields on the HTTP/2 wire, which strict WAFs
+        # read as non-browser behaviour.
         if extra:
-            merged.update(extra)
+            for key, value in extra.items():
+                folded = key.lower()
+                for existing in [k for k in merged if k.lower() == folded]:
+                    if existing != key:
+                        del merged[existing]
+                merged[key] = value
 
-        # Return only the delta: headers not already at client level,
-        # or with a different value (e.g. user per-request override).
+        # Return only the delta: headers not already at client level, or with
+        # a different value (e.g. user per-request override). The client-level
+        # comparison is also case-insensitive, so an override that differs
+        # only in casing is not re-sent alongside the client's own copy.
         # Strip empty-string values (suppression mechanism).
+        folded_client = {k.lower(): (k, v) for k, v in client_headers.items()}
         delta = {}
         for k, v in merged.items():
             if v == "":
                 continue
-            if k not in client_headers or client_headers[k] != v:
-                delta[k] = v
+            canonical, existing = folded_client.get(k.lower(), (k, _MISSING))
+            if existing is _MISSING or existing != v:
+                # Emit under the CLIENT's spelling when the header already
+                # exists there. wreq overrides a same-named per-request header
+                # but treats a differently-cased one as a separate field, so
+                # sending "accept" beside the client's "Accept" duplicates it
+                # on the HTTP/2 wire.
+                delta[canonical] = v
         return delta
 
     def _record_url(self, url: str) -> None:
@@ -1076,7 +1410,9 @@ class BaseSession:
             env = family_headers(family)
             self.headers = env if env is not None else dict(DEFAULT_HEADERS)
         logger.info(
-            "Rotation: switched to %s (family=%s)", emulation, family,
+            "Rotation: switched to %s (family=%s)",
+            emulation,
+            family,
         )
 
     def _advance_rotation(self, rotation_index: int) -> None:
@@ -1086,7 +1422,7 @@ class BaseSession:
         (so the first rotation is 1). Mutates the session's identity in place;
         the caller rebuilds the wreq client. A no-op for a pinned fingerprint
         (the caller guards that) and for ``profile=`` identity sessions
-        (Safari/Dart/Opera Mini), which keep their own coherent identity.
+        (Safari/iOS Safari/Dart/Opera Mini), which keep their coherent identity.
 
         Two modes:
 
@@ -1109,19 +1445,15 @@ class BaseSession:
             # reads the incoming identity's strike count).
             if self._fingerprint is not None:
                 cur_repr = repr(self._fingerprint.current)
-                self._pool_strikes[cur_repr] = (
-                    self._pool_strikes.get(cur_repr, 0) + 1
-                )
+                self._pool_strikes[cur_repr] = self._pool_strikes.get(cur_repr, 0) + 1
             self._pool_index += 1
-            em = self._fingerprint_pool[
-                self._pool_index % len(self._fingerprint_pool)
-            ]
+            em = self._fingerprint_pool[self._pool_index % len(self._fingerprint_pool)]
             self._switch_to_emulation(em)
             return
 
         # The cross-family ladder (Firefox/Safari/Edge rungs + version cycling)
         # is for Emulation-based (Chrome-family-capable) sessions only. A
-        # profile=Dart/Safari/Opera-Mini session carries its own coherent
+        # profile=Dart/Safari/iOS-Safari/Opera-Mini session carries its coherent
         # TLS+headers identity; swapping in a family envelope (or re-rolling
         # Safari's version) would produce an incoherent fingerprint (e.g. Dart
         # TLS + Safari headers). Key off self._profile, NOT _fingerprint: a
@@ -1130,9 +1462,7 @@ class BaseSession:
         # ladder (Safari -> Edge -> Chrome cycling), so it must NOT be bounced
         # out here. For profile= sessions rotation only refreshes the TLS
         # session / cookies (the caller's _rebuild_client); identity stays put.
-        if self._profile in (
-            Profile.SAFARI, Profile.OPERA_MINI, Profile.DART
-        ):
+        if self._profile in _IDENTITY_PROFILES:
             return
 
         # Default cross-family ladder. rotation_index 1 == fresh-session retry
@@ -1163,8 +1493,8 @@ class BaseSession:
             if target == "safari":
                 # Safari is a custom-TLS identity, not an Emulation. Restore
                 # the OLD guard semantics: only swap to Safari from a session
-                # that hasn't already tried it (profile= Safari/Dart sessions
-                # already returned above).
+                # that hasn't already tried it (profile= Safari/iOS
+                # Safari/Dart sessions already returned above).
                 if not self._tried_safari:
                     self._switch_to_safari()
                     return
@@ -1195,9 +1525,7 @@ class BaseSession:
                 dict(self._chrome_headers)
                 if self._user_headers and self._chrome_headers is not None
                 else (
-                    family_headers(
-                        emulation_family(self._fingerprint.current)
-                    )
+                    family_headers(emulation_family(self._fingerprint.current))
                     or dict(DEFAULT_HEADERS)
                 )
             )
@@ -1216,11 +1544,9 @@ class BaseSession:
         base = self._rate_limiter.min_interval if self._rate_limiter else 0.0
         penalty = 1.0
         if self._fingerprint_pool is not None and self._fingerprint is not None:
-            strikes = self._pool_strikes.get(
-                repr(self._fingerprint.current), 0
-            )
+            strikes = self._pool_strikes.get(repr(self._fingerprint.current), 0)
             if strikes:
-                penalty = min(1.0 * (2 ** strikes), 15.0)
+                penalty = min(1.0 * (2**strikes), 15.0)
         return base + penalty
 
     @staticmethod
@@ -1250,10 +1576,7 @@ class BaseSession:
             return
         normalized = (domain or "").rstrip(".").lower()
         domains = {domain}
-        if (
-            normalized == "reddit.com"
-            or normalized.endswith(".reddit.com")
-        ):
+        if normalized == "reddit.com" or normalized.endswith(".reddit.com"):
             domains.add("reddit.com")
             try:
                 for cached in self._cookie_cache.list_domains():
@@ -1308,10 +1631,7 @@ class BaseSession:
             drop.update(("content-type", "content-length"))
         if not drop:
             return extra_headers
-        filtered = {
-            k: v for k, v in extra_headers.items()
-            if k.lower() not in drop
-        }
+        filtered = {k: v for k, v in extra_headers.items() if k.lower() not in drop}
         if len(filtered) != len(extra_headers):
             logger.debug(
                 "Redirect: stripped headers %s",
@@ -1359,7 +1679,7 @@ class BaseSession:
         """Build kwargs for wreq Client construction.
 
         Not called for Opera Mini (which bypasses wreq entirely).
-        Safari uses TlsOptions + Http2Options (no Emulation).
+        Safari and iOS Safari use TlsOptions + Http2Options (no Emulation).
         Chrome uses Emulation (no TlsOptions).
 
         Also refreshes the cached _client_headers snapshot so that
@@ -1374,6 +1694,16 @@ class BaseSession:
             # injects an ALPN extension that breaks the fingerprint).
             kwargs = {
                 "tls_options": self._dart_identity.tls_options(),
+                "headers": dict(self._client_headers),
+                "connect_timeout": self.connect_timeout,
+                "timeout": self.timeout,
+                "cookie_store": True,
+            }
+        elif self._ios_safari_identity is not None:
+            # iOS Safari: custom mobile TLS + H2, no Emulation.
+            kwargs = {
+                "tls_options": self._ios_safari_identity.tls_options(),
+                "http2_options": self._ios_safari_identity.http2_options(),
                 "headers": dict(self._client_headers),
                 "connect_timeout": self.connect_timeout,
                 "timeout": self.timeout,
@@ -1467,11 +1797,17 @@ class BaseSession:
     def _native_tls_usable(self) -> bool:
         """Whether the native-TLS path can be used for this session.
 
+        The iOS Safari profile is a fixed mobile transport identity. Falling
+        back to system OpenSSL while retaining its iPhone UA would be
+        incoherent, so that profile always stays on its captured TLS stack.
+
         http.client can only CONNECT-tunnel an ``http://`` proxy. With a
         ``socks://``/``https://`` proxy the native transport would have to
         either leak the real IP or fail every attempt, so we skip it entirely
         and let the (proxy-aware) wreq path handle the challenge instead.
         """
+        if self._profile is Profile.IOS_SAFARI:
+            return False
         if not self._proxy_url:
             return True
         return urlparse(self._proxy_url).scheme == "http"
@@ -1530,7 +1866,7 @@ class BaseSession:
         """Pick a User-Agent for the native path.
 
         Prefer a caller-supplied UA, then the session identity's UA
-        (Safari/Dart set one in self.headers), then a host Chrome UA
+        (Safari/iOS Safari/Dart set one in self.headers), then a host Chrome UA
         derived from the current fingerprint version.
         """
         if extra_headers:
@@ -1575,9 +1911,7 @@ class BaseSession:
         headers = sanitize_headers(headers)
 
         body, content_type = self._extract_native_body(kwargs)
-        if content_type and not any(
-            k.lower() == "content-type" for k in headers
-        ):
+        if content_type and not any(k.lower() == "content-type" for k in headers):
             headers["Content-Type"] = content_type
         return headers, body
 
@@ -1619,9 +1953,9 @@ class BaseSession:
 
         content_type = headers.get("content-type", "")
         challenge_type = None
-        if not _is_binary_content_type(
+        if not _is_binary_content_type(content_type) and _is_challengeable_content_type(
             content_type
-        ) and _is_challengeable_content_type(content_type):
+        ):
             text = body_bytes.decode("utf-8", errors="replace")
             detected = detect_challenge(status, headers, text)
             challenge_type = detected.value if detected else None
@@ -1678,6 +2012,142 @@ class BaseSession:
             return False
         return host == domain or host.endswith("." + domain)
 
+    @staticmethod
+    def _cookie_path_matches(cookie_path: str | None, request_path: str) -> bool:
+        """Return RFC 6265 path-match for a stored cookie and request path."""
+
+        path = cookie_path or "/"
+        request_path = request_path if request_path.startswith("/") else "/"
+        if request_path == path:
+            return True
+        if not request_path.startswith(path):
+            return False
+        return path.endswith("/") or request_path[len(path) :].startswith("/")
+
+    def _record_cookie_scope(
+        self,
+        raw_set_cookie: str,
+        url: str,
+        *,
+        domain: str | None = None,
+        path: str | None = None,
+        host_only: bool | None = None,
+    ) -> None:
+        """Remember the host-only bit that wreq omits from Cookie objects."""
+
+        if not isinstance(raw_set_cookie, str):
+            return
+        first, *parts = raw_set_cookie.split(";")
+        name, separator, _value = first.strip().partition("=")
+        if not separator or not name:
+            return
+        attributes: dict[str, str] = {}
+        for part in parts:
+            key, has_value, value = part.strip().partition("=")
+            attributes[key.lower()] = value.strip() if has_value else ""
+
+        parsed = urlparse(url)
+        request_host = (parsed.hostname or "").lower().rstrip(".")
+        raw_domain = domain
+        if raw_domain is None:
+            raw_domain = attributes.get("domain")
+        normalized_domain = (raw_domain or request_host).lstrip(".").lower()
+        normalized_domain = normalized_domain.rstrip(".")
+        if not normalized_domain:
+            return
+
+        raw_path = path if path is not None else attributes.get("path")
+        normalized_path = raw_path or ""
+        if not normalized_path.startswith("/"):
+            normalized_path = _default_cookie_path(url)
+
+        if host_only is None:
+            host_only = domain is None and "domain" not in attributes
+        key = (name, normalized_domain, normalized_path)
+        # Refresh recency: re-assigning an existing dict key keeps its original
+        # insertion position, so without the pop a cookie that is rewritten on
+        # every response would still age out ahead of one-shot entries.
+        self._cookie_scopes.pop(key, None)
+        self._cookie_scopes[key] = bool(host_only)
+        # A session that walks many hosts would otherwise grow this map for
+        # its whole lifetime. Evict oldest-first; a dropped entry only costs
+        # get_cookie() its parent-domain lookup for that cookie.
+        while len(self._cookie_scopes) > _MAX_COOKIE_SCOPES:
+            self._cookie_scopes.pop(next(iter(self._cookie_scopes)), None)
+
+    def _record_response_cookie_scopes(self, url: str, resp) -> list[str]:
+        """Record Set-Cookie scope metadata and return the raw header values."""
+
+        try:
+            raw_cookies = list(resp.headers.get_all("set-cookie"))
+        except Exception:
+            logger.debug("Failed to inspect cookie scope for %s", url, exc_info=True)
+            return []
+        normalized = []
+        for raw in raw_cookies:
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8", errors="replace")
+            else:
+                raw = str(raw)
+            normalized.append(raw)
+            self._record_cookie_scope(raw, url)
+        return normalized
+
+    def _scoped_cookie_value(
+        self,
+        cookies,
+        name: str,
+        host: str,
+        request_path: str,
+        secure_ok: bool,
+        *,
+        native: bool,
+    ) -> str | None:
+        """Select the longest-path cookie that is valid for the target URL."""
+
+        candidates: list[tuple[int, bool, int, str]] = []
+        for cookie in cookies:
+            if cookie.name != name or (not secure_ok and cookie.secure):
+                continue
+            domain = (cookie.domain or "").lstrip(".").lower().rstrip(".")
+            path = cookie.path or "/"
+            if not self._cookie_path_matches(path, request_path):
+                continue
+
+            if native:
+                host_only = not bool(getattr(cookie, "domain_specified", False))
+            else:
+                host_only = self._cookie_scopes.get((cookie.name, domain, path))
+                # Unknown scope is safe on the exact host, but must never be
+                # promoted to a sibling/child host as a Domain cookie.
+                if host_only is None and host != domain:
+                    # Logged because the caller just gets None: without this a
+                    # parent-domain cookie that was never observed via
+                    # Set-Cookie (or whose scope aged out) is indistinguishable
+                    # from one that does not exist.
+                    logger.debug(
+                        "Cookie %r on %s skipped: no recorded scope for domain "
+                        "%s path %s, cannot prove it is not host-only",
+                        name,
+                        host,
+                        domain,
+                        path,
+                    )
+                    continue
+
+            if host_only:
+                applies = host == domain
+            else:
+                applies = self._cookie_applies_to_host(domain, host)
+            if applies:
+                candidates.append(
+                    (len(path), host == domain, len(domain), cookie.value)
+                )
+
+        if not candidates:
+            return None
+        return max(candidates, key=lambda item: item[:3])[3]
+
     def get_cookie(self, name: str, url: str) -> str | None:
         """Read a cookie value from the session's cookie jar(s).
 
@@ -1696,54 +2166,84 @@ class BaseSession:
         host) on this read-only path. Expand ``_psl._MULTI_LABEL_SUFFIXES``
         to close a specific gap.
         """
-        host = urlparse(url).hostname or ""
+        parsed_url = urlparse(url)
+        host = (parsed_url.hostname or "").lower().rstrip(".")
+        request_path = parsed_url.path or "/"
         # Secure cookies must not be exposed to non-https origins
         # (wreq's Jar.get does not enforce this itself).
-        secure_ok = urlparse(url).scheme == "https"
+        secure_ok = parsed_url.scheme == "https"
         client = getattr(self, "_client", None)
         if client is not None:
             jar = getattr(client, "cookie_jar", None)
             if jar is not None:
                 try:
-                    cookie = jar.get(name, url)
-                    if cookie is not None and (
-                        secure_ok or not cookie.secure
-                    ):
-                        return cookie.value
-                    # Jar.get() matches the host exactly; if it found
-                    # nothing, scan for parent-domain cookies
-                    # (Domain=.example.com). Don't scan after a Secure
-                    # rejection -- a less-specific match must not win.
-                    if cookie is None:
-                        for c in jar.get_all():
-                            if (
-                                c.name == name
-                                and (secure_ok or not c.secure)
-                                and self._cookie_applies_to_host(
-                                    c.domain, host
-                                )
-                            ):
-                                return c.value
-                except Exception:
-                    logger.debug(
-                        "Cookie jar read failed for %r", name, exc_info=True
+                    # wreq's Jar.get() only matches an exact stored path, and
+                    # alternate jar implementations may parent-match without
+                    # retaining the host-only bit. Resolve from all entries
+                    # using the scope metadata captured from Set-Cookie.
+                    value = self._scoped_cookie_value(
+                        jar.get_all(),
+                        name,
+                        host,
+                        request_path,
+                        secure_ok,
+                        native=False,
                     )
+                    if value is not None:
+                        return value
+                except Exception:
+                    logger.debug("Cookie jar read failed for %r", name, exc_info=True)
         # Native-TLS jar (Imperva OpenSSL bypass): http.cookiejar.CookieJar
         if self._native_tls is not None:
-            for c in self._native_tls._jar:
-                if (
-                    c.name == name
-                    and (secure_ok or not c.secure)
-                    and self._cookie_applies_to_host(c.domain, host)
-                ):
-                    return c.value
+            value = self._scoped_cookie_value(
+                self._native_tls._jar,
+                name,
+                host,
+                request_path,
+                secure_ok,
+                native=True,
+            )
+            if value is not None:
+                return value
         # Opera Mini urllib jar: http.cookiejar.CookieJar
         if self._om_identity is not None:
-            for c in self._om_identity._cookie_jar:
-                if (
-                    c.name == name
-                    and (secure_ok or not c.secure)
-                    and self._cookie_applies_to_host(c.domain, host)
-                ):
-                    return c.value
+            value = self._scoped_cookie_value(
+                self._om_identity._cookie_jar,
+                name,
+                host,
+                request_path,
+                secure_ok,
+                native=True,
+            )
+            if value is not None:
+                return value
         return None
+
+    def cookie_scope_summary(self, url: str) -> list[dict[str, object]]:
+        """Return bounded, value-free wreq cookie scope diagnostics.
+
+        This is deliberately an inspection API: it never exposes cookie
+        values and is intended for opt-in protected-flow diagnostics.
+        """
+        client = getattr(self, "_client", None)
+        jar = getattr(client, "cookie_jar", None) if client is not None else None
+        if jar is None:
+            return []
+        try:
+            cookies = jar.get_all()
+        except Exception:
+            return []
+        summary = []
+        for cookie in cookies[:32]:
+            try:
+                summary.append(
+                    {
+                        "name": str(cookie.name),
+                        "domain": str(cookie.domain),
+                        "path": str(cookie.path),
+                        "secure": bool(cookie.secure),
+                    }
+                )
+            except Exception:
+                continue
+        return summary

@@ -14,7 +14,7 @@ Only "s" is loaded at runtime. Both are Apache 2.0 licensed via [timm](https://g
 ## Requirements
 
 - Python 3.10+
-- Apple Silicon Mac (MPS) or NVIDIA GPU (CUDA)
+- Apple Silicon Mac with MPS
 - ~2 GB disk for dataset, ~1 GB for training runs
 
 ## Data Collection
@@ -60,16 +60,20 @@ training/recaptcha/
 
 ```bash
 cd training/recaptcha
-pip install -r requirements.txt
+uv venv
+uv pip install -r requirements.txt
 
 # 1. Train (s ~4-6 hr on M4, x ~6-8 hr)
-nohup python train_mps.py --sizes s,x --epochs 30 > train.log 2>&1 &
+nohup uv run --python .venv/bin/python --no-project python train_mps.py \
+  --sizes s,x --epochs 30 > train.log 2>&1 &
 
 # 2. Export to ONNX
-python export.py --cls-model runs/cls_s/weights/best.pth.tar --size s
+uv run --python .venv/bin/python --no-project python export.py \
+  --cls-model runs/cls_s/weights/best.pth.tar --size s
 
 # 3. Deliver ONNX files to wafer
-python export.py --cls-model runs/cls_s/weights/best.pth.tar --size s --deliver
+uv run --python .venv/bin/python --no-project python export.py \
+  --cls-model runs/cls_s/weights/best.pth.tar --size s --deliver
 ```
 
 To retrain with our collected data, dedup first then point at both data sources:
@@ -98,7 +102,30 @@ python train_mps.py --help
 --lr      Learning rate (default: 1e-3)
 --data    Dataset path (default: datasets/wafer_cls_classic)
 --patience Early stopping patience (default: 10)
+--seed    Base RNG seed; each size derives an order-independent seed
+--resume  Explicit checkpoint path; requires exactly one --sizes value
+--defer-heldout Select by validation and stop before held-out evaluation
 ```
+
+Checkpoints are atomically replaced and contain model, optimizer, scheduler,
+early-stopping history, exact run configuration, and all RNG states. Resume
+fails closed if the checkpoint is missing, incomplete, from a different
+manifest/configuration, already complete, or missing its matching
+immutable `best-epoch-<epoch>-<digest>.pth.tar` artifact. `best.pth.tar`
+remains the convenient canonical export path; `last.pth.tar` is durably
+updated after every completed epoch.
+
+The regression suite proves bit-for-bit interrupted/resumed equivalence on a
+small CPU training pipeline. The MPS trainer restores every controllable RNG
+and training state and enables PyTorch's deterministic-algorithm guard, but
+PyTorch does not guarantee bitwise-identical floating-point results for every
+MPS kernel or release. A resumed MPS run is state-equivalent; backend-level
+rounding remains outside the checkpoint format's guarantee.
+
+For release-candidate training, pass `--defer-heldout`. This freezes the
+validation-selected immutable checkpoint for review without running inference
+on held-out tiles. Evaluate held-out data only after that checkpoint passes
+review; it must never influence candidate selection.
 
 ## Export Options
 

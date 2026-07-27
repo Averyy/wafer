@@ -12,6 +12,7 @@ from wafer._fingerprint import (
     CHROME_PROFILES,
     FingerprintManager,
     build_fingerprint_envelope,
+    chrome_full_version,
     chrome_version,
     emulation_family,
     emulation_is_mobile,
@@ -104,6 +105,12 @@ class TestChromeVersion:
 
     def test_non_chrome_returns_none(self):
         assert chrome_version(Emulation.Firefox133) is None
+
+    def test_full_version_matches_transport_client_hints(self):
+        assert chrome_full_version(Emulation.Chrome149) == "149.0.7827.201"
+
+    def test_full_version_rejects_non_chrome(self):
+        assert chrome_full_version(Emulation.Firefox133) is None
 
 
 class TestChromeProfiles:

@@ -11,6 +11,7 @@ Passed to `chromium.launch(args=[...])`.
 | `--disable-blink-features=AutomationControlled` | Makes `navigator.webdriver` return `false` via native getter. | Both |
 | `--enable-gpu` | Forces real GPU. Without it, WebGL exposes `"SwiftShader"` as renderer. | Both |
 | `--use-gl=angle` | Uses ANGLE for GPU rendering (pairs with `--enable-gpu`). | Both |
+| `--use-angle=gl` + `--ignore-gpu-blocklist` | On Linux/Xvfb, selects Mesa OpenGL explicitly; automatic ANGLE selection can yield `gl=none` and remove WebGL. | Linux |
 | `--use-angle=metal` | Selects Metal backend on macOS. Only on `sys.platform == "darwin"`. | Both (macOS) |
 | `--disable-site-isolation-trials` | Forces all frames into one process so CDP scripts reach cross-origin iframes (e.g. DataDome's `geo.captcha-delivery.com`). | Both |
 | `--disable-features=IsolateOrigins,site-per-process` | Companion to site isolation disable. | Both |

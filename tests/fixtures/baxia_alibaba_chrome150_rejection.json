@@ -1,0 +1,76 @@
+{
+  "source": "sanitized live Alibaba Baxia diagnostic, 2026-07-27",
+  "browser": {
+    "major": 150,
+    "transport_emulation_major": 149,
+    "inner_width": 945,
+    "inner_height": 948,
+    "device_pixel_ratio": 1
+  },
+  "before": {
+    "elementCount": 95,
+    "shadowRootCount": 0,
+    "iframeCount": 0,
+    "canvasCount": 1,
+    "svgCount": 1,
+    "handle": {
+      "x": 325,
+      "y": 544,
+      "width": 42,
+      "height": 30
+    },
+    "trackWidth": 300,
+    "exact_candidates": {
+      "handle": {
+        "idHash": "1c9e61d8",
+        "classHash": "36061e11"
+      },
+      "fill": {
+        "idHash": "0789dc9f",
+        "classHash": "56cab724"
+      },
+      "track": {
+        "idHash": "1a9e5eb2",
+        "classHash": "a8ffdfe3"
+      }
+    }
+  },
+  "event_contract": {
+    "counts": {
+      "pointerdown": 1,
+      "pointermove": 260,
+      "pointerup": 1,
+      "mousedown": 1,
+      "mousemove": 260,
+      "mouseup": 1
+    },
+    "pointerDown": {
+      "x": 346,
+      "y": 559,
+      "buttons": 1,
+      "trusted": true
+    },
+    "pointerUp": {
+      "x": 604,
+      "y": 562,
+      "buttons": 0,
+      "trusted": true
+    },
+    "maxHandleLeft": 258,
+    "maxFillWidth": 279
+  },
+  "rejection": {
+    "state": "rejected",
+    "category": "sdk_error_code",
+    "code": "gddtf",
+    "elementCount": 92,
+    "handlePresent": false
+  },
+  "transport": {
+    "expectedCallback": false,
+    "atExpectedCallback": false,
+    "clearanceBefore": 0,
+    "clearanceAfter": 0,
+    "newClearance": false
+  }
+}

@@ -95,8 +95,11 @@ python train_mps.py --sizes s,x --epochs 30 --batch 64 --lr 1e-3
 
 - ImageNet-pretrained backbone, fine-tuned with AdamW + cosine annealing
 - Augmentation: RandomResizedCrop, HorizontalFlip, ColorJitter
-- Early stopping (patience=10), auto-resume from checkpoint
-- Outputs: `runs/cls_{s,x}/weights/best.pth.tar` + `results.json`
+- Early stopping (patience=10)
+- Explicit single-size `--resume` with complete optimizer/scheduler/history/RNG
+  state; mismatched or incomplete checkpoints fail closed
+- Crash-durable per-epoch `last.pth.tar`, digest-bound immutable best artifacts,
+  canonical `best.pth.tar`, and atomic `results.json`
 
 **ONNX export**: `export.py`
 

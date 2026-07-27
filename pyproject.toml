@@ -47,6 +47,24 @@ fallback-version = "0.0.0"
 [tool.hatch.build.targets.wheel]
 packages = ["wafer"]
 
+[tool.hatch.build.targets.sdist]
+include = [
+    "/wafer",
+    "/tests",
+    "/docs",
+    "/README.md",
+    "/LICENSE",
+    "/llms.txt",
+    "/pyproject.toml",
+    "/uv.lock",
+    "/training/recaptcha/classes.py",
+    "/training/recaptcha/dataset_manifest.py",
+    "/training/recaptcha/durable_io.py",
+    "/training/recaptcha/export.py",
+    "/training/recaptcha/train_mps.py",
+    "/training/recaptcha/training_contract.py",
+]
+
 [tool.hatch.build]
 exclude = [".DS_Store", "**/.DS_Store", "**/.gitkeep"]
 

@@ -395,28 +395,33 @@ class TestSessionTimeoutIsTotalBudget:
         the DEADLINE -- not the retry count -- ends the loop, reporting the
         total. Real sleeps consume the real budget (a class-level time.sleep
         patch would no-op them); only calculate_backoff is neutralized so the
-        inter-attempt backoff doesn't swallow the whole 0.1s in one gulp and
-        the multiple attempts stay observable."""
+        inter-attempt backoff doesn't swallow the whole budget in one gulp and
+        the multiple attempts stay observable.
+
+        The budget is deliberately ~25x the attempt cap rather than ~5x: the
+        sleeps are real, so per-attempt interpreter overhead is charged
+        against the same budget. At 5x, a loaded CI box spends the whole
+        budget on 1-2 attempts and the >=3 assertion flakes."""
         session, _ = make_sync_session(
             [ok()], attempt_timeout=0.02, max_retries=50, max_rotations=0
         )
-        session.timeout = datetime.timedelta(seconds=0.1)
+        session.timeout = datetime.timedelta(seconds=0.5)
         client = BudgetEatingClient()
         session._client = client
         with patch("wafer._sync.calculate_backoff", lambda *a, **k: 0.0):
             with pytest.raises(WaferTimeout) as exc_info:
                 session.get(URL)
-        # ~5 bounded 0.02s attempts fit in the 0.1s budget; far under the 50
-        # retries, proving the deadline (not exhaustion) ended the loop.
+        # ~25 bounded 0.02s attempts fit in the 0.5s budget; still under the
+        # 50 retries, proving the deadline (not exhaustion) ended the loop.
         assert client.request_count >= 3
         assert client.request_count < 50
-        assert exc_info.value.timeout_secs == pytest.approx(0.1)
+        assert exc_info.value.timeout_secs == pytest.approx(0.5)
 
     async def test_session_timeout_caps_total_across_retries_async(self):
         session, _ = make_async_session(
             [ok()], attempt_timeout=0.02, max_retries=50, max_rotations=0
         )
-        session.timeout = datetime.timedelta(seconds=0.1)
+        session.timeout = datetime.timedelta(seconds=0.5)
         client = AsyncBudgetEatingClient()
         session._client = client
         with patch("wafer._async.calculate_backoff", lambda *a, **k: 0.0):
@@ -424,7 +429,7 @@ class TestSessionTimeoutIsTotalBudget:
                 await session.get(URL)
         assert client.request_count >= 3
         assert client.request_count < 50
-        assert exc_info.value.timeout_secs == pytest.approx(0.1)
+        assert exc_info.value.timeout_secs == pytest.approx(0.5)
 
 
 class TestConstructorNormalization:

@@ -4,11 +4,16 @@ on:
   push:
     tags: ["v*"]
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+        with:
+          persist-credentials: false
 
       - name: Install uv
         uses: astral-sh/setup-uv@eac588ad8def6316056a12d4907a9d4d84ff7a3b  # v7.3.0
@@ -17,7 +22,9 @@ jobs:
         run: uv python install 3.12
 
       - name: Install dependencies
-        run: uv venv && uv pip install ".[dev,browser]"
+        run: |
+          uv venv
+          uv pip install ".[dev,browser]"
 
       - name: Lint
         run: uv run ruff check wafer/ tests/
@@ -25,16 +32,22 @@ jobs:
       - name: Test
         run: uv run pytest tests/ -x -q
 
+      # The reCAPTCHA training contracts need torch/torchvision/timm (~1 GB).
+      # They run in training.yml on push/PR instead, so a tag push is never
+      # blocked by a heavy install unrelated to the published package.
+
   publish:
     needs: test
     runs-on: ubuntu-latest
     permissions:
+      contents: read
       id-token: write  # trusted publishing (no API token needed)
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
         with:
           fetch-depth: 0
           fetch-tags: true
+          persist-credentials: false
 
       - name: Install uv
         uses: astral-sh/setup-uv@eac588ad8def6316056a12d4907a9d4d84ff7a3b  # v7.3.0
@@ -45,5 +58,20 @@ jobs:
       - name: Build
         run: uv build
 
+      - name: Verify built wheel
+        run: |
+          uv venv /tmp/wafer-wheel-test
+          uv pip install --python /tmp/wafer-wheel-test/bin/python dist/*.whl
+          /tmp/wafer-wheel-test/bin/python - <<'PY'
+          import os
+          import wafer
+
+          expected = os.environ["GITHUB_REF_NAME"].removeprefix("v")
+          if wafer.__version__ != expected:
+              raise SystemExit(
+                  f"wheel version {wafer.__version__!r} != tag {expected!r}"
+              )
+          PY
+
       - name: Publish
-        uses: pypa/gh-action-pypi-publish@v1.13.0
+        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e  # v1.13.0

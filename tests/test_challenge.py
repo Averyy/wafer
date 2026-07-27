@@ -1,6 +1,9 @@
 """Tests for challenge detection."""
 
+import pytest
+
 from wafer._challenge import ChallengeType, detect_challenge
+from wafer._solvers import is_reddit_verification
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -642,6 +645,83 @@ class TestReddit:
     def test_reddit_gate_requires_block_copy(self):
         body = "<body class=theme-beta><main>Normal page</main></body>"
         assert detect_challenge(403, {}, body) is None
+
+    def test_reddit_200_verification_document(self):
+        body = """
+        <html>
+          <head><title>Reddit - Please wait for verification</title></head>
+          <body>
+            <form action="/r/homelab/" method="GET">
+              <input type="hidden" name="solution" value="">
+              <input type="hidden" name="js_challenge" value="1">
+              <input type="hidden" name="token"
+                     value="abcdefghijklmnopqrstuvwxyz012345">
+              <input type="hidden" name="jsc_orig_r" value="">
+            </form>
+            <script>
+              document.addEventListener("DOMContentLoaded", async () => {
+                var e = document.forms[0],
+                  n = await(async e=>e+e)('AbC123xYz987LmNo');
+                e.elements.namedItem("solution").value = n;
+                e.requestSubmit();
+              });
+            </script>
+          </body>
+        </html>
+        """
+
+        assert detect_challenge(200, {}, body) == ChallengeType.REDDIT
+
+    def test_reddit_200_title_without_valid_form_is_not_a_gate(self):
+        body = (
+            "<html><title>Reddit - Please wait for verification</title>"
+            "<body>ordinary content</body></html>"
+        )
+
+        assert detect_challenge(200, {}, body) is None
+
+    @pytest.mark.parametrize(
+        "pad,detected",
+        [
+            (0, True),
+            (3_000, True),
+            (4_200, False),
+        ],
+    )
+    def test_reddit_200_title_is_matched_on_a_bounded_prefix(self, pad, detected):
+        """The title probe reads a 4KB prefix, not the whole body.
+
+        This branch runs on every successful 200 that reaches it, so
+        lowercasing a multi-megabyte page to find a <title> would be pure
+        waste. The bound is safe with a wide margin: on a real captured
+        Reddit verification page (8,424 bytes) the title sits at offset
+        **291**. A title pushed past the window is deliberately not detected
+        -- if Reddit ever restructures that far, raise the bound here.
+        """
+        form = (
+            '<form action="/r/homelab/" method="GET">'
+            '<input type="hidden" name="solution" value="">'
+            '<input type="hidden" name="js_challenge" value="1">'
+            '<input type="hidden" name="token" '
+            'value="abcdefghijklmnopqrstuvwxyz012345">'
+            '<input type="hidden" name="jsc_orig_r" value="">'
+            "</form>"
+            "<script>document.addEventListener('DOMContentLoaded', async () => {"
+            "var e = document.forms[0],"
+            "n = await(async e=>e+e)('AbC123xYz987LmNo');"
+            'e.elements.namedItem("solution").value = n;'
+            "e.requestSubmit();});</script>"
+        )
+        body = (
+            "<html><!--" + ("x" * pad) + "-->"
+            "<head><title>Reddit - Please wait for verification</title></head>"
+            "<body>" + form + "</body></html>"
+        )
+        # The form itself stays parseable either way; only the prefix probe moves.
+        assert is_reddit_verification(body) is True
+
+        expected = ChallengeType.REDDIT if detected else None
+        assert detect_challenge(200, {}, body) is expected
 
 # ---------------------------------------------------------------------------
 # Amazon

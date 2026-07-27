@@ -9,6 +9,8 @@ import asyncio
 import threading
 import time
 
+import pytest
+
 from wafer.browser._solver import BrowserSolver, InterceptResult, SolveResult
 
 
@@ -83,6 +85,98 @@ def test_asolve_forwards_all_args():
     )
 
 
+def test_asolve_omits_max_size_for_legacy_solve_override():
+    solver = _RecordingSolver()
+
+    result = asyncio.run(
+        solver.asolve(
+            "https://x.test",
+            "tmd",
+            timeout=1.0,
+            max_size=123,
+        )
+    )
+
+    assert isinstance(result, SolveResult)
+    assert solver.solve_calls[-1] == (
+        "https://x.test",
+        "tmd",
+        1.0,
+        None,
+        None,
+    )
+
+
+def test_asolve_forwards_max_size_to_compatible_solve_override():
+    class _SizeAwareSolver(_RecordingSolver):
+        def __init__(self):
+            super().__init__()
+            self.max_sizes = []
+
+        def solve(
+            self,
+            url,
+            challenge_type=None,
+            timeout=None,
+            embedder=None,
+            replay=None,
+            *,
+            max_size=None,
+        ):
+            self.max_sizes.append(max_size)
+            return super().solve(
+                url,
+                challenge_type,
+                timeout,
+                embedder,
+                replay,
+            )
+
+    solver = _SizeAwareSolver()
+
+    result = asyncio.run(
+        solver.asolve(
+            "https://x.test",
+            "tmd",
+            timeout=1.0,
+            max_size=123,
+        )
+    )
+
+    assert isinstance(result, SolveResult)
+    assert solver.max_sizes == [123]
+
+
+@pytest.mark.parametrize("max_size", [None, 123])
+def test_asolve_honors_instance_solve_override(max_size):
+    solver = BrowserSolver()
+    calls = []
+
+    def solve_override(*args, **kwargs):
+        calls.append((args, kwargs))
+        return "instance-result"
+
+    solver.solve = solve_override
+    solver._solve_on_worker = lambda *_args, **_kwargs: "base-result"
+
+    result = asyncio.run(
+        solver.asolve(
+            "https://x.test",
+            "tmd",
+            timeout=1.0,
+            max_size=max_size,
+        )
+    )
+
+    assert result == "instance-result"
+    assert calls == [
+        (
+            ("https://x.test", "tmd", 1.0, None, None),
+            {} if max_size is None else {"max_size": max_size},
+        )
+    ]
+
+
 def test_asolve_runs_in_a_worker_thread():
     solver = _RecordingSolver()
 
@@ -147,3 +241,67 @@ def test_aintercept_iframe_forwards_args_and_threads():
         9.0,
     )
     assert solver.intercept_thread is not main_thread
+
+
+def test_aintercept_iframe_recovers_worker_on_caller_cancellation():
+    """Caller cancellation must release the serial worker.
+
+    ``asolve`` recovers on ``CancelledError``; without the same handling on
+    ``aintercept_iframe`` the submitted operation keeps running and every
+    later solve on this solver blocks behind it.
+    """
+    solver = BrowserSolver()
+    started = threading.Event()
+    release = threading.Event()
+    recovered = []
+
+    def blocking_intercept(*_args, **_kwargs):
+        started.set()
+        release.wait(timeout=5)
+        return InterceptResult(cookies=[], responses=[], user_agent="UA")
+
+    solver.intercept_iframe = blocking_intercept
+    solver._recover_timed_out_worker = lambda future: recovered.append(future)
+
+    async def run():
+        task = asyncio.ensure_future(
+            solver.aintercept_iframe("https://page.test", "tile.test", timeout=30)
+        )
+        await asyncio.get_running_loop().run_in_executor(None, started.wait, 5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    try:
+        asyncio.run(run())
+        assert len(recovered) == 1
+    finally:
+        release.set()
+        solver.close(timeout=1)
+
+
+def test_aintercept_iframe_honors_instance_override():
+    solver = BrowserSolver()
+    calls = []
+
+    def intercept_override(*args):
+        calls.append(args)
+        return "instance-result"
+
+    solver.intercept_iframe = intercept_override
+    solver._intercept_iframe_on_worker = (
+        lambda *_args, **_kwargs: "base-result"
+    )
+
+    result = asyncio.run(
+        solver.aintercept_iframe(
+            "https://page.test",
+            "tile.test",
+            timeout=1.0,
+        )
+    )
+
+    assert result == "instance-result"
+    assert calls == [
+        ("https://page.test", "tile.test", 1.0),
+    ]

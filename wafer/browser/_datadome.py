@@ -195,7 +195,12 @@ def wait_for_datadome(solver, page, timeout_ms: int) -> bool:
                     patch_frame_headless,
                     patch_frame_screenxy,
                 )
-                patch_frame_screenxy(dd_frame)
+                patch_frame_screenxy(
+                    dd_frame,
+                    needs_patch=bool(
+                        getattr(solver, "_needs_screenxy_patch", False)
+                    ),
+                )
                 if solver._headless:
                     patch_frame_headless(dd_frame)
             iframe_seen = True

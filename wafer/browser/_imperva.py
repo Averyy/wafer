@@ -6,6 +6,7 @@ import time
 from urllib.parse import urlparse
 
 from wafer._cookies import registrable_domain as _registrable_domain
+from wafer._errors import ResponseTooLarge
 
 logger = logging.getLogger("wafer")
 
@@ -144,8 +145,46 @@ _XHR_JS = """async (req) => {
         if (req.body != null && req.method !== 'GET' && req.method !== 'HEAD')
             opts.body = req.body;
         const r = await fetch(req.url, opts);
-        const text = await r.text();
+        const declared = Number(r.headers.get('content-length'));
+        if (req.max_size != null && Number.isFinite(declared)
+                && declared > req.max_size) {
+            if (r.body) {
+                try { await r.body.cancel(); } catch (_) {}
+            }
+            return {status: -2, body: '', too_large: true, size: declared,
+                    content_type: r.headers.get('content-type') || ''};
+        }
+        let text = '';
+        let size = 0;
+        if (r.body && r.body.getReader) {
+            const reader = r.body.getReader();
+            const decoder = new TextDecoder();
+            const textParts = [];
+            while (true) {
+                const part = await reader.read();
+                if (part.done) break;
+                size += part.value.byteLength;
+                if (req.max_size != null && size > req.max_size) {
+                    try { await reader.cancel(); } catch (_) {}
+                    return {status: -2, body: '', too_large: true, size,
+                            content_type:
+                                r.headers.get('content-type') || ''};
+                }
+                textParts.push(decoder.decode(part.value, {stream: true}));
+            }
+            textParts.push(decoder.decode());
+            text = textParts.join('');
+        } else {
+            const bytes = new Uint8Array(await r.arrayBuffer());
+            size = bytes.byteLength;
+            if (req.max_size != null && size > req.max_size) {
+                return {status: -2, body: '', too_large: true, size,
+                        content_type: r.headers.get('content-type') || ''};
+            }
+            text = new TextDecoder().decode(bytes);
+        }
         return {status: r.status, body: text,
+                size,
                 content_type: r.headers.get('content-type') || ''};
     } catch (e) {
         return {status: -1, body: String(e), content_type: ''};
@@ -155,7 +194,13 @@ _XHR_JS = """async (req) => {
 }"""
 
 
-def imperva_xhr_replay(page, url: str, replay: dict, timeout_ms: int):
+def imperva_xhr_replay(
+    page,
+    url: str,
+    replay: dict,
+    timeout_ms: int,
+    max_size: int | None = None,
+):
     """Replay the original request as a same-site XHR from the embedder page.
 
     Runs in the page that just earned the WAF cookies, so the browser attaches
@@ -170,6 +215,7 @@ def imperva_xhr_replay(page, url: str, replay: dict, timeout_ms: int):
         "body": replay.get("body"),
         "content_type": replay.get("content_type"),
         "timeout_ms": max(1000, min(timeout_ms, 30000)),
+        "max_size": max_size,
     }
     try:
         res = page.evaluate(_XHR_JS, arg)
@@ -178,6 +224,8 @@ def imperva_xhr_replay(page, url: str, replay: dict, timeout_ms: int):
             "Imperva in-page XHR replay errored for %s", url, exc_info=True
         )
         return None
+    if res and res.get("too_large") and max_size is not None:
+        raise ResponseTooLarge(url, int(res.get("size", max_size + 1)), max_size)
     if not res or res.get("status", -1) < 0:
         return None
     return res

@@ -1,0 +1,123 @@
+name: Training contracts
+
+# The reCAPTCHA training contracts need torch/torchvision/timm (~1 GB). That
+# install is far too heavy and too failure-prone to sit on the release path,
+# but the tests must still run somewhere that proves they are not silently
+# skipping. This workflow owns that job; publish.yml stays lean.
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "training/**"
+      - "tests/test_recaptcha_dataset_manifest.py"
+      - "tests/test_recaptcha_training_contract.py"
+      - "pyproject.toml"
+      - ".github/workflows/training.yml"
+  pull_request:
+    paths:
+      - "training/**"
+      - "tests/test_recaptcha_dataset_manifest.py"
+      - "tests/test_recaptcha_training_contract.py"
+      - "pyproject.toml"
+      - ".github/workflows/training.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@eac588ad8def6316056a12d4907a9d4d84ff7a3b  # v7.3.0
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: |
+          uv venv
+          uv pip install ".[dev,browser]"
+          uv pip install \
+            "torch==2.10.0" \
+            "torchvision==0.25.0" \
+            "timm==1.0.25"
+
+      - name: Build source distribution
+        run: uv build --sdist
+
+      - name: Test source-distribution training contracts without skips
+        run: |
+          archive_file=$(find dist -maxdepth 1 -name '*.tar.gz' -print -quit)
+          extract_dir=$(mktemp -d /tmp/wafer-sdist-test.XXXXXX)
+          tar -xzf "$archive_file" -C "$extract_dir"
+          package_root=$(find "$extract_dir" -mindepth 1 -maxdepth 1 -type d -print -quit)
+          cd "$package_root"
+          PYTHONPATH=. "$GITHUB_WORKSPACE/.venv/bin/python" - <<'PY'
+          from pathlib import Path
+
+          import training.recaptcha.dataset_manifest as dataset_manifest
+          import training.recaptcha.export as export
+          import training.recaptcha.train_mps as train_mps
+          import training.recaptcha.training_contract as training_contract
+
+          package_root = Path.cwd().resolve()
+          for module in (
+              dataset_manifest,
+              export,
+              train_mps,
+              training_contract,
+          ):
+              module_path = Path(module.__file__).resolve()
+              if not module_path.is_relative_to(package_root):
+                  raise SystemExit(
+                      f"{module.__name__} loaded outside sdist: {module_path}"
+                  )
+          PY
+          PYTHONPATH=. "$GITHUB_WORKSPACE/.venv/bin/python" -m pytest \
+            -q \
+            --junitxml=/tmp/wafer-training-contract.xml \
+            tests/test_recaptcha_dataset_manifest.py \
+            tests/test_recaptcha_training_contract.py
+          "$GITHUB_WORKSPACE/.venv/bin/python" - <<'PY'
+          from pathlib import Path
+          from xml.etree import ElementTree
+
+          # The point of the gate is that NOTHING skipped: the timm-dependent
+          # cases silently skip when the heavy deps are missing, which is
+          # exactly the failure this job exists to catch. The count floor is
+          # the current total and only guards against tests being deleted --
+          # raise it when the suite grows.
+          MINIMUM_TESTS = 62
+
+          report = ElementTree.parse(
+              Path("/tmp/wafer-training-contract.xml")
+          ).getroot()
+          counts = {
+              name: sum(
+                  int(suite.attrib.get(name, 0))
+                  for suite in (
+                      list(report)
+                      if report.tag == "testsuites"
+                      else [report]
+                  )
+              )
+              for name in ("tests", "errors", "failures", "skipped")
+          }
+          if (
+              counts["tests"] < MINIMUM_TESTS
+              or counts["errors"]
+              or counts["failures"]
+              or counts["skipped"]
+          ):
+              raise SystemExit(
+                  f"training-contract gate failed: {counts}"
+              )
+          print(f"training-contract gate passed: {counts}")
+          PY

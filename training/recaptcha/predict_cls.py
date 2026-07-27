@@ -16,14 +16,13 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
+try:
+    from classes import CLS_NAMES
+except ModuleNotFoundError:
+    from training.recaptcha.classes import CLS_NAMES
+
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _DEFAULT_COLLECTED = _SCRIPT_DIR / "collected_cls"
-
-CLS_NAMES = [
-    "Bicycle", "Bridge", "Bus", "Car", "Chimney", "Crosswalk",
-    "Hydrant", "Motorcycle", "Mountain", "Other", "Palm",
-    "Stair", "Tractor", "Traffic Light",
-]
 
 IMG_SIZE = 224
 MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
@@ -84,14 +83,14 @@ def main():
         print("All tiles already have predictions.")
         return
 
-    print(f"Loading model...")
+    print("Loading model...")
     sess, input_name = _load_model()
 
     print(f"Running inference on {len(need_pred)} tiles (batch={BATCH_SIZE})...")
     processed = 0
 
     for batch_start in range(0, len(need_pred), BATCH_SIZE):
-        batch = need_pred[batch_start:batch_start + BATCH_SIZE]
+        batch = need_pred[batch_start : batch_start + BATCH_SIZE]
         images = []
         valid = []
 
@@ -127,7 +126,10 @@ def main():
 
     # Atomic rewrite
     tmp = tempfile.NamedTemporaryFile(
-        mode="w", dir=collected, suffix=".jsonl", delete=False,
+        mode="w",
+        dir=collected,
+        suffix=".jsonl",
+        delete=False,
     )
     try:
         for entry in entries:

@@ -129,7 +129,7 @@ Requires browser solver for initial solve, then TLS client replays cached cookie
 
 | URL | Challenge Type | Status | Notes |
 |---|---|---|---|
-| `scrapingcourse.com/cloudflare-challenge` | CF + Turnstile | browser-solve | 2026-02-21: Browser-solve verified. 403→browser→cf_clearance→200 4KB |
+| `scrapingcourse.com/cloudflare-challenge` | CF + Turnstile | browser-solve | 2026-02-21: Browser-solve verified. 403→browser→cf_clearance→200 4KB. **2026-07-27 re-verified on system Chrome 150.0.7871.182** (newer than `DEFAULT_EMULATION`): challenge→browser passthrough (7 cookies)→200 4,264B in 6.2s, `cf_clearance` present, and the immediate replay returned 200 in **0.3s with no challenge**. Confirms a UA-bound CF clearance minted by Chrome 150 replays over wreq under the pinned Chrome 150 UA + Chrome 149 TLS. |
 | `scrapingcourse.com/antibot-challenge` | CF + Turnstile | browser-solve | 2026-02-21: Browser-solve verified. 403→browser→cf_clearance→200 4KB |
 | `nowsecure.nl` | Cloudflare Turnstile | pass | 2026-02-21: 200 180KB via TLS -no challenge triggered |
 | `hltv.org` | Cloudflare | pass | 2026-02-21: 200 421KB via TLS. CF CDN confirmed; challenge not triggered |
@@ -164,7 +164,7 @@ Requires browser solver for initial solve, then TLS client replays cached cookie
 | `allegro.pl` | DataDome | browser-solve | 2026-02-21: Browser-solve verified. 403→browser→datadome cookie→200 1.3MB |
 | `deezer.com` | DataDome | pass | 2026-02-21: 200 188KB via TLS |
 | `tripadvisor.com` | DataDome | browser-solve | 2026-02-21: Browser-solve verified. 403→browser→datadome cookie→200 379KB. Major travel site. 2026-02-22: passed TLS-only (intermittent) |
-| `wellfound.com` (4 SSR page types) | DataDome (white-labeled `ddm.wellfound.com`) | pass + browser-solve | 2026-06-06: All 4 SSR types verified 2/2 live, each returns the real initial document. `/jobs` passes **no-browser** (200, `__NEXT_DATA__` apolloState). `/role/r/{role}`, `/company/{slug}`, `/jobs/{id}` return DD **403** fresh-session -> existing browser DataDome solver passes them via **passive passthrough** (white-labeled tag.js at `ddm.wellfound.com/js/`, captcha iframe still `captcha-delivery`): 200 with `__NEXT_DATA__`/`JobPosting` JSON-LD. **No code change needed** -current detection (datadome cookie + `captcha-delivery` on 403) already fires. **DO NOT detect on `window.ddjskey`/`ddoptions`** as the stale TODO suggested: those scripts are embedded on EVERY wellfound page including the successful SSR `/jobs` 200, so it would false-positive into an infinite solve loop. GraphQL POST to `wellfound.com/graphql` is a separate **Cloudflare** 403 (`cf-mitigated: challenge`), but fetchaller needs only the SSR document, not the XHRs |
+| `wellfound.com` (4 SSR page types) | DataDome (white-labeled `ddm.wellfound.com`) | pass + browser-solve | 2026-06-06: All 4 SSR types verified 2/2 live, each returns the real initial document. `/jobs` passes **no-browser** (200, `__NEXT_DATA__` apolloState). `/role/r/{role}`, `/company/{slug}`, `/jobs/{id}` return DD **403** fresh-session -> existing browser DataDome solver passes them via **passive passthrough** (white-labeled tag.js at `ddm.wellfound.com/js/`, captcha iframe still `captcha-delivery`): 200 with `__NEXT_DATA__`/`JobPosting` JSON-LD. **No code change needed** -current detection (datadome cookie + `captcha-delivery` on 403) already fires. **DO NOT detect on `window.ddjskey`/`ddoptions`** as the stale TODO suggested: those scripts are embedded on EVERY wellfound page including the successful SSR `/jobs` 200, so it would false-positive into an infinite solve loop. GraphQL POST to `wellfound.com/graphql` is a separate **Cloudflare** 403 (`cf-mitigated: challenge`), but fetchaller needs only the SSR document, not the XHRs. **2026-07-27 re-test FAILED:** `/role/r/*` and `/company/*` both raised `ChallengeDetected` (403). First solve hung the full 295s budget without logging a single DataDome line -- root-caused to `page.goto()` being handed the entire solve deadline, so a stalled interstitial starved the solver (fixed: navigation is now bounded to half the budget, max 60s). The retry then hit wafer's own `DataDome hard block detected (IP/device flagged)` verdict, so this host needs re-verification from an unflagged egress before the status above can be trusted. **Nav fix confirmed live 2026-07-27:** the same host now fails in **9.1s** with `DataDome hard block detected (IP/device flagged), cannot solve` instead of hanging 295s with no output -- the solver's own bail-out was previously unreachable because navigation consumed the whole deadline. The remaining failure is the IP/device flag, not a code defect. |
 
 ### Akamai
 
@@ -185,7 +185,7 @@ Requires browser solver for initial solve, then TLS client replays cached cookie
 
 | URL | Challenge Type | Status | Notes |
 |---|---|---|---|
-| `realtor.ca/on/st-catharines-niagara/real-estate` | Imperva (reese84 interstitial) | browser-solve | 2026-06-06: After a few rapid requests, serves the "Pardon Our Interruption" interstitial as **HTTP 200** (~6.4KB), not a 403. Now detected via interstitial-only JS markers (`reeseSkipExpirationCheck`, `interstitial-inprogress`) since the `_Incapsula_Resource` sensor also appears on real pages, so the marker alone would false-positive after a solve. Browser-solve verified: 200 interstitial→browser→reese84→200 362KB real page (8.3s) |
+| `realtor.ca/on/st-catharines-niagara/real-estate` | Imperva (reese84 interstitial) | browser-solve | 2026-06-06: After a few rapid requests, serves the "Pardon Our Interruption" interstitial as **HTTP 200** (~6.4KB), not a 403. Now detected via interstitial-only JS markers (`reeseSkipExpirationCheck`, `interstitial-inprogress`) since the `_Incapsula_Resource` sensor also appears on real pages, so the marker alone would false-positive after a solve. Browser-solve verified: 200 interstitial→browser→reese84→200 362KB real page (8.3s). **2026-07-27 re-verified on system Chrome 150.0.7871.182**: a single cold request passes on TLS alone (200/286KB, 3.0s, no interstitial). After a deliberate 3-6 request burst the host escalates and interstitials every request; it then still resolves to 200/346KB of real page, but via `Imperva bypassed via native-TLS (host pinned)` and taking **144.8s**. Under a 75s budget the *browser* solve timed out twice (53.4s, 69.9s) -- in both cases the solve actually completed (`cookie_count=4`) just after the caller gave up, so the path works but does not fit a short budget once the host is escalated. Re-measure from an unburst egress before treating the 8.3s figure as current. |
 | `api2.realtor.ca/Location.svc/*`, `api2.realtor.ca/Listing.svc/PropertySearch_Post` | Imperva (reese84, TLS-fingerprinting) | native-TLS + browser (heavy) | 2026-06-07: This host fingerprints the **TLS stack**. Every wreq profile (Chrome/Safari/OkHttp, H1 or H2, with or without valid `visid_incap`/`nlbi`/`incap_ses` cookies) gets the reese84 challenge; a generic OpenSSL client **without** `Sec-Fetch-*` gets 200 + JSON. **Light usage -no browser:** wafer auto-falls-back to a stdlib `http.client`/OpenSSL transport (curl-byte-identical: Host first, no Accept-Encoding/Connection) on Imperva detection, pinned per-host. Full search flow verified no-browser: SubAreaSearch→LocationDescription(polygons)→PropertySearch_Post→pagination, **12/12** 200. **Heavy usage -browser:** rapid-fire revokes the free pass and demands the reese84 token even from OpenSSL; with a `browser_solver` wafer solves reese84 **once** and wreq carries the token through (verified **18/18** under a burst; browser-earned reese84 replays cross-TLS on OpenSSL -> 200). See `docs/ref-imperva.md`. |
 | `amadeus.com` | Imperva (reese84) | pass | 2026-02-21: 200 183KB via TLS -no challenge on homepage. Previously required browser-solve |
 | `anz.com.au` | Imperva (reese84) | pass | 2026-02-21: 200 323KB via TLS |
@@ -197,7 +197,7 @@ Requires browser solver for initial solve, then TLS client replays cached cookie
 | URL | Challenge Type | Status | Notes |
 |---|---|---|---|
 | `amazon.com` | AWS WAF JS challenge | browser-solve | 2026-02-21: Browser-solve verified. 202→browser→aws-waf-token→200 790KB. 2026-02-22: passed TLS-only (intermittent) |
-| `booking.com` | AWS WAF | browser-solve | 2026-02-21: Browser-solve verified. 202→browser→200 487KB |
+| `booking.com` | AWS WAF | browser-solve | 2026-02-21: Browser-solve verified. 202→browser→200 487KB. 2026-07-27 on Chrome 150: 200/1.47MB via TLS in 5.1s. A deliberate 5-request search burst also stayed clean (all 200, 1.5MB each) -- **AWS WAF never challenged**, so the solver is unexercised, not broken. |
 | `shutterstock.com` | DataDome | browser-solve | 2026-02-21: Browser-solve verified. 403→browser→datadome cookie→200 978KB. **Reclassified from AWS WAF to DataDome** |
 | `stubhub.com` | AWS WAF | pass | 2026-02-21: 200 182KB via TLS |
 
@@ -222,7 +222,7 @@ Kasada solver: browser solve extracts CT token from ips.js/p.js response, cookie
 
 | URL | Challenge Type | Status | Notes |
 |---|---|---|---|
-| `nordstrom.com` | F5 Shape | browser-solve | 2026-02-21: 200+istlWasHere detected, browser-solve → 42 cookies, E2E 407KB real page |
+| `nordstrom.com` | F5 Shape | browser-solve | 2026-02-21: 200+istlWasHere detected, browser-solve → 42 cookies, E2E 407KB real page. 2026-07-27 on Chrome 150: 200/5.37MB via TLS in 10.6s. A deliberate 5-request category burst also stayed clean (all 200, 3-6MB each) -- **no istlWasHere interstitial**, so the solver is unexercised, not broken. |
 | `target.com` | F5 Shape | pass | 2026-02-22: 200 342KB via TLS. Custom `ssx.mod.js`; no Shape markers found |
 
 ## Tier 4: Interactive CAPTCHA (press-and-hold, slider)
@@ -233,7 +233,7 @@ Requires browser solver with human-like mouse input.
 
 | URL | Challenge Type | Status | Notes |
 |---|---|---|---|
-| `wayfair.com/v/account/authentication/login` | PX press-and-hold | pass | 2026-02-21: 200 318KB via TLS -PX not triggered on new URL. **SOLVED** 2026-02-20 on old /v/account/login. PX appId `PX3Vk96I6i`; also has DataDome |
+| `wayfair.com/v/account/authentication/login` | PX press-and-hold | pass | 2026-02-21: 200 318KB via TLS -PX not triggered on new URL. **SOLVED** 2026-02-20 on old /v/account/login. PX appId `PX3Vk96I6i`; also has DataDome. 2026-07-27 on Chrome 150: a deliberate 6-request burst across login + 5 category pages stayed clean (all 200, up to 3.9MB) -- **PX never challenged**, so the press-and-hold solver is unexercised, not broken. |
 | `zillow.com` | PX press-and-hold | pass | 2026-02-21: 200 419KB via TLS -no PX challenge on homepage |
 | `walmart.com/blocked` | PX press-and-hold | pass | 2026-02-21: 200 16KB via TLS -blocked page renders without PX challenge |
 | `fanduel.com` | PX (very aggressive) | pass | 2026-02-21: 200 427KB via TLS -no markers on Canadian landing page |
@@ -241,8 +241,8 @@ Requires browser solver with human-like mouse input.
 | `bhphotovideo.com` | PX press-and-hold | pass | 2026-02-21: 200 159KB via TLS |
 | `academy.com` | PX press-and-hold | pass | 2026-02-21: 200 855KB via TLS |
 | `belk.com` | PX press-and-hold | pass | 2026-02-21: 200 1.4MB via TLS |
-| `realtor.com` | Kasada | browser-solve | 2026-02-21: Browser-solve verified. 429→browser→kasada cookies→200 286KB. **Reclassified from PX to Kasada** |
-| `homedepot.com` | Akamai | browser-solve | 2026-02-21: Browser-solve verified. akamai challenge→browser→200 971KB. **Reclassified from PX to Akamai**. 2026-02-22: passed TLS-only (intermittent) |
+| `realtor.com` | Kasada | browser-solve | 2026-02-21: Browser-solve verified. 429→browser→kasada cookies→200 286KB. **Reclassified from PX to Kasada**. 2026-07-27: re-verified on system Chrome 150.0.7871.182 -- kasada detected→browser passthrough (31 cookies)→200 701KB in 7.7s; Kasada session stored (TTL 1800s). |
+| `homedepot.com` | Akamai | browser-solve | 2026-02-21: Browser-solve verified. akamai challenge→browser→200 971KB. **Reclassified from PX to Akamai**. 2026-02-22: passed TLS-only (intermittent). 2026-07-27: re-verified on system Chrome 150.0.7871.182 -- `akamai behavioral` detected on body, rotations exhausted and session retired, then browser passthrough (22 cookies)→200 901KB in 6.0s. |
 | `indeed.com` | PX | pass | 2026-02-21: 200 660KB via TLS |
 | `priceline.com` | PX | pass | 2026-02-21: 200 625KB via TLS |
 | `lanebryant.com` | PX | pass | 2026-02-21: 200 515KB via TLS |
@@ -269,7 +269,8 @@ Alibaba's proprietary CAPTCHA (internal name: **Baxia**). Loaded via `baxiaCommo
 
 | URL | Challenge Type | Status | Notes |
 |---|---|---|---|
-| `aliexpress.com` | Alibaba Baxia | browser-solve | 2026-02-22: Baxia SDK (`baxiaCommon.js`, `AWSC/awsc.js`) loads on all pages. Solver live-tested. Real browser often passes invisible check -interactive CAPTCHA triggers on rate-limiting or punish redirect. |
+| `alibaba.com` | Alibaba Baxia/TMD | pass + browser-solve | 2026-07-27: **live-verified end to end on system Chrome 150.0.7871.182** (macOS, headed). A search burst triggered TMD on request 1; the browser solved the Baxia slider and returned 200 / 1.43MB of real results in 19.5s, then 11 consecutive 200s at ~2s each replaying the earned `x5sec`. Re-run after the navigation-budget fix: solved again, 12/12 200s. One run logged `Baxia result remained pending after release` and still succeeded -- widget state is an intermediate signal; the authoritative `x5sec` check is what decides. A single cold request usually passes with no challenge at all, so a burst is required to exercise the solver. |
+| `aliexpress.com` | Alibaba Baxia | pass (no challenge triggered) | 2026-07-27: cold search returned 200 / 704KB real results in 2.2s under a Chrome 150-pinned transport identity -- confirms the pinned UA/hints are accepted, but the Baxia solver was **not** exercised. Solver itself covered by the alibaba.com row. |
 | `taobao.com` | Alibaba Baxia | browser-solve | Same Baxia backend; login-walled; Chinese IP required |
 
 ### GeeTest v4 Slide
@@ -278,7 +279,7 @@ GeeTest solver working (CV notch detection + mousse replay). 12/12 consecutive o
 
 | URL | Challenge Type | Status | Notes |
 |---|---|---|---|
-| `geetest.com/en/adaptive-captcha-demo` | GeeTest v4 slide | browser-solve | 2026-02-22: **SOLVED** 12/12+ consecutive. CV + mousse replay. |
+| `geetest.com/en/adaptive-captcha-demo` | GeeTest v4 slide | browser-solve | 2026-02-22: **SOLVED** 12/12+ consecutive. CV + mousse replay. **2026-07-27 re-verified on system Chrome 150.0.7871.182**: CV notch x=131 @ 0.940 confidence, drag replayed, `Drag puzzle solved!`, `solve_drag -> True in 10.6s`. **Trigger flow (the demo has no slide puzzle on load):** click `.tab-item` **nth(6)** = `Slide CAPTCHA`, wait ~3s, then click `.geetest_btn`. Do NOT use `text=Slide` -- it matches a nav menu entry and the click times out. |
 | `bilibili.com` | Custom captcha | untested | 2026-02-22: **NOT GeeTest v4.** Custom captcha (`body__captcha-img_wp`). May have switched vendors. |
 | `kucoin.com` | GeeTest v4 slide | pass | 2026-02-22: 200 394KB via TLS. No GeeTest triggered. SPA, may need form submission to trigger. |
 | `aerlingus.com` | GeeTest v3 click | unverified | 2026-02-22: **GeeTest v3** (gt.js + fullpage.9.2.0), not v4. Click-to-verify, not slide puzzle. 84 geetest elements. |
@@ -319,7 +320,7 @@ Wafer has **no Arkose Labs solver**. Arkose presents 3D puzzle CAPTCHAs (rotate,
 | `ssense.com` | Riskified | pass | 2026-02-21: 200 521KB via TLS |
 | `tiktok.com` | In-house (custom VM) | pass | 2026-02-21: 200 306KB via TLS. Redirects to /explore. Custom VM-based anti-bot |
 | `temu.com` | In-house (custom) | pass | 2026-02-21: 200 601KB via TLS. HMAC-signed headers on deeper pages |
-| `reddit.com`, `old.reddit.com/*.json`, `api.reddit.com` | DataDome + in-house session gate | pass | 2026-07-26: Cold JSON requests return a roughly 190 KiB Shreddit block page. Wafer performs the small logged-out verification at `www.reddit.com` on the same client, validates response-scoped anonymous cookie evidence, persists durable cookie legs under one Reddit cache namespace, drops the large solved homepage body unread, and replays JSON. Old Reddit remains available only when explicitly requested; it is never a bootstrap or fallback. |
+| `reddit.com`, `old.reddit.com/*.json`, `api.reddit.com` | DataDome + in-house session gate | pass | 2026-07-26: Cold JSON requests can return a roughly 190 KiB Shreddit block page, while direct New Reddit HTML can return a small 200 verification document. Wafer recognizes both, performs the logged-out verification at `www.reddit.com` on the same client, validates response-scoped anonymous cookie evidence, persists durable cookie legs under one Reddit cache namespace, and replays the original JSON or HTML URL. Old Reddit remains available only when explicitly requested; it is never a bootstrap or fallback. |
 | `facebook.com/marketplace/` | In-house (Meta) | pass | 2026-02-21: 200 1.2MB via TLS. Login-walled for most data |
 | `artists.spotify.com` | In-house (Spotify) | pass | 2026-02-21: 200 336KB via TLS. Redirects to /home. Login-walled |
 
@@ -347,7 +348,7 @@ Wafer has **no Arkose Labs solver**. Arkose presents 3D puzzle CAPTCHAs (rotate,
 | **F5 Shape** | Yes | 3 | Browser solve -passive wait for istlWasHere interstitial to clear. |
 | **GeeTest v4** (slide) | Yes | 4 | Browser solve with CV notch detection + recorded mouse replay. **SOLVED** 12/12+ on demo. bilibili NOT GeeTest; aerlingus is GeeTest v3. |
 | **hCaptcha** (checkbox) | Yes | 1 | Browser solve -checkbox click + token poll. Image escalation detected, not solved. |
-| **reCAPTCHA v2** (checkbox + image grid) | Yes | 1 | Browser solve -checkbox click, image grid via ONNX classifier (dynamic 3x3 + static 3x3). Demo: `google.com/recaptcha/api2/demo`. |
+| **reCAPTCHA v2** (checkbox + image grid) | Yes | 1 | Browser solve -checkbox click, image grid via ONNX classifier (dynamic 3x3 + static 3x3). Demo: `google.com/recaptcha/api2/demo`. **2026-07-27 live-verified on system Chrome 150.0.7871.182**: solved a real `dynamic_3x3` grid (keyword `bus`) on attempt 1 in 26.1s -- classifier scored all 9 tiles (3:0.974, 7:0.860, 6:0.581), all three clicks acknowledged, one dynamic-replacement round handled, Verify returned `statuses=200 classifications=protocol_solved`, token 2,340 chars. Note HTTP detection is gated on **403/429**, so a 200 page that merely embeds a widget is correctly not a challenge -- exercising the solver requires driving `wait_for_recaptcha` directly, as the demo returns 200. reCAPTCHA **v3** minting also verified: 2,105-char token in 0.4s, browser-free. |
 | **Arkose Labs** (FunCaptcha) | **No** | 4 | 3D puzzle CAPTCHA on login flows. Microsoft, Roblox, GitHub, EA. |
 | **Alibaba Baxia** | Yes | 2 | Browser solve with full-width drag + mousse replay. Live-tested on AliExpress. Real browser passes invisible check -interactive CAPTCHA hard to trigger externally. |
 | **Chinese custom** (JD, Shopee) | **No** | 3 | Each has proprietary slider; needs per-vendor work. |

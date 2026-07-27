@@ -402,18 +402,21 @@ class TestEmbedMode:
 
 class TestLogging:
     @patch("time.sleep")
-    def test_request_debug_log(self, mock_sleep, caplog):
-        """Request should log method + URL at DEBUG level."""
+    def test_request_debug_log_redacts_path_and_query(self, mock_sleep, caplog):
+        """Request diagnostics expose method/host but never signed URL data."""
         session, _ = make_sync_session([
             MockResponse(200, body="ok"),
         ])
         with caplog.at_level(logging.DEBUG, logger="wafer"):
-            session.get("https://example.com/test")
+            session.get("https://user:pass@example.com/secret?sign=token")
 
         assert any(
-            "GET https://example.com/test" in r.message
+            "GET host=example.com" in r.message
             for r in caplog.records
         )
+        assert "secret" not in caplog.text
+        assert "sign=token" not in caplog.text
+        assert "user:pass" not in caplog.text
 
     @patch("time.sleep")
     def test_auto_referer_debug_log(self, mock_sleep, caplog):
@@ -507,6 +510,51 @@ class TestBuildHeaders:
             {"Accept-Language": ""},
         )
         assert "Accept-Language" not in headers
+
+    @pytest.mark.parametrize(
+        "sent,canonical",
+        [
+            ("accept", "Accept"),
+            ("ACCEPT", "Accept"),
+            ("accept-language", "Accept-Language"),
+            ("ACCEPT-LANGUAGE", "Accept-Language"),
+        ],
+    )
+    def test_differently_cased_override_does_not_duplicate_on_the_wire(
+        self, sent, canonical
+    ):
+        """HTTP header names are case-insensitive; wreq's are not.
+
+        A per-request ``accept`` beside the client-level ``Accept`` puts two
+        Accept fields in the HTTP/2 frame, which strict WAFs read as
+        non-browser. The delta must carry the client's spelling so wreq
+        overrides the existing field instead of adding a second one.
+        """
+        session, _ = make_sync_session([])
+        client_headers = session._client_headers
+        assert canonical in client_headers
+
+        delta = session._build_headers(
+            "https://example.com", {sent: "application/json"}
+        )
+
+        assert delta[canonical] == "application/json"
+        # Exactly one spelling of the header, and it is the client's.
+        matches = [k for k in delta if k.lower() == canonical.lower()]
+        assert matches == [canonical]
+
+    def test_differently_cased_suppression_still_works(self):
+        """Empty-string suppression must survive the case folding."""
+        session, _ = make_sync_session([])
+        assert "Accept-Language" not in session._build_headers(
+            "https://example.com", {"accept-language": ""}
+        )
+
+    def test_unknown_header_keeps_caller_casing(self):
+        """Only headers that exist at client level get re-spelled."""
+        session, _ = make_sync_session([])
+        delta = session._build_headers("https://example.com", {"X-Custom": "1"})
+        assert delta["X-Custom"] == "1"
 
 
 # ---------------------------------------------------------------------------

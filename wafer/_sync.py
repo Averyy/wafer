@@ -10,6 +10,9 @@ from wreq import Method
 
 from wafer._base import (
     BaseSession,
+    _browser_attempt_timeout,
+    _browser_solve_timeout,
+    _callable_accepts_keyword,
     _canonicalize_url_host,
     _CapExceeded,
     _content_length_over_cap,
@@ -18,6 +21,9 @@ from wafer._base import (
     _is_binary_content_type,
     _is_challengeable_content_type,
     _read_body_capped,
+    _tmd_browser_attempt_count,
+    _tmd_browser_attempt_timeout,
+    _tmd_punish_url_from_body,
     _to_method,
 )
 from wafer._challenge import (
@@ -26,7 +32,7 @@ from wafer._challenge import (
     detect_challenge,
 )
 from wafer._cookies import (
-    cookie_domain_matches,
+    browser_cookie_matches_host,
     extract_domain,
     registrable_domain,
 )
@@ -75,9 +81,7 @@ class SyncSession(BaseSession):
         if self._profile is Profile.OPERA_MINI:
             self._client = None  # Opera Mini bypasses wreq entirely
         else:
-            self._client = wreq.blocking.Client(
-                **self._build_client_kwargs()
-            )
+            self._client = wreq.blocking.Client(**self._build_client_kwargs())
             self._hydrate_jar_from_cache()
 
     def _hydrate_jar_from_cache(self) -> None:
@@ -89,20 +93,16 @@ class SyncSession(BaseSession):
                 cookies = self._cookie_cache.load(domain)
                 for cookie in cookies:
                     try:
-                        self._client.cookie_jar.add(
-                            cookie["raw"], cookie["url"]
-                        )
-                    except Exception as e:
+                        self._record_cookie_scope(cookie["raw"], cookie["url"])
+                        self._client.cookie_jar.add(cookie["raw"], cookie["url"])
+                    except Exception as exc:
                         logger.debug(
-                            "Failed to hydrate cookie %s: %s",
+                            "Failed to hydrate cookie %s (%s)",
                             cookie.get("name", "?"),
-                            e,
+                            type(exc).__name__,
                         )
         except Exception:
-            logger.debug(
-                "Failed to hydrate cookies from cache",
-                exc_info=True,
-            )
+            logger.debug("Failed to hydrate cookies from cache")
 
     def _cache_response_cookies(
         self,
@@ -111,23 +111,17 @@ class SyncSession(BaseSession):
         cache_domain: str | None = None,
     ) -> None:
         """Write-through: save Set-Cookie headers to disk cache."""
+        raw_cookies = self._record_response_cookie_scopes(url, resp)
         if self._cookie_cache is None:
             return
         try:
             domain = cache_domain or extract_domain(url)
             if not domain:
                 return
-            raw_cookies = resp.headers.get_all("set-cookie")
             if raw_cookies:
-                self._cookie_cache.save_from_headers(
-                    domain, raw_cookies, url
-                )
+                self._cookie_cache.save_from_headers(domain, raw_cookies, url)
         except Exception:
-            logger.debug(
-                "Failed to cache cookies for %s",
-                url,
-                exc_info=True,
-            )
+            logger.debug("Failed to cache response cookies")
 
     def _rebuild_client(self) -> None:
         """Rebuild the wreq client with a fresh TLS session and cookie jar.
@@ -145,9 +139,7 @@ class SyncSession(BaseSession):
         """
         self._client = wreq.blocking.Client(**self._build_client_kwargs())
         self._hydrate_jar_from_cache()
-        logger.debug(
-            "Client rebuilt with emulation=%s", self.emulation
-        )
+        logger.debug("Client rebuilt with emulation=%s", self.emulation)
 
     def _retire_session(self, domain: str) -> None:
         """Full identity reset: new fingerprint, empty jar, clear cache.
@@ -156,10 +148,7 @@ class SyncSession(BaseSession):
         TLS session are refreshed (no fingerprint rotation).
         """
         # Restore Chrome if rotated to Safari (not explicit Safari profile)
-        if (
-            self._safari_identity is not None
-            and self._profile is not Profile.SAFARI
-        ):
+        if self._safari_identity is not None and self._profile is not Profile.SAFARI:
             self._switch_to_chrome()
         if self._fingerprint is not None:
             self._fingerprint.reset()
@@ -185,9 +174,7 @@ class SyncSession(BaseSession):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise WaferTimeout(url, total_timeout)
-        return {
-            "timeout": datetime.timedelta(seconds=remaining)
-        }
+        return {"timeout": datetime.timedelta(seconds=remaining)}
 
     def _try_reddit_bootstrap(
         self,
@@ -202,26 +189,18 @@ class SyncSession(BaseSession):
         try:
             verification_resp = self._client.get(
                 origin,
-                **self._reddit_subrequest_kwargs(
-                    url, deadline, total_timeout
-                ),
+                **self._reddit_subrequest_kwargs(url, deadline, total_timeout),
             )
-            verification_cookies = verification_resp.headers.get_all(
-                "set-cookie"
-            )
+            verification_cookies = verification_resp.headers.get_all("set-cookie")
             self._cache_response_cookies(
                 origin,
                 verification_resp,
                 cache_domain=REDDIT_CACHE_DOMAIN,
             )
             if not 200 <= verification_resp.status.as_int() < 300:
-                logger.debug(
-                    "Reddit bootstrap failed due to verification status"
-                )
+                logger.debug("Reddit bootstrap failed due to verification status")
                 return False
-            if reddit_has_cookie_evidence(
-                reddit_cookie_names(verification_cookies)
-            ):
+            if reddit_has_cookie_evidence(reddit_cookie_names(verification_cookies)):
                 logger.info("Reddit anonymous cookies established")
                 return True
 
@@ -232,17 +211,11 @@ class SyncSession(BaseSession):
                     REDDIT_VERIFICATION_MAX_BYTES,
                 ).decode("utf-8")
             except (_CapExceeded, UnicodeDecodeError):
-                logger.debug(
-                    "Reddit bootstrap failed due to verification structure"
-                )
+                logger.debug("Reddit bootstrap failed due to verification structure")
                 return False
-            verification = parse_reddit_verification(
-                verification_body
-            )
+            verification = parse_reddit_verification(verification_body)
             if verification is None:
-                logger.debug(
-                    "Reddit bootstrap failed due to verification structure"
-                )
+                logger.debug("Reddit bootstrap failed due to verification structure")
                 return False
 
             # Build the query into the URL. Raw wreq requests silently ignore
@@ -250,9 +223,7 @@ class SyncSession(BaseSession):
             submission_url = reddit_submission_url(verification)
             solved_resp = self._client.get(
                 submission_url,
-                **self._reddit_subrequest_kwargs(
-                    url, deadline, total_timeout
-                ),
+                **self._reddit_subrequest_kwargs(url, deadline, total_timeout),
             )
             solved_cookies = solved_resp.headers.get_all("set-cookie")
             # Use the safe fixed origin for persistence so the solved query
@@ -263,16 +234,10 @@ class SyncSession(BaseSession):
                 cache_domain=REDDIT_CACHE_DOMAIN,
             )
             if not 200 <= solved_resp.status.as_int() < 300:
-                logger.debug(
-                    "Reddit bootstrap failed due to submission status"
-                )
+                logger.debug("Reddit bootstrap failed due to submission status")
                 return False
-            if not reddit_has_cookie_evidence(
-                reddit_cookie_names(solved_cookies)
-            ):
-                logger.debug(
-                    "Reddit bootstrap failed due to cookie evidence"
-                )
+            if not reddit_has_cookie_evidence(reddit_cookie_names(solved_cookies)):
+                logger.debug("Reddit bootstrap failed due to cookie evidence")
                 return False
             logger.info("Reddit verification submitted")
             logger.info("Reddit anonymous cookies established")
@@ -309,6 +274,7 @@ class SyncSession(BaseSession):
             cookie_value = solve_acw(body)
             if cookie_value:
                 cookie_str = f"acw_sc__v2={cookie_value}; Path=/"
+                self._record_cookie_scope(cookie_str, url)
                 self._client.cookie_jar.add(cookie_str, url)
                 # Persist to disk cache
                 if self._cookie_cache:
@@ -333,11 +299,7 @@ class SyncSession(BaseSession):
             target = parse_amazon_captcha(body, url)
             if target:
                 try:
-                    sub_kw = (
-                        {"timeout": sub_timeout}
-                        if sub_timeout is not None
-                        else {}
-                    )
+                    sub_kw = {"timeout": sub_timeout} if sub_timeout is not None else {}
                     if target["method"] == "POST":
                         solve_resp = self._client.post(
                             target["url"],
@@ -346,45 +308,44 @@ class SyncSession(BaseSession):
                             **sub_kw,
                         )
                     else:
-                        target_url = self._apply_params(
-                            target["url"], target["params"]
-                        )
+                        target_url = self._apply_params(target["url"], target["params"])
                         solve_resp = self._client.get(
                             target_url,
                             headers={"Referer": url},
                             **sub_kw,
                         )
-                    self._cache_response_cookies(
-                        target["url"], solve_resp
-                    )
+                    self._cache_response_cookies(target["url"], solve_resp)
                     logger.info(
-                        "Amazon captcha submitted inline to %s",
-                        target["url"],
+                        "Amazon captcha submitted inline",
                     )
                     return True
                 except Exception:
-                    logger.debug(
-                        "Amazon inline solve failed", exc_info=True
-                    )
+                    logger.debug("Amazon inline solve failed")
 
         elif challenge == ChallengeType.TMD:
             homepage = tmd_homepage_url(url)
             try:
                 homepage_resp = self._client.get(
                     homepage,
-                    **(
-                        {"timeout": sub_timeout}
-                        if sub_timeout is not None
-                        else {}
-                    ),
+                    **({"timeout": sub_timeout} if sub_timeout is not None else {}),
                 )
-                self._cache_response_cookies(homepage, homepage_resp)
-                logger.info("TMD session warmed via %s", homepage)
-                return True
+                homepage_status = homepage_resp.status.as_int()
+                homepage_headers = _decode_headers(homepage_resp.headers)
+                homepage_content = _read_body_capped(homepage_resp, 1_000_000)
+                homepage_body = homepage_content.decode(
+                    resolve_charset(homepage_headers, homepage_content),
+                    errors="replace",
+                )
+                homepage_challenge = detect_challenge(
+                    homepage_status, homepage_headers, homepage_body
+                )
+                if 200 <= homepage_status < 300 and homepage_challenge is None:
+                    self._cache_response_cookies(homepage, homepage_resp)
+                    logger.info("TMD session warmed")
+                    return True
+                logger.debug("TMD homepage remained challenged")
             except Exception:
-                logger.debug(
-                    "TMD homepage fetch failed", exc_info=True
-                )
+                logger.debug("TMD homepage fetch failed")
 
         return False
 
@@ -396,6 +357,8 @@ class SyncSession(BaseSession):
         embedder: str | None = None,
         replay: dict | None = None,
         max_size: int | None = None,
+        use_solve_origin: bool = True,
+        challenge_url: str | None = None,
     ) -> WaferResponse | bool:
         """Attempt browser-based challenge solving.
 
@@ -428,11 +391,10 @@ class SyncSession(BaseSession):
 
         solve_timeout: float | None = None
         if deadline is not None:
-            solve_timeout = deadline - time.monotonic()
+            remaining = deadline - time.monotonic()
+            solve_timeout = _browser_solve_timeout(remaining)
             if solve_timeout <= 0:
-                logger.debug(
-                    "No time budget left for browser solve at %s", url
-                )
+                logger.debug("No time budget left for browser solve")
                 return False
 
         # solve_origin generalizes the Imperva embedder to every challenge:
@@ -444,12 +406,62 @@ class SyncSession(BaseSession):
         # registrable-domain cookies replay to the API session on retry. The
         # original ``url`` is still used below for cookie-domain filtering and
         # caching so the token lands on the API host's registrable domain.
-        if self._solve_origin:
+        if use_solve_origin and self._solve_origin:
             embedder = self._solve_origin
-        result = self._browser_solver.solve(
-            url, challenge.value, timeout=solve_timeout,
-            embedder=embedder, replay=replay,
-        )
+        solve_kwargs = {
+            "timeout": solve_timeout,
+            "embedder": embedder,
+            "replay": replay,
+        }
+        if max_size is not None and _callable_accepts_keyword(
+            self._browser_solver.solve,
+            "max_size",
+        ):
+            solve_kwargs["max_size"] = max_size
+        browser_attempts = 1
+        if challenge is ChallengeType.TMD and deadline is not None:
+            # Classify from the issued punishment URL when one is available:
+            # ``challenge_url`` is extracted from the response body (MTop
+            # answers an API call with the action already on the URL), and
+            # falls back to ``url`` for a caller that requested a punishment
+            # URL directly. A plain page navigation carries neither -- MTop
+            # issues the action only after the browser navigates -- so that
+            # case keeps the disposable-slider budget, which is correct for
+            # the slider and merely not optimal for a reCAPTCHA punishment.
+            browser_attempts = _tmd_browser_attempt_count(
+                deadline - time.monotonic(),
+                challenge_url or url,
+            )
+        result = None
+        for browser_attempt in range(browser_attempts):
+            if deadline is not None:
+                if challenge is ChallengeType.TMD:
+                    solve_timeout = _tmd_browser_attempt_timeout(
+                        deadline - time.monotonic(),
+                        browser_attempts - browser_attempt,
+                    )
+                else:
+                    solve_timeout = _browser_attempt_timeout(
+                        deadline - time.monotonic(),
+                        browser_attempts - browser_attempt,
+                    )
+                if solve_timeout <= 0:
+                    break
+                solve_kwargs["timeout"] = solve_timeout
+            result = self._browser_solver.solve(
+                url,
+                challenge.value,
+                **solve_kwargs,
+            )
+            if result is not None:
+                break
+            if browser_attempt + 1 < browser_attempts:
+                logger.info(
+                    "TMD browser solve failed; retrying in a fresh context "
+                    "(attempt %d/%d)",
+                    browser_attempt + 2,
+                    browser_attempts,
+                )
         if result is None:
             return False
 
@@ -463,9 +475,13 @@ class SyncSession(BaseSession):
         # host-exact match would drop ``reese84``.
         reg = registrable_domain(domain)
         target_cookies = [
-            c for c in result.cookies
-            if cookie_domain_matches(c.get("domain", ""), reg)
-        ] or result.cookies  # fallback to all if filter matches none
+            c
+            for c in result.cookies
+            if browser_cookie_matches_host(c.get("domain", ""), domain)
+        ]
+        if not target_cookies and result.response is None:
+            logger.warning("Browser solve produced no cookies scoped to %s", reg)
+            return False
 
         # Persist browser cookies to disk cache
         if self._cookie_cache and domain:
@@ -478,19 +494,23 @@ class SyncSession(BaseSession):
                         "name": cookie["name"],
                         "raw": raw,
                         "url": url,
+                        "domain": cookie.get("domain", domain),
+                        "path": cookie.get("path", "/"),
                         "expires": (
-                            time.time() + 86400
-                            if expires <= 0
-                            else float(expires)
+                            time.time() + 86400 if expires <= 0 else float(expires)
                         ),
                         "last_used": time.time(),
                     }
                 )
-            self._cookie_cache.save(domain, cache_entries)
+            try:
+                self._cookie_cache.save(domain, cache_entries)
+            except Exception:
+                logger.debug("Failed to persist browser cookies")
 
         # Cache Kasada CT/ST tokens for per-request CD generation
         if result.extras and "ct" in result.extras:
             from wafer._kasada import store_session
+
             store_session(
                 domain,
                 ct=result.extras["ct"],
@@ -509,15 +529,11 @@ class SyncSession(BaseSession):
         # and the session rotates away from the identity the cookie belongs to.
         # Skip Imperva (its token rides an unpinned wreq/native path — see
         # below) and Safari (self._fingerprint is None; keep the Safari TLS).
-        if (
-            self._fingerprint is not None
-            and challenge != ChallengeType.IMPERVA
-        ):
+        if self._fingerprint is not None and challenge != ChallengeType.IMPERVA:
             chrome_ver = chrome_version_from_ua(result.user_agent)
             if chrome_ver:
-                full_ver = (
-                    result.browser_version
-                    or chrome_full_version_from_ua(result.user_agent)
+                full_ver = result.browser_version or chrome_full_version_from_ua(
+                    result.user_agent
                 )
                 self._fingerprint.pin_to_browser(
                     result.user_agent, chrome_ver, full_ver
@@ -529,14 +545,24 @@ class SyncSession(BaseSession):
         # Also inject directly into jar (covers cache-disabled case)
         for cookie in target_cookies:
             try:
-                self._client.cookie_jar.add(
-                    format_cookie_str(cookie), url
+                raw = format_cookie_str(cookie)
+                cookie_domain = cookie.get("domain")
+                self._record_cookie_scope(
+                    raw,
+                    url,
+                    domain=cookie_domain,
+                    path=cookie.get("path"),
+                    host_only=(
+                        not bool(cookie_domain)
+                        or not str(cookie_domain).startswith(".")
+                    ),
                 )
-            except Exception as e:
+                self._client.cookie_jar.add(raw, url)
+            except Exception as exc:
                 logger.debug(
-                    "Failed to inject cookie %s: %s",
+                    "Failed to inject cookie %s (%s)",
                     cookie.get("name", "?"),
-                    e,
+                    type(exc).__name__,
                 )
 
         # Imperva: the earned reese84/incap token replays over OpenSSL, so
@@ -550,23 +576,23 @@ class SyncSession(BaseSession):
         if challenge == ChallengeType.IMPERVA and self._native_tls_usable():
             try:
                 self._native_transport().add_cookies(target_cookies)
-            except Exception as e:
-                logger.debug("Failed to seed native-TLS jar: %s", e)
+            except Exception as exc:
+                logger.debug("Failed to seed native-TLS jar (%s)", type(exc).__name__)
 
-        # Passthrough: browser got real content without solving
-        if result.response is not None:
+        # Passthrough: browser got real content without solving. TMD/Baxia is
+        # different: Alibaba's post-slider page can be a small CSR shell while
+        # the same cookies unlock the authoritative SSR response over wreq.
+        # Always replay TMD through the normal transport instead of returning
+        # that incomplete shell as successful content.
+        if result.response is not None and challenge != ChallengeType.TMD:
             body_bytes = result.response.body
             # Enforce the response-size cap on the browser body too (it never
             # went through the wreq capped-read path).
             if max_size is not None and len(body_bytes) > max_size:
-                raise ResponseTooLarge(
-                    result.response.url, len(body_bytes), max_size
-                )
+                raise ResponseTooLarge(result.response.url, len(body_bytes), max_size)
             logger.info(
-                "Browser passthrough %s at %s "
-                "(%d cookies injected, %d bytes)",
+                "Browser passthrough challenge_type=%s (%d cookies injected, %d bytes)",
                 challenge.value,
-                url,
                 len(target_cookies),
                 len(body_bytes),
             )
@@ -582,15 +608,12 @@ class SyncSession(BaseSession):
                 # Individual Set-Cookie values from the captured response
                 # (the flat headers dict joins multi-value headers with
                 # "; ", which is lossy for Set-Cookie). Mirrors native-TLS.
-                raw_set_cookie=getattr(
-                    result.response, "set_cookie", None
-                ) or None,
+                raw_set_cookie=getattr(result.response, "set_cookie", None) or None,
             )
 
         logger.info(
-            "Browser solved %s at %s (%d cookies injected)",
+            "Browser solved challenge_type=%s (cookie_count=%d)",
             challenge.value,
-            url,
             len(target_cookies),
         )
         return True
@@ -635,13 +658,16 @@ class SyncSession(BaseSession):
             # spent -- surfacing it matches the wreq-path rule (hang past
             # the deadline -> WaferTimeout, never ConnectionFailed).
             raise
-        except Exception:
-            logger.warning(
-                "Native-TLS request failed for %s", url, exc_info=True
-            )
+        except Exception as exc:
+            logger.warning("Native-TLS request failed (%s)", type(exc).__name__)
             return None
         return self._native_make_response(
-            status, hdrs, body_bytes, final_url, start_time, state,
+            status,
+            hdrs,
+            body_bytes,
+            final_url,
+            start_time,
+            state,
             raw_set_cookie=rest[0] if rest else None,
         )
 
@@ -679,6 +705,87 @@ class SyncSession(BaseSession):
             raw=raw,
         )
 
+    def browser_prime(
+        self,
+        url: str,
+        *,
+        timeout: float | datetime.timedelta | None = None,
+        max_response_size: int | None = None,
+    ) -> bool:
+        """Deliberately visit an origin in the configured browser solver.
+
+        This is the sync counterpart to :meth:`AsyncSession.browser_prime`.
+        It imports and persists scoped browser state, but callers must retry
+        and validate their application-level response.
+        """
+
+        if self._browser_solver is None:
+            return False
+        timeout_secs = (
+            timeout.total_seconds()
+            if hasattr(timeout, "total_seconds")
+            else float(timeout)
+            if timeout is not None
+            else self.timeout.total_seconds()
+        )
+        if timeout_secs <= 0:
+            return False
+        effective_max_size = (
+            self.max_response_size if max_response_size is None else max_response_size
+        )
+        result = self._try_browser_solve(
+            ChallengeType.GENERIC_JS,
+            url,
+            time.monotonic() + timeout_secs,
+            max_size=effective_max_size,
+        )
+        # A passthrough response is content, not proof that state was earned.
+        # Keep this boolean API strict: callers use True to decide whether an
+        # application request is safe to retry with imported browser cookies.
+        return result is True
+
+    def browser_solve_challenge(
+        self,
+        url: str,
+        challenge_type: str,
+        *,
+        timeout: float | datetime.timedelta | None = None,
+        max_response_size: int | None = None,
+    ) -> bool:
+        """Solve an already-issued browser challenge and import its state.
+
+        This navigates the supplied challenge URL directly rather than the
+        session's ``solve_origin``.  A caller must retry and validate the
+        application request after a ``True`` result.
+        """
+
+        try:
+            challenge = ChallengeType(challenge_type)
+        except ValueError:
+            return False
+        if self._browser_solver is None:
+            return False
+        timeout_secs = (
+            timeout.total_seconds()
+            if hasattr(timeout, "total_seconds")
+            else float(timeout)
+            if timeout is not None
+            else self.timeout.total_seconds()
+        )
+        if timeout_secs <= 0:
+            return False
+        effective_max_size = (
+            self.max_response_size if max_response_size is None else max_response_size
+        )
+        result = self._try_browser_solve(
+            challenge,
+            url,
+            time.monotonic() + timeout_secs,
+            max_size=effective_max_size,
+            use_solve_origin=False,
+        )
+        return result is True
+
     def request(self, method: str, url: str, **kwargs) -> WaferResponse:
         """Send an HTTP request with retry, backoff, and challenge handling."""
         start_time = time.monotonic()
@@ -689,9 +796,7 @@ class SyncSession(BaseSession):
         req_timeout = kwargs.pop("timeout", None)
         req_attempt_timeout = kwargs.pop("attempt_timeout", None)
         # Per-request response-size cap overrides the session value.
-        max_response_size = kwargs.pop(
-            "max_response_size", self.max_response_size
-        )
+        max_response_size = kwargs.pop("max_response_size", self.max_response_size)
         if params:
             url = self._apply_params(url, params)
 
@@ -737,12 +842,14 @@ class SyncSession(BaseSession):
                 self._rate_limiter.wait_sync(
                     domain,
                     max_wait=(
-                        deadline - time.monotonic()
-                        if deadline is not None
-                        else None
+                        deadline - time.monotonic() if deadline is not None else None
                     ),
                 )
-            logger.debug("%s %s (Opera Mini)", method, url)
+            logger.debug(
+                "%s host=%s (Opera Mini)",
+                method,
+                extract_domain(url) or "unknown",
+            )
             # Single request, no retries -- bound it by the remaining total
             # budget (the rate-limit wait above may have eaten some of it).
             timeout = deadline - time.monotonic()
@@ -750,7 +857,9 @@ class SyncSession(BaseSession):
                 raise WaferTimeout(url, timeout_secs)
             status, resp_headers, body_bytes, final_url, set_cookies = (
                 self._om_identity.request(
-                    url, headers=extra_headers, timeout=timeout,
+                    url,
+                    headers=extra_headers,
+                    timeout=timeout,
                     max_size=max_response_size,
                 )
             )
@@ -777,12 +886,13 @@ class SyncSession(BaseSession):
 
         browser_attempted_type: str | None = None
         reddit_bootstrap_attempted = False
+        tmd_inline_attempted = False
         native_attempted = False
         native_retries = 0
         redirects_followed = 0
         history: list[HistoryEntry] = []
 
-        logger.debug("%s %s", method, url)
+        logger.debug("%s host=%s", method, extract_domain(url) or "unknown")
 
         while True:
             # Per-request deadline: abort retry loop if exceeded
@@ -794,9 +904,7 @@ class SyncSession(BaseSession):
                 self._rate_limiter.wait_sync(
                     domain,
                     max_wait=(
-                        deadline - time.monotonic()
-                        if deadline is not None
-                        else None
+                        deadline - time.monotonic() if deadline is not None else None
                     ),
                 )
 
@@ -806,8 +914,14 @@ class SyncSession(BaseSession):
             # the native jar, not wreq's, holds the WAF cookies.
             if domain in self._native_tls_domains:
                 native_resp = self._try_native_tls(
-                    method, current_url, extra_headers, kwargs,
-                    deadline, start_time, state, max_response_size,
+                    method,
+                    current_url,
+                    extra_headers,
+                    kwargs,
+                    deadline,
+                    start_time,
+                    state,
+                    max_response_size,
                 )
                 if native_resp is not None:
                     native_resp.history = history
@@ -831,14 +945,15 @@ class SyncSession(BaseSession):
                         delay = min(delay, max(0.0, deadline - time.monotonic()))
                     logger.debug(
                         "Native-TLS retry %d/%d for %s in %.1fs",
-                        native_retries, NATIVE_MAX_RETRIES, current_url, delay,
+                        native_retries,
+                        NATIVE_MAX_RETRIES,
+                        current_url,
+                        delay,
                     )
                     time.sleep(self._clamp_delay(delay, deadline))
                     continue
                 if native_resp is None:
-                    raise ConnectionFailed(
-                        current_url, "native-TLS request failed"
-                    )
+                    raise ConnectionFailed(current_url, "native-TLS request failed")
                 # Native retries exhausted on a persistent reese84 challenge
                 # (the heavy state where even OpenSSL must present a token).
                 # If a browser is available, un-pin and fall back to the wreq
@@ -847,9 +962,7 @@ class SyncSession(BaseSession):
                 # browser there's no way to mint the token, so surface it.
                 if self._browser_solver is not None:
                     logger.info(
-                        "Native-TLS exhausted at %s; reverting to "
-                        "wreq + browser solve",
-                        current_url,
+                        "Native-TLS exhausted; reverting to wreq + browser solve",
                     )
                     self._native_tls_domains.discard(domain)
                     native_attempted = True
@@ -867,8 +980,7 @@ class SyncSession(BaseSession):
                     return native_resp
                 else:
                     raise ChallengeDetected(
-                        native_resp.challenge_type
-                        or ChallengeType.IMPERVA.value,
+                        native_resp.challenge_type or ChallengeType.IMPERVA.value,
                         current_url,
                         native_resp.status_code,
                         response=native_resp,
@@ -902,9 +1014,7 @@ class SyncSession(BaseSession):
                     else min(attempt_secs, attempt_limit)
                 )
             if attempt_limit is not None:
-                kwargs["timeout"] = datetime.timedelta(
-                    seconds=attempt_limit
-                )
+                kwargs["timeout"] = datetime.timedelta(seconds=attempt_limit)
 
             # Make the request. When a resolve pin is set, canonicalize the
             # URL host (lowercase + trailing-dot strip) so wreq's DnsOptions -
@@ -912,9 +1022,7 @@ class SyncSession(BaseSession):
             # the pin on a mixed-case/trailing-dot host and fall through to
             # real DNS (the SSRF-rebinding hole). No-op when unpinned.
             wreq_url = (
-                _canonicalize_url_host(current_url)
-                if self._resolve
-                else current_url
+                _canonicalize_url_host(current_url) if self._resolve else current_url
             )
             try:
                 resp = self._client.request(m, wreq_url, **kwargs)
@@ -927,15 +1035,11 @@ class SyncSession(BaseSession):
                 # whole budget) and, when finally giving up, surface it as a
                 # WaferTimeout rather than a bare ConnectionFailed. The loop-top
                 # deadline check still bounds the total time.
-                attempt_timed_out = isinstance(
-                    e, wreq.exceptions.TimeoutError
-                )
+                attempt_timed_out = isinstance(e, wreq.exceptions.TimeoutError)
                 # The wall-clock limit this attempt actually ran under (for
                 # logging); attempt_limit is the min(cap, remaining) bound.
                 timed_out_after = (
-                    attempt_limit
-                    if attempt_limit is not None
-                    else timeout_secs
+                    attempt_limit if attempt_limit is not None else timeout_secs
                 )
                 if not state.can_retry:
                     # Normal retries exhausted. A timed-out attempt may
@@ -966,8 +1070,7 @@ class SyncSession(BaseSession):
                             time.sleep(self._clamp_delay(delay, deadline))
                             continue
                         pinned = (
-                            self._fingerprint is not None
-                            and self._fingerprint.pinned
+                            self._fingerprint is not None and self._fingerprint.pinned
                         )
                         # Mirror the 403 path: clear cookies (unless pinned)
                         # and advance the cross-family ladder / fingerprint_pool
@@ -1016,37 +1119,31 @@ class SyncSession(BaseSession):
                 state.use_retry()
                 delay = calculate_backoff(state.normal_retries - 1)
                 if deadline is not None:
-                    delay = min(
-                        delay, max(0.0, deadline - time.monotonic())
-                    )
+                    delay = min(delay, max(0.0, deadline - time.monotonic()))
                 logger.debug(
                     "Connection error, retry %d/%d in %.1fs: %s",
-                    state.normal_retries, state.max_retries, delay, e,
+                    state.normal_retries,
+                    state.max_retries,
+                    delay,
+                    e,
                 )
                 time.sleep(self._clamp_delay(delay, deadline))
                 continue
 
             status = resp.status.as_int()
+            self._record_response_cookie_scopes(current_url, resp)
 
             # Record request timestamp for rate limiting
             if self._rate_limiter:
                 self._rate_limiter.record(domain)
 
             # 3xx → follow redirect
-            if (
-                self.follow_redirects
-                and 300 <= status < 400
-                and status != 304
-            ):
+            if self.follow_redirects and 300 <= status < 400 and status != 304:
                 location = _extract_location(resp.headers)
                 if location:
                     if redirects_followed >= self.max_redirects:
-                        raise TooManyRedirects(
-                            current_url, self.max_redirects
-                        )
-                    new_url = self._resolve_redirect_url(
-                        current_url, location
-                    )
+                        raise TooManyRedirects(current_url, self.max_redirects)
+                    new_url = self._resolve_redirect_url(current_url, location)
                     redirects_followed += 1
                     # Record the hop: the 3xx status and the URL that
                     # returned it (requests-style history chain).
@@ -1061,9 +1158,7 @@ class SyncSession(BaseSession):
                     )
                     # Track referer from pre-redirect URL
                     self._record_url(current_url)
-                    cross_origin = self._is_cross_origin(
-                        current_url, new_url
-                    )
+                    cross_origin = self._is_cross_origin(current_url, new_url)
                     current_url = new_url
                     domain = extract_domain(current_url) or current_url
                     # A redirect to a new host gets its own native-TLS probe
@@ -1097,17 +1192,22 @@ class SyncSession(BaseSession):
                 or browser_attempted_type is not None
             )
             content_type = headers.get("content-type", "")
+            reddit_response = reddit_solve_origin(current_url) is not None
             reddit_gate_probe = (
                 max_response_size is not None
-                and status == 403
-                and reddit_solve_origin(current_url) is not None
+                and status in (200, 403)
+                and reddit_response
                 and _is_challengeable_content_type(content_type)
             )
             body_read_cap = max_response_size
             if reddit_gate_probe:
                 body_read_cap = max(
                     max_response_size,
-                    REDDIT_GATE_MAX_BYTES,
+                    (
+                        REDDIT_GATE_MAX_BYTES
+                        if status == 403
+                        else REDDIT_VERIFICATION_MAX_BYTES
+                    ),
                 )
 
             # Response-size cap: short-circuit on a declared Content-Length
@@ -1115,9 +1215,7 @@ class SyncSession(BaseSession):
             if body_read_cap is not None:
                 declared = _content_length_over_cap(resp, body_read_cap)
                 if declared is not None:
-                    raise ResponseTooLarge(
-                        current_url, declared, max_response_size
-                    )
+                    raise ResponseTooLarge(current_url, declared, max_response_size)
 
             # Read body: wreq's bytes() returns the DECOMPRESSED body
             # (gzip/br/zstd already handled), so raw_content is the true
@@ -1125,9 +1223,7 @@ class SyncSession(BaseSession):
             # charset -> <meta charset> sniff -> UTF-8) -- the same
             # resolution WaferResponse.text uses -- instead of wreq's
             # text(), which never meta-sniffs.
-            is_binary = _is_binary_content_type(
-                headers.get("content-type", "")
-            )
+            is_binary = _is_binary_content_type(headers.get("content-type", ""))
             try:
                 if body_read_cap is not None:
                     # Streamed early-abort: stop the moment the running total
@@ -1149,14 +1245,15 @@ class SyncSession(BaseSession):
             except Exception as e:
                 # Decompression errors (e.g. malformed gzip from eBay)
                 if not state.can_retry:
-                    raise ConnectionFailed(
-                        current_url, f"body decode: {e}"
-                    ) from e
+                    raise ConnectionFailed(current_url, f"body decode: {e}") from e
                 state.use_retry()
                 delay = calculate_backoff(state.normal_retries - 1)
                 logger.debug(
                     "Body decode error, retry %d/%d in %.1fs: %s",
-                    state.normal_retries, state.max_retries, delay, e,
+                    state.normal_retries,
+                    state.max_retries,
+                    delay,
+                    e,
                 )
                 time.sleep(self._clamp_delay(delay, deadline))
                 continue
@@ -1180,7 +1277,10 @@ class SyncSession(BaseSession):
                 delay = calculate_backoff(state.normal_retries - 1)
                 logger.debug(
                     "%d server error, retry %d/%d in %.1fs",
-                    status, state.normal_retries, state.max_retries, delay,
+                    status,
+                    state.normal_retries,
+                    state.max_retries,
+                    delay,
                 )
                 time.sleep(self._clamp_delay(delay, deadline))
                 continue
@@ -1199,10 +1299,12 @@ class SyncSession(BaseSession):
                 and _is_challengeable_content_type(content_type)
                 else None
             )
+            if challenge == ChallengeType.REDDIT and not reddit_response:
+                challenge = None
             if (
                 max_response_size is not None
                 and len(raw_content) > max_response_size
-                and challenge != ChallengeType.REDDIT
+                and not (challenge == ChallengeType.REDDIT and reddit_response)
             ):
                 raise ResponseTooLarge(
                     current_url,
@@ -1212,9 +1314,7 @@ class SyncSession(BaseSession):
 
             # 429 without detected challenge → rate limit retry
             if status == 429 and challenge is None:
-                retry_after = parse_retry_after(
-                    headers.get("retry-after", "")
-                )
+                retry_after = parse_retry_after(headers.get("retry-after", ""))
                 if not state.can_rotate:
                     if self.max_rotations == 0:
                         return self._make_response(
@@ -1264,10 +1364,7 @@ class SyncSession(BaseSession):
                     # fingerprint is pinned (browser-solve matched the
                     # emulation to the browser's TLS identity, so the
                     # cookies belong to THIS fingerprint).
-                    pinned = (
-                        self._fingerprint is not None
-                        and self._fingerprint.pinned
-                    )
+                    pinned = self._fingerprint is not None and self._fingerprint.pinned
                     if self._cookie_cache and not pinned:
                         self._clear_cached_cookies(domain)
                     if not pinned:
@@ -1287,15 +1384,15 @@ class SyncSession(BaseSession):
                 )
                 logger.debug(
                     "429 rate limited, waiting %.1fs (rotation %d/%d)",
-                    delay, state.rotation_retries, state.max_rotations,
+                    delay,
+                    state.rotation_retries,
+                    state.max_rotations,
                 )
                 time.sleep(self._clamp_delay(delay, deadline))
                 continue
 
             # Challenge or bare 403 → try inline solver, then rotate
-            if challenge is not None or (
-                status == 403 and body is not None
-            ):
+            if challenge is not None or (status == 403 and body is not None):
                 # Session health: track failure (defer retirement
                 # until after budget check to avoid destroying
                 # state before raising)
@@ -1304,10 +1401,7 @@ class SyncSession(BaseSession):
                 # Reddit's gate response establishes half of the anonymous
                 # cookie set (csv/edgebucket); persist that leg alongside the
                 # verification cookies so cache_dir survives a process restart.
-                if (
-                    challenge == ChallengeType.REDDIT
-                    and not reddit_bootstrap_attempted
-                ):
+                if challenge == ChallengeType.REDDIT and not reddit_bootstrap_attempted:
                     self._cache_response_cookies(
                         current_url,
                         resp,
@@ -1319,11 +1413,12 @@ class SyncSession(BaseSession):
                 # gets exactly one bootstrap + replay; repeating the same
                 # navigation cannot improve a failed bootstrap.
                 inline_allowed = (
-                    challenge != ChallengeType.REDDIT
-                    or not reddit_bootstrap_attempted
-                )
+                    challenge != ChallengeType.REDDIT or not reddit_bootstrap_attempted
+                ) and (challenge != ChallengeType.TMD or not tmd_inline_attempted)
                 if challenge == ChallengeType.REDDIT:
                     reddit_bootstrap_attempted = True
+                elif challenge == ChallengeType.TMD:
+                    tmd_inline_attempted = True
                 inline_solved = False
                 if (
                     challenge == ChallengeType.REDDIT
@@ -1343,10 +1438,7 @@ class SyncSession(BaseSession):
                     inline_solved = self._try_inline_solve(
                         challenge, body, current_url, deadline
                     )
-                if (
-                    challenge is not None
-                    and inline_solved
-                ):
+                if challenge is not None and inline_solved:
                     state.inline_solves += 1
                     delay = calculate_backoff(
                         state.inline_solves - 1,
@@ -1354,10 +1446,8 @@ class SyncSession(BaseSession):
                         max_delay=10.0,
                     )
                     logger.debug(
-                        "%s solved inline at %s (%d/%d), "
-                        "retrying in %.1fs",
+                        "%s solved inline (%d/%d), retrying in %.1fs",
                         challenge.value,
-                        current_url,
                         state.inline_solves,
                         state.max_inline_solves,
                         delay,
@@ -1377,27 +1467,28 @@ class SyncSession(BaseSession):
                 ):
                     native_attempted = True
                     native_resp = self._try_native_tls(
-                        method, current_url, extra_headers, kwargs,
-                        deadline, start_time, state, max_response_size,
+                        method,
+                        current_url,
+                        extra_headers,
+                        kwargs,
+                        deadline,
+                        start_time,
+                        state,
+                        max_response_size,
                     )
                     if native_resp is not None:
                         native_resp.history = history
                     # A non-challenge reply means the OpenSSL client got past
                     # the WAF — pin the host regardless of HTTP status (a real
                     # 404/500 from the origin still proves the bypass works).
-                    if (
-                        native_resp is not None
-                        and native_resp.challenge_type is None
-                    ):
+                    if native_resp is not None and native_resp.challenge_type is None:
                         self._native_tls_domains.add(domain)
                         if self._rate_limiter:
                             self._rate_limiter.record(domain)
                         self._record_success(domain)
                         self._record_url(current_url)
                         logger.info(
-                            "Imperva bypassed via native-TLS at %s "
-                            "(host pinned)",
-                            current_url,
+                            "Imperva bypassed via native-TLS (host pinned)",
                         )
                         return native_resp
                     logger.debug(
@@ -1421,19 +1512,24 @@ class SyncSession(BaseSession):
                 ):
                     browser_attempted_type = challenge.value
                     browser_result = self._try_browser_solve(
-                        challenge, current_url, deadline,
+                        challenge,
+                        current_url,
+                        deadline,
                         embedder=self._imperva_embedder(
                             challenge, current_url, extra_headers, kwargs
                         ),
                         replay=self._browser_replay(method, kwargs),
                         max_size=max_response_size,
+                        challenge_url=(
+                            _tmd_punish_url_from_body(body, current_url)
+                            if challenge is ChallengeType.TMD
+                            else None
+                        ),
                     )
                     if isinstance(browser_result, WaferResponse):
                         self._record_success(domain)
                         self._record_url(current_url)
-                        browser_result.elapsed = (
-                            time.monotonic() - start_time
-                        )
+                        browser_result.elapsed = time.monotonic() - start_time
                         browser_result.history = history
                         return browser_result
                     if browser_result:
@@ -1443,10 +1539,7 @@ class SyncSession(BaseSession):
                         continue
 
                 # No browser solver — rotation can't help JS-only challenges
-                if (
-                    self._browser_solver is None
-                    and challenge in JS_ONLY_CHALLENGES
-                ):
+                if self._browser_solver is None and challenge in JS_ONLY_CHALLENGES:
                     if self.max_rotations == 0:
                         return self._make_response(
                             status_code=status,
@@ -1485,12 +1578,15 @@ class SyncSession(BaseSession):
                     # Last resort: browser solve (once per challenge type)
                     if (
                         challenge is not None
+                        and challenge != ChallengeType.REDDIT
                         and browser_attempted_type != challenge.value
                         and self._browser_solver is not None
                     ):
                         browser_attempted_type = challenge.value
                         browser_result = self._try_browser_solve(
-                            challenge, current_url, deadline,
+                            challenge,
+                            current_url,
+                            deadline,
                             embedder=self._imperva_embedder(
                                 challenge, current_url, extra_headers, kwargs
                             ),
@@ -1500,9 +1596,7 @@ class SyncSession(BaseSession):
                         if isinstance(browser_result, WaferResponse):
                             self._record_success(domain)
                             self._record_url(current_url)
-                            browser_result.elapsed = (
-                                time.monotonic() - start_time
-                            )
+                            browser_result.elapsed = time.monotonic() - start_time
                             browser_result.history = history
                             return browser_result
                         if browser_result:
@@ -1560,10 +1654,7 @@ class SyncSession(BaseSession):
                     # Clear domain cookies on rotation unless the
                     # fingerprint is pinned (browser-solve matched the
                     # emulation, so cookies belong to THIS fingerprint).
-                    pinned = (
-                        self._fingerprint is not None
-                        and self._fingerprint.pinned
-                    )
+                    pinned = self._fingerprint is not None and self._fingerprint.pinned
                     if self._cookie_cache and not pinned:
                         self._clear_cached_cookies(domain)
                     if not pinned:
@@ -1577,8 +1668,7 @@ class SyncSession(BaseSession):
                     self._rebuild_client()
                 delay = self._rotation_delay()
                 logger.debug(
-                    "%s at %s, rotated (rotation %d/%d), "
-                    "waiting %.1fs",
+                    "%s at %s, rotated (rotation %d/%d), waiting %.1fs",
                     challenge.value if challenge else "403",
                     current_url,
                     state.rotation_retries,
@@ -1589,11 +1679,7 @@ class SyncSession(BaseSession):
                 continue
 
             # 200 with empty text body → normal retry (skip for binary)
-            if (
-                body is not None
-                and status == 200
-                and not body.strip()
-            ):
+            if body is not None and status == 200 and not body.strip():
                 if not state.can_retry:
                     # max_retries=0 or max_rotations=0 (.bulk()): the
                     # documented contract is to RETURN the empty-200 response,
@@ -1619,14 +1705,10 @@ class SyncSession(BaseSession):
                     # signal. Once same-identity retries are spent, escalate to
                     # a fresh identity (within max_rotations) before giving up:
                     # a different fingerprint often gets the real body back.
-                    if (
-                        domain in self._body_capable_domains
-                        and state.can_rotate
-                    ):
+                    if domain in self._body_capable_domains and state.can_rotate:
                         state.use_rotation()
                         pinned = (
-                            self._fingerprint is not None
-                            and self._fingerprint.pinned
+                            self._fingerprint is not None and self._fingerprint.pinned
                         )
                         if self._cookie_cache and not pinned:
                             self._clear_cached_cookies(domain)
@@ -1664,7 +1746,9 @@ class SyncSession(BaseSession):
                 delay = calculate_backoff(state.normal_retries - 1)
                 logger.debug(
                     "Empty 200 body, retry %d/%d in %.1fs",
-                    state.normal_retries, state.max_retries, delay,
+                    state.normal_retries,
+                    state.max_retries,
+                    delay,
                 )
                 time.sleep(self._clamp_delay(delay, deadline))
                 continue
@@ -1719,6 +1803,7 @@ class SyncSession(BaseSession):
             raise NotImplementedError(
                 "add_cookie() is not supported with Opera Mini profile"
             )
+        self._record_cookie_scope(raw_set_cookie, url)
         self._client.cookie_jar.add(raw_set_cookie, url)
 
     def mint_recaptcha_v3(
@@ -1803,4 +1888,4 @@ class SyncSession(BaseSession):
             try:
                 self._browser_solver.close()
             except Exception:
-                logger.debug("BrowserSolver.close() failed", exc_info=True)
+                logger.debug("BrowserSolver.close() failed")

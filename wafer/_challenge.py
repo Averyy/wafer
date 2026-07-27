@@ -12,6 +12,8 @@ Detection order is intentional:
 import enum
 import logging
 
+from wafer._solvers import is_reddit_verification
+
 logger = logging.getLogger("wafer")
 
 
@@ -49,6 +51,7 @@ JS_ONLY_CHALLENGES = frozenset({
     ChallengeType.CLOUDFLARE,
     ChallengeType.DATADOME,
     ChallengeType.KASADA,
+    ChallengeType.TMD,
     ChallengeType.VERCEL,
     ChallengeType.HCAPTCHA,
     ChallengeType.RECAPTCHA,
@@ -224,15 +227,25 @@ def detect_challenge(
         logger.info("Challenge detected: tmd")
         return ChallengeType.TMD
 
-    # Reddit JSON API cold-session gate. The API returns its normal, large
-    # Shreddit block template until a same-session HTML navigation establishes
-    # the anonymous browser cookies. This is deliberately structural + textual
-    # rather than a broad "blocked" match: ordinary Reddit 403 pages must not
-    # be turned into a session-warming loop.
+    # Reddit anonymous-session gates. JSON endpoints return a large Shreddit
+    # block template, while direct HTML navigation can return a small, valid
+    # 200 verification form. The latter goes through the strict verification
+    # parser so an ordinary successful Reddit page cannot become a bootstrap
+    # loop.
     if (
         status_code == 403
         and "theme-beta" in body[:256].lower()
         and "you've been blocked by network security" in body.lower()
+    ):
+        logger.info("Challenge detected: reddit")
+        return ChallengeType.REDDIT
+    if (
+        status_code == 200
+        # Bounded prefix, like the 403 probe above: this runs on every
+        # successful 200 that reaches here, and lowercasing a multi-megabyte
+        # body to look for a <title> in <head> is pure waste.
+        and "reddit - please wait for verification" in body[:4096].lower()
+        and is_reddit_verification(body)
     ):
         logger.info("Challenge detected: reddit")
         return ChallengeType.REDDIT

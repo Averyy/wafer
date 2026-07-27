@@ -237,6 +237,11 @@ _CHROME_BUILDS: dict[int, tuple[int, int]] = {
     147: (7727, 24),
     148: (7778, 217),
     149: (7827, 201),
+    # Chrome 150 stable. wreq has no Chrome150 Emulation yet, so
+    # DEFAULT_EMULATION stays at 149 and pin_to_browser() carries the real
+    # 150 UA/hints; this entry keeps _full_version(150) exact rather than
+    # falling back to the +61/major linear approximation (150.0.7943.58).
+    150: (7871, 182),
 }
 
 # Fallback for versions outside the lookup table.
@@ -647,6 +652,16 @@ def chrome_version(emulation: Emulation) -> int | None:
     return _VERSION_BY_REPR.get(repr(emulation))
 
 
+def chrome_full_version(emulation: Emulation) -> str | None:
+    """Return the exact Chrome version represented by an Emulation profile.
+
+    The returned four-part version is the same value wafer emits in
+    high-entropy Chrome client hints. Non-Chrome profiles return ``None``.
+    """
+    major = chrome_version(emulation)
+    return _full_version(major) if major is not None else None
+
+
 def emulation_for_version(version: int) -> Emulation | None:
     """Find the Emulation profile matching a Chrome major version, or None."""
     return _EMULATION_BY_VERSION.get(version)
@@ -806,7 +821,7 @@ class FingerprintManager:
             # shape tracks it too. See CLAUDE.md wreq-upgrade steps.
             newest = emulation_major_version(self._current)
             logger.warning(
-                "Solving browser is Chrome %s but newest wreq Emulation is "
+                "Browser identity is Chrome %s but newest wreq Emulation is "
                 "Chrome %s; pinning %s TLS with the browser's real Chrome %s "
                 "UA/hints (cookie replay works; update wreq to close the gap)",
                 major_version,
