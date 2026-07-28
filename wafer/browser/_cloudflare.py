@@ -30,7 +30,7 @@ def _page_is_challenge(page) -> bool:
     return any(m in head for m in _CF_CHALLENGE_MARKERS)
 
 
-def wait_for_cloudflare(solver, page, timeout_ms: int) -> bool:
+def wait_for_cloudflare(solver, page, timeout_ms: int) -> bool | None:
     """Wait for Cloudflare challenge to resolve.
 
     Handles both managed challenges (cType: 'managed', auto-solve
@@ -44,10 +44,10 @@ def wait_for_cloudflare(solver, page, timeout_ms: int) -> bool:
     2. Poll for resolution: cf_clearance cookie OR page title/
        content changing away from the challenge page.
 
-    Early bail-out: if no challenges.cloudflare.com iframe appears
-    within 3 seconds, returns False immediately.  This handles the
-    "WAF-transparent-to-browser" pattern where the browser gets 200
-    instantly with no challenge.
+    Returns ``True`` after authoritative solve evidence, ``False`` after an
+    observed challenge fails to resolve, and ``None`` when no challenge iframe
+    appears. The caller may validate the successful main-document navigation
+    as a pass-through only for that last, distinct outcome.
     """
     state = solver._start_browse(
         page,
@@ -108,7 +108,7 @@ def wait_for_cloudflare(solver, page, timeout_ms: int) -> bool:
                 "No Cloudflare challenge iframe after 3s, "
                 "browser likely passed through"
             )
-            return False
+            return None
 
         solver._replay_browse_chunk(page, state, 2)
 

@@ -17,10 +17,10 @@ pip install wafer-py            # core
 pip install wafer-py[browser]   # core + browser solving
 ```
 
-**Core** (`wafer-py`) provides the TLS client with browser-grade fingerprints,
+**Core** (`wafer-py`) provides the TLS client with wreq browser emulations,
 automatic challenge detection, retry with fingerprint rotation, cookie caching,
 rate limiting, and inline solving for challenges that don't need JavaScript
-(ACW, Amazon CAPTCHA, TMD).
+(ACW, Amazon CAPTCHA, TMD, Reddit).
 
 **Browser** (`wafer-py[browser]`) adds a real Chrome browser solver for
 challenges that require JavaScript execution (Cloudflare Turnstile, DataDome,
@@ -59,8 +59,8 @@ async with AsyncSession() as session:
     resp = await session.get("https://example.com")
 ```
 
-For multiple requests, prefer a session - it reuses the TLS identity and
-cookie jar, which is faster and gives better anti-detection behavior.
+For multiple requests, prefer a session so the TLS identity, connection state,
+cookie jar, retry state, and rate limiter are reused.
 
 ---
 
@@ -151,12 +151,12 @@ SyncSession(
     # Retry behavior. WARNING: the defaults replay the WHOLE request up to
     # max_retries + max_rotations times (up to 6x by default). For stateful
     # multi-step flows (login, cart, checkout) that is hazardous - lower these
-    # or use bulk(). See "Reputation-burn guard" below.
+    # or use bulk(). See "Stateful request replay" below.
     max_retries: int = 3,       # for 5xx, connection errors, empty 200
     max_rotations: int = 2,     # for 403/challenge (see rotation escalation below)
 
     # Session health
-    max_failures: int | None = 3,  # consecutive failures per domain before full identity reset; None to disable.
+    max_failures: int | None = 3,  # consecutive failures per hostname before full identity reset; None to disable.
                                     # IGNORED when fingerprint_pool is set (a pool is never retired).
 
     # Response-size cap (memory safety). None = no cap (default; behavior
@@ -432,7 +432,7 @@ reaching into `wafer._fingerprint`. Always returns these keys:
 {
   "user_agent": str | None,        # the UA wreq sends for this profile
   "family": str | None,            # "chrome"|"edge"|"firefox"|"opera"|"safari"|"dart"|"opera_mini"|None
-  "emulation": str | None,         # "Profile.Chrome147" or "safari"/"ios_safari"/"dart"/"opera_mini"
+  "emulation": str | None,         # "Profile.Chrome149" or "safari"/"ios_safari"/"dart"/"opera_mini"
   "sec_ch_ua": str | None,         # low-entropy hint; None for Firefox/Safari/Opera (see below)
   "sec_ch_ua_mobile": str | None,  # "?0" or None
   "sec_ch_ua_platform": str | None,# e.g. '"macOS"' or None
@@ -526,7 +526,7 @@ cookie jar) and continues retrying. It does not raise.
 Default mode (`max_rotations > 0`):
 - 403 + challenge detected -> raises `ChallengeDetected` after exhausting rotations
 - 429 without challenge -> raises `RateLimited` after exhausting rotations
-- 200 with empty body -> retries; if the host already served a real body this session, also rotates to a fresh identity (within `max_rotations`); raises `EmptyResponse` once retries+rotations are exhausted (see "Reputation-burn guard")
+- 200 with empty body -> retries; if the host already served a real body this session, also rotates to a fresh identity (within `max_rotations`); raises `EmptyResponse` once retries+rotations are exhausted (see "Stateful request replay")
 - Connection error (refused/reset/TLS failure) -> raises `ConnectionFailed` after exhausting retries
 - Server hang past the total `timeout` deadline -> raises `WaferTimeout` (a timeout on any transport - the wreq path, the native-TLS Imperva bypass, or the Opera Mini path, whether during connect or read - is always bounded by your budget and surfaced as `WaferTimeout`, never `ConnectionFailed`)
 - 5xx -> returns response after exhausting retries
@@ -540,23 +540,31 @@ No-rotation mode (`max_rotations = 0`, including `.bulk()`):
 
 ### Rotation escalation
 
-On 403 or challenge, rotation escalates ACROSS BROWSER FAMILIES before cycling
-versions within one family. WAF reputation pools key on browser family, so a
-Chrome->Firefox switch is real diversity, while Chrome145->146->147 all share
-one Chromium reputation pool (the weakest axis). Every family switch ALSO swaps
-the HTTP header envelope to that family's (Accept, Accept-Language, sec-ch-ua)
-so the headers stay coherent with the TLS fingerprint - a Firefox TLS shape with
-Chrome's Accept/sec-ch-ua would defeat the rotation.
+On 403 or challenge, rotation changes browser families before cycling versions
+within one family. Chrome versions share Chromium-family characteristics,
+whereas Firefox uses a Gecko TLS/H2 profile. Every family switch also swaps the
+HTTP header envelope to that family's `Accept`, `Accept-Language`, and client
+hints so the headers remain coherent with the TLS fingerprint.
 
 The deterministic ladder (starting from the default Chrome family):
 
-1. **Fresh TLS session** (rotation 1) - rebuilds the wreq client (new TLS session, empty cookie jar) with the SAME family. Also clears that domain's disk cookie cache (if `cache_dir` is set). Often sufficient when the 403 is from a stale TLS session or tainted cookies, not a fingerprint block.
-2. **Firefox** (rotation 2) - `Emulation.Firefox149`: Gecko TLS/H2, Firefox Accept, `Accept-Language: en-US,en;q=0.5`, NO sec-ch-ua.
-3. **Safari** (rotation 3) - wafer's wire-verified Safari 26 (custom TlsOptions/Http2Options), a fundamentally different TLS/H2 shape, no client hints.
-4. **Edge** (rotation 4) - `Emulation.Edge147`: Chromium TLS but the `"Microsoft Edge"` sec-ch-ua brand + Edge build.
+1. **Fresh TLS session** (rotation 1) - rebuilds the wreq client (new TLS session, empty cookie jar) with the SAME family. Also clears that domain's disk cookie cache (if `cache_dir` is set).
+2. **Firefox** (rotation 2) - `Emulation.Firefox151`: Gecko TLS/H2, Firefox Accept, `Accept-Language: en-US,en;q=0.5`, NO sec-ch-ua.
+3. **Safari** (rotation 3) - wafer's Safari 26 custom TlsOptions/Http2Options profile, no client hints.
+4. **Edge** (rotation 4) - `Emulation.Edge148`: Chromium TLS but the `"Microsoft Edge"` sec-ch-ua brand + Edge build.
 5. **Chrome version cycling** (rotation 5+) - returns to the Chrome family and cycles Chrome versions on subsequent rotations.
 
-The rung you reach is bounded by `max_rotations`: the full Chrome->Firefox->Safari->Edge ladder needs `max_rotations>=4` (Safari needs `>=3`, Edge `>=4`, Chrome-version cycling `>=5`). With the **default `max_rotations=2`** you get exactly one cross-family jump (a fresh Chrome session, then Firefox) before wafer raises. The default is deliberately low: a higher rotation budget burns more identities against the same host and worsens its reputation, so raise it only when you actually need deeper escalation. A **pinned** fingerprint (after a browser solve matched the emulation to the solving browser) does NOT rotate - its cookies are bound to that identity. A session started on a non-Chrome `emulation=` walks the same ladder skipping its own starting family; `profile=` identities (Safari/iOS Safari/Dart/Opera Mini) keep their existing special-casing and are not forced into the ladder.
+The rung you reach is bounded by `max_rotations`: the full
+Chrome->Firefox->Safari->Edge ladder needs `max_rotations>=4` (Safari needs
+`>=3`, Edge `>=4`, Chrome-version cycling `>=5`). With the default
+`max_rotations=2` you get one cross-family jump (a fresh Chrome session, then
+Firefox) before wafer raises. A higher budget tries more identities against
+the same host. A fingerprint pinned after earning browser-bound challenge
+state does not rotate because its cookies are bound to that identity. Reddit
+browser recovery and challenge-absent Cloudflare passthrough do not pin. A
+session started on a non-Chrome `emulation=` walks the same ladder, skipping
+its own starting family; `profile=` identities (Safari/iOS
+Safari/Dart/Opera Mini) retain their profile-specific behavior.
 
 ### Fingerprint pool
 
@@ -568,25 +576,23 @@ WITHOUT retiring the whole session on N strikes.
   order (cycling) instead of the Chrome->Firefox->Safari->Edge ladder. Each step
   swaps to that identity's family header envelope (same coherence as the ladder).
 - **Per-identity backoff.** A pool member that fails accrues a strike; the next
-  time the cycle reaches it, its rotation delay grows (capped). A hot identity
-  "rests" while the others are tried, rather than being hammered.
+  time the cycle reaches it, its rotation delay grows up to the configured cap.
 - **Never retired.** `max_failures` is IGNORED in pool mode: rotation-induced
-  403s are expected and must not nuke the session (this is why bell/pcbparts/
-  fetchaller disable retirement today). The pool backoff is the entire health
-  model. `max_rotations` still bounds the number of rotations per request.
+  failures do not retire the session. Pool backoff is the health model;
+  `max_rotations` still bounds rotations per request.
 - **Emulation-only.** Pool entries are wreq `Emulation` profiles
-  (`[Emulation.Chrome147, Emulation.Firefox149, Emulation.Edge147]`). A pool is
+  (`[Emulation.Chrome149, Emulation.Firefox151, Emulation.Edge148]`). A pool is
   ignored for `profile=` (Safari/iOS Safari/Dart/Opera Mini) sessions.
 
 ```python
 from wreq import Emulation
 session = SyncSession(
-    fingerprint_pool=[Emulation.Chrome147, Emulation.Firefox149, Emulation.Edge147],
+    fingerprint_pool=[Emulation.Chrome149, Emulation.Firefox151, Emulation.Edge148],
     max_rotations=6,  # bound how many pool steps a single request may take
 )
 ```
 
-### Reputation-burn guard (stateful flows)
+### Stateful request replay
 
 **WARNING:** the default `max_retries=3, max_rotations=2` can replay a single
 request up to **6 times** - and the replay re-issues the WHOLE request (same
@@ -611,16 +617,12 @@ outcome once rotations are exhausted (or returned, under `max_rotations=0`/
 `bulk()`). A FIRST-request empty 200 (host never proven 200-capable) is NOT
 rotated - it could legitimately be an empty endpoint - and just retries/raises.
 
-### Imperva / Incapsula (automatic; browserless at light load)
+### Imperva / Incapsula native-TLS fallback
 
-Some Imperva-protected hosts (e.g. `api2.realtor.ca`) fingerprint the TLS
-stack itself and challenge *every* browser-emulating client - rotating Chrome
-or Safari fingerprints can't help, because they all share the same underlying
-TLS library. When wafer detects an Imperva challenge it automatically retries
-the request over a system-OpenSSL transport that presents as a plain API
-client (no `Sec-Fetch-*` headers), which these hosts wave through. You don't
-configure anything: pass your normal `Origin`/`Referer` headers and call
-`get`/`post` as usual; you just get the JSON back.
+Some Imperva deployments challenge browser-emulating clients based on their
+TLS stack. Wafer can retry those requests over a system-OpenSSL transport
+without `Sec-Fetch-*` headers. The request method, body, and caller-supplied
+`Origin`/`Referer` headers are preserved.
 
 - **No browser required** for this path (works without the `[browser]` extra).
 - **Sticky per hostname:** once a host is served this way, the whole session
@@ -628,18 +630,12 @@ configure anything: pass your normal `Origin`/`Referer` headers and call
   back mid-flow would just get re-challenged). Other hosts are unaffected.
 - **Any method/body:** GET with `params=`, POST with `form=`/`json=`/`body=`
   all work; the body and `Content-Type` are preserved.
-- **Light vs heavy usage (the no-browser/browser split):** at light load these
-  hosts give the OpenSSL client a free pass (no `reese84` token needed) - no
-  browser. Under heavy load the WAF revokes that and demands the `reese84`
-  JS token from *everyone* (even OpenSSL). When that happens and a
-  `browser_solver` is set, wafer solves `reese84` **once** in a real browser and
-  the token is then reused across the rest of the session (exactly how a real
-  browser reuses the token it earned) - so heavy bursts keep returning data.
-  This holds whether or not the host was pinned to the native path: a pinned
-  host first backs off and retries native (for a transient rate blip), and if
-  the challenge persists it un-pins and falls through to the same browser-solve
-  escalation. Without a `browser_solver` there's no way to mint the token, so
-  the heavy state raises `ChallengeDetected` (or returns the 403 under
+- **Token escalation:** when the native path also requires a `reese84` token
+  and `browser_solver` is configured, wafer obtains the token in the browser
+  and reuses it for the session. A host already assigned to the native path
+  retries there first, then leaves that path if the challenge persists.
+  Without a browser solver, the persistent challenge raises
+  `ChallengeDetected` (or returns the response under
   `.bulk()`/`max_rotations=0`).
 - **Proxies:** with no proxy or an `http://` proxy the native path is used (an
   http proxy is honored via CONNECT tunnelling). With a `socks://`/`https://`
@@ -665,7 +661,8 @@ call creates and tears down its own independent SyncSession.
 **Cookie cache** (`cache_dir`) is off by default (`None`). When set, only solver
 cookies (browser-solved WAF challenges, inline solvers) are persisted to disk.
 Normal `Set-Cookie` headers stay in-memory and are lost on session rebuild (WAFs
-bind cookies to TLS fingerprints). Recommended for `BrowserSolver` users.
+can bind cookies to TLS fingerprints). Set `cache_dir` when browser or inline
+solver cookies must persist across sessions.
 Thread-safe (per-domain locks, atomic writes via temp file + rename). Multiple
 threads can share the same `cache_dir` path safely. Multiple processes sharing
 the same path may lose updates under concurrent writes to the same domain.
@@ -706,11 +703,11 @@ capabilities and trade-offs.
 
 ### Chrome (default, no profile= needed)
 
-- TLS + HTTP/2 fingerprint matches real Chrome (currently Chrome 147)
+- Default wreq TLS + HTTP/2 profile is `Emulation.Chrome149`
 - Auto-generates `sec-ch-ua` Client Hints headers
 - On 403/challenge: rotates across families (Chrome -> Firefox -> Safari -> Edge -> Chrome versions), swapping the header envelope each switch (see "Rotation escalation")
 - All features enabled: challenge detection, retry, rotation, browser solving
-- Pass `emulation=wreq.Emulation.Chrome147` to pin a specific version
+- Pass `emulation=wreq.Emulation.Chrome149` to select that specific profile
 
 ### Safari (`profile=Profile.SAFARI`)
 
@@ -718,7 +715,6 @@ capabilities and trade-offs.
 - No `sec-ch-ua` headers (Safari doesn't send Client Hints)
 - All features except fingerprint rotation (only one Safari profile)
 - `safari_locale=` param: `"us"` (default) or `"ca"`
-- More effective than Chrome against DataDome (less commonly spoofed TLS)
 
 ### iOS Safari (`profile=Profile.IOS_SAFARI`)
 
@@ -767,7 +763,7 @@ capabilities and trade-offs.
 These are all automatic. Do not write code to handle these yourself:
 
 - **Redirects** - 3xx followed automatically (POST -> GET on 301/302/303). 304 passes through. Auth stripped on cross-origin redirects. Body headers stripped on method change. Followed hops are recorded in `resp.history`.
-- **Referer headers** - set automatically from the last URL visited per domain
+- **Referer headers** - set automatically from the last URL visited per hostname
 - **Cookies** - managed in-memory and optionally persisted to disk; no manual cookie jar needed
 - **WAF challenges** - detected, browser-solved if configured, retried with cross-family fingerprint rotation (Chrome -> Firefox -> Safari -> Edge)
 - **Rate limiting** - per-hostname delays enforced automatically when `rate_limit` is set
@@ -795,7 +791,7 @@ one of these strings:
 "acw"          - Alibaba Cloud WAF (solved inline, no browser needed)
 "tmd"          - Alibaba TMD (inline warm-up; browser for Baxia/reCAPTCHA)
 "amazon"       - Amazon CAPTCHA (solved inline, no browser needed)
-"reddit"       - Reddit cold-session JSON/HTML gate (solved inline, no browser needed)
+"reddit"       - Reddit cold-session JSON/HTML gate (inline first; optional browser recovery)
 "vercel"       - Vercel bot protection
 "arkose"       - Arkose Labs / FunCaptcha (no dedicated solver; not solvable)
 "geetest"      - GeeTest v4
@@ -817,10 +813,16 @@ a score token, not a visible challenge, and is minted browser-free via
 `session.mint_recaptcha_v3(...)` (see "reCAPTCHA v3 token minting").
 `"vercel"`/`"generic_js"` also get the generic browser JS-wait (no
 dedicated solver, but it passes their passive JS checks). The inline set
-(`acw`, `tmd`, `amazon`, `reddit`) needs no browser at all. Reddit's solver
-recognizes both the large JSON block and direct 200 verification HTML, performs
-the logged-out New Reddit verification at `https://www.reddit.com/` in the same
-TLS session, then retries the original request; `cache_dir`
+(`acw`, `tmd`, `amazon`, `reddit`) needs no browser for its normal path.
+Reddit's solver recognizes both the large JSON block and direct 200 verification
+HTML, performs the logged-out New Reddit verification at
+`https://www.reddit.com/` in the same TLS session, then retries the original
+request. If the strict inline flow fails and `browser_solver` is configured,
+wafer navigates that fixed HTML root in Chrome, optionally reloads it once,
+requires `loid` plus `token_v2` or `csv`, imports the cookies, and retries the
+original method/body through wreq. It never browser-navigates the JSON URL or
+returns browser HTML as the API response. Reddit's fixed root overrides
+`solve_origin` for this recovery. `cache_dir`
 persists the durable cookie-setting response legs so later processes can start
 warm. Explicit `old.reddit.com` requests are fetched normally, but wafer never
 selects Old Reddit automatically or uses it as a fallback. A login wall from
@@ -835,11 +837,16 @@ Requires `pip install wafer-py[browser]`. Uses Patchright (patched Playwright).
 ```python
 from wafer.browser import (
     BrowserSolver,
+    CapturedResponse,
     InterceptResult,
     SolveResult,
+    format_cookie_str,
     preflight_recaptcha_models,
     preload_recaptcha_models,
 )
+
+# Convert one Playwright/Patchright cookie dict to a Set-Cookie string.
+format_cookie_str(cookie: dict) -> str
 
 # Optional startup/release preflight for deployments that require reCAPTCHA
 # image-grid support. Downloads the immutable, library-pinned classifier and
@@ -851,7 +858,7 @@ models_ready = preload_recaptcha_models(timeout=60.0)
 preflight_recaptcha_models(timeout=60.0)
 
 solver = BrowserSolver(
-    headless=False,       # default: False. Headful recommended for stealth
+    headless=False,       # default; headless has lower solve coverage
     idle_timeout=300.0,   # default: 300s. Close browser after N seconds idle
     solve_timeout=30.0,   # default: 30s. Max seconds per solve attempt.
                           # The call's timeout= (session default or per-request)
@@ -863,16 +870,29 @@ solver = BrowserSolver(
                           # guard for browser-only destination filtering. This
                           # is not an upstream identity proxy and does not need
                           # a matching Session(proxy=).
+    executable_path=None, # optional str/os.PathLike Chrome executable override
 )
+# Proxy configuration is mutable only before Chromium launches.
+solver.proxy_server -> str | None
+solver.egress_guard_proxy -> str | None
+solver.configure_proxy(proxy: str) -> None
+solver.configure_egress_guard(proxy: str) -> None
+solver.proxy_matches(proxy: str | None) -> bool
+# Launch Chrome and validate the runtime without navigating a target site.
+solver.preflight() -> None
+# Published after a successful preflight; reading it performs no browser I/O.
+solver.browser_identity -> tuple[str, str] | None  # (user_agent, full_version)
 # Read-only, non-blocking lifecycle signal. True only while the launched Chrome
 # process remains connected; it clears on disconnect, idle close, and close().
 assert solver.runtime_ready is False
 # Startup checks the browser's four-part version against
 # chrome_full_version(DEFAULT_EMULATION). A difference is logged and accepted,
 # not rejected: Chrome auto-updates ahead of the newest available emulation, so
-# the installed browser is authoritative and the session's User-Agent and
-# client hints are pinned onto it. An unreadable binary, or one that does not
-# report a Chrome version, still raises.
+# the installed browser is authoritative for browser-bound clearance replay.
+# Those solve paths align the session's User-Agent and client hints to it.
+# Reddit recovery and challenge-absent Cloudflare passthrough do not pin the
+# session. An unreadable binary, or one that does not report a Chrome version,
+# still raises.
 # Automatic session solves reserve 10% of the remaining total request timeout
 # (capped at 5s) for cookie injection and the protected-request replay; the
 # timeout passed into BrowserSolver is reduced by that reserve.
@@ -899,6 +919,16 @@ result: SolveResult | None = solver.solve(url, challenge_type)
 #   "150.0.7871.125"); the version-reduced user_agent hides it
 # result.extras: dict | None - WAF-specific data
 # result.response: CapturedResponse | None - passthrough content (see below)
+# result.challenge_absent: bool - True only for a validated Cloudflare
+#   main-document response when no Cloudflare challenge iframe appeared.
+#   Automatic session handling returns that response without pinning the
+#   fingerprint or rebuilding the wreq client.
+# CapturedResponse fields:
+#   .url: str
+#   .status: int
+#   .headers: dict[str, str] (lowercase names)
+#   .body: bytes
+#   .set_cookie: list[str] (individual Set-Cookie values)
 # Imperva on an API host (e.g. api2.example.com): a top-level browser nav to an
 # API host hits Imperva's "Error 15" block. Pass embedder= (the site's origin
 # page, e.g. "https://www.example.com/") so the token is earned there, and
@@ -930,7 +960,7 @@ result: InterceptResult | None = solver.intercept_iframe(
 # Explicit cleanup. The solver is yours: session __exit__ does NOT close
 # a solver you passed in, so close it when all sessions are done with it
 # (or let idle_timeout shut the browser down):
-solver.close()
+solver.close(timeout: float | None = None) -> bool
 ```
 
 When a session has both `proxy=` and `browser_solver=`, wafer configures an
@@ -963,7 +993,7 @@ Supports: Cloudflare, Akamai, DataDome (WASM PoW auto-resolve + confirm click
 only; bails on interactive captchas), PerimeterX
 (press-and-hold), Imperva, Kasada, F5 Shape, AWS WAF, GeeTest v4 (slide),
 Baxia (slider), hCaptcha, reCAPTCHA v2 (checkbox + image grid via local ONNX
-models), generic JS.
+models), Reddit fixed-origin cookie recovery, generic JS.
 
 ### Passthrough mode
 
@@ -973,6 +1003,19 @@ content directly and returns it as the response. This is transparent -
 `session.get()` returns a normal `WaferResponse`. No special handling needed.
 Applies to Kasada, AWS WAF, and any challenge where the browser lands on the
 real page after solving.
+
+Cloudflare has an additional challenge-absent pass-through: wreq may receive a
+Cloudflare 403 while the real browser receives the normal page immediately and
+therefore has no challenge iframe to solve. For a same-site HTML `GET`, wafer
+validates and returns the actual Playwright main-document response (status,
+headers, body, and individual `Set-Cookie` values). It rejects known
+challenge/block bodies, empty/non-2xx/non-HTML documents, server redirects,
+cross-site or path-changing client navigation, `solve_origin`/embedder loads,
+and non-GET originals. Query/fragment-only `history.replaceState()` changes
+are allowed. Decoded browser bodies omit stale wire compression/framing
+headers. Cookie-less validated responses are allowed, and this path merges any
+browser cookies without pinning the fingerprint or rebuilding the transport.
+An observed but unresolved Cloudflare iframe remains a failed solve.
 
 ### solve_origin (auto-solve on an origin page, not the API URL)
 
@@ -1064,12 +1107,9 @@ def mint_recaptcha_v3(self, sitekey: str, action: str, *,
   Google). It **never silently returns None**. `.stage` is `"anchor"`,
   `"reload"`, or `"apijs"`; `.status_code` is the failing HTTP status when known.
 
-**Crucial caveat:** minting always *succeeds in producing a token*, but the
-**score** Google assigns it depends on request reputation - IP, TLS fingerprint,
-and cookies. wafer mints the token; it **cannot guarantee** the site's score
-threshold passes. A clean residential IP with the session's real-browser TLS
-fingerprint scores best; a flagged datacenter IP may mint a token that the site
-still rejects on score.
+**Caveat:** producing a token does not prove the site will accept it. Google's
+score depends on reputation signals including IP, TLS identity, and cookies;
+the site's score threshold is outside wafer's token-minting result.
 
 ---
 
@@ -1184,15 +1224,13 @@ logging.getLogger("wafer").setLevel(logging.DEBUG)
     response object returned instead, use `.bulk()` or set `max_retries=0`
     or `max_rotations=0`.
 
-13. **Set `rate_limit` for repeated requests.** Defaults to `0.0` (disabled).
-    Without it, requests fire back-to-back. A semaphore limits concurrency,
-    not rate. Set `rate_limit=0.2`-`1.0` for any domain you hit more than a
-    few times.
+13. **Set `rate_limit` when requests need minimum spacing.** It defaults to
+    `0.0` (disabled). A semaphore limits concurrency, not request frequency;
+    choose the interval required by the target service.
 
-14. **Never `close()` or recreate sessions between requests to the same domain.**
-    Sessions accumulate cookies, TLS identity, and rate limiting state.
-    Destroying a session mid-use means the next request looks like a new
-    visitor to the WAF. One session per domain, for its entire lifetime.
+14. **Reuse a session while cookies and identity state should persist.**
+    Recreating it discards in-memory cookies, TLS identity, and rate-limiter
+    state.
 
     Recipe - reuse, don't recreate. In a long-running service (MCP server,
     scraper, worker) build the session ONCE and reuse it. Sync:

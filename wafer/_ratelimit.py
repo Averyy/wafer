@@ -1,4 +1,4 @@
-"""Per-domain rate limiting with configurable min-interval + jitter."""
+"""Per-hostname rate limiting with configurable min-interval + jitter."""
 
 import logging
 import random
@@ -8,9 +8,9 @@ logger = logging.getLogger("wafer")
 
 
 class RateLimiter:
-    """Enforces minimum intervals between requests to the same domain.
+    """Enforces minimum intervals between requests to the same hostname.
 
-    Tracks the last request timestamp per domain and sleeps if a new
+    Tracks the last request timestamp per hostname and sleeps if a new
     request would arrive too soon.
     """
 
@@ -24,7 +24,7 @@ class RateLimiter:
         self._last_request: dict[str, float] = {}
 
     def _delay_for(self, domain: str) -> float:
-        """Calculate how long to wait before the next request to domain."""
+        """Calculate how long to wait before the next request to hostname."""
         last = self._last_request.get(domain)
         if last is None:
             return 0.0
@@ -34,7 +34,7 @@ class RateLimiter:
         return max(0.0, remaining)
 
     def record(self, domain: str) -> None:
-        """Record that a request was sent to this domain."""
+        """Record that a request was sent to this hostname."""
         self._last_request[domain] = time.monotonic()
 
     def wait_sync(self, domain: str, max_wait: float | None = None) -> float:

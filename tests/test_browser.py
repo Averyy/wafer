@@ -1732,6 +1732,91 @@ class TestBrowserPassthrough:
         assert any("session_id=injected_val" in c[0] for c in jar.added)
 
     @patch("time.sleep")
+    def test_challenge_absent_passthrough_preserves_client_identity_and_jar(
+        self,
+        mock_sleep,
+    ):
+        """Challenge-absent CF passthrough must not rebuild or pin."""
+        from wafer.browser._solver import CapturedResponse
+
+        cf_resp = MockResponse(
+            403,
+            {"cf-mitigated": "challenge"},
+            "<html>Just a moment...</html>",
+        )
+        browser_result = SolveResult(
+            cookies=[
+                {
+                    "name": "browser_cookie",
+                    "value": "merged",
+                    "domain": ".example.com",
+                    "path": "/",
+                    "expires": -1,
+                }
+            ],
+            user_agent="Chrome/150.0.0.0",
+            response=CapturedResponse(
+                url="https://example.com/page",
+                status=200,
+                headers={"content-type": "text/html"},
+                body=b"<html>Real content</html>",
+            ),
+            challenge_absent=True,
+        )
+        session, client = make_sync_session(
+            [cf_resp],
+            max_rotations=0,
+            browser_solver=MockBrowserSolver(result=browser_result),
+            use_cookie_jar=True,
+        )
+        client.cookie_jar.add(
+            "auth=keep; Domain=.example.com; Path=/; Secure",
+            "https://example.com/",
+        )
+        session._rebuild_client = MagicMock()
+
+        response = session.get("https://example.com/page")
+
+        assert response.status_code == 200
+        session._rebuild_client.assert_not_called()
+        assert session._fingerprint.pinned is False
+        assert client.cookie_jar.get("auth", response.url).value == "keep"
+        assert (
+            client.cookie_jar.get("browser_cookie", response.url).value
+            == "merged"
+        )
+
+    @patch("time.sleep")
+    def test_passthrough_text_uses_declared_charset(self, mock_sleep):
+        from wafer.browser._solver import CapturedResponse
+
+        cf_resp = MockResponse(
+            403,
+            {"cf-mitigated": "challenge"},
+            "<html>Just a moment...</html>",
+        )
+        browser_result = SolveResult(
+            cookies=[],
+            user_agent="Chrome/150.0.0.0",
+            response=CapturedResponse(
+                url="https://example.com/page",
+                status=200,
+                headers={"content-type": "text/html; charset=iso-8859-1"},
+                body=b"<html><body>caf\xe9</body></html>",
+            ),
+            challenge_absent=True,
+        )
+        session, _ = make_sync_session(
+            [cf_resp],
+            max_rotations=0,
+            browser_solver=MockBrowserSolver(result=browser_result),
+        )
+
+        response = session.get("https://example.com/page")
+
+        assert "café" in response.text
+
+    @patch("time.sleep")
     def test_passthrough_not_triggered_when_solved(self, mock_sleep):
         """Normal solve (response=None) should retry via TLS as before."""
         cf_resp = MockResponse(
@@ -5659,7 +5744,369 @@ class TestBrowserSolverFailClosed:
         assert result is None
         page.content.assert_not_called()
 
-    def test_reddit_browser_dispatch_fails_closed_without_generic_wait(self):
+    @staticmethod
+    def _cloudflare_navigation(
+        *,
+        body=None,
+        status=200,
+        response_url="https://apollomapping.com/",
+        page_url="https://apollomapping.com/",
+        content_type="text/html; charset=utf-8",
+        cookies=None,
+    ):
+        if body is None:
+            body = (
+                b"<html><head><title>Apollo Mapping | The Image Hunters</title>"
+                b"</head><body>"
+                + b"real application content " * 100
+                + b"</body></html>"
+            )
+        solver = BrowserSolver(solve_timeout=1)
+        solver._browser = MagicMock()
+        solver._browser.is_connected.return_value = True
+        solver._browser_ua = "Chrome/149"
+        solver._needs_screenxy_patch = False
+
+        response = MagicMock()
+        response.status = status
+        response.url = response_url
+        response.all_headers.return_value = {
+            "content-type": content_type,
+            "cache-control": "public, max-age=0",
+        }
+        response.headers_array.return_value = [
+            {
+                "name": "set-cookie",
+                "value": "apollo_session=ready; Path=/; Secure",
+            }
+        ]
+        response.body.return_value = body
+
+        context = MagicMock()
+        page = MagicMock()
+        page.url = page_url
+        page.goto.return_value = response
+        context.new_page.return_value = page
+        context.cookies.return_value = cookies or []
+        return solver, context, page, response
+
+    def test_cloudflare_absent_returns_validated_main_document(self):
+        solver, context, page, response = self._cloudflare_navigation()
+        response.all_headers.return_value.update(
+            {
+                "content-encoding": "br",
+                "content-length": "123",
+                "transfer-encoding": "chunked",
+            }
+        )
+
+        try:
+            with (
+                patch.object(solver, "_create_context", return_value=context),
+                patch.object(solver, "_setup_headless_patches"),
+                patch.object(
+                    solver,
+                    "_dispatch_challenge",
+                    return_value=None,
+                ),
+            ):
+                result = solver._solve_on_worker(
+                    "https://apollomapping.com/",
+                    "cloudflare",
+                    timeout=1,
+                )
+        finally:
+            solver.close()
+
+        assert result is not None
+        assert result.cookies == []
+        assert result.response is not None
+        assert result.response.status == 200
+        assert result.response.url == "https://apollomapping.com/"
+        assert result.response.body == response.body.return_value
+        assert result.response.headers["cache-control"] == "public, max-age=0"
+        assert "content-encoding" not in result.response.headers
+        assert "content-length" not in result.response.headers
+        assert "transfer-encoding" not in result.response.headers
+        assert result.response.set_cookie == [
+            "apollo_session=ready; Path=/; Secure"
+        ]
+        assert result.challenge_absent is True
+        page.content.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("response_url", "page_url"),
+        [
+            (
+                "https://apollomapping.com/?utm_source=test",
+                "https://apollomapping.com/",
+            ),
+            (
+                "https://apollomapping.com/?source=one",
+                "https://apollomapping.com/?source=two#section",
+            ),
+        ],
+    )
+    def test_cloudflare_absent_allows_history_query_cleanup(
+        self,
+        response_url,
+        page_url,
+    ):
+        solver, context, _page, _response = self._cloudflare_navigation(
+            response_url=response_url,
+            page_url=page_url,
+        )
+
+        try:
+            with (
+                patch.object(solver, "_create_context", return_value=context),
+                patch.object(solver, "_setup_headless_patches"),
+                patch.object(
+                    solver,
+                    "_dispatch_challenge",
+                    return_value=None,
+                ),
+            ):
+                result = solver._solve_on_worker(
+                    response_url,
+                    "cloudflare",
+                    timeout=1,
+                )
+        finally:
+            solver.close()
+
+        assert result is not None
+        assert result.response is not None
+
+    def test_cloudflare_absent_rejects_history_path_navigation(self):
+        solver, context, _page, response = self._cloudflare_navigation(
+            response_url="https://apollomapping.com/",
+            page_url="https://apollomapping.com/other-document",
+        )
+
+        try:
+            with (
+                patch.object(solver, "_create_context", return_value=context),
+                patch.object(solver, "_setup_headless_patches"),
+                patch.object(
+                    solver,
+                    "_dispatch_challenge",
+                    return_value=None,
+                ),
+            ):
+                result = solver._solve_on_worker(
+                    "https://apollomapping.com/",
+                    "cloudflare",
+                    timeout=1,
+                )
+        finally:
+            solver.close()
+
+        assert result is None
+        response.body.assert_not_called()
+
+    def test_cloudflare_absent_rejects_server_redirect_passthrough(self):
+        solver, context, _page, response = self._cloudflare_navigation(
+            response_url="https://www.apollomapping.com/",
+            page_url="https://www.apollomapping.com/",
+        )
+
+        try:
+            with (
+                patch.object(solver, "_create_context", return_value=context),
+                patch.object(solver, "_setup_headless_patches"),
+                patch.object(
+                    solver,
+                    "_dispatch_challenge",
+                    return_value=None,
+                ),
+            ):
+                result = solver._solve_on_worker(
+                    "https://apollomapping.com/",
+                    "cloudflare",
+                    timeout=1,
+                )
+        finally:
+            solver.close()
+
+        assert result is None
+        response.body.assert_not_called()
+
+    def test_cloudflare_absent_accepts_small_valid_html(self):
+        body = b"<html><title>Ready</title><body>ok</body></html>"
+        solver, context, _page, _response = self._cloudflare_navigation(
+            body=body
+        )
+
+        try:
+            with (
+                patch.object(solver, "_create_context", return_value=context),
+                patch.object(solver, "_setup_headless_patches"),
+                patch.object(
+                    solver,
+                    "_dispatch_challenge",
+                    return_value=None,
+                ),
+            ):
+                result = solver._solve_on_worker(
+                    "https://apollomapping.com/",
+                    "cloudflare",
+                    timeout=1,
+                )
+        finally:
+            solver.close()
+
+        assert result is not None
+        assert result.response is not None
+        assert result.response.body == body
+
+    def test_cloudflare_observed_but_unresolved_is_never_passthrough(self):
+        solver, context, _page, response = self._cloudflare_navigation()
+
+        try:
+            with (
+                patch.object(solver, "_create_context", return_value=context),
+                patch.object(solver, "_setup_headless_patches"),
+                patch.object(
+                    solver,
+                    "_dispatch_challenge",
+                    return_value=False,
+                ),
+            ):
+                result = solver._solve_on_worker(
+                    "https://apollomapping.com/",
+                    "cloudflare",
+                    timeout=1,
+                )
+        finally:
+            solver.close()
+
+        assert result is None
+        response.body.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            b"<html><title>Just a moment...</title>"
+            + b"<script src='/cdn-cgi/challenge-platform/x'></script>"
+            + b"x" * 2000,
+            b"<html><title>Access denied</title>" + b"x" * 2000,
+        ],
+    )
+    def test_cloudflare_absent_rejects_challenge_and_block_documents(
+        self,
+        body,
+    ):
+        solver, context, _page, _response = self._cloudflare_navigation(
+            body=body
+        )
+
+        try:
+            with (
+                patch.object(solver, "_create_context", return_value=context),
+                patch.object(solver, "_setup_headless_patches"),
+                patch.object(
+                    solver,
+                    "_dispatch_challenge",
+                    return_value=None,
+                ),
+            ):
+                result = solver._solve_on_worker(
+                    "https://apollomapping.com/",
+                    "cloudflare",
+                    timeout=1,
+                )
+        finally:
+            solver.close()
+
+        assert result is None
+
+    @pytest.mark.parametrize(
+        "marker",
+        [
+            "checking your browser",
+            "attention required",
+            "enable javascript and cookies",
+            "unusual traffic",
+            "request blocked",
+            "access denied",
+        ],
+    )
+    def test_cloudflare_generic_block_copy_is_not_shared_with_other_wafs(
+        self,
+        marker,
+    ):
+        from wafer.browser._solver import (
+            _is_cloudflare_absent_challenge_html,
+            _is_passthrough_challenge_html,
+        )
+
+        legitimate = (
+            "<html><script>window.translations = "
+            f'{{"permission_error": "{marker}"}}'
+            "</script><body>Real application</body></html>"
+        )
+
+        assert not _is_passthrough_challenge_html(legitimate)
+        assert _is_cloudflare_absent_challenge_html(legitimate)
+
+    def test_cloudflare_absent_does_not_substitute_get_for_post(self):
+        solver, context, _page, response = self._cloudflare_navigation()
+
+        try:
+            with (
+                patch.object(solver, "_create_context", return_value=context),
+                patch.object(solver, "_setup_headless_patches"),
+                patch.object(
+                    solver,
+                    "_dispatch_challenge",
+                    return_value=None,
+                ),
+            ):
+                result = solver._solve_on_worker(
+                    "https://apollomapping.com/api",
+                    "cloudflare",
+                    timeout=1,
+                    replay={
+                        "method": "POST",
+                        "body": "{}",
+                        "content_type": "application/json",
+                    },
+                )
+        finally:
+            solver.close()
+
+        assert result is None
+        response.body.assert_not_called()
+
+    def test_cloudflare_absent_rejects_cross_site_final_document(self):
+        solver, context, _page, response = self._cloudflare_navigation(
+            response_url="https://example.net/landing",
+            page_url="https://example.net/landing",
+        )
+
+        try:
+            with (
+                patch.object(solver, "_create_context", return_value=context),
+                patch.object(solver, "_setup_headless_patches"),
+                patch.object(
+                    solver,
+                    "_dispatch_challenge",
+                    return_value=None,
+                ),
+            ):
+                result = solver._solve_on_worker(
+                    "https://apollomapping.com/",
+                    "cloudflare",
+                    timeout=1,
+                )
+        finally:
+            solver.close()
+
+        assert result is None
+        response.body.assert_not_called()
+
+    def test_reddit_browser_dispatch_refuses_json_navigation(self):
         solver = BrowserSolver(solve_timeout=1)
         solver._browser = MagicMock()
         solver._browser.is_connected.return_value = True
@@ -5694,6 +6141,138 @@ class TestBrowserSolverFailClosed:
         assert result is None
         page.wait_for_load_state.assert_not_called()
         page.content.assert_not_called()
+        page.reload.assert_not_called()
+
+    def test_reddit_browser_dispatch_accepts_scoped_cookie_evidence(self):
+        solver = BrowserSolver(solve_timeout=1)
+        page = MagicMock()
+        page.url = "https://www.reddit.com/"
+        page.context.cookies.return_value = [
+            {"name": "loid", "domain": ".reddit.com"},
+            {"name": "token_v2", "domain": ".reddit.com"},
+        ]
+
+        try:
+            assert solver._dispatch_challenge(page, "reddit", 1000)
+        finally:
+            solver.close()
+
+        page.context.cookies.assert_called_once_with(
+            "https://www.reddit.com/"
+        )
+        page.reload.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://www.reddit.com/?rdt=logged-out",
+            "https://www.reddit.com/#verification",
+            "https://www.reddit.com/?rdt=logged-out#verification",
+        ],
+    )
+    def test_reddit_browser_dispatch_allows_root_query_and_fragment(
+        self,
+        url,
+    ):
+        solver = BrowserSolver(solve_timeout=1)
+        page = MagicMock()
+        page.url = url
+        page.context.cookies.return_value = [
+            {"name": "loid", "domain": ".reddit.com"},
+            {"name": "csv", "domain": ".reddit.com"},
+        ]
+
+        try:
+            assert solver._dispatch_challenge(page, "reddit", 1000)
+        finally:
+            solver.close()
+
+    def test_reddit_browser_solve_navigates_fixed_root_not_json(self):
+        solver = BrowserSolver(solve_timeout=1)
+        solver._browser = MagicMock()
+        solver._browser.is_connected.return_value = True
+        solver._browser_ua = "Chrome/149"
+        solver._needs_screenxy_patch = False
+
+        cookies = [
+            {
+                "name": "loid",
+                "value": "anonymous",
+                "domain": ".reddit.com",
+                "path": "/",
+            },
+            {
+                "name": "token_v2",
+                "value": "token",
+                "domain": ".reddit.com",
+                "path": "/",
+            },
+        ]
+        context = MagicMock()
+        page = MagicMock()
+        page.url = "https://www.reddit.com/"
+        page.context = context
+        context.new_page.return_value = page
+        context.cookies.return_value = cookies
+        json_url = "https://www.reddit.com/r/Python/hot.json"
+
+        try:
+            with (
+                patch.object(solver, "_create_context", return_value=context),
+                patch.object(solver, "_setup_headless_patches"),
+            ):
+                result = solver._solve_on_worker(
+                    json_url,
+                    "reddit",
+                    timeout=1,
+                    embedder="https://www.reddit.com/",
+                )
+        finally:
+            solver.close()
+
+        assert result is not None
+        assert result.cookies == cookies
+        assert page.goto.call_args.args[0] == "https://www.reddit.com/"
+        assert page.goto.call_args.args[0] != json_url
+
+    def test_reddit_browser_dispatch_reloads_root_once_for_cookie_evidence(
+        self,
+    ):
+        solver = BrowserSolver(solve_timeout=1)
+        page = MagicMock()
+        page.url = "https://www.reddit.com/"
+        partial = [{"name": "csv", "domain": ".reddit.com"}]
+        solved = [
+            {"name": "loid", "domain": ".reddit.com"},
+            {"name": "csv", "domain": ".reddit.com"},
+        ]
+        page.context.cookies.side_effect = [partial, partial, solved]
+
+        try:
+            assert solver._dispatch_challenge(page, "reddit", 1000)
+        finally:
+            solver.close()
+
+        page.reload.assert_called_once()
+        assert page.reload.call_args.kwargs["wait_until"] == "domcontentloaded"
+
+    def test_reddit_browser_dispatch_rejects_partial_cookies_after_reload(
+        self,
+    ):
+        solver = BrowserSolver(solve_timeout=1)
+        page = MagicMock()
+        page.url = "https://www.reddit.com/"
+        page.context.cookies.return_value = [
+            {"name": "csv", "domain": ".reddit.com"},
+            {"name": "edgebucket", "domain": ".reddit.com"},
+        ]
+
+        try:
+            assert not solver._dispatch_challenge(page, "reddit", 1000)
+        finally:
+            solver.close()
+
+        page.reload.assert_called_once()
 
     @pytest.mark.parametrize(
         "marker",
@@ -8900,7 +9479,7 @@ class TestCloudflareEarlyBailout:
     @patch("time.sleep")
     @patch("time.monotonic")
     def test_no_iframe_bails_after_grace(self, mock_mono, mock_sleep):
-        """No CF iframe after 3s grace period → returns False quickly."""
+        """No CF iframe after 3s grace period → reports challenge absence."""
         from wafer.browser._cloudflare import wait_for_cloudflare
 
         page = MagicMock()
@@ -8914,7 +9493,7 @@ class TestCloudflareEarlyBailout:
         mock_mono.side_effect = [0.0, 0.0, 1.0, 4.0]
 
         result = wait_for_cloudflare(solver, page, 30000)
-        assert result is False
+        assert result is None
 
     @patch("time.sleep")
     @patch("time.monotonic")
@@ -9006,6 +9585,60 @@ class TestAsyncBrowserPassthrough:
         assert resp.status_code == 200
         assert resp.content == passthrough_body
         assert mock_client.request_count == 1
+
+    @patch("asyncio.sleep")
+    async def test_challenge_absent_passthrough_preserves_session_and_charset(
+        self,
+        mock_sleep,
+    ):
+        from wafer.browser._solver import CapturedResponse
+
+        cf_resp = MockResponse(
+            403,
+            {"cf-mitigated": "challenge"},
+            "<html>Just a moment...</html>",
+        )
+        browser_result = SolveResult(
+            cookies=[
+                {
+                    "name": "browser_cookie",
+                    "value": "merged",
+                    "domain": ".example.com",
+                    "path": "/",
+                    "expires": -1,
+                }
+            ],
+            user_agent="Chrome/150.0.0.0",
+            response=CapturedResponse(
+                url="https://example.com/page",
+                status=200,
+                headers={"content-type": "text/html; charset=iso-8859-1"},
+                body=b"<html><body>caf\xe9</body></html>",
+            ),
+            challenge_absent=True,
+        )
+        session, client = make_async_session(
+            [cf_resp],
+            max_rotations=0,
+            browser_solver=MockBrowserSolver(result=browser_result),
+            use_cookie_jar=True,
+        )
+        client.cookie_jar.add(
+            "auth=keep; Domain=.example.com; Path=/; Secure",
+            "https://example.com/",
+        )
+        session._rebuild_client = MagicMock()
+
+        response = await session.get("https://example.com/page")
+
+        session._rebuild_client.assert_not_called()
+        assert session._fingerprint.pinned is False
+        assert client.cookie_jar.get("auth", response.url).value == "keep"
+        assert (
+            client.cookie_jar.get("browser_cookie", response.url).value
+            == "merged"
+        )
+        assert "café" in response.text
 
 
 # ---------------------------------------------------------------------------

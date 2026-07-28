@@ -43,7 +43,7 @@ from concurrent.futures import (
 from dataclasses import dataclass, field
 from urllib.parse import unquote, urlparse
 
-from wafer._cookies import browser_cookie_matches_host
+from wafer._cookies import browser_cookie_matches_host, registrable_domain
 from wafer._errors import ResponseTooLarge
 from wafer._fingerprint import chrome_full_version
 
@@ -246,8 +246,101 @@ _REDDIT_BROWSER_CHALLENGE_RE = re.compile(
 )
 
 
+def _is_reddit_solve_page(url: str) -> bool:
+    """Whether the browser is on Reddit's fixed anonymous solve page."""
+
+    try:
+        parsed = urlparse(url)
+        port = parsed.port
+    except (TypeError, ValueError):
+        return False
+    return (
+        parsed.scheme == "https"
+        and (parsed.hostname or "").rstrip(".").lower() == "www.reddit.com"
+        and port in (None, 443)
+        and parsed.path in ("", "/")
+    )
+
+
+def _reddit_browser_cookie_evidence(page) -> bool:
+    """Check only cookies applicable to the fixed Reddit solve origin."""
+
+    from wafer._solvers import (
+        REDDIT_SOLVE_ORIGIN,
+        reddit_has_cookie_evidence,
+    )
+
+    try:
+        cookies = page.context.cookies(REDDIT_SOLVE_ORIGIN)
+    except Exception:
+        return False
+    names = {
+        str(cookie.get("name", ""))
+        for cookie in cookies
+        if isinstance(cookie, dict)
+    }
+    return reddit_has_cookie_evidence(names)
+
+
+def _wait_for_reddit(page, timeout_ms: int) -> bool:
+    """Establish Reddit cookies on the fixed HTML origin, with one reload."""
+
+    if not _is_reddit_solve_page(page.url):
+        try:
+            parsed = urlparse(page.url)
+            observed_host = (parsed.hostname or "").rstrip(".").lower()
+            observed_path = parsed.path or "/"
+        except (TypeError, ValueError):
+            observed_host = "invalid"
+            observed_path = "invalid"
+        # Do not log the query or fragment: either may contain opaque values.
+        logger.warning(
+            "Reddit browser solve refused a non-root navigation "
+            "(host=%s path=%s)",
+            observed_host,
+            observed_path,
+        )
+        return False
+
+    deadline = time.monotonic() + max(0, timeout_ms) / 1000
+    if _reddit_browser_cookie_evidence(page):
+        return True
+
+    # Give the verification document a short chance to run before refreshing.
+    # A refresh of this HTML origin is the observed recovery path; refreshing
+    # the blocked JSON URL cannot execute Reddit's verification JavaScript.
+    remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
+    if remaining_ms <= 0:
+        return False
+    try:
+        page.wait_for_timeout(min(1000, max(1, remaining_ms // 4)))
+    except Exception:
+        pass
+    if _reddit_browser_cookie_evidence(page):
+        return True
+
+    remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
+    if remaining_ms <= 0:
+        return False
+    try:
+        page.reload(
+            wait_until="domcontentloaded",
+            timeout=max(1, min(remaining_ms, _MAX_NAVIGATION_MS)),
+        )
+    except Exception as exc:
+        logger.debug("Reddit browser reload failed (%s)", type(exc).__name__)
+
+    remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
+    if remaining_ms > 0:
+        try:
+            page.wait_for_timeout(min(2000, remaining_ms))
+        except Exception:
+            pass
+    return _reddit_browser_cookie_evidence(page)
+
+
 def _is_passthrough_challenge_html(html: str) -> bool:
-    """Reject known challenge bodies before browser passthrough capture."""
+    """Reject structurally identifiable WAF bodies in shared passthroughs."""
 
     head = html[:10000].lower()
     return (
@@ -265,6 +358,180 @@ def _is_passthrough_challenge_html(html: str) -> bool:
         # Shreddit response, so it must not be limited to the generic 10 KiB
         # marker prefix.
         or _REDDIT_BROWSER_CHALLENGE_RE.search(html) is not None
+    )
+
+
+_CLOUDFLARE_ABSENT_BLOCK_MARKERS = (
+    "checking your browser",
+    "attention required",
+    "enable javascript and cookies",
+    "unusual traffic",
+    "request blocked",
+    "access denied",
+)
+
+
+def _is_cloudflare_absent_challenge_html(html: str) -> bool:
+    """Reject challenge/block copy only on the Cloudflare-absent path.
+
+    The prose markers are intentionally not part of the shared post-solve
+    validator: legitimate application pages and inline translation bundles
+    commonly contain phrases such as "access denied".
+    """
+
+    head = html[:10000].lower()
+    return _is_passthrough_challenge_html(html) or any(
+        marker in head for marker in _CLOUDFLARE_ABSENT_BLOCK_MARKERS
+    )
+
+
+def _origin_path_identity(parsed) -> tuple[str, str, int | None, str]:
+    """Return a URL identity stable across query/fragment history rewrites."""
+
+    port = parsed.port
+    if port is None:
+        if parsed.scheme == "https":
+            port = 443
+        elif parsed.scheme == "http":
+            port = 80
+    return (
+        parsed.scheme,
+        (parsed.hostname or "").rstrip(".").lower(),
+        port,
+        parsed.path or "/",
+    )
+
+
+def _network_url_identity(parsed) -> tuple[str, str, int | None, str, str]:
+    """Return the request/response URL identity, excluding only fragments."""
+
+    return (*_origin_path_identity(parsed), parsed.query)
+
+
+def _response_headers(response) -> tuple[dict[str, str], list[str]]:
+    """Read a Playwright response's headers without collapsing Set-Cookie."""
+
+    headers: dict[str, str] = {}
+    try:
+        all_headers = response.all_headers()
+        if isinstance(all_headers, dict):
+            headers = {
+                str(name).lower(): str(value)
+                for name, value in all_headers.items()
+            }
+    except Exception:
+        try:
+            headers = {
+                str(name).lower(): str(value)
+                for name, value in response.headers.items()
+            }
+        except Exception:
+            pass
+
+    # Patchright/Chrome exposes the decoded response body via response.body().
+    # Wire framing and compression headers would describe different bytes.
+    for name in ("content-encoding", "content-length", "transfer-encoding"):
+        headers.pop(name, None)
+
+    set_cookie: list[str] = []
+    try:
+        for entry in response.headers_array():
+            if (
+                isinstance(entry, dict)
+                and str(entry.get("name", "")).lower() == "set-cookie"
+            ):
+                set_cookie.append(str(entry.get("value", "")))
+    except Exception:
+        pass
+    return headers, set_cookie
+
+
+def _capture_navigation_passthrough(
+    response,
+    page,
+    requested_url: str,
+    max_size: int | None,
+) -> "CapturedResponse | None":
+    """Validate and capture a challenge-free main-document GET response."""
+
+    if response is None:
+        return None
+    try:
+        status = int(response.status)
+        response_url = str(response.url)
+        page_url = str(page.url)
+        requested = urlparse(requested_url)
+        final_response = urlparse(response_url)
+        final_page = urlparse(page_url)
+        requested_network_identity = _network_url_identity(requested)
+        response_network_identity = _network_url_identity(final_response)
+        response_document_identity = _origin_path_identity(final_response)
+        page_document_identity = _origin_path_identity(final_page)
+    except (TypeError, ValueError):
+        return None
+
+    if not 200 <= status < 300:
+        return None
+    if (
+        requested.scheme not in {"http", "https"}
+        or final_response.scheme != requested.scheme
+        or final_page.scheme != requested.scheme
+        or registrable_domain(requested.hostname or "")
+        != registrable_domain(final_response.hostname or "")
+        or registrable_domain(requested.hostname or "")
+        != registrable_domain(final_page.hostname or "")
+    ):
+        return None
+
+    # Chromium follows server redirects inside page.goto(). Wafer cannot return
+    # that final 2xx without either violating follow_redirects=False or losing
+    # redirect history. Fail closed and leave redirects to the normal transport.
+    if requested_network_identity != response_network_identity:
+        return None
+
+    # goto() returns the final server-redirect response. Reject a different
+    # document after Cloudflare's grace window, but tolerate query/fragment-only
+    # history.replaceState() cleanup on the document that actually produced the
+    # captured response.
+    if response_document_identity != page_document_identity:
+        return None
+
+    lowered_url = page_url.lower()
+    if "invitation" in lowered_url or "siteclosed" in lowered_url:
+        return None
+
+    headers, set_cookie = _response_headers(response)
+    content_type = headers.get("content-type", "").lower()
+    disposition = headers.get("content-disposition", "").lower()
+    if (
+        not (
+            content_type.startswith("text/html")
+            or content_type.startswith("application/xhtml+xml")
+        )
+        or "attachment" in disposition
+    ):
+        return None
+
+    try:
+        body = response.body()
+    except Exception:
+        return None
+    if not isinstance(body, bytes):
+        return None
+    if max_size is not None and len(body) > max_size:
+        raise ResponseTooLarge(response_url, len(body), max_size)
+    if not body:
+        return None
+    html = body.decode("utf-8", errors="replace")
+    if _is_cloudflare_absent_challenge_html(html):
+        return None
+
+    return CapturedResponse(
+        url=response_url,
+        status=status,
+        headers=headers,
+        body=body,
+        set_cookie=set_cookie,
     )
 
 
@@ -723,7 +990,7 @@ class _BrowseState:
 
 @dataclass
 class CapturedResponse:
-    """A single HTTP response captured during iframe interception.
+    """An HTTP response captured during interception or passthrough.
 
     ``headers`` is the flat (last-wins / joined) header dict; ``set_cookie``
     preserves the individual ``Set-Cookie`` values, which the flat dict would
@@ -751,6 +1018,10 @@ class SolveResult:
     # this carries the true build the session needs to reproduce the browser's
     # sec-ch-ua-full-version-list when replaying UA/CH-bound WAF cookies.
     browser_version: str | None = None
+    # True only when Cloudflare was absent and the browser's validated main
+    # document is being returned directly. No clearance identity was earned,
+    # so the session must merge cookies without pinning or rebuilding.
+    challenge_absent: bool = False
 
 
 @dataclass
@@ -773,8 +1044,9 @@ class BrowserSolver:
     extracted after challenge resolution and returned for injection into
     the wreq session.
 
-    Must run headful (headless = 16.7% bypass rate in benchmarks).
-    Uses an exact-version Chrome executable for browser/TLS identity parity.
+    Headless mode is supported but has lower solve coverage. Browser-bound
+    clearance replay aligns the session's UA/client hints to the launched
+    Chrome version when it differs from the newest wreq emulation.
     """
 
     def __init__(
@@ -1009,17 +1281,18 @@ class BrowserSolver:
             # auto-updates and wreq's newest Emulation lags it, so an equality
             # gate makes every solver path dead on an ordinary machine the
             # week Chrome ships an update. Agreement between the browser and
-            # wafer's transport hints is still required -- it is achieved the
-            # other way round, by FingerprintManager.pin_to_browser() moving
-            # wafer onto the installed browser's exact UA/client hints. That
-            # is the documented design for this skew.
+            # wafer's transport hints is still required for browser-bound
+            # clearance replay. Those solve paths achieve it the other way
+            # round, by FingerprintManager.pin_to_browser() moving wafer onto
+            # the installed browser's exact UA/client hints.
             actual = _browser_executable_version(chrome, timeout)
             if actual != expected:
                 logger.warning(
                     "Installed Chrome %s differs from wafer's default emulation "
-                    "Chrome %s; transport identity will be pinned to the "
-                    "installed browser (bump DEFAULT_EMULATION/_CHROME_BUILDS "
-                    "once wreq ships this Chrome so the TLS shape tracks it too)",
+                    "Chrome %s; browser-bound solve paths will align transport "
+                    "identity to the installed browser (bump "
+                    "DEFAULT_EMULATION/_CHROME_BUILDS once wreq ships this "
+                    "Chrome so the TLS shape tracks it too)",
                     actual,
                     expected,
                 )
@@ -1164,12 +1437,13 @@ class BrowserSolver:
         expected_version = self._expected_browser_version()
         if launched_version != expected_version:
             # Same contract as _ensure_browser_installed: the launched browser
-            # is authoritative and wafer's hints are pinned onto it below via
-            # _publish_browser_identity -> pin_to_browser. Refusing to run
-            # would strand every solver behind a routine Chrome update.
+            # is authoritative for solve paths whose browser-bound state must
+            # replay through wafer. Refusing to run would strand every solver
+            # behind a routine Chrome update.
             logger.warning(
                 "Launched Chrome %s differs from wafer's default emulation "
-                "Chrome %s; pinning transport identity to the launched browser",
+                "Chrome %s; browser-bound solve paths will align transport "
+                "identity to the launched browser",
                 launched_version,
                 expected_version,
             )
@@ -2456,7 +2730,7 @@ class BrowserSolver:
         ``replay`` (Imperva embedder only): ``{method, body, content_type}``
         of the original request. After earning cookies on the embedder, the
         solve replays it as a same-site XHR from that page and returns the
-        response as a passthrough - bytes identical to a real browser's.
+        response as a passthrough using the body bytes returned by the browser.
         """
         if not _valid_browser_url(url) or (
             embedder is not None and not _valid_browser_url(embedder)
@@ -2653,6 +2927,7 @@ class BrowserSolver:
                 # challenge on the real page and let the earned cookies replay
                 # to the API host. Falls back to ``url`` for the normal case.
                 nav_target = embedder or url
+                navigation_response = None
                 try:
                     # Bounded, not the whole budget: a WAF interstitial that
                     # never fires domcontentloaded would otherwise consume the
@@ -2661,7 +2936,7 @@ class BrowserSolver:
                     # never logged a single line. A navigation timeout is
                     # caught below and the solver still runs on what loaded.
                     nav_ms = _navigation_budget_ms(overall_deadline)
-                    page.goto(
+                    navigation_response = page.goto(
                         nav_target,
                         wait_until="domcontentloaded",
                         timeout=nav_ms,
@@ -2684,9 +2959,14 @@ class BrowserSolver:
                     1,
                     int((overall_deadline - time.monotonic()) * 1000),
                 )
-                solved = self._dispatch_challenge(
+                dispatch_result = self._dispatch_challenge(
                     page, challenge_type, dispatch_ms, challenge_url=url
                 )
+                challenge_absent = (
+                    challenge_type == "cloudflare"
+                    and dispatch_result is None
+                )
+                solved = dispatch_result is True
                 if size_guard["exceeded"]:
                     raise ResponseTooLarge(
                         url,
@@ -2741,7 +3021,32 @@ class BrowserSolver:
                             widget_solved,
                         )
 
-                if not cookies:
+                captured = None
+                passthrough_method = (
+                    str(replay.get("method", "GET")).upper()
+                    if isinstance(replay, dict)
+                    else "GET"
+                )
+                if (
+                    challenge_absent
+                    and nav_target == url
+                    and embedder is None
+                    and passthrough_method == "GET"
+                ):
+                    captured = _capture_navigation_passthrough(
+                        navigation_response,
+                        page,
+                        url,
+                        max_size,
+                    )
+                    if captured is not None:
+                        logger.info(
+                            "Cloudflare absent; returning validated browser "
+                            "main document (%d bytes)",
+                            len(captured.body),
+                        )
+
+                if not cookies and captured is None:
                     logger.warning(
                         "Browser solve yielded no cookies (challenge_type=%s)",
                         challenge_type or "unknown",
@@ -2749,8 +3054,6 @@ class BrowserSolver:
                     return None
 
                 self._last_used = time.monotonic()
-
-                captured = None
 
                 # Post-solve passthrough: after solving, the page
                 # may auto-reload to real content.  Capture it
@@ -2828,6 +3131,7 @@ class BrowserSolver:
                     extras=extras,
                     response=captured,
                     browser_version=self._browser_version,
+                    challenge_absent=challenge_absent and captured is not None,
                 )
 
             except ResponseTooLarge:
@@ -2854,7 +3158,7 @@ class BrowserSolver:
         challenge_type: str | None,
         timeout_ms: int,
         challenge_url: str | None = None,
-    ) -> bool:
+    ) -> bool | None:
         """Route to the correct WAF-specific solver."""
         if challenge_type == "cloudflare":
             from wafer.browser._cloudflare import (
@@ -2897,11 +3201,10 @@ class BrowserSolver:
 
             return solve_drag(self, page, timeout_ms)
         elif challenge_type == "reddit":
-            # Reddit's anonymous-session gate has a strict, response-scoped
-            # native-transport bootstrap in SyncSession/AsyncSession. Generic
-            # browser network-idle is not authoritative and can mistake the
-            # Shreddit network-security block for a successful navigation.
-            return False
+            # The session supplies https://www.reddit.com/ as an embedder.
+            # Cookie evidence is authoritative; page load/network-idle is not,
+            # because the Shreddit network-security block can look complete.
+            return _wait_for_reddit(page, timeout_ms)
         elif challenge_type == "tmd":
             # AliExpress MTop can issue a TMD punishment URL with
             # ``action=captcharecaptcha``.  That is a Google reCAPTCHA flow,

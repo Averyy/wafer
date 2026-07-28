@@ -45,7 +45,7 @@ resp.status_code   # int -HTTP status code
 resp.ok            # bool -True if 200 <= status < 300
 resp.text          # str -decoded body (lazy, charset-aware: Content-Type charset,
                    #       HTML <meta charset>, then UTF-8; never raises)
-resp.content       # bytes -true wire body, decompressed but otherwise exact
+resp.content       # bytes -decompressed response body in its original encoding
                    #         (NOT a utf-8 re-encode of .text; safe for binary)
 resp.headers       # dict[str, str] -lowercase keys
 resp.url           # str -final URL after redirects
@@ -63,7 +63,7 @@ resp.elapsed        # float -seconds from request to response
 resp.was_retried    # bool -True if retries/rotations were used
 resp.retries        # int -normal retries used (5xx, connection errors)
 resp.rotations      # int -fingerprint rotations used (403/challenge)
-resp.inline_solves  # int -inline challenge solves used (ACW, Amazon, TMD)
+resp.inline_solves  # int -inline challenge solves used (ACW, Amazon, TMD, Reddit)
 resp.challenge_type # str | None -WAF challenge type if detected
 resp.emulation      # str | None -the identity that served this response, for
                     #   diagnosing a 403 (e.g. "Profile.Chrome149", "safari")
@@ -91,11 +91,15 @@ scopes = session.cookie_scope_summary("https://example.com")
 
 ```python
 import datetime
-from wafer import SyncSession, AsyncSession
+from wafer import AsyncSession, Profile, SyncSession
+from wreq import Emulation
 
 session = SyncSession(
     # TLS fingerprint (defaults to newest Chrome)
-    emulation=None,  # or wreq.Emulation.Chrome149
+    emulation=None,  # or Emulation.Chrome149
+    profile=None,    # or Profile.SAFARI / IOS_SAFARI / DART / OPERA_MINI
+    safari_locale="us",  # "us" or "ca" for Safari profiles
+    headers=None,    # optional complete replacement for DEFAULT_HEADERS
 
     # Timeouts (float seconds or timedelta)
     timeout=30,                                    # float/int seconds. The TOTAL
@@ -114,7 +118,7 @@ session = SyncSession(
     max_retries=3,       # retries on 5xx / connection errors / empty 200
     max_rotations=2,     # fingerprint rotations on 403/challenge (cross-family ladder)
 
-    # Cookies (disk cache for solver cookies; recommended with BrowserSolver)
+    # Cookies (disk cache for browser/inline solver cookies)
     cache_dir=None,  # default: in-memory only; set a path to persist solver cookies
 
     # Session health
@@ -131,7 +135,7 @@ session = SyncSession(
                              # ladder; per-identity backoff; max_failures ignored.
 
     # Rate limiting
-    rate_limit=1.0,      # seconds between requests per domain
+    rate_limit=1.0,      # seconds between requests to the same hostname
     rate_jitter=0.5,     # random jitter added to interval
 
     # TLS rotation
@@ -143,6 +147,9 @@ session = SyncSession(
 
     # Proxy
     proxy="socks5://user:pass@host:port",  # HTTP/HTTPS/SOCKS4/SOCKS5
+
+    # DNS pinning for non-browser transports. Cannot be combined with proxy=.
+    resolve=None,  # dict[str, list[str]] mapping hostnames to validated IPs
 
     # Embed mode (see below)
     embed="xhr",  # or "xhr-jquery" or "iframe"
@@ -156,7 +163,7 @@ session = SyncSession(
 )
 ```
 
-`AsyncSession` accepts the same parameters. All are optional with sensible defaults.
+`AsyncSession` accepts the same parameters. All are optional.
 
 ## HTTP Methods
 
@@ -185,7 +192,9 @@ Per-request kwargs: `headers`, `params`, `json`, `form`, `body`, `multipart`, `t
 
 ## TLS Fingerprinting
 
-Wafer uses wreq's `Emulation` profiles to produce browser-identical TLS fingerprints (JA3, JA4, HTTP/2 SETTINGS frames, header order). Defaults to the newest Chrome profile.
+Wafer uses wreq's `Emulation` profiles for TLS and HTTP/2 fingerprints
+(including JA3, JA4, SETTINGS frames, and header order). It defaults to the
+newest available Chrome profile.
 
 ```python
 # Automatic -newest Chrome
@@ -207,11 +216,11 @@ from wreq import Emulation
 
 # Edge: Chromium TLS, Chrome-like Accept, but sec-ch-ua brand "Microsoft Edge"
 # (carrying Edge's own build number, distinct from the Chromium build).
-session = SyncSession(emulation=Emulation.Edge147)
+session = SyncSession(emulation=Emulation.Edge148)
 
 # Firefox: Gecko TLS/H2, Firefox Accept and Accept-Language (...;q=0.5),
 # and NO sec-ch-ua client hints at all (Firefox sends none).
-session = SyncSession(emulation=Emulation.Firefox149)
+session = SyncSession(emulation=Emulation.Firefox151)
 ```
 
 Selecting a non-Chrome `emulation` only sets a coherent starting identity; the same cross-family rotation ladder still applies (see [Retry and Rotation](#retry-and-rotation)).
@@ -243,12 +252,15 @@ wafer.sec_ch_ua(147)                          # '"Google Chrome";v="147", ...'
 wafer.sec_ch_ua(147, brand="Microsoft Edge")  # Edge brand
 wafer.full_version(147)                       # "147.0.7727.24"
 wafer.chrome_full_version(Emulation.Chrome149)  # "149.0.7827.201"
-wafer.emulation_family(Emulation.Edge147)     # "edge"
+wafer.emulation_family(Emulation.Edge148)     # "edge"
 wafer.emulation_is_mobile(Emulation.SafariIos26_2)  # True
 wafer.build_fingerprint_envelope(Emulation.Chrome149, user_agent="...")  # full dict
 ```
 
-On a 403 or challenge, wafer automatically rotates across browser families (Chrome -> Firefox -> Safari -> Edge), swapping the header envelope to match each TLS fingerprint. This is far more effective than cycling between Chrome versions, which share one Chromium reputation pool. See [Retry and Rotation](#retry-and-rotation).
+On a 403 or challenge, wafer rotates across browser families (Chrome ->
+Firefox -> Safari -> Edge), swapping the header envelope to match each TLS
+fingerprint before cycling Chrome versions. See
+[Retry and Rotation](#retry-and-rotation).
 
 ## Opera Mini Profile
 
@@ -286,7 +298,8 @@ async with AsyncSession(profile=Profile.SAFARI) as session:
     resp = await session.get("https://example.com")
 ```
 
-Safari is particularly effective against DataDome, which heavily fingerprints the TLS layer -Safari's profile is less commonly spoofed than Chrome's.
+Safari supplies a non-Chromium TLS/H2 and header identity for sites where
+changing Chromium versions does not alter challenge behavior.
 
 ## iOS Safari Profile
 
@@ -346,7 +359,7 @@ solver - you must handle it yourself).
 | ACW (Alibaba) | `acw_sc__v2` challenge script | inline |
 | TMD | TMD session validation pattern | inline (+ browser slider) |
 | Amazon | CAPTCHA page with `amzn` markers | inline |
-| Reddit | cold-session JSON block or 200 HTML verification | inline (HTML cookie warm-up) |
+| Reddit | cold-session JSON block or 200 HTML verification | inline first; optional browser cookie recovery |
 | Arkose / FunCaptcha | `arkoselabs.com` or `funcaptcha` markers | **detect-only** (no solver; the generic browser fallback can't pass FunCaptcha) |
 | GeeTest v4 | `initGeetest4`, `gcaptcha4.geetest.com`, `gt4.js` | browser |
 | hCaptcha | `hcaptcha.com` script, `h-captcha` div | browser |
@@ -360,12 +373,14 @@ When a challenge is detected, wafer escalates automatically:
    free-pass (no browser - see [Imperva bypass](#imperva--incapsula-no-browser-bypass))
 3. Browser solver if configured (JS challenges: Cloudflare, DataDome, reCAPTCHA,
    and Imperva `reese84` under heavy load)
-4. Chrome -> Safari fingerprint rotation
+4. Cross-family fingerprint rotation: fresh current family -> Firefox -> Safari -> Edge
 5. Raises `ChallengeDetected` if all attempts fail
 
 ## Inline Solvers
 
-Four challenge types are solved without a browser:
+Four challenge types have an inline path that does not require a browser.
+Reddit can optionally fall back to the configured browser if its strict inline
+bootstrap fails:
 
 - **ACW (Alibaba Cloud WAF)** -Extracts the obfuscated cookie value from the challenge page JavaScript, computes the XOR-shuffle, and sets the `acw_sc__v2` cookie.
 - **Amazon CAPTCHA** -Parses the captcha form and submits it programmatically.
@@ -379,8 +394,12 @@ Four challenge types are solved without a browser:
 - **Reddit** -On a cold-session JSON block or direct 200 HTML verification
   page, performs New Reddit's logged-out verification at
   `https://www.reddit.com/` in the same TLS session, then replays the original
-  request. With `cache_dir`, every
-  durable cookie-setting leg is persisted for fresh processes. Explicit
+  request. If that strict inline flow fails and `browser_solver` is configured,
+  wafer navigates the browser to that fixed HTML root (never the JSON URL),
+  requires authoritative Reddit cookies, imports them, and replays the original
+  request through wreq before trying fingerprint rotation. A session-level
+  `solve_origin` does not override Reddit's fixed solve page. With `cache_dir`,
+  every durable cookie-setting leg is persisted for fresh processes. Explicit
   `old.reddit.com` URLs are fetched as requested, but Old Reddit is never
   selected automatically or used as a fallback.
 
@@ -416,10 +435,11 @@ cannot guarantee the site's score threshold passes.
 
 ## Cookie Cache
 
-Cookies are always enabled (in-memory jar). With `BrowserSolver`, enable disk persistence to avoid re-solving expensive WAF challenges across restarts:
+Cookies are always enabled in memory. Set `cache_dir` to persist browser and
+inline solver cookies across sessions:
 
 ```python
-# Disk persistence for solver cookies (recommended with BrowserSolver)
+# Disk persistence for browser/inline solver cookies
 session = SyncSession(cache_dir="./data/wafer/cookies")
 
 # In-memory only (default)
@@ -434,11 +454,11 @@ Features:
 
 ## Rate Limiting
 
-Per-domain rate limiting with configurable intervals and jitter:
+Per-hostname rate limiting with configurable intervals and jitter:
 
 ```python
 session = SyncSession(
-    rate_limit=2.0,    # at least 2s between requests per domain
+    rate_limit=2.0,    # at least 2s between requests to the same hostname
     rate_jitter=1.0,   # add 0-1s random jitter
 )
 ```
@@ -456,15 +476,27 @@ After `max_failures` consecutive failures on a domain, the session is retired (f
 
 ### Cross-family rotation ladder
 
-WAF reputation pools key on browser *family*, so wafer escalates across families before cycling versions within one (Chrome145 -> 146 -> 147 all share a single Chromium pool -the weakest axis). Each family switch also swaps the HTTP header envelope (Accept, Accept-Language, sec-ch-ua) so the headers stay coherent with the new TLS fingerprint:
+Wafer escalates across browser families before cycling versions within one.
+Each family switch also swaps the HTTP header envelope (Accept,
+Accept-Language, sec-ch-ua) so the headers stay coherent with the new TLS
+fingerprint:
 
 1. **Fresh TLS session** (rotation 1) -rebuilds the wreq client (new TLS session, empty cookie jar) on the *same* family. Often enough when the 403 is from a stale session or tainted cookies.
-2. **Firefox** (rotation 2) -`Emulation.Firefox149`: Gecko TLS/H2, no sec-ch-ua.
+2. **Firefox** (rotation 2) -`Emulation.Firefox151`: Gecko TLS/H2, no sec-ch-ua.
 3. **Safari** (rotation 3) -wafer's wire-verified Safari 26 (custom TlsOptions/Http2Options).
-4. **Edge** (rotation 4) -`Emulation.Edge147`: Chromium TLS, "Microsoft Edge" brand.
+4. **Edge** (rotation 4) -`Emulation.Edge148`: Chromium TLS, "Microsoft Edge" brand.
 5. **Chrome version cycling** (rotation 5+) -returns to Chrome and cycles versions.
 
-The rung you reach is bounded by `max_rotations`: the **full** Chrome->Firefox->Safari->Edge ladder needs `max_rotations>=4` (Safari `>=3`, Edge `>=4`, version cycling `>=5`). The default `max_rotations=2` gives exactly one cross-family jump (fresh Chrome session, then Firefox) before wafer raises. The default is deliberately low -a higher budget burns more identities against the same host and worsens its reputation. A session started on a non-Chrome `emulation=` walks the same ladder, skipping its own starting family; `profile=` identities (Safari/iOS Safari/Dart/Opera Mini) keep their own special-casing and are not forced into the ladder. A **pinned** fingerprint (after a browser solve) does not rotate.
+The rung you reach is bounded by `max_rotations`: the **full**
+Chrome->Firefox->Safari->Edge ladder needs `max_rotations>=4` (Safari `>=3`,
+Edge `>=4`, version cycling `>=5`). The default `max_rotations=2` gives one
+cross-family jump (fresh Chrome session, then Firefox) before wafer raises. A
+higher budget tries more identities against the same host. A session started
+on a non-Chrome `emulation=` walks the same ladder, skipping its own starting
+family; `profile=` identities (Safari/iOS Safari/Dart/Opera Mini) keep their
+own special-casing and are not forced into the ladder. A fingerprint pinned
+after earning browser-bound challenge state does not rotate. Reddit browser
+recovery and challenge-absent Cloudflare passthrough do not pin.
 
 ### Fingerprint pool
 
@@ -576,17 +608,19 @@ pip install wafer-py[browser]
 from wafer.browser import BrowserSolver
 
 solver = BrowserSolver(
-    headless=False,       # headful for best stealth
+    headless=False,       # default; headless has lower solve coverage
     idle_timeout=300.0,   # close browser after 5min idle
     solve_timeout=30.0,   # max time per solve attempt; the call's timeout=
                           # (session default or per-request) caps it lower
     # proxy="http://user:pass@proxy.example:8080",  # optional manual use
+    egress_guard_proxy=None,  # optional loopback SOCKS5 destination guard
+    executable_path=None, # optional Chrome/Chromium executable override
 )
 # Non-blocking readiness signal for health checks. It becomes true after Chrome
 # launches and clears immediately on disconnect, idle close, or explicit close.
 assert solver.runtime_ready is False
 
-# Use with a session -automatic fallback after rotation exhaustion
+# Use with a session -automatic solving inside the retry loop
 session = SyncSession(browser_solver=solver)
 resp = session.get("https://protected-site.com")  # auto-solves challenges
 
@@ -595,17 +629,35 @@ result = solver.solve("https://protected-site.com", challenge_type="cloudflare")
 if result:
     print(result.cookies)     # extracted cookies
     print(result.user_agent)  # browser's real UA
+    print(result.response)    # CapturedResponse | None
+    print(result.challenge_absent)  # True only for validated CF absence
 ```
 
 Uses [Patchright](https://github.com/Kaliiiiiiiiii-Vinyzu/patchright-python)
-(patched Playwright) with the exact real system Chrome version represented by
-wafer's default transport profile. Startup rejects even a same-major Chrome
-whose four-part version differs from wafer's high-entropy client hints.
-Persistent browser instance with idle timeout. Thread-safe.
+(patched Playwright) with the installed Chrome. Chrome can auto-update ahead
+of wreq's newest emulation; version skew is logged and accepted. Solve paths
+that earn browser-bound challenge state align the session's User-Agent/client
+hints to the launched browser. Reddit recovery and challenge-absent Cloudflare
+passthrough do not pin the session. The browser instance persists until its
+idle timeout and solver operations are serialized. A solver passed to a
+session remains caller-owned: call `solver.close()` when it is no longer
+needed, or rely on `idle_timeout`; exiting the session does not close it.
 
 For automatic solves, the session keeps 10% of the remaining request timeout
 (up to five seconds) outside the browser so it can inject the earned cookies
 and retry the protected HTTP request before the caller's total deadline.
+
+Cloudflare can be transparent to the real browser even when the initial wreq
+request was challenged. If no Cloudflare iframe appears, wafer validates the
+actual Playwright main-document response and returns its status, headers, and
+body plus individual `Set-Cookie` values. This pass-through is limited to a
+non-empty 2xx HTML `GET` with no server redirect. It rejects known
+challenge/block bodies, cross-site or path-changing client navigation,
+embedder/`solve_origin` loads, attachments, and original non-GET methods.
+Query/fragment-only history rewrites are allowed. Because Patchright returns a
+decoded body, stale wire `Content-Encoding`, `Content-Length`, and
+`Transfer-Encoding` headers are removed. This path merges browser cookies
+without pinning the fingerprint or rebuilding the wreq client.
 
 When a session has both `proxy=` and `browser_solver=`, wafer configures the
 solver to the same proxy before Chrome launches. A preconfigured, mismatched
@@ -613,7 +665,12 @@ solver (or a custom solver that cannot expose/configure its proxy) is rejected
 so a browser challenge cannot bypass the session proxy or mint IP-bound cookies
 on a different egress.
 
-Supports: Cloudflare (managed + Turnstile), Akamai, DataDome (WASM PoW auto-resolve + confirm click; bails out on interactive captchas -DD rejects CDP-dispatched input), PerimeterX (including press-and-hold), Imperva, Kasada, F5 Shape, AWS WAF, GeeTest v4 (slide puzzle), Alibaba Baxia (slider), hCaptcha (checkbox), reCAPTCHA v2 (checkbox + image grid via EfficientNet + D-FINE), and generic JS challenges.
+Supports: Cloudflare (managed + Turnstile), Akamai, DataDome (WASM PoW
+auto-resolve + confirm click; interactive captchas are not solved), PerimeterX
+(including press-and-hold), Imperva, Kasada, F5 Shape, AWS WAF, GeeTest v4
+(slide puzzle), Alibaba Baxia (slider), hCaptcha (checkbox), reCAPTCHA v2
+(checkbox + image grid via EfficientNet + D-FINE), Reddit fixed-origin cookie
+recovery, and generic JS challenges.
 
 ### Solving on an origin page (`solve_origin`)
 
@@ -768,8 +825,8 @@ wafer/
   _sync.py          # SyncSession -wraps wreq.blocking.Client
   _async.py         # AsyncSession -wraps wreq.Client
   _response.py      # WaferResponse wrapper
-  _challenge.py     # Challenge detection (17 WAF types)
-  _solvers.py       # Inline solvers (ACW, Amazon, TMD)
+  _challenge.py     # Challenge detection (18 WAF types)
+  _solvers.py       # Inline solvers (ACW, Amazon, TMD, Reddit)
   _cookies.py       # JSON disk cache with TTL and LRU
   _fingerprint.py   # Emulation profiles, sec-ch-ua generation
   _profiles.py      # Profile enum (OPERA_MINI, SAFARI, IOS_SAFARI, DART)
@@ -780,10 +837,10 @@ wafer/
   _native_tls.py    # Native OpenSSL transport (Imperva TLS-fingerprint bypass)
   _kasada.py        # Kasada CD (proof-of-work) generation
   _retry.py         # Retry strategy and backoff
-  _ratelimit.py     # Per-domain rate limiting
+  _ratelimit.py     # Per-hostname rate limiting
   _errors.py        # Typed exceptions
   browser/
-    __init__.py     # BrowserSolver, InterceptResult, format_cookie_str
+    __init__.py     # BrowserSolver, SolveResult, CapturedResponse, InterceptResult
     _solver.py      # Core BrowserSolver + mouse replay
     _cloudflare.py  # Cloudflare challenge solver
     _akamai.py      # Akamai challenge solver

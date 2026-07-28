@@ -36,7 +36,7 @@ Also: **never send Host per-request** -wreq auto-sets it from the URL. Sending i
 
 ## Emulation Enum
 
-- **Not hashable.** Cannot use as a dict key. Use `repr(emulation)` instead (e.g. `"Profile.Chrome147"` — note: `Emulation.ChromeXXX` is a ClassVar pointing at `Profile.ChromeXXX`, so repr returns the `Profile.` form).
+- **Not hashable.** Cannot use as a dict key. Use `repr(emulation)` instead (e.g. `"Profile.Chrome149"` — note: `Emulation.ChromeXXX` is a ClassVar pointing at `Profile.ChromeXXX`, so repr returns the `Profile.` form).
 - **No `.name` attribute.** Use `repr()` for display and lookups.
 - **macOS User-Agent.** Chrome Emulation profiles produce a macOS User-Agent when running on macOS hosts. This is correct browser behavior -real Chrome does the same.
 

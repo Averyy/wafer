@@ -253,6 +253,32 @@ class SyncSession(BaseSession):
             logger.debug("Reddit bootstrap failed during transport")
             return False
 
+    def _try_reddit_browser_bootstrap(
+        self,
+        url: str,
+        deadline: float | None,
+    ) -> bool:
+        """Recover a failed inline bootstrap on Reddit's fixed HTML origin."""
+
+        origin = reddit_solve_origin(url)
+        if self._browser_solver is None or origin is None:
+            return False
+        # Deliberately do not pass the caller's max_response_size. This fixed
+        # HTML root is internal challenge overhead and is never returned; the
+        # cap still applies to the original response replayed through wreq.
+        result = self._try_browser_solve(
+            ChallengeType.REDDIT,
+            url,
+            deadline,
+            embedder=origin,
+            use_solve_origin=False,
+        )
+        if not result:
+            logger.debug("Reddit browser bootstrap failed")
+            return False
+        logger.info("Reddit anonymous cookies established in browser")
+        return True
+
     def _try_inline_solve(
         self,
         challenge: ChallengeType | None,
@@ -479,12 +505,28 @@ class SyncSession(BaseSession):
             for c in result.cookies
             if browser_cookie_matches_host(c.get("domain", ""), domain)
         ]
+        if challenge == ChallengeType.REDDIT and not reddit_has_cookie_evidence(
+            {
+                str(cookie.get("name", ""))
+                for cookie in target_cookies
+                if isinstance(cookie, dict)
+            }
+        ):
+            logger.warning(
+                "Reddit browser solve produced no authoritative cookie evidence"
+            )
+            return False
         if not target_cookies and result.response is None:
             logger.warning("Browser solve produced no cookies scoped to %s", reg)
             return False
 
         # Persist browser cookies to disk cache
-        if self._cookie_cache and domain:
+        if self._cookie_cache and domain and target_cookies:
+            cache_domain = (
+                REDDIT_CACHE_DOMAIN
+                if challenge == ChallengeType.REDDIT
+                else domain
+            )
             cache_entries = []
             for cookie in target_cookies:
                 raw = format_cookie_str(cookie)
@@ -503,7 +545,7 @@ class SyncSession(BaseSession):
                     }
                 )
             try:
-                self._cookie_cache.save(domain, cache_entries)
+                self._cookie_cache.save(cache_domain, cache_entries)
             except Exception:
                 logger.debug("Failed to persist browser cookies")
 
@@ -518,6 +560,11 @@ class SyncSession(BaseSession):
                 cookies=target_cookies,
             )
 
+        challenge_absent_passthrough = (
+            getattr(result, "challenge_absent", False)
+            and result.response is not None
+        )
+
         # Align the replay identity to the browser that solved and pin it.
         # WAF clearance cookies are bound to the solving browser's TLS shape
         # AND its UA/client-hints (Cloudflare cf_clearance, DataDome), so wafer
@@ -528,8 +575,18 @@ class SyncSession(BaseSession):
         # required, or the freshly minted cookie is rejected on the first replay
         # and the session rotates away from the identity the cookie belongs to.
         # Skip Imperva (its token rides an unpinned wreq/native path — see
-        # below) and Safari (self._fingerprint is None; keep the Safari TLS).
-        if self._fingerprint is not None and challenge != ChallengeType.IMPERVA:
+        # below), Reddit (its anonymous cookies are not UA-bound, and a
+        # session-wide pin would disable the fallback rotation escape hatch),
+        # and Safari (self._fingerprint is None; keep the Safari TLS).
+        if (
+            not challenge_absent_passthrough
+            and self._fingerprint is not None
+            and challenge
+            not in (
+                ChallengeType.IMPERVA,
+                ChallengeType.REDDIT,
+            )
+        ):
             chrome_ver = chrome_version_from_ua(result.user_agent)
             if chrome_ver:
                 full_ver = result.browser_version or chrome_full_version_from_ua(
@@ -539,8 +596,12 @@ class SyncSession(BaseSession):
                     result.user_agent, chrome_ver, full_ver
                 )
 
-        # Rebuild client (rehydrates cookies from cache)
-        self._rebuild_client()
+        # A real solve changes the replay identity and needs a rebuilt client.
+        # A challenge-absent passthrough earned no clearance identity: rebuilding
+        # there would discard unrelated in-memory cookies. Merge its browser
+        # cookies into the existing jar below instead.
+        if not challenge_absent_passthrough:
+            self._rebuild_client()
 
         # Also inject directly into jar (covers cache-disabled case)
         for cookie in target_cookies:
@@ -584,7 +645,10 @@ class SyncSession(BaseSession):
         # the same cookies unlock the authoritative SSR response over wreq.
         # Always replay TMD through the normal transport instead of returning
         # that incomplete shell as successful content.
-        if result.response is not None and challenge != ChallengeType.TMD:
+        if result.response is not None and challenge not in (
+            ChallengeType.TMD,
+            ChallengeType.REDDIT,
+        ):
             body_bytes = result.response.body
             # Enforce the response-size cap on the browser body too (it never
             # went through the wreq capped-read path).
@@ -596,13 +660,11 @@ class SyncSession(BaseSession):
                 len(target_cookies),
                 len(body_bytes),
             )
-            text = body_bytes.decode("utf-8", errors="replace")
             return WaferResponse(
                 status_code=result.response.status,
                 headers=result.response.headers,
                 url=result.response.url,
                 content=body_bytes,
-                text=text,
                 was_retried=True,
                 emulation=self._serving_emulation_repr(),
                 # Individual Set-Cookie values from the captured response
@@ -1430,6 +1492,11 @@ class SyncSession(BaseSession):
                         deadline,
                         timeout_secs,
                     )
+                    if not inline_solved:
+                        inline_solved = self._try_reddit_browser_bootstrap(
+                            current_url,
+                            deadline,
+                        )
                 elif (
                     challenge is not None
                     and inline_allowed

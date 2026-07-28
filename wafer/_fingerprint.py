@@ -540,7 +540,7 @@ def emulation_is_mobile(emulation: Emulation) -> bool:
 # Per-family navigation Accept / Accept-Language / Accept-Encoding envelope.
 # Wire-verified 2026-06-12 against tls.peet.ws + tools.scrapfly.io (the
 # values wreq itself sends for each Emulation, cross-checked with MDN's
-# "List of default Accept values"). Firefox 132+ (our Firefox149 target)
+# "List of default Accept values"). Firefox 132+ (our Firefox151 target)
 # uses the SHORT Accept - the longer image/avif... form is Firefox 128-131
 # and is stale. Edge is Chromium, so it shares Chrome's navigation Accept
 # (only the sec-ch-ua brand differs).
@@ -959,7 +959,7 @@ def build_fingerprint_envelope(
       (the caller supplies it; wreq sets it from the Emulation, wafer never
       overrides it for Chrome/Edge/Firefox)
     - ``family``: ``"chrome" | "edge" | "firefox" | "opera" | "safari" | None``
-    - ``emulation``: ``repr(emulation)`` (e.g. ``"Profile.Chrome147"``)
+    - ``emulation``: ``repr(emulation)`` (e.g. ``"Profile.Chrome149"``)
     - ``sec_ch_ua`` / ``sec_ch_ua_mobile`` / ``sec_ch_ua_platform``:
       the low-entropy Client Hints. ``None`` for Firefox/Safari (no client
       hints) and for Opera (wreq's Emulation emits accurate Opera hints

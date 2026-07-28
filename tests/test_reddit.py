@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import time
+from types import SimpleNamespace
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlparse
 
@@ -129,19 +130,50 @@ class _RecordingBrowserSolver:
     proxy_server = None
     browser_identity = None
 
-    def __init__(self):
+    def __init__(self, result=None):
         self.calls = []
+        self.result = result
 
     def solve(self, url, challenge_type=None, **kwargs):
         self.calls.append((url, challenge_type, kwargs))
-        return None
+        return self.result
 
     async def asolve(self, url, challenge_type=None, **kwargs):
         self.calls.append((url, challenge_type, kwargs))
-        return None
+        return self.result
 
     def close(self):
         pass
+
+
+def _browser_result(*names, response=None):
+    return SimpleNamespace(
+        cookies=[
+            {
+                "name": name,
+                "value": f"{name}-value",
+                "domain": ".reddit.com",
+                "path": "/",
+                "expires": time.time() + 3600,
+            }
+            for name in names
+        ],
+        user_agent="Chrome/149.0.0.0",
+        browser_version="149.0.7827.201",
+        extras=None,
+        response=response,
+    )
+
+
+def _assert_reddit_browser_call(solver):
+    assert len(solver.calls) == 1
+    url, challenge_type, kwargs = solver.calls[0]
+    assert url == _JSON_URL
+    assert challenge_type == "reddit"
+    assert kwargs["embedder"] == REDDIT_SOLVE_ORIGIN
+    assert kwargs["replay"] is None
+    # The root HTML is internal solve overhead, never the returned body.
+    assert "max_size" not in kwargs
 
 
 def _assert_submission_url(url):
@@ -424,11 +456,13 @@ class TestRedditBootstrapSync:
         ) == 1
 
     @patch("wafer._sync.time.sleep")
-    def test_failed_exact_bootstrap_never_falls_back_to_browser(
+    def test_failed_exact_bootstrap_falls_back_to_browser_origin(
         self,
         mock_sleep,
     ):
-        solver = _RecordingBrowserSolver()
+        solver = _RecordingBrowserSolver(
+            _browser_result("loid", "token_v2")
+        )
         session, mock = make_sync_session(
             [
                 _gate_response(),
@@ -437,18 +471,25 @@ class TestRedditBootstrapSync:
                     {"content-type": "text/html"},
                     "<html>not a valid verification</html>",
                 ),
+                MockResponse(
+                    200,
+                    {"content-type": "application/json"},
+                    "{}",
+                ),
             ],
             max_rotations=0,
             browser_solver=solver,
+            solve_origin="https://wrong.example/",
         )
 
         resp = session.get(_JSON_URL)
 
-        assert resp.status_code == 403
-        assert resp.text == _REDDIT_GATE_BODY
-        assert resp.challenge_type == "reddit"
-        assert mock.request_count == 2
-        assert solver.calls == []
+        assert resp.status_code == 200
+        assert resp.json() == {}
+        assert resp.rotations == 0
+        assert mock.request_count == 3
+        assert session._fingerprint.pinned is False
+        _assert_reddit_browser_call(solver)
 
     @patch("wafer._sync.time.sleep")
     def test_failed_exact_bootstrap_preserves_transport_rotation(
@@ -479,7 +520,129 @@ class TestRedditBootstrapSync:
         assert resp.status_code == 200
         assert resp.json() == {}
         assert resp.rotations == 1
-        assert solver.calls == []
+        _assert_reddit_browser_call(solver)
+
+    @patch("wafer._sync.time.sleep")
+    def test_browser_fallback_requires_authoritative_cookie_evidence(
+        self,
+        mock_sleep,
+    ):
+        solver = _RecordingBrowserSolver(
+            _browser_result("csv", "edgebucket")
+        )
+        session, mock = make_sync_session(
+            [
+                _gate_response(),
+                MockResponse(200, {}, "<html>unknown verification</html>"),
+            ],
+            max_rotations=0,
+            browser_solver=solver,
+        )
+
+        resp = session.get(_JSON_URL)
+
+        assert resp.status_code == 403
+        assert resp.challenge_type == "reddit"
+        assert mock.request_count == 2
+        assert mock.cookie_jar.added == [
+            (raw.decode("utf-8"), _JSON_URL)
+            for raw in _gate_response().headers.get_all("set-cookie")
+        ]
+        _assert_reddit_browser_call(solver)
+
+    @patch("wafer._sync.time.sleep")
+    def test_browser_fallback_replays_original_method_and_body(
+        self,
+        mock_sleep,
+    ):
+        solver = _RecordingBrowserSolver(
+            _browser_result("loid", "csv")
+        )
+        session, mock = make_sync_session(
+            [
+                _gate_response(),
+                MockResponse(200, {}, "<html>unknown verification</html>"),
+                MockResponse(200, {"content-type": "application/json"}, "{}"),
+            ],
+            max_rotations=0,
+            browser_solver=solver,
+        )
+
+        resp = session.post(_JSON_URL, json={"limit": 1})
+
+        assert resp.status_code == 200
+        assert mock.request_log[0][0] == mock.request_log[-1][0]
+        assert mock.request_log[0][2]["json"] == {"limit": 1}
+        assert mock.request_log[-1][2]["json"] == {"limit": 1}
+        _assert_reddit_browser_call(solver)
+
+    @patch("wafer._sync.time.sleep")
+    def test_browser_fallback_never_returns_html_for_json_request(
+        self,
+        mock_sleep,
+    ):
+        captured_html = SimpleNamespace(
+            url=REDDIT_SOLVE_ORIGIN,
+            status=200,
+            headers={"content-type": "text/html"},
+            body=b"<html>browser homepage</html>",
+            set_cookie=[],
+        )
+        solver = _RecordingBrowserSolver(
+            _browser_result(
+                "loid",
+                "token_v2",
+                response=captured_html,
+            )
+        )
+        session, mock = make_sync_session(
+            [
+                _gate_response(),
+                MockResponse(200, {}, "<html>unknown verification</html>"),
+                MockResponse(
+                    200,
+                    {"content-type": "application/json"},
+                    '{"source":"wreq"}',
+                ),
+            ],
+            max_rotations=0,
+            browser_solver=solver,
+        )
+
+        resp = session.get(_JSON_URL)
+
+        assert resp.json() == {"source": "wreq"}
+        assert resp.url == _JSON_URL
+        assert mock.request_log[-1][1] == _JSON_URL
+
+    @patch("wafer._sync.time.sleep")
+    def test_browser_fallback_uses_canonical_cookie_cache(
+        self,
+        mock_sleep,
+        tmp_path,
+    ):
+        cache = CookieCache(str(tmp_path))
+        solver = _RecordingBrowserSolver(
+            _browser_result("loid", "token_v2")
+        )
+        session, _ = make_sync_session(
+            [
+                _gate_response(),
+                MockResponse(200, {}, "<html>unknown verification</html>"),
+                MockResponse(200, {"content-type": "application/json"}, "{}"),
+            ],
+            max_rotations=0,
+            browser_solver=solver,
+            cookie_cache=cache,
+        )
+
+        assert session.get(_JSON_URL).status_code == 200
+
+        assert {
+            cookie["name"]
+            for cookie in cache.load(REDDIT_CACHE_DOMAIN)
+        } == {"csv", "edgebucket", "loid", "token_v2"}
+        assert cache.load("api.reddit.com") == []
 
     @patch("wafer._sync.time.sleep")
     def test_submission_requires_response_cookie_evidence(
@@ -783,11 +946,13 @@ class TestRedditBootstrapAsync:
 
     @pytest.mark.asyncio
     @patch("wafer._async.asyncio.sleep")
-    async def test_failed_exact_bootstrap_never_falls_back_to_browser(
+    async def test_failed_exact_bootstrap_falls_back_to_browser_origin(
         self,
         mock_sleep,
     ):
-        solver = _RecordingBrowserSolver()
+        solver = _RecordingBrowserSolver(
+            _browser_result("loid", "token_v2")
+        )
         session, mock = make_async_session(
             [
                 _async_gate_response(),
@@ -796,18 +961,25 @@ class TestRedditBootstrapAsync:
                     {"content-type": "text/html"},
                     "<html>not a valid verification</html>",
                 ),
+                AsyncMockResponse(
+                    200,
+                    {"content-type": "application/json"},
+                    "{}",
+                ),
             ],
             max_rotations=0,
             browser_solver=solver,
+            solve_origin="https://wrong.example/",
         )
 
         resp = await session.get(_JSON_URL)
 
-        assert resp.status_code == 403
-        assert resp.text == _REDDIT_GATE_BODY
-        assert resp.challenge_type == "reddit"
-        assert mock.request_count == 2
-        assert solver.calls == []
+        assert resp.status_code == 200
+        assert resp.json() == {}
+        assert resp.rotations == 0
+        assert mock.request_count == 3
+        assert session._fingerprint.pinned is False
+        _assert_reddit_browser_call(solver)
 
     @pytest.mark.asyncio
     @patch("wafer._async.asyncio.sleep")
@@ -839,7 +1011,71 @@ class TestRedditBootstrapAsync:
         assert resp.status_code == 200
         assert resp.json() == {}
         assert resp.rotations == 1
-        assert solver.calls == []
+        _assert_reddit_browser_call(solver)
+
+    @pytest.mark.asyncio
+    @patch("wafer._async.asyncio.sleep")
+    async def test_browser_fallback_requires_authoritative_cookie_evidence(
+        self,
+        mock_sleep,
+    ):
+        solver = _RecordingBrowserSolver(
+            _browser_result("csv", "edgebucket")
+        )
+        session, mock = make_async_session(
+            [
+                _async_gate_response(),
+                AsyncMockResponse(
+                    200,
+                    {},
+                    "<html>unknown verification</html>",
+                ),
+            ],
+            max_rotations=0,
+            browser_solver=solver,
+        )
+
+        resp = await session.get(_JSON_URL)
+
+        assert resp.status_code == 403
+        assert resp.challenge_type == "reddit"
+        assert mock.request_count == 2
+        _assert_reddit_browser_call(solver)
+
+    @pytest.mark.asyncio
+    @patch("wafer._async.asyncio.sleep")
+    async def test_browser_fallback_replays_original_method_and_body(
+        self,
+        mock_sleep,
+    ):
+        solver = _RecordingBrowserSolver(
+            _browser_result("loid", "csv")
+        )
+        session, mock = make_async_session(
+            [
+                _async_gate_response(),
+                AsyncMockResponse(
+                    200,
+                    {},
+                    "<html>unknown verification</html>",
+                ),
+                AsyncMockResponse(
+                    200,
+                    {"content-type": "application/json"},
+                    "{}",
+                ),
+            ],
+            max_rotations=0,
+            browser_solver=solver,
+        )
+
+        resp = await session.post(_JSON_URL, json={"limit": 1})
+
+        assert resp.status_code == 200
+        assert mock.request_log[0][0] == mock.request_log[-1][0]
+        assert mock.request_log[0][2]["json"] == {"limit": 1}
+        assert mock.request_log[-1][2]["json"] == {"limit": 1}
+        _assert_reddit_browser_call(solver)
 
     @pytest.mark.asyncio
     async def test_lock_wait_uses_request_deadline(self):
@@ -962,6 +1198,85 @@ class TestRedditBootstrapAsync:
         _assert_submission_url(new.urls[1])
 
     @pytest.mark.asyncio
+    async def test_browser_fallback_records_rebuilt_client_generation(self):
+        class NewClient:
+            cookie_jar = MockJar()
+
+        solver = _RecordingBrowserSolver(
+            _browser_result("loid", "token_v2")
+        )
+        session, _ = make_async_session(
+            [
+                AsyncMockResponse(
+                    200,
+                    {},
+                    "<html>unknown verification</html>",
+                )
+            ],
+            browser_solver=solver,
+        )
+        new_client = NewClient()
+
+        def rebuild():
+            session._client = new_client
+            session._client_generation += 1
+
+        session._rebuild_client = rebuild
+
+        solved_generation = await session._try_reddit_bootstrap(
+            _JSON_URL,
+            None,
+            30.0,
+            0,
+        )
+
+        assert solved_generation == 1
+        assert session._reddit_bootstrap_client_generation == 1
+        assert new_client.cookie_jar.get("loid", _JSON_URL) is not None
+        assert new_client.cookie_jar.get("token_v2", _JSON_URL) is not None
+
+    @pytest.mark.asyncio
+    async def test_cancellation_during_browser_fallback_releases_lock(self):
+        started = asyncio.Event()
+
+        class HangingBrowserSolver:
+            proxy_server = None
+            browser_identity = None
+
+            def solve(self, url, challenge_type=None, **kwargs):
+                raise AssertionError("async solver should use asolve")
+
+            async def asolve(self, url, challenge_type=None, **kwargs):
+                started.set()
+                await asyncio.Event().wait()
+
+        session, _ = make_async_session(
+            [
+                AsyncMockResponse(
+                    200,
+                    {},
+                    "<html>unknown verification</html>",
+                )
+            ],
+            browser_solver=HangingBrowserSolver(),
+        )
+        task = asyncio.create_task(
+            session._try_reddit_bootstrap(
+                _JSON_URL,
+                None,
+                30.0,
+                0,
+            )
+        )
+        await started.wait()
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert not session._reddit_bootstrap_lock.locked()
+
+    @pytest.mark.asyncio
     @patch("wafer._async.asyncio.sleep")
     async def test_concurrent_cold_requests_share_one_bootstrap(
         self, mock_sleep
@@ -1027,3 +1342,70 @@ class TestRedditBootstrapAsync:
         assert client.origin_count == 1
         assert client.submit_count == 1
         assert session._reddit_bootstrap_generation == 1
+
+    @pytest.mark.asyncio
+    @patch("wafer._async.asyncio.sleep")
+    async def test_concurrent_inline_failures_share_one_browser_fallback(
+        self,
+        mock_sleep,
+    ):
+        both_gated = asyncio.Event()
+
+        class ConcurrentClient:
+            cookie_jar = MockJar()
+
+            def __init__(self):
+                self.json_gate_count = 0
+                self.origin_count = 0
+
+            async def request(self, method, url, **kwargs):
+                if url != _JSON_URL:
+                    raise AssertionError(f"unexpected request: {url}")
+                if (
+                    self.cookie_jar.get("loid", url)
+                    and self.cookie_jar.get("token_v2", url)
+                ):
+                    return AsyncMockResponse(
+                        200,
+                        {"content-type": "application/json"},
+                        "{}",
+                    )
+                self.json_gate_count += 1
+                if self.json_gate_count == 2:
+                    both_gated.set()
+                else:
+                    await both_gated.wait()
+                return _async_gate_response()
+
+            async def get(self, url, **kwargs):
+                assert url == REDDIT_SOLVE_ORIGIN
+                self.origin_count += 1
+                return AsyncMockResponse(
+                    200,
+                    {},
+                    "<html>unknown verification</html>",
+                )
+
+        client = ConcurrentClient()
+        solver = _RecordingBrowserSolver(
+            _browser_result("loid", "token_v2")
+        )
+        session, _ = make_async_session(
+            [_gate_response()],
+            browser_solver=solver,
+        )
+        session._client = client
+
+        first, second = await asyncio.gather(
+            session.get(_JSON_URL),
+            session.get(_JSON_URL),
+        )
+
+        assert first.status_code == second.status_code == 200
+        assert client.json_gate_count == 2
+        assert client.origin_count == 1
+        assert len(solver.calls) == 1
+        assert session._reddit_bootstrap_generation == 1
+        assert session._reddit_bootstrap_client_generation == (
+            session._client_generation
+        )

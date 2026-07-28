@@ -88,7 +88,7 @@ class WaferResponse:
 
     Provides a requests/httpx-like API:
     - ``status_code``: int
-    - ``content``: bytes (raw response body, always available)
+    - ``content``: bytes (body after transport decompression, always available)
     - ``text``: str (decoded from content, lazy, charset-aware)
     - ``headers``: dict[str, str] (lowercase keys)
     - ``url``: final URL after redirects
@@ -145,7 +145,7 @@ class WaferResponse:
         self._text = text
         self._cookies: dict[str, str] | None = None
         # Individual Set-Cookie header values, preserved by transports
-        # that decode headers into a flat dict (native-TLS, Opera Mini)
+        # that decode headers into a flat dict (native-TLS, Opera Mini, browser)
         # where multiple Set-Cookie values would otherwise be joined.
         self._raw_set_cookie: list[str] | None = (
             list(raw_set_cookie) if raw_set_cookie is not None else None
@@ -162,14 +162,14 @@ class WaferResponse:
         self.inline_solves = inline_solves
         self.elapsed = elapsed
         # repr() of the Emulation (or profile name) that served the request,
-        # e.g. "Profile.Chrome147". Populated by the session at construction;
+        # e.g. "Profile.Chrome149". Populated by the session at construction;
         # lets callers diagnose which fingerprint served a 403/regression.
         self.emulation = emulation
         self._raw = raw
 
     @property
     def content(self) -> bytes:
-        """Raw response body as bytes."""
+        """Response body bytes after transport decompression."""
         return self._content
 
     @property

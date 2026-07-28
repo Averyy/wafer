@@ -1,10 +1,10 @@
-"""Challenge detection for 10+ WAF types.
+"""Challenge detection for 18 WAF types.
 
 Pure logic, no I/O. Inspects status code, headers, and body to identify
 which WAF/challenge system is blocking a request.
 
 Detection order is intentional:
-1. Inline-solvable challenges first (ACW, TMD, Amazon) — cheapest to resolve
+1. Inline-solvable challenges first (ACW, TMD, Amazon, Reddit)
 2. Browser-solvable challenges next (Cloudflare, Akamai, DataDome, etc.)
 3. Generic JS fallback last
 """

@@ -20,11 +20,12 @@ When updating, change the **Status** column and add a date + note. Don't assume 
 **Status values:**
 - `pass` -confirmed working via TLS only (wreq Emulation)
 - `browser-solve` -needs browser solver, confirmed working
-- `no-solver` -WAF vendor has no wafer solver yet (Kasada, F5 Shape, in-house)
-- `no-drag` -needs drag/slider solver (not yet built)
+- `browser-passthrough` -browser returns the validated response body directly
+- `no-solver` -challenge has no dedicated wafer solver
+- `no-drag` -challenge needs a dedicated drag flow wafer does not implement
 - `untested` -not yet tested
 - `unverified` -WAF claim not confirmed in latest smoke test (may trigger on deeper pages)
-- `blocked` -IP/behavioral block, needs strategy change
+- `blocked` -wafer did not reproduce the successful real-browser behavior; record the observed code path without attributing the cause externally
 
 ---
 
@@ -121,9 +122,10 @@ Passes with wreq Chrome Emulation (JA3/JA4 + H2 fingerprint match).
 |---|---|---|---|
 | `footdistrict.com` | Unknown | pass | 2026-02-21: 200 1.6MB via TLS. European sneaker store; WAF not identified |
 
-## Tier 3: Browser Challenge (cookie solve + replay)
+## Tier 3: Browser Challenge
 
-Requires browser solver for initial solve, then TLS client replays cached cookies.
+Requires the browser solver. Depending on the WAF, wafer either replays earned
+cookies through the TLS client or returns a validated browser response.
 
 ### Cloudflare
 
@@ -141,7 +143,8 @@ Requires browser solver for initial solve, then TLS client replays cached cookie
 | `glassdoor.com` | Cloudflare | pass | 2026-02-21: 200 648KB via TLS |
 | `kick.com` | Cloudflare | browser-solve | 2026-02-21: Browser-solve verified. 403→browser→cf_clearance→200 502KB. **Reclassified from Kasada to Cloudflare** |
 | `fbref.com` | Cloudflare | browser-solve | 2026-02-21: Browser-solve verified. 403→browser→cf_clearance→200 554KB. Sports reference |
-| `manta.com` | Cloudflare | blocked | 2026-02-21: CF managed challenge (403 for TLS, 200 for browser). Browser passes without challenge → no cf_clearance issued → cookie replay impossible. **Reclassified from Imperva to Cloudflare**. Requires JS execution, not solvable via cookie replay |
+| `manta.com` | Cloudflare | browser-passthrough | 2026-07-28: reverified live. Initial wreq response was a Cloudflare challenge; headed Chrome reached the real page and wafer returned the post-solve HTML passthrough (200, 110,183 bytes, 20 cookies, zero rotations). This supersedes the 2026-02-21 `blocked` classification. |
+| `apollomapping.com` | Cloudflare | browser-passthrough | 2026-07-28: wreq receives a CF 403 while headed Chrome receives the real page with no challenge iframe. Verified the challenge-absent main-document passthrough returns the actual 200 HTML response (218,487 bytes on final recheck), with zero fingerprint rotations, no fingerprint pin, the original wreq client preserved, and stale wire encoding/length headers removed. |
 
 ### Cloudflare Turnstile
 
@@ -320,7 +323,7 @@ Wafer has **no Arkose Labs solver**. Arkose presents 3D puzzle CAPTCHAs (rotate,
 | `ssense.com` | Riskified | pass | 2026-02-21: 200 521KB via TLS |
 | `tiktok.com` | In-house (custom VM) | pass | 2026-02-21: 200 306KB via TLS. Redirects to /explore. Custom VM-based anti-bot |
 | `temu.com` | In-house (custom) | pass | 2026-02-21: 200 601KB via TLS. HMAC-signed headers on deeper pages |
-| `reddit.com`, `old.reddit.com/*.json`, `api.reddit.com` | DataDome + in-house session gate | pass | 2026-07-26: Cold JSON requests can return a roughly 190 KiB Shreddit block page, while direct New Reddit HTML can return a small 200 verification document. Wafer recognizes both, performs the logged-out verification at `www.reddit.com` on the same client, validates response-scoped anonymous cookie evidence, persists durable cookie legs under one Reddit cache namespace, and replays the original JSON or HTML URL. Old Reddit remains available only when explicitly requested; it is never a bootstrap or fallback. |
+| `reddit.com`, `old.reddit.com/*.json`, `api.reddit.com` | DataDome + in-house session gate | pass | 2026-07-26: Cold JSON requests can return a roughly 190 KiB Shreddit block page, while direct New Reddit HTML can return a small 200 verification document. Wafer recognizes both, performs the logged-out verification at `www.reddit.com` on the same client, validates response-scoped anonymous cookie evidence, persists durable cookie legs under one Reddit cache namespace, and replays the original JSON or HTML URL. Old Reddit remains available only when explicitly requested; it is never a bootstrap or fallback. **2026-07-28:** forced-inline-failure live verification recovered authoritative cookies at the fixed New Reddit root and replayed the original JSON request to 200 with zero rotations and no fingerprint pin. |
 | `facebook.com/marketplace/` | In-house (Meta) | pass | 2026-02-21: 200 1.2MB via TLS. Login-walled for most data |
 | `artists.spotify.com` | In-house (Spotify) | pass | 2026-02-21: 200 336KB via TLS. Redirects to /home. Login-walled |
 
@@ -338,7 +341,7 @@ Wafer has **no Arkose Labs solver**. Arkose presents 3D puzzle CAPTCHAs (rotate,
 
 | WAF Vendor | Solver? | Verified Sites | What Works |
 |---|---|---|---|
-| **Cloudflare** (JS + Turnstile) | Yes | 15 | Browser solve + cookie replay. 30 min TTL. |
+| **Cloudflare** (JS + Turnstile) | Yes | 17 | Browser solve with cookie replay or validated browser passthrough. |
 | **Akamai** | Yes | 18 | Browser solve. Cookie replay difficult (_abck continuously validated). |
 | **DataDome** | Partial | 17 | WASM PoW auto-resolve + confirm button + cookie replay. Match OS. Interactive challenges (slider, audio) are **unsolvable** - DD detects CDP input events. See `docs/ref-datadome.md`. |
 | **PerimeterX** (press-and-hold) | Yes | 21 | Browser solve with recorded mouse input. **SOLVED** on wayfair. |

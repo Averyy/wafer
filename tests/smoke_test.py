@@ -72,6 +72,8 @@ SITES: list[tuple[int, str, str]] = [
     (3, "cloudflare", "https://miata.net"),
     (3, "cloudflare", "https://www.researchgate.net/publication/352299571_Additives_in_pet_food_are_they_safe"),
     (3, "cloudflare", "https://glassdoor.com"),
+    (3, "cloudflare", "https://www.manta.com"),
+    (3, "cloudflare", "https://apollomapping.com"),
     (3, "turnstile", "https://scrapingcourse.com/login/cf-turnstile"),
     (3, "turnstile", "https://2captcha.com/demo/cloudflare-turnstile"),
     (3, "datadome", "https://g2.com"),
@@ -133,7 +135,6 @@ SITES: list[tuple[int, str, str]] = [
     (3, "cloudflare", "https://kick.com"),
     (3, "cloudflare", "https://fbref.com"),
     (3, "datadome", "https://www.tripadvisor.com"),
-    (5, "cloudflare", "https://www.manta.com"),  # CF passes browser, no cf_clearance
     # Tier 4: Interactive CAPTCHA
     (4, "perimeterx", "https://wayfair.com/v/account/authentication/login"),
     (4, "perimeterx", "https://zillow.com"),

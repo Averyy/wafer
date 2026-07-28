@@ -652,7 +652,7 @@ class BaseSession:
         # failing rests longer before it is tried again (vs. a flat delay).
         self._pool_strikes: dict[str, int] = {}
 
-        # Per-domain rate limiter. Validate rather than let a wrong type fall
+        # Per-hostname rate limiter. Validate rather than let a wrong type fall
         # into the comparison below as a bare TypeError from deep inside
         # __init__: "disable this" reads as None to a caller, but the knob is
         # a float where 0.0 is off.
@@ -671,7 +671,7 @@ class BaseSession:
         else:
             self._rate_limiter = None
 
-        # Session health: consecutive failure count per domain
+        # Session health: consecutive failure count per hostname
         self._domain_failures: dict[str, int] = {}
         self._tried_safari = profile in (
             Profile.SAFARI,
@@ -691,7 +691,7 @@ class BaseSession:
         # Keyed by the RFC cookie identity (name, normalized domain, path).
         self._cookie_scopes: dict[tuple[str, str, str], bool] = {}
 
-        # Referer chain tracking: last URL fetched per domain
+        # Referer chain tracking: last URL fetched per hostname
         self._last_url: dict[str, str] = {}
 
         # Hosts that have served a NON-EMPTY 200 this session ("200-capable").
@@ -1024,7 +1024,7 @@ class BaseSession:
           "safari" | "dart" | "opera_mini" | None``
         - ``emulation``: ``repr()`` of the Emulation, or the Profile name
           for Safari/iOS Safari/Dart/Opera Mini (e.g.
-          ``"Profile.Chrome147"``, ``"ios_safari"``)
+          ``"Profile.Chrome149"``, ``"ios_safari"``)
         - ``sec_ch_ua`` / ``sec_ch_ua_mobile`` / ``sec_ch_ua_platform``:
           the low-entropy Client Hints. ``None`` for Firefox/Safari (no
           client hints) and for Opera (wreq's Emulation emits accurate
@@ -1263,7 +1263,7 @@ class BaseSession:
                 merged.get("Referer", "(none)"),
             )
         else:
-            # Normal referer chain: auto-set from last URL on same domain
+            # Normal referer chain: auto-set from last URL on same hostname
             if "Referer" not in merged and domain in self._last_url:
                 merged["Referer"] = self._last_url[domain]
                 logger.debug("Auto-Referer: %s", self._last_url[domain])
@@ -1318,15 +1318,13 @@ class BaseSession:
             self._last_url[domain] = url
 
     def _record_failure(self, domain: str) -> bool:
-        """Record a 403/429 failure for a domain.
+        """Record a 403/429 failure for a hostname.
 
         Returns True if the session should be retired (threshold hit).
 
-        When a ``fingerprint_pool`` is in use the session is NEVER retired:
-        rotation-induced 403s are expected (each pool identity gets probed
-        and a hot one is meant to rest, not nuke the whole session). The
-        per-identity backoff in ``_advance_rotation`` is the entire health
-        model in pool mode; full identity reset would defeat the pool.
+        When a ``fingerprint_pool`` is in use the session is never retired.
+        Rotation failures accrue per-identity backoff in
+        ``_advance_rotation``; a full identity reset would defeat that model.
         """
         count = self._domain_failures.get(domain, 0) + 1
         self._domain_failures[domain] = count
@@ -1346,15 +1344,15 @@ class BaseSession:
         return False
 
     def _record_success(self, domain: str) -> None:
-        """Record a successful response for a domain, resetting failures."""
+        """Record a successful response for a hostname, resetting failures."""
         if domain in self._domain_failures:
             del self._domain_failures[domain]
 
     def _switch_to_safari(self) -> None:
         """Switch from Chrome to Safari identity for rotation fallback.
 
-        Safari has a fundamentally different TLS/H2 fingerprint, making
-        it much more effective than rotating between Chrome versions.
+        Safari supplies a different TLS/H2 fingerprint from Chromium-family
+        profiles.
         Only called for default Chrome sessions (not Safari or Opera Mini).
         """
         self._safari_identity = SafariIdentity(locale=self._safari_locale)
@@ -1480,7 +1478,7 @@ class BaseSession:
             else None
         )
         # Map rotation 2 -> ladder[0], rotation 3 -> ladder[1], etc. When a
-        # rung is not real diversity for THIS session -- the "safari" rung after
+        # rung would repeat this session's current family -- the "safari" rung after
         # Safari was already tried, or an Emulation rung that IS the session's
         # current family (e.g. a Firefox-START session reaching the Firefox
         # rung) -- advance to the NEXT ladder rung rather than dropping straight
@@ -1502,7 +1500,7 @@ class BaseSession:
                 continue
             if target is not None:
                 # Skip a family rung that IS the session's current family
-                # (re-asserting it is not real diversity); try the next rung.
+                # rather than repeating it; try the next rung.
                 if emulation_family(target) != cur_family:
                     self._switch_to_emulation(target)
                     return
