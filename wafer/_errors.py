@@ -27,8 +27,35 @@ class ChallengeDetected(WaferError):
         self.url = url
         self.status_code = status_code
         self.response = response
-        super().__init__(
-            f"{challenge_type} challenge detected at {url} (HTTP {status_code})"
+        super().__init__(self._message())
+
+    def _message(self) -> str:
+        return (
+            f"{self.challenge_type} challenge detected at {self.url} "
+            f"(HTTP {self.status_code})"
+        )
+
+
+class RequestBlocked(ChallengeDetected):
+    """A WAF rule denied the request -- there is nothing to solve.
+
+    Raised instead of ``ChallengeDetected`` (and caught by handlers for it,
+    being a subclass) when the response is a block page rather than a
+    challenge. The distinction is the remedy: a challenge asks the client to
+    prove it is a browser, so retrying, rotating identity, or solving in a
+    browser can all change the outcome. A block means the request matched a
+    rule, and every one of those returns the same denial -- so wafer spends
+    none of its retry or rotation budget before raising this.
+
+    What does help is changing the request itself: a different path, origin,
+    or egress address.
+    """
+
+    def _message(self) -> str:
+        return (
+            f"{self.challenge_type} blocked the request to {self.url} "
+            f"(HTTP {self.status_code}); a WAF rule denied it, so retrying, "
+            "rotating identity, and browser solving all return the same answer"
         )
 
 

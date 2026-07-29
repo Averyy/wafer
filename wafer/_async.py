@@ -17,6 +17,7 @@ from wafer._base import (
     _callable_accepts_keyword,
     _canonicalize_url_host,
     _CapExceeded,
+    _connection_failure_reason,
     _content_length_over_cap,
     _decode_headers,
     _extract_location,
@@ -29,6 +30,7 @@ from wafer._base import (
 )
 from wafer._challenge import (
     JS_ONLY_CHALLENGES,
+    TERMINAL_CHALLENGES,
     ChallengeType,
     detect_challenge,
 )
@@ -42,6 +44,7 @@ from wafer._errors import (
     ConnectionFailed,
     EmptyResponse,
     RateLimited,
+    RequestBlocked,
     ResponseTooLarge,
     TooManyRedirects,
     WaferTimeout,
@@ -466,6 +469,28 @@ class AsyncSession(BaseSession):
 
         return False
 
+    async def _arender_via_solver(
+        self,
+        url: str,
+        timeout: float | None,
+        max_size: int | None,
+    ):
+        """Await the solver's render, preferring its native async entry point."""
+
+        async_render = getattr(self._browser_solver, "arender", None)
+        render_callable = (
+            async_render if callable(async_render) else self._browser_solver.render
+        )
+        kwargs = {"timeout": timeout}
+        if max_size is not None and _callable_accepts_keyword(
+            render_callable,
+            "max_size",
+        ):
+            kwargs["max_size"] = max_size
+        if callable(async_render):
+            return await async_render(url, **kwargs)
+        return await asyncio.to_thread(render_callable, url, **kwargs)
+
     async def _try_browser_solve(
         self,
         challenge: ChallengeType,
@@ -476,6 +501,7 @@ class AsyncSession(BaseSession):
         max_size: int | None = None,
         use_solve_origin: bool = True,
         challenge_url: str | None = None,
+        render: bool = False,
     ) -> WaferResponse | bool:
         """Attempt browser-based challenge solving.
 
@@ -496,6 +522,12 @@ class AsyncSession(BaseSession):
             max_size: effective ``max_response_size`` (bytes). When a
                 passthrough body exceeds it, ``ResponseTooLarge`` is raised
                 instead of returning the oversize body.
+            render: navigate and capture the settled document instead of
+                answering a challenge wafer already detected. The result is
+                always a passthrough body; everything downstream (cookie
+                scoping, persistence, jar injection, and the identity pin when
+                the render had to solve an interstitial in place) is shared
+                with the solve path.
 
         Returns:
             WaferResponse: browser got real content without challenge
@@ -554,6 +586,9 @@ class AsyncSession(BaseSession):
                 challenge_url or url,
             )
         result = None
+        if render:
+            result = await self._arender_via_solver(url, solve_timeout, max_size)
+            browser_attempts = 0
         for browser_attempt in range(browser_attempts):
             if deadline is not None:
                 if challenge is ChallengeType.TMD:
@@ -968,6 +1003,87 @@ class AsyncSession(BaseSession):
         )
         return result is True
 
+    async def render(
+        self,
+        url: str,
+        *,
+        timeout: float | datetime.timedelta | None = None,
+        max_response_size: int | None = None,
+    ) -> WaferResponse:
+        """Fetch ``url`` by rendering it in a real browser.
+
+        Async counterpart to :meth:`SyncSession.render`. When a page writes
+        its own content with client-side JavaScript the server ships a shell,
+        and no fingerprint recovers what was never in the bytes. This
+        navigates the browser solver to ``url``, waits for rendering to
+        settle, and returns the resulting document.
+
+        The browser follows redirects regardless of ``follow_redirects``, so
+        ``WaferResponse.url`` is the final URL and ``history`` is empty.
+        Cookies the page set are merged into the session jar, so a following
+        :meth:`get` reuses them.
+
+        A non-HTML resource (JSON, XML, an image) comes back as the bytes the
+        server sent under its real content type, so :meth:`WaferResponse.json`
+        works on a rendered API URL; Chrome would otherwise wrap those in a
+        viewer document and the serialized DOM would be that wrapper.
+
+        An interstitial is solved in place with the same per-WAF handlers the
+        transport path uses, and the session then pins its replay identity to
+        the solving browser so the earned clearance survives the next request.
+
+        A session with no ``browser_solver=`` creates one on the first render
+        and closes it on exit; from then on the session can also browser-solve
+        challenges on ordinary requests.
+
+        Raises ``ChallengeDetected`` if the document is still a WAF challenge
+        after that attempt, and ``ConnectionFailed`` if the browser produced
+        no document within the timeout.
+        """
+
+        self._ensure_browser_solver()
+        start_time = time.monotonic()
+        timeout_secs = (
+            timeout.total_seconds()
+            if hasattr(timeout, "total_seconds")
+            else float(timeout)
+            if timeout is not None
+            else self.timeout.total_seconds()
+        )
+        if timeout_secs <= 0:
+            raise WaferTimeout(url, timeout_secs)
+        effective_max_size = (
+            self.max_response_size if max_response_size is None else max_response_size
+        )
+        result = await self._try_browser_solve(
+            ChallengeType.GENERIC_JS,
+            url,
+            start_time + timeout_secs,
+            max_size=effective_max_size,
+            use_solve_origin=False,
+            render=True,
+        )
+        if not isinstance(result, WaferResponse):
+            raise ConnectionFailed(url, "browser render produced no document")
+        result.elapsed = time.monotonic() - start_time
+        # Classify the rendered body exactly like a transport response: a
+        # WAF interstitial that outlived the render is a challenge, not
+        # content, and the caller must be able to tell the two apart.
+        challenge = detect_challenge(
+            result.status_code,
+            result.headers,
+            result.text,
+        )
+        if challenge is not None:
+            result.challenge_type = challenge.value
+            raise ChallengeDetected(
+                challenge.value,
+                url,
+                result.status_code,
+                response=result,
+            )
+        return result
+
     async def request(self, method: str, url: str, **kwargs) -> WaferResponse:
         """Send an HTTP request with retry, backoff, and challenge handling."""
         start_time = time.monotonic()
@@ -1320,7 +1436,10 @@ class AsyncSession(BaseSession):
                             if (req_timeout is None and attempt_cap_bound)
                             else timeout_secs,
                         ) from e
-                    raise ConnectionFailed(current_url, str(e)) from e
+                    raise ConnectionFailed(
+                        current_url,
+                        _connection_failure_reason(current_url, e),
+                    ) from e
                 state.use_retry()
                 delay = calculate_backoff(state.normal_retries - 1)
                 if deadline is not None:
@@ -1515,6 +1634,33 @@ class AsyncSession(BaseSession):
                     current_url,
                     len(raw_content),
                     max_response_size,
+                )
+
+            # Terminal WAF block: report it before touching the retry,
+            # rotation, or session-health budget. Every one of those would
+            # buy another identical denial, and retiring the session would
+            # throw away state that was never the reason for the block.
+            if challenge is not None and challenge in TERMINAL_CHALLENGES:
+                blocked = self._make_response(
+                    status_code=status,
+                    content=raw_content,
+                    text=body,
+                    headers=headers,
+                    url=current_url,
+                    start_time=start_time,
+                    was_retried=was_retried,
+                    challenge_type=challenge.value,
+                    state=state,
+                    history=history,
+                    raw=resp,
+                )
+                if self.max_rotations == 0:
+                    return blocked
+                raise RequestBlocked(
+                    challenge.value,
+                    current_url,
+                    status,
+                    response=blocked,
                 )
 
             # 429 without detected challenge → rate limit retry

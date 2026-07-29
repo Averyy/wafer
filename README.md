@@ -65,6 +65,9 @@ resp.retries        # int -normal retries used (5xx, connection errors)
 resp.rotations      # int -fingerprint rotations used (403/challenge)
 resp.inline_solves  # int -inline challenge solves used (ACW, Amazon, TMD, Reddit)
 resp.challenge_type # str | None -WAF challenge type if detected
+resp.needs_render   # bool -body is HTML that ships script but under 1000 chars
+                    #   of visible text, i.e. a client-rendered shell. A hint
+                    #   for deciding to call session.render(url)
 resp.emulation      # str | None -the identity that served this response, for
                     #   diagnosing a 403 (e.g. "Profile.Chrome149", "safari")
 ```
@@ -340,7 +343,7 @@ and limitations.
 
 ## Challenge Detection
 
-Wafer detects 18 WAF challenge types from response status, headers, and body.
+Wafer detects 19 WAF challenge types from response status, headers, and body.
 **Detection is not the same as solving** - the "Solved by" column shows how each
 type is actually handled: `inline` (over HTTP, no browser), `browser` (needs a
 configured `browser_solver`), or `detect-only` (raises `ChallengeDetected`; no
@@ -366,6 +369,7 @@ solver - you must handle it yourself).
 | reCAPTCHA | `google.com/recaptcha` script, `g-recaptcha` div | browser for v2 (checkbox + grid); v3 score tokens are minted browser-free via [`session.mint_recaptcha_v3()`](#recaptcha-v3-token-minting) |
 | Vercel | Vercel bot protection challenge | browser (generic JS wait) |
 | Generic JS | Unclassified JavaScript challenges | browser (generic JS wait) |
+| Cloudflare WAF block | Error 1020 / IP-ban page: `cf.errors.css` present, `challenge-platform` absent | **terminal** -raises `RequestBlocked` at once, no retry or rotation |
 
 When a challenge is detected, wafer escalates automatically:
 1. Inline solving/warm-up (ACW, Amazon, Reddit, and the first TMD warm-up)
@@ -375,6 +379,10 @@ When a challenge is detected, wafer escalates automatically:
    and Imperva `reese84` under heavy load)
 4. Cross-family fingerprint rotation: fresh current family -> Firefox -> Safari -> Edge
 5. Raises `ChallengeDetected` if all attempts fail
+
+A terminal block skips all of it. A Cloudflare WAF *block* page is a denial, not
+a challenge: nothing is issued to solve, and no identity answers it differently.
+Wafer raises `RequestBlocked` on the first response, spending no budget.
 
 ## Inline Solvers
 
@@ -626,6 +634,9 @@ resp = session.get("https://protected-site.com")  # auto-solves challenges
 
 # Or solve manually
 result = solver.solve("https://protected-site.com", challenge_type="cloudflare")
+
+# Or render manually (what session.render() drives; arender() is the async form)
+rendered = solver.render("https://spa.example.com/")
 if result:
     print(result.cookies)     # extracted cookies
     print(result.user_agent)  # browser's real UA
@@ -671,6 +682,48 @@ auto-resolve + confirm click; interactive captchas are not solved), PerimeterX
 (slide puzzle), Alibaba Baxia (slider), hCaptcha (checkbox), reCAPTCHA v2
 (checkbox + image grid via EfficientNet + D-FINE), Reddit fixed-origin cookie
 recovery, and generic JS challenges.
+
+### Rendering a JavaScript-built page (`session.render`)
+
+Some pages have no content to fetch. The server ships a shell -a `<div id="root">`
+and a script bundle -and the text, nav, and job listings are written by the client.
+No fingerprint recovers markup that was never in the bytes. `session.render()`
+loads the URL in the browser solver, waits for rendering to settle, and returns
+the finished document as an ordinary `WaferResponse`:
+
+```python
+resp = session.get("https://spa.example.com/careers")
+if resp.needs_render:                       # HTML + script, almost no text
+    resp = session.render("https://spa.example.com/careers")
+print(resp.text)                            # the DOM after hydration
+```
+
+No transport request is made -the render replaces the fetch. For an HTML document
+`resp.text` is the serialized DOM (`Content-Type: text/html; charset=utf-8`). A
+non-HTML resource -JSON, XML, plain text, an image -comes back as the bytes the
+server sent under its real `Content-Type`, since Chrome displays those inside a
+generated viewer document and serializing that would return the wrapper instead of
+the resource; `resp.json()` on a rendered API URL works normally. Status and headers
+always describe the document the body came from, including after a client-side
+redirect. The browser follows redirects regardless of `follow_redirects`, so
+`resp.url` is the final URL and `resp.history` is empty. Cookies the page set are
+merged into the session jar.
+
+A session with no `browser_solver=` creates one on its first render and closes it
+on exit; from then on that session can also browser-solve challenges on ordinary
+requests -and the usual solver rule applies, so a per-request
+`headers={"User-Agent": ...}` that does not match the launched browser raises
+`ValueError`. A solver you passed in stays yours to close.
+
+A render that lands on a WAF interstitial solves it in place with the same per-WAF
+handlers the solve path uses, then re-captures the page -so render works on
+protected sites, not just open ones. The earned cookies land in the session jar
+and the session pins its replay identity to the solving browser, so the
+clearance survives the next ordinary request. Verified on `miata.net`
+(Cloudflare): plain TLS gets a 403 challenge, the render returns the real 200
+page in ~7s, and the follow-up `session.get()` returns 200 with no challenge. If the document is still a challenge
+after that, `ChallengeDetected` is raised rather than the interstitial being
+returned as content.
 
 ### Solving on an origin page (`solve_origin`)
 
@@ -770,6 +823,7 @@ from wafer import (
     WaferError,          # base
     WaferTimeout,        # request exceeded timeout (also a TimeoutError)
     ChallengeDetected,   # WAF challenge unsolvable
+    RequestBlocked,      # WAF rule denied the request (subclass of ChallengeDetected)
     RateLimited,         # HTTP 429
     ConnectionFailed,    # network error
     EmptyResponse,       # 200 with empty body
@@ -802,6 +856,19 @@ cases where no response was in hand, so check before dereferencing. (Caution:
 `e.response` may be a full WAF challenge page with embedded tokens -do not log it
 unscrubbed.) `TokenMintFailed` carries `.stage` (`"anchor"`/`"reload"`/`"apijs"`)
 and `.status_code`; see [reCAPTCHA v3 token minting](#recaptcha-v3-token-minting).
+
+`RequestBlocked` subclasses `ChallengeDetected`, so existing handlers still
+catch it. Catch it separately to tell "try again later" from "this will never
+work as-is": a challenge can be solved, a block cannot, and only changing the
+request itself (path, origin, egress address) changes the answer. Its
+`.challenge_type` is `"cloudflare_block"`, which is also what
+`resp.challenge_type` carries when `max_rotations=0` returns the block instead
+of raising.
+
+`ConnectionFailed.reason` names a sinkholed DNS answer when that is the cause -
+a host that resolves only to `0.0.0.0` / `::` was refused by the resolver, not
+unreachable. Pin the address with `resolve={"host": ["1.2.3.4"]}` or use another
+resolver.
 
 `WaferTimeout` inherits from both `WaferError` and `TimeoutError`, so `except WaferError` catches everything including timeouts.
 

@@ -446,6 +446,38 @@ def _response_headers(response) -> tuple[dict[str, str], list[str]]:
     return headers, set_cookie
 
 
+# Rendered-fetch settle tuning. The DOM-stability poll runs after the
+# network has gone quiet, so a short interval and a handful of samples are
+# enough to tell "hydration finished" from "still writing nodes"; the cap
+# keeps a permanently animating page from eating the caller's whole budget.
+_RENDER_POLL_INTERVAL = 0.25
+_RENDER_STABLE_POLLS = 3
+_RENDER_SETTLE_CAP = 10.0
+
+# The only content types whose serialized DOM is the resource. Everything else
+# Chrome shows inside a generated viewer document.
+_RENDERABLE_CONTENT_TYPES = frozenset({"text/html", "application/xhtml+xml"})
+
+
+def _rendered_headers(response) -> tuple[dict[str, str], list[str]]:
+    """Headers for a serialized DOM, not for the bytes the server sent.
+
+    The document is re-serialized from the live DOM and encoded as UTF-8, so
+    the original content-type charset no longer describes it. ``_response_headers``
+    already drops the framing/compression headers.
+    """
+
+    headers: dict[str, str] = {}
+    set_cookie: list[str] = []
+    if response is not None:
+        try:
+            headers, set_cookie = _response_headers(response)
+        except Exception:
+            headers, set_cookie = {}, []
+    headers["content-type"] = "text/html; charset=utf-8"
+    return headers, set_cookie
+
+
 def _capture_navigation_passthrough(
     response,
     page,
@@ -3152,6 +3184,420 @@ class BrowserSolver:
         finally:
             self._lock.release()
 
+    # ------------------------------------------------------------------
+    # Rendered fetch
+    # ------------------------------------------------------------------
+
+    def render(
+        self,
+        url: str,
+        timeout: float | None = None,
+        max_size: int | None = None,
+    ) -> SolveResult | None:
+        """Navigate ``url`` and return the settled document as a passthrough.
+
+        Unlike :meth:`solve` this requires no cookies and expects no
+        challenge: the result is the document after client-side rendering has
+        finished, which is the only way to reach content a server ships as an
+        empty shell. Redirects are followed by the browser, so the captured
+        URL is the final one, and the status and headers describe whichever
+        document the body actually came from.
+
+        A page that answers with a WAF interstitial is solved in place using
+        the same per-WAF handler :meth:`solve` uses, then re-captured. That
+        earns clearance, so the result reports ``challenge_absent=False`` and
+        the session pins its replay identity to this browser; a render with no
+        challenge reports ``True`` and the session merely merges cookies.
+
+        A non-HTML resource is returned as the bytes the server sent under its
+        real content type -Chrome shows JSON, text, XML and images inside a
+        generated viewer document, and serializing that would hand back the
+        wrapper instead of the resource.
+        """
+
+        if threading.get_ident() == self._worker_ident:
+            return self._render_on_worker(url, timeout, max_size)
+        if not _valid_browser_url(url):
+            logger.warning("Refusing invalid browser navigation target")
+            return None
+        render_timeout = self._solve_timeout if timeout is None else timeout
+        if render_timeout <= 0:
+            return None
+        deadline = time.monotonic() + render_timeout
+        future = self._submit_on_worker(
+            self._render_on_worker,
+            url,
+            render_timeout,
+            max_size,
+            _deadline=deadline,
+        )
+        try:
+            return future.result(timeout=render_timeout)
+        except FutureTimeoutError:
+            cancelled = future.cancel()
+            if not cancelled and not future.done():
+                self._recover_timed_out_worker(future)
+            logger.warning("Browser render timed out after %.1fs", render_timeout)
+            return None
+
+    def _render_on_worker(
+        self,
+        url: str,
+        timeout: float | None = None,
+        max_size: int | None = None,
+        *,
+        _deadline: float | None = None,
+    ) -> SolveResult | None:
+        """Render ``url`` on the dedicated worker and capture the DOM."""
+
+        if not _valid_browser_url(url):
+            logger.warning("Refusing invalid browser navigation target")
+            return None
+        if timeout is None:
+            timeout = self._solve_timeout
+        overall_deadline = (
+            _deadline if _deadline is not None else time.monotonic() + timeout
+        )
+        timeout = min(timeout, overall_deadline - time.monotonic())
+        if timeout <= 0:
+            logger.debug("No render budget left")
+            return None
+        # Same bounded lock as solve(): a shared solver serializes browser
+        # work, and a render must not block its caller past the deadline
+        # waiting for someone else's solve to finish.
+        if not self._lock.acquire(timeout=timeout):
+            logger.warning(
+                "Browser render skipped: solver busy (waited=%.1fs)",
+                timeout,
+            )
+            return None
+        try:
+            if time.monotonic() >= overall_deadline:
+                logger.debug("Render budget exhausted waiting for lock")
+                return None
+            try:
+                self._ensure_browser(overall_deadline)
+                self._probe_screenxy_patch()
+            except Exception as exc:
+                logger.warning("Failed to launch browser (%s)", type(exc).__name__)
+                return None
+
+            context = None
+            try:
+                context = self._create_context()
+                page = context.new_page()
+                self._setup_headless_patches(page, challenge_type=None)
+                size_guard = self._install_navigation_size_limit(page, max_size)
+
+                if self._browser_ua is None:
+                    self._browser_ua = page.evaluate("navigator.userAgent")
+                    self._publish_browser_identity()
+                    logger.debug("Browser UA: %s", self._browser_ua)
+
+                logger.info("Browser rendering %s", url)
+                # Track main-frame document responses so the status and headers
+                # returned describe the SAME document as the captured DOM. A
+                # page that client-side redirects after load (location.href)
+                # replaces the document, and reporting the first navigation's
+                # status against the destination's body would be a lie. A
+                # history.pushState route change issues no document response,
+                # so the last recorded one stays correct there too.
+                document_responses = []
+
+                def _record_document(response) -> None:
+                    try:
+                        request = response.request
+                        if request.resource_type != "document":
+                            return
+                        if request.frame != page.main_frame:
+                            return
+                    except Exception:
+                        return
+                    document_responses.append(response)
+
+                page.on("response", _record_document)
+                navigation_response = None
+                try:
+                    navigation_response = page.goto(
+                        url,
+                        wait_until="domcontentloaded",
+                        timeout=_navigation_budget_ms(overall_deadline),
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        "Render navigation timeout/error (%s)",
+                        type(exc).__name__,
+                    )
+                self._verify_headless_patches(page)
+                if size_guard["exceeded"]:
+                    raise ResponseTooLarge(url, int(size_guard["size"]), max_size)
+
+                self._wait_for_hydration(page, overall_deadline)
+                if size_guard["exceeded"]:
+                    raise ResponseTooLarge(url, int(size_guard["size"]), max_size)
+
+                html = self._bounded_page_content(page, max_size)
+                # A protected page answers the navigation with an interstitial,
+                # so the settled DOM is the challenge rather than the content.
+                # The browser that would solve it is already on that page: run
+                # the same per-WAF handler the solve path uses, then let the
+                # page settle again. Returning the interstitial without trying
+                # would make render useless on any protected site.
+                solved_challenge = False
+                if html and _is_passthrough_challenge_html(html):
+                    solved = self._solve_challenge_in_place(
+                        page,
+                        url,
+                        html,
+                        overall_deadline,
+                    )
+                    if solved:
+                        solved_challenge = True
+                        self._wait_for_hydration(page, overall_deadline)
+                        if size_guard["exceeded"]:
+                            raise ResponseTooLarge(
+                                url,
+                                int(size_guard["size"]),
+                                max_size,
+                            )
+                        html = self._bounded_page_content(page, max_size)
+                if not html and max_size is not None:
+                    # _bounded_page_content returns "" for both an absent
+                    # document and one over the cap. Ask which it was, so a DOM
+                    # that hydrates past the budget raises the same error as an
+                    # oversize transfer instead of looking like a failed render.
+                    try:
+                        rendered_length = page.evaluate(
+                            "() => document.documentElement"
+                            " ? document.documentElement.outerHTML.length : 0"
+                        )
+                    except Exception:
+                        rendered_length = 0
+                    if (
+                        isinstance(rendered_length, (int, float))
+                        and rendered_length > max_size
+                    ):
+                        raise ResponseTooLarge(
+                            str(page.url) or url,
+                            int(rendered_length),
+                            max_size,
+                        )
+                # The document currently in the page, which is the one the DOM
+                # above was serialized from. Falls back to the goto() response
+                # when the listener recorded nothing (a cached or synthetic
+                # document that produced no response event).
+                final_response = (
+                    document_responses[-1]
+                    if document_responses
+                    else navigation_response
+                )
+                status = 200
+                if final_response is not None:
+                    try:
+                        status = int(final_response.status)
+                    except (TypeError, ValueError):
+                        status = 200
+                page_url = str(page.url) or url
+
+                # A non-HTML resource has no DOM worth serializing: Chrome
+                # displays JSON, plain text, XML and images inside a generated
+                # viewer document, so the "rendered" markup would be that
+                # wrapper rather than the resource. Return the bytes the server
+                # sent, under their real content type, so resp.json() and
+                # resp.content behave as the caller expects.
+                served_headers, served_cookies = (
+                    _response_headers(final_response)
+                    if final_response is not None
+                    else ({}, [])
+                )
+                served_type = (
+                    served_headers.get("content-type", "")
+                    .split(";")[0]
+                    .strip()
+                    .lower()
+                )
+                if served_type and served_type not in _RENDERABLE_CONTENT_TYPES:
+                    raw_body = None
+                    try:
+                        raw_body = final_response.body()
+                    except Exception:
+                        logger.debug("Could not read non-HTML render body")
+                    if isinstance(raw_body, bytes) and raw_body:
+                        if max_size is not None and len(raw_body) > max_size:
+                            raise ResponseTooLarge(
+                                page_url, len(raw_body), max_size
+                            )
+                        self._last_used = time.monotonic()
+                        logger.info(
+                            "Rendered %s as %s (%d bytes, not serialized)",
+                            page_url,
+                            served_type,
+                            len(raw_body),
+                        )
+                        return SolveResult(
+                            cookies=context.cookies(),
+                            user_agent=self._browser_ua or "",
+                            extras=None,
+                            response=CapturedResponse(
+                                url=page_url,
+                                status=status,
+                                headers=served_headers,
+                                body=raw_body,
+                                set_cookie=served_cookies,
+                            ),
+                            browser_version=self._browser_version,
+                            challenge_absent=not solved_challenge,
+                        )
+
+                if not html:
+                    logger.warning("Render produced no document for %s", url)
+                    return None
+                body = html.encode("utf-8")
+                if max_size is not None and len(body) > max_size:
+                    raise ResponseTooLarge(url, len(body), max_size)
+                headers, set_cookie = _rendered_headers(final_response)
+                cookies = context.cookies()
+                self._last_used = time.monotonic()
+                logger.info(
+                    "Rendered %s (%d bytes, %d cookies)",
+                    page_url,
+                    len(body),
+                    len(cookies),
+                )
+                # The rendered body is classified by the caller exactly like
+                # any other response, so a WAF interstitial that survived the
+                # render is reported as a challenge rather than as content.
+                return SolveResult(
+                    cookies=cookies,
+                    user_agent=self._browser_ua or "",
+                    extras=None,
+                    response=CapturedResponse(
+                        url=page_url,
+                        status=status,
+                        headers=headers,
+                        body=body,
+                        set_cookie=set_cookie,
+                    ),
+                    browser_version=self._browser_version,
+                    # A plain render earns no clearance identity, so the session
+                    # merges its cookies without pinning or rebuilding. A render
+                    # that solved a challenge in place DID earn one: its
+                    # clearance cookie is bound to the solving browser's UA and
+                    # client hints, so the session must pin to that browser or
+                    # the first replay is rejected under a mismatched identity.
+                    challenge_absent=not solved_challenge,
+                )
+            except ResponseTooLarge:
+                raise
+            except Exception as exc:
+                logger.warning("Browser render failed (%s)", type(exc).__name__)
+                return None
+            finally:
+                if context:
+                    try:
+                        context.close()
+                    except Exception:
+                        pass
+        finally:
+            self._lock.release()
+
+    def _solve_challenge_in_place(
+        self,
+        page,
+        url: str,
+        html: str,
+        deadline: float,
+    ) -> bool:
+        """Run the per-WAF handler on the interstitial a render landed on.
+
+        Classifies with the same detector the session uses, so render and the
+        transport path agree on what a body is. Returns whether a solve was
+        attempted and reported success - a False leaves the interstitial in
+        place for the caller to classify and report as a challenge.
+        """
+
+        from wafer._challenge import detect_challenge
+
+        remaining_ms = int((deadline - time.monotonic()) * 1000)
+        if remaining_ms <= 0:
+            return False
+        # Classified against 403 rather than the real navigation status: the
+        # DOM already tested positive as an interstitial, and several WAFs'
+        # body markers are gated on a blocking status, so a challenge served
+        # in place as 200 would hide them from the detector.
+        challenge = detect_challenge(
+            403,
+            {"content-type": "text/html"},
+            html,
+        )
+        if challenge is None:
+            return False
+        logger.info(
+            "Render landed on a %s challenge; solving in place",
+            challenge.value,
+        )
+        try:
+            solved = self._dispatch_challenge(
+                page,
+                challenge.value,
+                remaining_ms,
+                challenge_url=url,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Render challenge solve failed (challenge_type=%s error=%s)",
+                challenge.value,
+                type(exc).__name__,
+            )
+            return False
+        # None means "no challenge was present after all" (the Cloudflare
+        # handler reports absence that way); re-capturing is right there too.
+        return solved is not False
+
+    def _wait_for_hydration(self, page, deadline: float) -> None:
+        """Wait for client-side rendering to settle, bounded by ``deadline``.
+
+        Two signals. The network going quiet means client-fetched content (an
+        ATS board pulled over XHR) has landed; the serialized DOM holding its
+        length across consecutive polls means framework hydration stopped
+        mutating it. Neither may have the whole budget: analytics beacons and
+        long-polls mean networkidle can never fire on some pages, and a page
+        with a running animation never looks stable, so the settle phase is
+        capped and both fall through instead of failing.
+        """
+
+        idle_ms = int(max(0.0, deadline - time.monotonic()) * 1000 * 0.5)
+        if idle_ms > 0:
+            try:
+                page.wait_for_load_state("networkidle", timeout=idle_ms)
+            except Exception:
+                logger.debug(
+                    "Render: network did not go idle within %dms",
+                    idle_ms,
+                )
+        settle_deadline = min(deadline, time.monotonic() + _RENDER_SETTLE_CAP)
+        previous = -1
+        stable = 0
+        while stable < _RENDER_STABLE_POLLS and time.monotonic() < settle_deadline:
+            try:
+                length = page.evaluate(
+                    "() => document.documentElement"
+                    " ? document.documentElement.outerHTML.length : 0"
+                )
+            except Exception:
+                return
+            if not isinstance(length, (int, float)):
+                return
+            if length == previous:
+                stable += 1
+            else:
+                stable = 0
+                previous = length
+            if stable >= _RENDER_STABLE_POLLS:
+                return
+            if not _sleep_before_deadline(settle_deadline, _RENDER_POLL_INTERVAL):
+                return
+
     def _dispatch_challenge(
         self,
         page,
@@ -3617,6 +4063,75 @@ class BrowserSolver:
                 "(challenge_type=%s worker_continues=%s)",
                 solve_timeout,
                 challenge_type or "unknown",
+                not cancelled and not future.done(),
+            )
+            return None
+
+    async def arender(
+        self,
+        url: str,
+        timeout: float | None = None,
+        max_size: int | None = None,
+    ) -> "SolveResult | None":
+        """Async wrapper around :meth:`render` - identical args and result.
+
+        Pure dispatch onto the solver's worker, mirroring :meth:`asolve`:
+        the render drives Playwright's blocking API, so awaiting it directly
+        would stall the event loop.
+        """
+        render_timeout = self._solve_timeout if timeout is None else timeout
+        if render_timeout <= 0:
+            return None
+        deadline = time.monotonic() + render_timeout
+        render_callable = self.render
+        base_render = (
+            getattr(render_callable, "__func__", None) is BrowserSolver.render
+        )
+
+        def invoke_render():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            if base_render:
+                return self._render_on_worker(
+                    url,
+                    render_timeout,
+                    max_size,
+                    _deadline=deadline,
+                )
+            from wafer._base import _callable_accepts_keyword
+
+            if max_size is None or not _callable_accepts_keyword(
+                render_callable,
+                "max_size",
+            ):
+                return render_callable(url, render_timeout)
+            return render_callable(url, render_timeout, max_size=max_size)
+
+        future = self._submit_on_worker(invoke_render)
+        try:
+            return await asyncio.wait_for(
+                asyncio.wrap_future(future),
+                timeout=render_timeout,
+            )
+        except asyncio.CancelledError:
+            cancelled = future.cancel()
+            if not cancelled and not future.done():
+                self._recover_timed_out_worker(future)
+            logger.warning(
+                "Browser render caller cancelled (worker_continues=%s)",
+                not cancelled and not future.done(),
+            )
+            raise
+        except TimeoutError:
+            if time.monotonic() < deadline:
+                raise
+            cancelled = future.cancel()
+            if not cancelled and not future.done():
+                self._recover_timed_out_worker(future)
+            logger.warning(
+                "Browser render timed out after %.1fs (worker_continues=%s)",
+                render_timeout,
                 not cancelled and not future.done(),
             )
             return None

@@ -38,6 +38,14 @@ class ChallengeType(enum.Enum):
     HCAPTCHA = "hcaptcha"
     RECAPTCHA = "recaptcha"
     GENERIC_JS = "generic_js"
+    CLOUDFLARE_BLOCK = "cloudflare_block"
+
+
+# Terminal classifications: the WAF denied the request outright instead of
+# issuing something to solve. Nothing wafer can vary — fingerprint, headers,
+# a real browser — changes the answer, so these never reach the retry,
+# rotation, or browser-solve paths; they are reported to the caller at once.
+TERMINAL_CHALLENGES = frozenset({ChallengeType.CLOUDFLARE_BLOCK})
 
 
 # Challenge types that require JS execution to solve. Fingerprint
@@ -315,6 +323,22 @@ def detect_challenge(
 
     # Body-based detection for 403/429
     if status_code in (403, 429):
+
+        # Cloudflare WAF *block* (Error 1020 and the 100x IP bans) — a
+        # denial, not a challenge. Cloudflare serves its static error
+        # stylesheet on every error page, while a real interstitial always
+        # loads /cdn-cgi/challenge-platform/... to run the challenge. That
+        # pair — error stylesheet present, challenge script absent — is what
+        # separates "the request matched a rule" from "prove you're a
+        # browser", and only the second one is solvable.
+        if (
+            status_code == 403
+            and "/cdn-cgi/styles/cf.errors.css" in body_lower
+            and "challenge-platform" not in body_lower
+            and "cf_chl" not in body_lower
+        ):
+            logger.info("Challenge detected (body): cloudflare_block")
+            return ChallengeType.CLOUDFLARE_BLOCK
 
         # Akamai body markers — bazadebezolkohpepadr is the obfuscated
         # global variable set by Akamai Bot Manager's sensor script.

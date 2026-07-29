@@ -7,6 +7,7 @@ import logging
 import platform
 import random
 import re
+import socket
 import subprocess
 import time
 from html import unescape
@@ -437,6 +438,41 @@ def _extract_location(header_map) -> str:
     if isinstance(raw, bytes):
         return raw.decode("utf-8", errors="replace")
     return str(raw)
+
+
+# The unspecified addresses. A resolver that answers with one of these has
+# not named a destination -- it has refused the name, which is what a DNS
+# sinkhole, a blocklist, and some captive networks do.
+_UNSPECIFIED_ADDRESSES = frozenset({"0.0.0.0", "::"})
+
+
+def _connection_failure_reason(url: str, error: Exception) -> str:
+    """Explain a connect failure, naming a sinkholed DNS answer when that is it.
+
+    The transport can only report what it tried, so a name that resolved to
+    0.0.0.0 surfaces as a refused connection to ``[::]:443`` -- which reads
+    like the host is down when the host was never looked up successfully.
+    Resolving once here, on the failure path only, tells the two apart.
+    """
+
+    reason = str(error)
+    host = urlparse(url).hostname
+    if not host:
+        return reason
+    try:
+        infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
+    except OSError:
+        return reason
+    addresses = {info[4][0] for info in infos if info[4]}
+    if not addresses or not addresses <= _UNSPECIFIED_ADDRESSES:
+        return reason
+    return (
+        f"DNS resolved {host} to {', '.join(sorted(addresses))}, an "
+        "unspecified address rather than a destination -- the resolver "
+        "refused the name (sinkhole, blocklist, or filtered DNS). The host "
+        "itself may be perfectly reachable; try another resolver, or pin the "
+        "address with resolve="
+    )
 
 
 def _canonical_host(host: str) -> str:
@@ -882,6 +918,41 @@ class BaseSession:
             "must expose configure_proxy(proxy), or an identical proxy_server, "
             "so browser solves cannot bypass the session proxy"
         )
+
+    def _ensure_browser_solver(self):
+        """Return this session's browser solver, creating one if needed.
+
+        Only a render calls this. A solver created here is owned by the
+        session (closed on exit); one passed in via ``browser_solver=`` is
+        shared and its lifecycle stays with the caller. The session proxy is
+        applied to a solver we create, so the browser and the transport can
+        never egress from different addresses.
+        """
+
+        if self._browser_solver is not None:
+            return self._browser_solver
+        if self._profile is Profile.IOS_SAFARI:
+            raise ValueError(
+                "Browser solving is not supported with Profile.IOS_SAFARI: "
+                "wafer's solver is desktop Chromium, so replaying its cookies "
+                "would break the iOS Safari identity"
+            )
+        from wafer.browser import BrowserSolver
+
+        solver = BrowserSolver()
+        self._browser_solver = solver
+        self._owns_solver = True
+        try:
+            self._align_browser_proxy(self._proxy_url)
+        except Exception:
+            self._browser_solver = None
+            self._owns_solver = False
+            try:
+                solver.close()
+            except Exception:
+                logger.debug("BrowserSolver.close() failed")
+            raise
+        return solver
 
     def _align_preflight_browser_identity(self) -> None:
         """Pin transport identity to an already-preflighted Chrome instance.

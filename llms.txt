@@ -276,6 +276,45 @@ session.browser_solve_challenge(url: str, challenge_type: str, *,
 # application request succeeded: reissue that request yourself and validate
 # the result. timeout defaults to the session timeout; <= 0 returns False.
 
+# Browser-rendered fetch (sync on SyncSession; coroutine on AsyncSession):
+session.render(url: str, *, timeout=None, max_response_size=None) -> WaferResponse
+# Loads url in the browser solver, waits for client-side rendering to settle,
+# and returns the resulting document as a normal WaferResponse. Use it when a
+# page writes its own content with JavaScript: the server ships a shell, and no
+# fingerprint recovers markup that was never in the bytes. resp.needs_render
+# tells you when a body looks like one.
+# No transport request is made - the render replaces the fetch. For an HTML
+# document resp.text is the serialized DOM, so Content-Type is text/html;
+# charset=utf-8. A non-HTML resource (JSON, XML, plain text, an image) is
+# returned as the bytes the server sent under its real Content-Type, because
+# Chrome displays those inside a generated viewer document and serializing
+# that would hand back the wrapper instead of the resource - so resp.json()
+# and resp.content behave normally on a rendered API URL.
+# Status and headers describe the document the body came from, including after
+# a client-side redirect: a page that sets location.href reports the
+# destination's status, not the first navigation's.
+# The browser follows redirects regardless of follow_redirects, so resp.url is
+# the final URL and resp.history is empty. Cookies the page set are merged into
+# the session jar, so a following get() reuses them.
+# A session with no browser_solver= creates one on the first render and closes
+# it on exit; from then on that session can browser-solve challenges on
+# ordinary requests too. Passing browser_solver= keeps the caller's ownership.
+# That solver is a real one, so the usual rule applies from then on: a
+# per-request headers={"User-Agent": ...} that does not exactly match the
+# launched browser's UA raises ValueError, because browser state is bound to
+# the browser's UA/client-hint envelope. Set the UA on the session instead, or
+# do not mix a custom UA with render on the same session.
+# A render that lands on a WAF interstitial solves it in place with the same
+# per-WAF handlers the solve path uses, then re-captures the page, so render
+# works on protected sites too. The earned cookies land in the session jar
+# AND the session pins its replay identity to the solving browser, so the
+# clearance survives the next ordinary get() -- the same pin an automatic
+# browser solve performs. A render that met no challenge does not pin.
+# Raises ChallengeDetected if the document is STILL a challenge after that,
+# ConnectionFailed if the browser produced no document, ResponseTooLarge if the
+# document exceeds the cap (whether the transfer or the hydrated DOM is what
+# went over), and WaferTimeout for timeout <= 0.
+
 session.cookie_scope_summary(url: str) -> list[dict]
 # Value-free inspection of the wreq jar for diagnosing a protected flow: up to
 # 32 entries of {"name": str, "domain": str, "path": str, "secure": bool}.
@@ -342,6 +381,11 @@ resp.raise_for_status()  # raises WaferHTTPError if not ok
 resp.get_all(key)   # list[str] - all values for a header. For "set-cookie" this
                     # returns the individual Set-Cookie strings on every transport.
 resp.retry_after    # float | None - parsed Retry-After header
+resp.needs_render   # bool - the body is HTML that ships script but under 1000
+                    # characters of visible text, i.e. a client-rendered shell.
+                    # A hint for deciding whether to call session.render(url),
+                    # not a verdict. False for every non-HTML body. Computed on
+                    # first access and cached.
 
 # Retry metadata:
 resp.elapsed        # float (seconds)
@@ -497,6 +541,7 @@ wafer.build_fingerprint_envelope(emulation, user_agent: str | None = None, *,
 ```
 WaferError (base)
   +- ChallengeDetected    .challenge_type: str, .url: str, .status_code: int, .response: WaferResponse | None
+  |    +- RequestBlocked  same attributes; a WAF rule denied the request outright
   +- RateLimited          .url: str, .retry_after: float | None, .response: WaferResponse | None
   +- ConnectionFailed     .url: str, .reason: str
   +- EmptyResponse        .url: str, .status_code: int, .response: WaferResponse | None
@@ -508,6 +553,19 @@ WaferError (base)
 ```
 
 `except WaferError` catches everything including WaferTimeout.
+
+`RequestBlocked` separates a denial from a challenge. A challenge asks the
+client to prove it is a browser, so retrying, rotating identity, or solving in
+a browser can change the outcome. A block means the request matched a WAF rule,
+and every one of those returns the same denial - so wafer raises immediately,
+spending no retry or rotation budget, with `.challenge_type` set to the
+terminal type (`cloudflare_block`). What can change the outcome is changing the
+request: a different path, origin, or egress address. It subclasses
+`ChallengeDetected`, so existing handlers still catch it; catch it separately to
+tell "try again later" from "this will never work as-is". Under
+`max_rotations=0` (including `.bulk()`) the block is returned as a response with
+`challenge_type="cloudflare_block"` instead of raised, like every other
+challenge.
 
 `ChallengeDetected`, `RateLimited`, `EmptyResponse`, and `WaferHTTPError`
 carry the final `WaferResponse` as `e.response` (body, headers, status of the
@@ -525,9 +583,10 @@ cookie jar) and continues retrying. It does not raise.
 
 Default mode (`max_rotations > 0`):
 - 403 + challenge detected -> raises `ChallengeDetected` after exhausting rotations
+- 403 + terminal WAF block detected -> raises `RequestBlocked` immediately, before any retry or rotation
 - 429 without challenge -> raises `RateLimited` after exhausting rotations
 - 200 with empty body -> retries; if the host already served a real body this session, also rotates to a fresh identity (within `max_rotations`); raises `EmptyResponse` once retries+rotations are exhausted (see "Stateful request replay")
-- Connection error (refused/reset/TLS failure) -> raises `ConnectionFailed` after exhausting retries
+- Connection error (refused/reset/TLS failure) -> raises `ConnectionFailed` after exhausting retries. When the host resolved only to `0.0.0.0` / `::`, `.reason` says so: the resolver refused the name (sinkhole, blocklist, filtered DNS) rather than the host being unreachable. Pin the address with `resolve=` or use another resolver.
 - Server hang past the total `timeout` deadline -> raises `WaferTimeout` (a timeout on any transport - the wreq path, the native-TLS Imperva bypass, or the Opera Mini path, whether during connect or read - is always bounded by your budget and surfaced as `WaferTimeout`, never `ConnectionFailed`)
 - 5xx -> returns response after exhausting retries
 - Other 4xx (400, 401, 404, etc.) -> returns response immediately (no retry)
@@ -765,7 +824,7 @@ These are all automatic. Do not write code to handle these yourself:
 - **Redirects** - 3xx followed automatically (POST -> GET on 301/302/303). 304 passes through. Auth stripped on cross-origin redirects. Body headers stripped on method change. Followed hops are recorded in `resp.history`.
 - **Referer headers** - set automatically from the last URL visited per hostname
 - **Cookies** - managed in-memory and optionally persisted to disk; no manual cookie jar needed
-- **WAF challenges** - detected, browser-solved if configured, retried with cross-family fingerprint rotation (Chrome -> Firefox -> Safari -> Edge)
+- **WAF challenges** - detected, browser-solved if configured, retried with cross-family fingerprint rotation (Chrome -> Firefox -> Safari -> Edge). A terminal WAF *block* is reported at once instead (see `RequestBlocked`).
 - **Rate limiting** - per-hostname delays enforced automatically when `rate_limit` is set
 - **TLS fingerprint** - sec-ch-ua headers auto-generated to match the Chrome version
 - **Binary responses** - detected via Content-Type. `resp.content` preserves the decompressed body bytes exactly on every response (safe for PDFs, images, etc.). `resp.text` decodes charset-aware (Content-Type charset, HTML meta tag, UTF-8 fallback) with replacement characters - it never raises.
@@ -775,7 +834,7 @@ These are all automatic. Do not write code to handle these yourself:
 
 ## Challenge Types
 
-Wafer detects 18 WAF/challenge types automatically. When a challenge cannot be
+Wafer detects 19 WAF/challenge types automatically. When a challenge cannot be
 solved, `ChallengeDetected.challenge_type` and `resp.challenge_type` contain
 one of these strings:
 
@@ -798,6 +857,10 @@ one of these strings:
 "hcaptcha"     - hCaptcha
 "recaptcha"    - reCAPTCHA v2
 "generic_js"   - unclassified JS challenge
+"cloudflare_block" - Cloudflare WAF *block* page (Error 1020 and the IP bans):
+                 terminal, nothing to solve. Raised as RequestBlocked without
+                 spending retry or rotation budget. Do not confuse it with
+                 "cloudflare", which is a solvable interstitial.
 ```
 
 Some challenges (Cloudflare, DataDome, AWS WAF, Kasada, Vercel, hCaptcha,
@@ -919,10 +982,18 @@ result: SolveResult | None = solver.solve(url, challenge_type)
 #   "150.0.7871.125"); the version-reduced user_agent hides it
 # result.extras: dict | None - WAF-specific data
 # result.response: CapturedResponse | None - passthrough content (see below)
-# result.challenge_absent: bool - True only for a validated Cloudflare
-#   main-document response when no Cloudflare challenge iframe appeared.
-#   Automatic session handling returns that response without pinning the
-#   fingerprint or rebuilding the wreq client.
+# result.challenge_absent: bool - no clearance identity was earned. True for a
+#   validated Cloudflare main-document response when no challenge iframe
+#   appeared, and for a render that met no challenge. Automatic session
+#   handling returns those without pinning the fingerprint or rebuilding the
+#   wreq client; False means clearance WAS earned and the session pins.
+
+# Manual render (the browser-rendered fetch behind session.render()):
+result: SolveResult | None = solver.render(url, timeout=None, max_size=None)
+await solver.arender(url, timeout=None, max_size=None)   # async counterpart
+# Same SolveResult shape. result.response is always populated on success and
+# holds the settled document; prefer session.render(), which wraps this in a
+# WaferResponse and merges the cookies for you.
 # CapturedResponse fields:
 #   .url: str
 #   .status: int

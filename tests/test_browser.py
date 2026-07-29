@@ -25,6 +25,12 @@ from tests.conftest import (
 )
 from wafer._base import BaseSession
 from wafer._challenge import ChallengeType
+from wafer._errors import (
+    ChallengeDetected,
+    ConnectionFailed,
+    ResponseTooLarge,
+    WaferTimeout,
+)
 from wafer._fingerprint import (
     chrome_version_from_ua,
     emulation_for_version,
@@ -10144,6 +10150,71 @@ class TestBrowserSolveTimeout:
         assert result["value"] is None
         assert elapsed < 3.0  # bounded by ~0.3s, not the 30s default
 
+    def test_render_skips_when_lock_busy(self):
+        """render() owes callers the same bound as solve().
+
+        A shared solver serializes browser work, so a render must not stall
+        past its budget waiting on someone else's solve. Same structure as
+        the solve test: the lock is held on a separate thread and the render
+        runs on its own joined thread, so an unbounded acquire fails the
+        assertion instead of deadlocking the suite.
+        """
+        import threading
+
+        solver = BrowserSolver()
+        held = threading.Event()
+        release = threading.Event()
+
+        def _holder():
+            solver._lock.acquire()
+            held.set()
+            release.wait(10)
+            solver._lock.release()
+
+        holder = threading.Thread(target=_holder, daemon=True)
+        holder.start()
+        assert held.wait(2), "holder thread failed to take the lock"
+
+        result = {}
+
+        def _run():
+            result["value"] = solver.render("https://example.com/", timeout=0.3)
+
+        worker = threading.Thread(target=_run, daemon=True)
+        t0 = time.monotonic()
+        worker.start()
+        worker.join(timeout=5)
+        elapsed = time.monotonic() - t0
+
+        release.set()
+        holder.join(timeout=2)
+        solver.close()
+
+        assert not worker.is_alive(), (
+            "render() hung on a busy lock (regression: unbounded acquire)"
+        )
+        assert result["value"] is None
+        assert elapsed < 3.0
+
+    def test_render_timeout_is_bounded_by_the_request_budget(self):
+        """A per-request timeout= must cap the render, not just the solve."""
+        solver = BrowserSolver(solve_timeout=300)
+        recorded = []
+
+        def _slow_render(url, timeout=None, max_size=None):
+            recorded.append(timeout)
+            return None
+
+        solver.render = _slow_render
+        session, _ = make_sync_session([MockResponse(200)], browser_solver=solver)
+        with pytest.raises(ConnectionFailed):
+            session.render("https://example.com/", timeout=12)
+        solver.close()
+
+        # The solver's own 300s default must not win over the caller's budget.
+        assert recorded and recorded[0] is not None
+        assert recorded[0] <= 12
+
 
 class TestRecaptchaModelWaitBudget:
     """A cold model load must not consume the whole challenge deadline."""
@@ -10321,3 +10392,509 @@ class TestInitScriptFallback:
             assert [c.args[0] for c in main.evaluate.call_args_list] == ["A", "B"]
         finally:
             solver.close(timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# Rendered fetch
+# ---------------------------------------------------------------------------
+
+
+_RENDERED_HTML = (
+    "<html><head><title>App</title></head><body>"
+    "<nav>Home</nav><main>" + ("Content the client wrote. " * 60) + "</main>"
+    "</body></html>"
+)
+
+
+class _RenderingSolver:
+    """Solver stub that records render calls and returns a captured DOM."""
+
+    def __init__(
+        self, result=None, *, html=_RENDERED_HTML, cookies=None, status=200
+    ):
+        self.render_calls = []
+        self._result = (
+            result
+            if result is not None
+            else SolveResult(
+                cookies=cookies if cookies is not None else [],
+                user_agent="Chrome/150.0.0.0",
+                response=CapturedResponse(
+                    url="https://example.com/",
+                    status=status,
+                    headers={"content-type": "text/html; charset=utf-8"},
+                    body=html.encode("utf-8"),
+                ),
+                browser_version="150.0.7871.187",
+                challenge_absent=True,
+            )
+        )
+
+    def render(self, url, timeout=None, max_size=None):
+        self.render_calls.append(
+            {"url": url, "timeout": timeout, "max_size": max_size}
+        )
+        return self._result
+
+    async def arender(self, url, timeout=None, max_size=None):
+        return self.render(url, timeout=timeout, max_size=max_size)
+
+    def solve(self, *args, **kwargs):
+        raise AssertionError("render must not go through solve()")
+
+    def close(self):
+        pass
+
+
+class TestSessionRender:
+    def test_returns_the_rendered_document(self):
+        solver = _RenderingSolver()
+        session, mock = make_sync_session(
+            [MockResponse(200, body="unused")],
+            browser_solver=solver,
+        )
+        resp = session.render("https://example.com/", timeout=30)
+        assert resp.status_code == 200
+        assert "Content the client wrote." in resp.text
+        assert resp.needs_render is False
+        # No transport request: a render replaces the fetch, not follows it.
+        assert mock.request_count == 0
+        assert solver.render_calls[0]["url"] == "https://example.com/"
+
+    def test_shell_response_points_at_render(self):
+        """The hint and the remedy line up."""
+        shell = MockResponse(
+            200,
+            headers={"content-type": "text/html"},
+            body='<html><body><div id="root"></div><script src="/a.js">'
+            "</script></body></html>",
+        )
+        solver = _RenderingSolver()
+        session, _ = make_sync_session([shell], browser_solver=solver)
+        first = session.get("https://example.com/")
+        assert first.needs_render is True
+        rendered = session.render("https://example.com/")
+        assert rendered.needs_render is False
+
+    def test_max_response_size_is_passed_through(self):
+        solver = _RenderingSolver()
+        session, _ = make_sync_session(
+            [MockResponse(200)],
+            browser_solver=solver,
+            max_response_size=4321,
+        )
+        session.render("https://example.com/")
+        assert solver.render_calls[0]["max_size"] == 4321
+
+    def test_per_call_max_response_size_overrides_session(self):
+        solver = _RenderingSolver()
+        session, _ = make_sync_session(
+            [MockResponse(200)],
+            browser_solver=solver,
+            max_response_size=4321,
+        )
+        session.render("https://example.com/", max_response_size=100_000)
+        assert solver.render_calls[0]["max_size"] == 100_000
+
+    def test_cookies_set_during_render_reach_the_jar(self):
+        solver = _RenderingSolver(
+            cookies=[
+                {
+                    "name": "session",
+                    "value": "abc",
+                    "domain": ".example.com",
+                    "path": "/",
+                    "expires": time.time() + 3600,
+                }
+            ]
+        )
+        session, _ = make_sync_session(
+            [MockResponse(200)],
+            browser_solver=solver,
+            use_cookie_jar=True,
+        )
+        session.render("https://example.com/")
+        assert any(
+            "session=abc" in raw
+            for raw, _ in session._client.cookie_jar.added
+        )
+
+    def test_challenge_page_raises_instead_of_passing_as_content(self):
+        solver = _RenderingSolver(
+            html="<html><body><script>window._cf_chl_opt={};</script>"
+            "</body></html>",
+            status=403,
+        )
+        session, _ = make_sync_session([MockResponse(200)], browser_solver=solver)
+        with pytest.raises(ChallengeDetected) as excinfo:
+            session.render("https://example.com/")
+        assert excinfo.value.challenge_type == "cloudflare"
+
+    def test_no_document_raises_connection_failed(self):
+        class _EmptySolver(_RenderingSolver):
+            def render(self, url, timeout=None, max_size=None):
+                self.render_calls.append({"url": url})
+                return None
+
+        session, _ = make_sync_session(
+            [MockResponse(200)],
+            browser_solver=_EmptySolver(),
+        )
+        with pytest.raises(ConnectionFailed):
+            session.render("https://example.com/")
+
+    def test_zero_timeout_raises_before_launching_a_browser(self):
+        solver = _RenderingSolver()
+        session, _ = make_sync_session([MockResponse(200)], browser_solver=solver)
+        with pytest.raises(WaferTimeout):
+            session.render("https://example.com/", timeout=0)
+        assert solver.render_calls == []
+
+    def test_supplied_solver_is_not_taken_over(self):
+        """A shared solver keeps its lifecycle with the caller."""
+        solver = _RenderingSolver()
+        session, _ = make_sync_session([MockResponse(200)], browser_solver=solver)
+        session.render("https://example.com/")
+        assert session._owns_solver is False
+
+
+class TestAsyncSessionRender:
+    @pytest.mark.asyncio
+    async def test_returns_the_rendered_document(self):
+        solver = _RenderingSolver()
+        session, mock = make_async_session(
+            [MockResponse(200, body="unused")],
+            browser_solver=solver,
+        )
+        resp = await session.render("https://example.com/", timeout=30)
+        assert resp.status_code == 200
+        assert "Content the client wrote." in resp.text
+        assert mock.request_count == 0
+
+    @pytest.mark.asyncio
+    async def test_prefers_the_async_render_entry_point(self):
+        class _SyncOnlyIsAnError(_RenderingSolver):
+            def render(self, url, timeout=None, max_size=None):
+                raise AssertionError("sync render should not be called")
+
+            async def arender(self, url, timeout=None, max_size=None):
+                self.render_calls.append({"url": url, "max_size": max_size})
+                return self._result
+
+        solver = _SyncOnlyIsAnError()
+        session, _ = make_async_session(
+            [MockResponse(200)],
+            browser_solver=solver,
+        )
+        resp = await session.render("https://example.com/")
+        assert resp.status_code == 200
+        assert solver.render_calls[0]["url"] == "https://example.com/"
+
+    @pytest.mark.asyncio
+    async def test_challenge_page_raises(self):
+        solver = _RenderingSolver(
+            html="<html><body><script>window._cf_chl_opt={};</script>"
+            "</body></html>",
+            status=403,
+        )
+        session, _ = make_async_session([MockResponse(200)], browser_solver=solver)
+        with pytest.raises(ChallengeDetected):
+            await session.render("https://example.com/")
+
+
+class TestRenderedHeaders:
+    def test_forces_utf8_html_content_type(self):
+        """The DOM is re-serialized, so the original charset no longer holds."""
+        from wafer.browser._solver import _rendered_headers
+
+        response = SimpleNamespace(
+            all_headers=lambda: {
+                "Content-Type": "text/html; charset=iso-8859-1",
+                "Content-Length": "1234",
+                "X-Frame-Options": "SAMEORIGIN",
+            },
+            headers_array=lambda: [],
+        )
+        headers, set_cookie = _rendered_headers(response)
+        assert headers["content-type"] == "text/html; charset=utf-8"
+        assert "content-length" not in headers
+        assert headers["x-frame-options"] == "SAMEORIGIN"
+        assert set_cookie == []
+
+    def test_no_navigation_response_still_yields_html_headers(self):
+        from wafer.browser._solver import _rendered_headers
+
+        headers, set_cookie = _rendered_headers(None)
+        assert headers == {"content-type": "text/html; charset=utf-8"}
+        assert set_cookie == []
+
+
+class TestRenderOnWorker:
+    """The render path itself, driven with a faked Playwright page."""
+
+    @staticmethod
+    def _setup(
+        *,
+        dom="<html><body>" + "rendered content " * 50 + "</body></html>",
+        nav_status=200,
+        url="https://spa.example.com/",
+        page_url=None,
+        extra_responses=(),
+        cookies=None,
+        content_type="text/html",
+        raw_body=b"",
+        body_error=False,
+    ):
+        """Build a solver whose page replays `extra_responses` during goto()."""
+        solver = BrowserSolver(solve_timeout=5)
+        solver._browser = MagicMock()
+        solver._browser.is_connected.return_value = True
+        solver._browser_ua = "Chrome/150"
+        solver._needs_screenxy_patch = False
+
+        navigation = _fake_document_response(
+            url, nav_status, content_type=content_type, raw_body=raw_body
+        )
+        if body_error:
+            navigation.body.side_effect = RuntimeError("body not retained")
+        context = MagicMock()
+        page = MagicMock()
+        page.url = page_url or url
+        page.main_frame = _MAIN_FRAME
+        page.content.return_value = dom
+        # Steady DOM length: the stability poll settles after its sample count
+        # and the size check sees a real number rather than a mock.
+        page.evaluate.return_value = len(dom)
+        context.new_page.return_value = page
+        context.cookies.return_value = list(cookies or [])
+
+        handlers = {}
+        page.on.side_effect = lambda event, fn: handlers.__setitem__(event, fn)
+
+        def _goto(*_args, **_kwargs):
+            handler = handlers.get("response")
+            if handler is not None:
+                handler(navigation)
+                for response in extra_responses:
+                    handler(response)
+            return navigation
+
+        page.goto.side_effect = _goto
+        return solver, context, page
+
+    @staticmethod
+    def _run(solver, context, **kwargs):
+        with (
+            patch.object(solver, "_create_context", return_value=context),
+            patch.object(solver, "_setup_headless_patches"),
+            patch.object(solver, "_verify_headless_patches"),
+            patch("wafer.browser._solver._RENDER_POLL_INTERVAL", 0.0),
+        ):
+            try:
+                return solver._render_on_worker("https://spa.example.com/", **kwargs)
+            finally:
+                solver.close()
+
+    def test_returns_the_serialized_dom(self):
+        solver, context, page = self._setup(cookies=[{"name": "a", "value": "b"}])
+        result = self._run(solver, context, timeout=5)
+        assert result is not None
+        assert b"rendered content" in result.response.body
+        assert result.response.status == 200
+        assert result.response.headers["content-type"] == "text/html; charset=utf-8"
+        assert result.cookies == [{"name": "a", "value": "b"}]
+        # A render earns no clearance, so the session must not pin or rebuild.
+        assert result.challenge_absent is True
+
+    def test_client_side_redirect_reports_the_final_document(self):
+        """Status and body must describe the same document."""
+        destination = _fake_document_response(
+            "https://spa.example.com/login", 404
+        )
+        solver, context, page = self._setup(
+            nav_status=200,
+            extra_responses=[destination],
+            page_url="https://spa.example.com/login",
+        )
+        result = self._run(solver, context, timeout=5)
+        assert result.response.status == 404
+        assert result.response.url == "https://spa.example.com/login"
+
+    def test_subresources_do_not_become_the_document(self):
+        script = _fake_document_response(
+            "https://cdn.example.com/app.js", 500, resource_type="script"
+        )
+        solver, context, page = self._setup(extra_responses=[script])
+        result = self._run(solver, context, timeout=5)
+        assert result.response.status == 200
+
+    def test_iframe_documents_do_not_become_the_document(self):
+        frame = _fake_document_response(
+            "https://ads.example.com/frame", 503, main_frame=False
+        )
+        solver, context, page = self._setup(extra_responses=[frame])
+        result = self._run(solver, context, timeout=5)
+        assert result.response.status == 200
+
+    def test_route_change_without_a_document_keeps_the_navigation_status(self):
+        """history.pushState issues no document response."""
+        solver, context, page = self._setup(
+            page_url="https://spa.example.com/careers",
+        )
+        result = self._run(solver, context, timeout=5)
+        assert result.response.status == 200
+        assert result.response.url == "https://spa.example.com/careers"
+
+    def test_empty_document_is_not_returned_as_content(self):
+        solver, context, page = self._setup(dom="")
+        assert self._run(solver, context, timeout=5) is None
+
+    def test_oversize_dom_raises_rather_than_looking_empty(self):
+        """A DOM that hydrates past the cap is an error, not a failed render."""
+        solver, context, page = self._setup()
+        with pytest.raises(ResponseTooLarge) as excinfo:
+            self._run(solver, context, timeout=5, max_size=64)
+        assert excinfo.value.limit == 64
+
+    def test_no_budget_returns_none_without_touching_the_browser(self):
+        solver, context, page = self._setup()
+        assert self._run(solver, context, timeout=0) is None
+        context.new_page.assert_not_called()
+
+    def test_challenge_is_solved_in_place_and_the_page_recaptured(self):
+        """A protected page must not come back as its interstitial."""
+        interstitial = (
+            "<html><body><script>window._cf_chl_opt={};</script>"
+            "Just a moment...</body></html>"
+        )
+        real = "<html><body>" + "real page content " * 50 + "</body></html>"
+        solver, context, page = self._setup(dom=interstitial)
+        page.content.side_effect = [interstitial, real, real, real]
+        with patch.object(
+            solver, "_dispatch_challenge", return_value=True
+        ) as dispatch:
+            result = self._run(solver, context, timeout=30)
+        assert dispatch.call_count == 1
+        assert dispatch.call_args[0][1] == "cloudflare"
+        assert b"real page content" in result.response.body
+
+    def test_solving_in_place_earns_an_identity_to_pin(self):
+        """Clearance is bound to the solving browser; the session must pin."""
+        interstitial = (
+            "<html><body><script>window._cf_chl_opt={};</script>"
+            "Just a moment...</body></html>"
+        )
+        real = "<html><body>" + "real page content " * 50 + "</body></html>"
+        solver, context, page = self._setup(dom=interstitial)
+        page.content.side_effect = [interstitial, real, real, real]
+        with patch.object(solver, "_dispatch_challenge", return_value=True):
+            result = self._run(solver, context, timeout=30)
+        assert result.challenge_absent is False
+
+    def test_plain_render_claims_no_identity(self):
+        """No challenge means no clearance, so the session must not pin."""
+        solver, context, page = self._setup()
+        result = self._run(solver, context, timeout=30)
+        assert result.challenge_absent is True
+
+    def test_unsolved_challenge_is_returned_for_the_caller_to_classify(self):
+        interstitial = (
+            "<html><body><script>window._cf_chl_opt={};</script>"
+            "Just a moment...</body></html>"
+        )
+        solver, context, page = self._setup(dom=interstitial)
+        with patch.object(solver, "_dispatch_challenge", return_value=False):
+            result = self._run(solver, context, timeout=30)
+        assert b"_cf_chl_opt" in result.response.body
+
+    def test_ordinary_page_never_reaches_the_challenge_dispatcher(self):
+        solver, context, page = self._setup()
+        with patch.object(solver, "_dispatch_challenge") as dispatch:
+            result = self._run(solver, context, timeout=30)
+        dispatch.assert_not_called()
+        assert b"rendered content" in result.response.body
+
+    def test_unclassifiable_interstitial_is_not_dispatched(self):
+        """Structurally challenge-shaped but no known WAF: nothing to run."""
+        body = "<html><body>just a moment</body></html>"
+        solver, context, page = self._setup(dom=body)
+        with patch.object(solver, "_dispatch_challenge") as dispatch:
+            self._run(solver, context, timeout=30)
+        dispatch.assert_not_called()
+
+    def test_json_is_returned_as_bytes_not_as_chromes_viewer(self):
+        """Chrome wraps JSON in a viewer document; the caller wants the JSON."""
+        payload = b'{"jobs": [{"title": "FPGA Engineer"}]}'
+        solver, context, page = self._setup(
+            dom="<html><body><pre>{&quot;jobs&quot;: []}</pre></body></html>",
+            content_type="application/json; charset=utf-8",
+            raw_body=payload,
+        )
+        result = self._run(solver, context, timeout=5)
+        assert result.response.body == payload
+        assert result.response.headers["content-type"] == (
+            "application/json; charset=utf-8"
+        )
+
+    def test_non_html_over_the_cap_still_raises(self):
+        solver, context, page = self._setup(
+            content_type="application/json",
+            raw_body=b"x" * 4096,
+        )
+        with pytest.raises(ResponseTooLarge):
+            self._run(solver, context, timeout=5, max_size=100)
+
+    def test_xhtml_is_serialized_like_html(self):
+        solver, context, page = self._setup(
+            content_type="application/xhtml+xml",
+            raw_body=b"<html/>",
+        )
+        result = self._run(solver, context, timeout=5)
+        assert b"rendered content" in result.response.body
+        assert result.response.headers["content-type"] == "text/html; charset=utf-8"
+
+    def test_unreadable_non_html_body_falls_back_to_the_dom(self):
+        """Chrome not retaining the bytes must not lose the render entirely."""
+        solver, context, page = self._setup(
+            content_type="application/json",
+            raw_body=b'{"a": 1}',
+            body_error=True,
+        )
+        result = self._run(solver, context, timeout=5)
+        assert b"rendered content" in result.response.body
+        assert result.response.headers["content-type"] == "text/html; charset=utf-8"
+
+    def test_invalid_url_is_refused(self):
+        solver = BrowserSolver(solve_timeout=5)
+        try:
+            assert solver._render_on_worker("file:///etc/passwd") is None
+            assert solver._render_on_worker("javascript:alert(1)") is None
+        finally:
+            solver.close()
+
+
+_MAIN_FRAME = object()
+
+
+def _fake_document_response(
+    url,
+    status,
+    *,
+    resource_type="document",
+    main_frame=True,
+    content_type="text/html",
+    raw_body=b"",
+):
+    """A Playwright-shaped response for the render listener to classify."""
+    request = SimpleNamespace(
+        resource_type=resource_type,
+        frame=_MAIN_FRAME if main_frame else object(),
+    )
+    response = MagicMock()
+    response.status = status
+    response.url = url
+    response.request = request
+    response.all_headers.return_value = {"content-type": content_type}
+    response.headers_array.return_value = []
+    response.body.return_value = raw_body
+    return response

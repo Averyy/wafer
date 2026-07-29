@@ -83,6 +83,17 @@ def resolve_charset(headers: dict[str, str], content: bytes) -> str:
     return "utf-8"
 
 
+# Everything that contributes markup but no reading matter, stripped before
+# measuring how much text a body actually carries.
+_NON_TEXT_ELEMENT_RE = re.compile(
+    r"(?is)<(script|style|noscript|template|svg)[^>]*>.*?</\1>"
+)
+_TAG_RE = re.compile(r"(?s)<[^>]+>")
+# Below this many characters of visible text, an HTML body that ships script
+# is a shell: the content is written by the client, not by the server.
+_SHELL_TEXT_THRESHOLD = 1000
+
+
 class WaferResponse:
     """Friendly response object wrapping raw wreq responses.
 
@@ -95,6 +106,7 @@ class WaferResponse:
     - ``history``: list[HistoryEntry] of followed redirect hops
     - ``cookies``: dict[str, str] of cookies set by this response
     - ``ok``: True if 200 <= status_code < 300
+    - ``needs_render``: True if the body looks like a client-rendered shell
     - ``json()``: parsed JSON
     - ``raise_for_status()``: raises WaferHTTPError if not ok
     """
@@ -104,6 +116,7 @@ class WaferResponse:
         "_content",
         "_text",
         "_cookies",
+        "_needs_render",
         "_raw_set_cookie",
         "headers",
         "url",
@@ -144,6 +157,7 @@ class WaferResponse:
         self._content = content
         self._text = text
         self._cookies: dict[str, str] | None = None
+        self._needs_render: bool | None = None
         # Individual Set-Cookie header values, preserved by transports
         # that decode headers into a flat dict (native-TLS, Opera Mini, browser)
         # where multiple Set-Cookie values would otherwise be joined.
@@ -217,6 +231,33 @@ class WaferResponse:
                     cookies[name] = value.strip()
             self._cookies = cookies
         return self._cookies
+
+    @property
+    def needs_render(self) -> bool:
+        """Whether this body looks like a shell whose content is client-written.
+
+        A hint, not a verdict: True when an HTML body ships script but almost
+        no visible text, which is what a single-page app returns before its
+        JavaScript runs. Answer it with ``session.render(url)``, which loads
+        the page in a browser and returns the document after rendering
+        settles. False for every non-HTML body.
+        """
+        if self._needs_render is None:
+            self._needs_render = self._looks_like_shell()
+        return self._needs_render
+
+    def _looks_like_shell(self) -> bool:
+        """Measure visible text against the markup that carries it."""
+        mime = self.headers.get("content-type", "").split(";")[0].strip().lower()
+        if mime and "html" not in mime and "xml" not in mime:
+            return False
+        body = self.text
+        if not mime and not body.lstrip()[:1] == "<":
+            return False
+        if "<script" not in body.lower():
+            return False
+        text = _TAG_RE.sub(" ", _NON_TEXT_ELEMENT_RE.sub(" ", body))
+        return len(" ".join(text.split())) < _SHELL_TEXT_THRESHOLD
 
     @property
     def ok(self) -> bool:

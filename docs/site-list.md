@@ -26,6 +26,7 @@ When updating, change the **Status** column and add a date + note. Don't assume 
 - `untested` -not yet tested
 - `unverified` -WAF claim not confirmed in latest smoke test (may trigger on deeper pages)
 - `blocked` -wafer did not reproduce the successful real-browser behavior; record the observed code path without attributing the cause externally
+- `render` -no WAF; the server ships a client-rendered shell and the content only exists after `session.render()`
 
 ---
 
@@ -37,6 +38,29 @@ When updating, change the **Status** column and add a date + note. Don't assume 
 | `httpbin.org/headers` | None | pass | Echoes all headers |
 | `httpbin.org/anything` | None | pass | Full request echo |
 | `example.com` | None | pass | Static HTML |
+
+## Tier 0b: Client-Rendered Shells (no WAF, needs render)
+
+The server answers 200 with a shell; the content is written by JavaScript.
+`resp.needs_render` is True on the plain fetch and `session.render(url)` returns
+the finished document. These are render regression targets, not WAF targets.
+
+| URL | Shell -> Rendered (visible text) | Status | Notes |
+|---|---|---|---|
+| `www.greypointindustries.com` | 20 -> ~2,900 chars | render | Vite SPA, `<div id="root">`; whole page is client-written (verified 2026-07-29) |
+| `strategicmissions.ca/careers` | 539 -> ~1,900 chars | render | Open Roles fetched client-side from BambooHR (verified 2026-07-29) |
+| `www.lodge.tech` | 846 -> ~400 chars | render | Framer. Raw HTML carries duplicated breakpoint variants; the render de-duplicates them and adds the nav + footer the shell omits. Lower char count is correct -the site is a one-pager (verified 2026-07-29) |
+| `csmc.bamboohr.com/careers` | 8 chars of visible text | render | Job data is embedded JSON; 200 over TLS, render only needed for visible text (verified 2026-07-29) |
+
+## Terminal Blocks (nothing to solve)
+
+Denials, not challenges. wafer classifies these as `cloudflare_block` and raises
+`RequestBlocked` on the first response with zero rotations. They are regression
+targets for that classification, not solve targets.
+
+| URL | Challenge Type | Status | Notes |
+|---|---|---|---|
+| `airmatrix.ca` | `cloudflare_block` | blocked | Parked/abandoned zone (Cloudflare NS, no live origin); the company's real site is `airmatrix.ai`, which fetches 200 over plain TLS. Error 1020 to every client from every network -verified against wafer, a real headed Chrome, curl, and check-host nodes in 4 countries (2026-07-29). Body captured at `tests/fixtures/cloudflare_waf_block_1020.html` |
 
 ## Tier 1: UA Check Only
 

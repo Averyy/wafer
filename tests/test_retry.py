@@ -1,8 +1,9 @@
 """Tests for retry logic, backoff, and separate counters."""
 
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
+import wreq.exceptions
 from wreq import Emulation
 
 from tests.conftest import (
@@ -10,11 +11,13 @@ from tests.conftest import (
     make_async_session,
     make_sync_session,
 )
+from wafer._base import _connection_failure_reason
 from wafer._errors import (
     ChallengeDetected,
     ConnectionFailed,
     EmptyResponse,
     RateLimited,
+    RequestBlocked,
     TooManyRedirects,
 )
 from wafer._fingerprint import emulation_family
@@ -1354,3 +1357,209 @@ class TestWaferResponseFields:
         ])
         resp = session.get("https://example.com")
         assert isinstance(resp.headers, dict)
+
+
+# ---------------------------------------------------------------------------
+# Terminal WAF blocks
+# ---------------------------------------------------------------------------
+
+
+_CF_BLOCK_BODY = (
+    '<html><head><link rel="stylesheet"'
+    ' href="/cdn-cgi/styles/cf.errors.css" /><title>Attention Required!'
+    " | Cloudflare</title></head><body>"
+    "<h1>Sorry, you have been blocked</h1>"
+    "<script>console.log(1)</script></body></html>"
+)
+
+
+def _cf_block_response():
+    return MockResponse(
+        403,
+        headers={"server": "cloudflare", "content-type": "text/html"},
+        body=_CF_BLOCK_BODY,
+    )
+
+
+@patch("wafer._sync.time.sleep")
+class TestSyncTerminalBlock:
+    def test_raises_request_blocked_on_first_response(self, mock_sleep):
+        session, mock = make_sync_session(
+            [_cf_block_response() for _ in range(5)],
+            max_retries=3,
+            max_rotations=4,
+        )
+        with pytest.raises(RequestBlocked) as excinfo:
+            session.get("https://example.com")
+        # The whole point: no rotation or retry budget is spent buying
+        # another copy of the same denial.
+        assert mock.request_count == 1
+        assert excinfo.value.challenge_type == "cloudflare_block"
+        assert excinfo.value.status_code == 403
+        assert excinfo.value.response.rotations == 0
+        assert excinfo.value.response.retries == 0
+        mock_sleep.assert_not_called()
+
+    def test_request_blocked_is_a_challenge_detected(self, mock_sleep):
+        session, _ = make_sync_session([_cf_block_response()])
+        with pytest.raises(ChallengeDetected):
+            session.get("https://example.com")
+
+    def test_message_says_retrying_will_not_help(self, mock_sleep):
+        session, _ = make_sync_session([_cf_block_response()])
+        with pytest.raises(RequestBlocked) as excinfo:
+            session.get("https://example.com")
+        assert "return the same answer" in str(excinfo.value)
+
+    def test_max_rotations_zero_returns_the_response(self, mock_sleep):
+        session, mock = make_sync_session(
+            [_cf_block_response()],
+            max_rotations=0,
+        )
+        resp = session.get("https://example.com")
+        assert resp.status_code == 403
+        assert resp.challenge_type == "cloudflare_block"
+        assert mock.request_count == 1
+
+    def test_block_does_not_retire_the_session(self, mock_sleep):
+        """A rule match is not the identity's fault; keep its state."""
+        session, _ = make_sync_session(
+            [_cf_block_response()],
+            max_failures=1,
+        )
+        emulation_before = session._fingerprint.current
+        with pytest.raises(RequestBlocked):
+            session.get("https://example.com")
+        assert session._domain_failures == {}
+        assert session._fingerprint.current == emulation_before
+
+    def test_solvable_cloudflare_is_not_blocked(self, mock_sleep):
+        """Guard the discriminator: an interstitial keeps the solve path."""
+        challenge = MockResponse(
+            403,
+            headers={"server": "cloudflare", "content-type": "text/html"},
+            body=(
+                '<html><head><link href="/cdn-cgi/styles/cf.errors.css" />'
+                "</head><body><script>window._cf_chl_opt={};</script>"
+                "</body></html>"
+            ),
+        )
+        session, _ = make_sync_session([challenge], max_rotations=4)
+        with pytest.raises(ChallengeDetected) as excinfo:
+            session.get("https://example.com")
+        assert not isinstance(excinfo.value, RequestBlocked)
+        assert excinfo.value.challenge_type == "cloudflare"
+
+
+class TestAsyncTerminalBlock:
+    @pytest.mark.asyncio
+    async def test_raises_request_blocked_without_spending_budget(self):
+        session, mock = make_async_session(
+            [_cf_block_response() for _ in range(5)],
+            max_retries=3,
+            max_rotations=4,
+        )
+        with patch("wafer._async.asyncio.sleep", return_value=None):
+            with pytest.raises(RequestBlocked) as excinfo:
+                await session.get("https://example.com")
+        assert mock.request_count == 1
+        assert excinfo.value.challenge_type == "cloudflare_block"
+        assert excinfo.value.response.rotations == 0
+
+    @pytest.mark.asyncio
+    async def test_max_rotations_zero_returns_the_response(self):
+        session, mock = make_async_session(
+            [_cf_block_response()],
+            max_rotations=0,
+        )
+        with patch("wafer._async.asyncio.sleep", return_value=None):
+            resp = await session.get("https://example.com")
+        assert resp.status_code == 403
+        assert resp.challenge_type == "cloudflare_block"
+        assert mock.request_count == 1
+
+
+class TestConnectionFailureReason:
+    """A sinkholed DNS answer must not read like an unreachable host."""
+
+    @staticmethod
+    def _addrinfo(*addresses):
+        return [
+            (2, 1, 6, "", (address, 443))
+            for address in addresses
+        ]
+
+    def test_names_the_sinkhole(self):
+        with patch(
+            "wafer._base.socket.getaddrinfo",
+            return_value=self._addrinfo("0.0.0.0"),
+        ):
+            reason = _connection_failure_reason(
+                "https://example.com/jobs",
+                OSError("tcp connect error [::]:443 Connection refused"),
+            )
+        assert "0.0.0.0" in reason
+        assert "resolver refused the name" in reason
+        assert "resolve=" in reason
+
+    def test_ipv6_unspecified_is_also_a_sinkhole(self):
+        with patch(
+            "wafer._base.socket.getaddrinfo",
+            return_value=self._addrinfo("::"),
+        ):
+            reason = _connection_failure_reason(
+                "https://example.com/",
+                OSError("connect error"),
+            )
+        assert "resolver refused the name" in reason
+
+    def test_real_address_keeps_the_transport_error(self):
+        with patch(
+            "wafer._base.socket.getaddrinfo",
+            return_value=self._addrinfo("51.161.117.187"),
+        ):
+            reason = _connection_failure_reason(
+                "https://example.com/",
+                OSError("tcp connect error: timed out"),
+            )
+        assert reason == "tcp connect error: timed out"
+
+    def test_mixed_answer_is_not_called_a_sinkhole(self):
+        """One routable address means the name did resolve."""
+        with patch(
+            "wafer._base.socket.getaddrinfo",
+            return_value=self._addrinfo("0.0.0.0", "51.161.117.187"),
+        ):
+            reason = _connection_failure_reason(
+                "https://example.com/",
+                OSError("connect error"),
+            )
+        assert reason == "connect error"
+
+    def test_unresolvable_host_keeps_the_transport_error(self):
+        with patch(
+            "wafer._base.socket.getaddrinfo",
+            side_effect=OSError("Name or service not known"),
+        ):
+            reason = _connection_failure_reason(
+                "https://example.com/",
+                OSError("connect error"),
+            )
+        assert reason == "connect error"
+
+    def test_url_without_a_host_is_left_alone(self):
+        reason = _connection_failure_reason("not a url", OSError("boom"))
+        assert reason == "boom"
+
+    def test_surfaces_through_connection_failed(self):
+        session, _ = make_sync_session([])
+        session._client.request = MagicMock(
+            side_effect=wreq.exceptions.ConnectionError("tcp connect error")
+        )
+        with patch("wafer._sync.time.sleep"), patch(
+            "wafer._base.socket.getaddrinfo",
+            return_value=self._addrinfo("0.0.0.0"),
+        ):
+            with pytest.raises(ConnectionFailed) as excinfo:
+                session.get("https://example.com/")
+        assert "resolver refused the name" in str(excinfo.value)

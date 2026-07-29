@@ -881,3 +881,71 @@ class TestBinaryContent:
         )
         assert resp.content == b""
         assert resp.text == ""
+
+
+class TestNeedsRender:
+    """The shell hint: HTML that ships script but almost no text."""
+
+    @staticmethod
+    def _html(body: str, content_type: str = "text/html; charset=utf-8"):
+        return WaferResponse(
+            status_code=200,
+            headers={"content-type": content_type},
+            url="https://example.com",
+            text=body,
+        )
+
+    def test_spa_shell_is_flagged(self):
+        resp = self._html(
+            '<!doctype html><html><head><title>App</title></head>'
+            '<body><div id="root"></div>'
+            '<script type="module" src="/assets/index.js"></script>'
+            "</body></html>"
+        )
+        assert resp.needs_render is True
+
+    def test_server_rendered_page_is_not_flagged(self):
+        resp = self._html(
+            "<html><body><article>"
+            + ("Real prose that a reader can actually read. " * 40)
+            + "</article><script>analytics()</script></body></html>"
+        )
+        assert resp.needs_render is False
+
+    def test_script_payload_alone_is_not_text(self):
+        """A big inline bundle is markup weight, not reading matter."""
+        resp = self._html(
+            "<html><body><div id=app></div><script>"
+            + ("var x = 'padding padding padding';" * 200)
+            + "</script></body></html>"
+        )
+        assert resp.needs_render is True
+
+    def test_html_without_script_is_not_flagged(self):
+        """Nothing to run means nothing a render would add."""
+        resp = self._html("<html><body><p>Short.</p></body></html>")
+        assert resp.needs_render is False
+
+    def test_json_is_never_flagged(self):
+        resp = WaferResponse(
+            status_code=200,
+            headers={"content-type": "application/json"},
+            url="https://example.com/api",
+            text='{"a": 1}',
+        )
+        assert resp.needs_render is False
+
+    def test_untyped_non_markup_body_is_not_flagged(self):
+        resp = WaferResponse(
+            status_code=200,
+            headers={},
+            url="https://example.com/data",
+            text="plain text, no tags, <script> never opens a document",
+        )
+        assert resp.needs_render is False
+
+    def test_result_is_cached(self):
+        resp = self._html('<html><body><div id="root"></div><script></script></html>')
+        assert resp.needs_render is True
+        assert resp._needs_render is True
+        assert resp.needs_render is True

@@ -1,8 +1,15 @@
 """Tests for challenge detection."""
 
+import pathlib
+
 import pytest
 
-from wafer._challenge import ChallengeType, detect_challenge
+from wafer._challenge import (
+    JS_ONLY_CHALLENGES,
+    TERMINAL_CHALLENGES,
+    ChallengeType,
+    detect_challenge,
+)
 from wafer._solvers import is_reddit_verification
 
 # ---------------------------------------------------------------------------
@@ -58,6 +65,70 @@ class TestCloudflare:
         """cf-mitigated with value other than 'challenge' should not match."""
         headers = _h(cf_mitigated="captcha")
         assert detect_challenge(403, headers, "") != ChallengeType.CLOUDFLARE
+
+
+# ---------------------------------------------------------------------------
+# Cloudflare WAF block (Error 1020) — terminal, not a challenge
+# ---------------------------------------------------------------------------
+
+
+_CF_BLOCK_FIXTURE = (
+    pathlib.Path(__file__).parent / "fixtures" / "cloudflare_waf_block_1020.html"
+)
+
+
+class TestCloudflareBlock:
+    def test_real_1020_block_page(self):
+        """The live airmatrix.ca block page, captured verbatim."""
+        body = _CF_BLOCK_FIXTURE.read_text()
+        headers = _h(server="cloudflare")
+        assert detect_challenge(403, headers, body) == ChallengeType.CLOUDFLARE_BLOCK
+
+    def test_error_stylesheet_without_challenge_script(self):
+        body = (
+            '<html><head><link rel="stylesheet"'
+            ' href="/cdn-cgi/styles/cf.errors.css" /></head>'
+            "<body><h1>Sorry, you have been blocked</h1>"
+            "<script>console.log(1)</script></body></html>"
+        )
+        assert detect_challenge(403, {}, body) == ChallengeType.CLOUDFLARE_BLOCK
+
+    def test_challenge_script_is_never_terminal(self):
+        """A page that loads the challenge platform still has something to run."""
+        body = (
+            '<html><head><link href="/cdn-cgi/styles/cf.errors.css" /></head>'
+            '<body><script src="/cdn-cgi/challenge-platform/h/b/orchestrate/'
+            'chl_page/v1"></script></body></html>'
+        )
+        assert detect_challenge(403, {}, body) != ChallengeType.CLOUDFLARE_BLOCK
+
+    def test_cf_chl_marker_wins_over_error_stylesheet(self):
+        body = (
+            '<html><head><link href="/cdn-cgi/styles/cf.errors.css" /></head>'
+            "<body><script>window._cf_chl_opt={}</script></body></html>"
+        )
+        assert detect_challenge(403, {}, body) == ChallengeType.CLOUDFLARE
+
+    def test_429_error_page_is_not_a_terminal_block(self):
+        """CF 1015 is rate limiting: retryable on a clock, so not terminal."""
+        body = (
+            '<html><head><link href="/cdn-cgi/styles/cf.errors.css" /></head>'
+            "<body><h1>You are being rate limited</h1>"
+            "<script>x</script></body></html>"
+        )
+        assert detect_challenge(429, {}, body) != ChallengeType.CLOUDFLARE_BLOCK
+
+    def test_block_not_reported_as_generic_js(self):
+        """The defect this classification exists to fix."""
+        body = _CF_BLOCK_FIXTURE.read_text()
+        assert detect_challenge(403, {}, body) != ChallengeType.GENERIC_JS
+
+    def test_block_is_terminal_and_not_js_solvable(self):
+        assert ChallengeType.CLOUDFLARE_BLOCK in TERMINAL_CHALLENGES
+        assert ChallengeType.CLOUDFLARE_BLOCK not in JS_ONLY_CHALLENGES
+
+    def test_solvable_cloudflare_is_not_terminal(self):
+        assert ChallengeType.CLOUDFLARE not in TERMINAL_CHALLENGES
 
 
 # ---------------------------------------------------------------------------
