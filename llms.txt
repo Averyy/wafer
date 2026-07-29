@@ -963,11 +963,16 @@ assert solver.runtime_ready is False
 # request budget can fund them, automatic solving uses up to three fresh
 # browser contexts, splits browser time fairly among them, and excludes recent
 # rejected drag recordings across contexts. It reserves up to 15 seconds for
-# authoritative native-HTTP replay. Short budgets use one viable context
-# instead of several underfunded attempts. When the response body carries an
-# issued punishment URL selecting Google reCAPTCHA (AliExpress MTop answers an
-# API call that way), one long context is used instead: its image rounds
-# belong to a single-use document that a fresh context would discard.
+# authoritative native-HTTP replay when a new target-scoped x5sec is minted.
+# If Chrome instead reaches a validated, challenge-free exact GET document
+# without transferable clearance, the session returns that browser response
+# directly, preserves its existing wreq identity/jar, and does not claim later
+# transport requests are unlocked. An unchanged URL or vanished iframe with
+# TMD markup still in the main DOM is failure. Short budgets use one viable
+# context instead of several underfunded attempts. When the response body
+# carries an issued punishment URL selecting Google reCAPTCHA (AliExpress MTop
+# answers an API call that way), one long context is used instead: its image
+# rounds belong to a single-use document that a fresh context would discard.
 
 # Automatic usage (pass to session):
 session = SyncSession(browser_solver=solver)
@@ -982,11 +987,13 @@ result: SolveResult | None = solver.solve(url, challenge_type)
 #   "150.0.7871.125"); the version-reduced user_agent hides it
 # result.extras: dict | None - WAF-specific data
 # result.response: CapturedResponse | None - passthrough content (see below)
-# result.challenge_absent: bool - no clearance identity was earned. True for a
-#   validated Cloudflare main-document response when no challenge iframe
-#   appeared, and for a render that met no challenge. Automatic session
-#   handling returns those without pinning the fingerprint or rebuilding the
-#   wreq client; False means clearance WAS earned and the session pins.
+# result.challenge_absent: bool - no transferable clearance identity was
+#   earned. True for a validated Cloudflare main-document response when no
+#   challenge iframe appeared, a challenge-free TMD GET returned as
+#   browser-only passthrough without x5sec, and a render that met no challenge.
+#   Automatic session handling returns those without pinning the fingerprint
+#   or rebuilding the wreq client; False means clearance WAS earned and the
+#   session pins.
 
 # Manual render (the browser-rendered fetch behind session.render()):
 result: SolveResult | None = solver.render(url, timeout=None, max_size=None)

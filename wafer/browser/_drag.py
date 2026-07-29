@@ -549,6 +549,55 @@ def _get_baxia_geometry(
     return handle, max_slide
 
 
+def _baxia_frame_offset(page, frame, deadline: float | None = None) -> dict | None:
+    """Page-relative position of the iframe hosting the Baxia widget.
+
+    Handle geometry comes from ``getBoundingClientRect()`` evaluated inside the
+    frame, so it is relative to that frame's own viewport. Input is dispatched
+    against the page, and the two only agree once the iframe's own position is
+    added.
+
+    Resolved from the frame's owning element, which is exact. The attribute
+    match is kept as a fallback but cannot be relied on alone: it compares an
+    element's resolved ``src`` against the frame's CURRENT url, and a challenge
+    iframe that navigates after load -- the punish document redirects to load
+    the NoCaptcha SDK -- makes those diverge, while the ``baxia-dialog-content``
+    id only exists on the inline-overlay variant and not on the full-page one.
+    """
+
+    try:
+        box = frame.frame_element().bounding_box()
+    except Exception:
+        logger.debug("Baxia frame element unavailable", exc_info=True)
+        box = None
+    if not isinstance(box, dict):
+        box = _baxia_evaluate(
+            page,
+            """(_root, frameUrl) => {
+            for (const el of document.querySelectorAll('iframe')) {
+                if (el.src === frameUrl
+                    || el.id === 'baxia-dialog-content') {
+                    const r = el.getBoundingClientRect();
+                    return {x: r.x, y: r.y};
+                }
+            }
+            return null;
+        }""",
+            frame.url,
+            deadline=deadline,
+        )
+    if not isinstance(box, dict):
+        return None
+    x = box.get("x")
+    y = box.get("y")
+    if any(
+        isinstance(value, bool) or not isinstance(value, (int, float))
+        for value in (x, y)
+    ):
+        return None
+    return {"x": float(x), "y": float(y)}
+
+
 def _wait_for_baxia_geometry(page, frame, deadline: float | None):
     """Return a laid-out Baxia frame and geometry before dispatching input.
 
@@ -1514,25 +1563,49 @@ def _page_reached_baxia_target(
     issued_url: str,
     deadline: float | None,
 ) -> bool:
-    """Recognize only a strict callback or a challenge-free exact target."""
+    """Recognize only a strict callback or a challenge-free exact target.
+
+    The widget iframe disappearing is not enough. Live Alibaba failures leave
+    the main document at the exact application URL with no Baxia frame while
+    its DOM is still the ``_____tmd_____`` "Captcha Interception" page. Treating
+    that teardown state as navigation clearance makes the outer solver import
+    ordinary ``tfstk``/``arms_uid`` cookies and replay a request that is still
+    challenged.
+    """
 
     if _expected_baxia_callback(issued_url) is not None:
-        return _page_left_punish(page, issued_url)
-    if not _page_left_punish(
-        page,
-        issued_url,
-        challenge_gone=True,
-    ):
-        return False
-    probe_deadline = time.monotonic() + 0.35
-    if deadline is not None:
-        probe_deadline = min(probe_deadline, deadline)
-    if _remaining(probe_deadline) <= 0:
-        return False
+        if not _page_left_punish(page, issued_url):
+            return False
+    else:
+        if not _page_left_punish(
+            page,
+            issued_url,
+            challenge_gone=True,
+        ):
+            return False
+        probe_deadline = time.monotonic() + 0.35
+        if deadline is not None:
+            probe_deadline = min(probe_deadline, deadline)
+        if _remaining(probe_deadline) <= 0:
+            return False
+        try:
+            if _find_baxia_frame(page, probe_deadline) is not None:
+                return False
+        except Exception:
+            return False
+
     try:
-        return _find_baxia_frame(page, probe_deadline) is None
+        html = page.content()
     except Exception:
         return False
+    if not isinstance(html, str) or not html:
+        return False
+
+    # This is the exact body marker used by the status-200 TMD detector. Avoid
+    # calling the logging detector from a 200ms poll: a rejected document can
+    # remain here for the whole clearance window and would emit dozens of
+    # duplicate "Challenge detected" lines.
+    return "/_____tmd_____/punish" not in html
 
 
 def _baxia_clearance_signatures(
@@ -1677,27 +1750,22 @@ def _attempt_baxia_drag(
         handle_cx = handle_box["x"] + handle_box["width"] / 2
         handle_cy = handle_box["y"] + handle_box["height"] / 2
 
-        # Iframe offset for child frames
+        # Iframe offset for child frames. Without it the coordinates below are
+        # frame-relative while the input is dispatched page-relative, so the
+        # press lands on empty page: the widget renders, the drag runs, and the
+        # handle never moves. Skip the attempt rather than dispatch into the
+        # void -- a later attempt re-resolves against a freshly found frame.
         if frame is not page:
-            frame_url = frame.url
-            iframe_offset = _baxia_evaluate(
-                page,
-                """(_root, frameUrl) => {
-                for (const el of document.querySelectorAll('iframe')) {
-                    if (el.src === frameUrl
-                        || el.id === 'baxia-dialog-content') {
-                        const r = el.getBoundingClientRect();
-                        return {x: r.x, y: r.y};
-                    }
-                }
-                return null;
-            }""",
-                frame_url,
-                deadline=deadline,
-            )
-            if iframe_offset:
-                handle_cx += iframe_offset["x"]
-                handle_cy += iframe_offset["y"]
+            iframe_offset = _baxia_frame_offset(page, frame, deadline)
+            if iframe_offset is None:
+                logger.warning(
+                    "Baxia iframe offset unresolved; skipping attempt %d/%d",
+                    attempt + 1,
+                    max_attempts,
+                )
+                continue
+            handle_cx += iframe_offset["x"]
+            handle_cy += iframe_offset["y"]
 
         end_x = handle_cx + max_slide
         end_y = handle_cy

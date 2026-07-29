@@ -866,6 +866,45 @@ class TestSyncBrowserSolveIntegration:
         assert client.request_count == 3
         assert solver.solve_calls == [("https://www.example.com/search", "tmd")]
 
+    @patch("time.sleep")
+    def test_tmd_challenge_free_browser_document_is_returned_without_replay(
+        self,
+        mock_sleep,
+    ):
+        punish = MockResponse(
+            200,
+            {"content-type": "text/html"},
+            '<meta content="0;url=/_____tmd_____/punish?x=1">',
+        )
+        browser_body = b"<html>validated browser search results</html>"
+        solver = MockBrowserSolver(
+            SolveResult(
+                cookies=[],
+                user_agent="Chrome/150.0.0.0",
+                response=CapturedResponse(
+                    url="https://www.example.com/search",
+                    status=200,
+                    headers={"content-type": "text/html; charset=utf-8"},
+                    body=browser_body,
+                ),
+                challenge_absent=True,
+            )
+        )
+        session, client = make_sync_session(
+            [punish, punish],
+            max_rotations=0,
+            browser_solver=solver,
+        )
+        session._rebuild_client = MagicMock()
+
+        response = session.get("https://www.example.com/search")
+
+        assert response.content == browser_body
+        assert response.challenge_type is None
+        assert client.request_count == 2
+        session._rebuild_client.assert_not_called()
+        assert session._fingerprint.pinned is False
+
     def test_browser_prime_imports_state_without_http_challenge(self):
         mock_solver = MockBrowserSolver(
             result=SolveResult(
@@ -2150,6 +2189,45 @@ class TestAsyncBrowserSolveIntegration:
         assert response.text == "<html>authoritative SSR offer data</html>"
         assert client.request_count == 3
         assert solver.solve_calls == [("https://www.example.com/search", "tmd")]
+
+    @patch("asyncio.sleep")
+    async def test_tmd_challenge_free_browser_document_is_returned_without_replay(
+        self,
+        mock_sleep,
+    ):
+        punish = MockResponse(
+            200,
+            {"content-type": "text/html"},
+            '<meta content="0;url=/_____tmd_____/punish?x=1">',
+        )
+        browser_body = b"<html>validated browser search results</html>"
+        solver = MockBrowserSolver(
+            SolveResult(
+                cookies=[],
+                user_agent="Chrome/150.0.0.0",
+                response=CapturedResponse(
+                    url="https://www.example.com/search",
+                    status=200,
+                    headers={"content-type": "text/html; charset=utf-8"},
+                    body=browser_body,
+                ),
+                challenge_absent=True,
+            )
+        )
+        session, client = make_async_session(
+            [punish, punish],
+            max_rotations=0,
+            browser_solver=solver,
+        )
+        session._rebuild_client = MagicMock()
+
+        response = await session.get("https://www.example.com/search")
+
+        assert response.content == browser_body
+        assert response.challenge_type is None
+        assert client.request_count == 2
+        session._rebuild_client.assert_not_called()
+        assert session._fingerprint.pinned is False
 
     async def test_browser_prime_imports_state_without_http_challenge(self):
         mock_solver = MockBrowserSolver(
@@ -4031,12 +4109,13 @@ class TestBaxiaViewport:
             is False
         )
 
-    def test_application_target_requires_baxia_handle_to_disappear(self):
+    def test_application_target_requires_handle_and_challenge_to_disappear(self):
         from wafer.browser._drag import _page_reached_baxia_target
 
         issued = "https://www.aliexpress.com/w/wholesale-cable.html"
         page = MagicMock()
         page.url = issued
+        page.content.return_value = "<html><body>real search results</body></html>"
 
         with patch(
             "wafer.browser._drag._find_baxia_frame",
@@ -4048,6 +4127,16 @@ class TestBaxiaViewport:
             return_value=None,
         ):
             assert _page_reached_baxia_target(page, issued, None) is True
+
+        page.content.return_value = (
+            '<html><script>location="/_____tmd_____/punish?x5secdata=x"'
+            "</script></html>"
+        )
+        with patch(
+            "wafer.browser._drag._find_baxia_frame",
+            return_value=None,
+        ):
+            assert _page_reached_baxia_target(page, issued, None) is False
 
     @pytest.mark.parametrize("leading_slash", ["/", "//"])
     def test_mtop_prefixed_issued_callback_is_success(self, leading_slash):
@@ -10778,6 +10867,43 @@ class TestRenderOnWorker:
         assert dispatch.call_args[0][1] == "cloudflare"
         assert b"real page content" in result.response.body
 
+    def test_solved_challenge_replays_original_navigation_before_capture(self):
+        """The earned clearance must be applied to a fresh target request."""
+        interstitial = (
+            '<html><script>window.location="/_____tmd_____/punish'
+            '?x5secdata=abc"</script></html>'
+        )
+        real = "<html><body>" + "real page content " * 50 + "</body></html>"
+        solver, context, page = self._setup(dom=interstitial)
+        page.content.side_effect = (
+            lambda: interstitial if page.goto.call_count == 1 else real
+        )
+        with patch.object(
+            solver, "_dispatch_challenge", return_value=True
+        ) as dispatch:
+            result = self._run(solver, context, timeout=30)
+
+        assert dispatch.call_args[0][1] == "tmd"
+        assert page.goto.call_count == 2
+        retry = page.goto.call_args_list[1]
+        assert retry.args == ("https://spa.example.com/",)
+        assert retry.kwargs["wait_until"] == "domcontentloaded"
+        # Bounded by the caller's own deadline, not a fixed slice of it.
+        assert 1 <= retry.kwargs["timeout"] <= 30_000
+        assert b"real page content" in result.response.body
+
+    def test_hydration_network_idle_wait_shares_the_settle_cap(self):
+        """Persistent traffic cannot spend half a long render timeout."""
+        solver, context, page = self._setup()
+        try:
+            with patch("wafer.browser._solver._RENDER_POLL_INTERVAL", 0.0):
+                solver._wait_for_hydration(page, time.monotonic() + 150)
+        finally:
+            solver.close()
+
+        idle_timeout = page.wait_for_load_state.call_args.kwargs["timeout"]
+        assert 1 <= idle_timeout <= 5_000
+
     def test_solving_in_place_earns_an_identity_to_pin(self):
         """Clearance is bound to the solving browser; the session must pin."""
         interstitial = (
@@ -10813,6 +10939,21 @@ class TestRenderOnWorker:
             result = self._run(solver, context, timeout=30)
         dispatch.assert_not_called()
         assert b"rendered content" in result.response.body
+
+    def test_legitimate_ips_script_is_not_reclassified_as_kasada(self):
+        """A real 200 must not inherit the detector's blocking-status rules."""
+        body = (
+            '<html><head><script src="/assets/ips.js"></script></head>'
+            "<body>real Alibaba-style content</body></html>"
+        )
+        solver, context, page = self._setup(dom=body)
+        with patch.object(solver, "_dispatch_challenge") as dispatch:
+            result = self._run(solver, context, timeout=30)
+
+        dispatch.assert_not_called()
+        assert page.goto.call_count == 1
+        assert result.challenge_absent is True
+        assert b"real Alibaba-style content" in result.response.body
 
     def test_unclassifiable_interstitial_is_not_dispatched(self):
         """Structurally challenge-shaped but no known WAF: nothing to run."""
@@ -10898,3 +11039,292 @@ def _fake_document_response(
     response.headers_array.return_value = []
     response.body.return_value = raw_body
     return response
+
+
+class TestBaxiaFrameOffset:
+    """Frame-relative handle geometry must be translated to page coordinates.
+
+    Baxia serves the slider two ways: a full-page punish document (main frame,
+    no offset needed) and an iframe. In the iframe case the offset is the only
+    thing keeping the press on the handle, and the old attribute match silently
+    returned nothing for a frame that had navigated since load - the drag then
+    ran at frame-relative coordinates and the handle never moved.
+    """
+
+    @staticmethod
+    def _frame(*, box=None, element_error=False, url="https://acs.example.com/punish"):
+        frame = MagicMock()
+        frame.url = url
+        if element_error:
+            frame.frame_element.side_effect = RuntimeError("frame detached")
+        else:
+            frame.frame_element.return_value.bounding_box.return_value = box
+        return frame
+
+    def test_offset_comes_from_the_owning_element(self):
+        from wafer.browser._drag import _baxia_frame_offset
+
+        page = MagicMock()
+        frame = self._frame(box={"x": 120.0, "y": 340.0, "width": 300, "height": 200})
+        assert _baxia_frame_offset(page, frame) == {"x": 120.0, "y": 340.0}
+        # Exact resolution means no DOM scan is needed at all.
+        page.evaluate.assert_not_called()
+
+    def test_navigated_iframe_still_resolves(self):
+        """The regression: src no longer equals the frame's current url."""
+        from wafer.browser._drag import _baxia_frame_offset
+
+        page = MagicMock()
+        frame = self._frame(
+            box={"x": 40.0, "y": 60.0, "width": 300, "height": 200},
+            url="https://acs.example.com/punish?redirected=1",
+        )
+        assert _baxia_frame_offset(page, frame) == {"x": 40.0, "y": 60.0}
+
+    def test_falls_back_to_the_dom_scan(self):
+        from wafer.browser._drag import _baxia_frame_offset
+
+        page = MagicMock()
+        page.evaluate.return_value = {"x": 11.0, "y": 22.0}
+        frame = self._frame(element_error=True)
+        assert _baxia_frame_offset(page, frame) == {"x": 11.0, "y": 22.0}
+
+    def test_unresolvable_offset_returns_none(self):
+        from wafer.browser._drag import _baxia_frame_offset
+
+        page = MagicMock()
+        page.evaluate.return_value = None
+        frame = self._frame(element_error=True)
+        assert _baxia_frame_offset(page, frame) is None
+
+    def test_non_numeric_offset_is_rejected(self):
+        from wafer.browser._drag import _baxia_frame_offset
+
+        page = MagicMock()
+        frame = self._frame(box={"x": None, "y": 5})
+        page.evaluate.return_value = None
+        assert _baxia_frame_offset(page, frame) is None
+
+    def test_drag_skips_the_attempt_when_the_offset_is_unresolved(self):
+        """Never dispatch frame-relative coordinates against the page."""
+        from wafer.browser import _drag
+
+        solver = MagicMock()
+        page = MagicMock()
+        frame = MagicMock()
+        frame.url = "https://acs.example.com/punish"
+
+        viewport = {"width": 1280, "height": 720}
+        geometry = (frame, ({"x": 10, "y": 20, "width": 42, "height": 30}, 258))
+        with (
+            patch.object(_drag, "_viewport_size", return_value=viewport),
+            patch.object(_drag, "_wait_for_baxia_geometry", return_value=geometry),
+            patch.object(_drag, "_baxia_frame_offset", return_value=None),
+            patch.object(_drag, "_remaining", return_value=30.0),
+            patch.object(solver, "_replay_drag") as replay,
+        ):
+            result = _drag._attempt_baxia_drag(
+                solver,
+                page,
+                frame,
+                max_attempts=2,
+                issued_url="https://www.alibaba.com/",
+            )
+
+        assert result is False
+        replay.assert_not_called()
+
+
+class TestTmdClearanceAfterSolve:
+    """Separate transferable TMD clearance from browser-only content.
+
+    A new x5sec unlocks transport replay. A challenge-free exact browser
+    document without x5sec is useful only as a passthrough for the current GET.
+    A vanished widget whose main DOM is still TMD is neither outcome.
+    """
+
+    @staticmethod
+    def _solver_with_page(*, cookies, reached_target):
+        from wafer.browser import _solver as solver_mod
+
+        solver = BrowserSolver(solve_timeout=120)
+        solver._browser = MagicMock()
+        solver._browser.is_connected.return_value = True
+        solver._browser_ua = "Chrome/150"
+        solver._needs_screenxy_patch = False
+
+        response = MagicMock()
+        response.status = 200
+        response.url = "https://www.alibaba.com/trade/search?SearchText=x"
+        response.all_headers.return_value = {"content-type": "text/html"}
+        response.headers_array.return_value = []
+        response.body.return_value = b"<html>ok</html>"
+
+        context = MagicMock()
+        page = MagicMock()
+        page.url = "https://www.alibaba.com/trade/search?SearchText=x"
+        page.content.return_value = "<html><body>" + "content " * 200 + "</body></html>"
+        page.goto.return_value = response
+        context.new_page.return_value = page
+        context.cookies.return_value = cookies
+        return solver, context, page, solver_mod
+
+    @staticmethod
+    def _x5sec(value="fresh"):
+        return {
+            "name": "x5sec",
+            "value": value,
+            "domain": "www.alibaba.com",
+            "path": "/",
+            "secure": True,
+        }
+
+    def _run(self, solver, context, mod, reached_target, elapsed):
+        with (
+            patch.object(solver, "_create_context", return_value=context),
+            patch.object(solver, "_setup_headless_patches"),
+            patch.object(solver, "_verify_headless_patches"),
+            patch.object(solver, "_dispatch_challenge", return_value=True),
+            patch(
+                "wafer.browser._drag._page_reached_baxia_target",
+                return_value=reached_target,
+            ),
+            # Keep the suite fast: the assertion is that the poll honours its
+            # own bound rather than the solve deadline, not the bound's value.
+            patch.object(mod, "_TMD_CLEARANCE_POLL_SECONDS", 0.5),
+        ):
+            start = time.monotonic()
+            result = solver._solve_on_worker(
+                "https://www.alibaba.com/trade/search?SearchText=x",
+                "tmd",
+                timeout=120,
+            )
+            elapsed.append(time.monotonic() - start)
+        return result
+
+    def test_challenge_free_navigation_becomes_browser_passthrough(self):
+        solver, context, page, mod = self._solver_with_page(
+            cookies=[{"name": "tfstk", "value": "a", "domain": ".alibaba.com"}],
+            reached_target=True,
+        )
+        elapsed = []
+        try:
+            result = self._run(solver, context, mod, True, elapsed)
+        finally:
+            solver.close()
+        assert result is not None
+        assert result.response is not None
+        assert b"content" in result.response.body
+        assert result.challenge_absent is True
+
+    def test_missing_x5sec_does_not_burn_the_solve_budget(self):
+        """The poll is bounded on its own, not on the 120s solve deadline."""
+        solver, context, page, mod = self._solver_with_page(
+            cookies=[{"name": "tfstk", "value": "a", "domain": ".alibaba.com"}],
+            reached_target=False,
+        )
+        elapsed = []
+        try:
+            result = self._run(solver, context, mod, False, elapsed)
+        finally:
+            solver.close()
+        assert result is None
+        assert elapsed and elapsed[0] < 15, (
+            f"clearance poll consumed {elapsed[0]:.1f}s of a 120s budget"
+        )
+
+    def test_target_url_with_tmd_dom_is_not_browser_passthrough(self):
+        solver, context, page, mod = self._solver_with_page(
+            cookies=[{"name": "tfstk", "value": "a", "domain": ".alibaba.com"}],
+            reached_target=True,
+        )
+        page.content.return_value = (
+            '<html><script>location="/_____tmd_____/punish?x5secdata=x"'
+            "</script><title>Captcha Interception</title></html>"
+        )
+        elapsed = []
+        try:
+            result = self._run(solver, context, mod, True, elapsed)
+        finally:
+            solver.close()
+
+        assert result is None
+
+    def test_poll_bound_is_far_below_a_normal_solve_budget(self):
+        from wafer.browser._solver import _TMD_CLEARANCE_POLL_SECONDS
+
+        assert 0 < _TMD_CLEARANCE_POLL_SECONDS <= 15
+
+
+class TestInPlaceChallengeClassification:
+    """A rendered interstitial must be classified at its real status.
+
+    TMD's punish page is only recognized at 200. Classifying every rendered
+    interstitial as 403 turned Alibaba's slider into a generic JS wait that
+    never ran the drag.
+    """
+
+    @staticmethod
+    def _solver():
+        solver = BrowserSolver(solve_timeout=5)
+        solver._browser = MagicMock()
+        solver._browser.is_connected.return_value = True
+        return solver
+
+    def test_tmd_punish_page_is_classified_at_status_200(self):
+        solver = self._solver()
+        html = (
+            '<html><script>window.location="/_____tmd_____/punish'
+            '?x5secdata=abc"</script></html>'
+        )
+        try:
+            with patch.object(solver, "_dispatch_challenge", return_value=True) as d:
+                assert solver._solve_challenge_in_place(
+                    MagicMock(), "https://www.alibaba.com/trade/search", html,
+                    time.monotonic() + 30, 200,
+                ) is True
+        finally:
+            solver.close()
+        assert d.call_args[0][1] == "tmd", "TMD must reach the slider solver"
+
+    def test_blocking_status_fallback_still_catches_cloudflare_at_200(self):
+        """A challenge served in place as 200 must still be recognized."""
+        solver = self._solver()
+        html = "<html><body><script>window._cf_chl_opt={};</script></body></html>"
+        try:
+            with patch.object(solver, "_dispatch_challenge", return_value=True) as d:
+                assert solver._solve_challenge_in_place(
+                    MagicMock(), "https://example.com/", html,
+                    time.monotonic() + 30, 200,
+                ) is True
+        finally:
+            solver.close()
+        assert d.call_args[0][1] == "cloudflare"
+
+    def test_unclassifiable_body_dispatches_nothing(self):
+        solver = self._solver()
+        try:
+            with patch.object(solver, "_dispatch_challenge") as d:
+                assert solver._solve_challenge_in_place(
+                    MagicMock(), "https://example.com/", "<html>just a moment</html>",
+                    time.monotonic() + 30, 200,
+                ) is False
+        finally:
+            solver.close()
+        d.assert_not_called()
+
+    def test_legitimate_ips_script_does_not_use_blocking_status_fallback(self):
+        solver = self._solver()
+        html = '<html><script src="/assets/ips.js"></script><body>real</body></html>'
+        try:
+            with patch.object(solver, "_dispatch_challenge") as dispatch:
+                assert solver._solve_challenge_in_place(
+                    MagicMock(),
+                    "https://www.alibaba.com/trade/search",
+                    html,
+                    time.monotonic() + 30,
+                    200,
+                ) is False
+        finally:
+            solver.close()
+        dispatch.assert_not_called()

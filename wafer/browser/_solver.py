@@ -453,6 +453,9 @@ def _response_headers(response) -> tuple[dict[str, str], list[str]]:
 _RENDER_POLL_INTERVAL = 0.25
 _RENDER_STABLE_POLLS = 3
 _RENDER_SETTLE_CAP = 10.0
+# Post-solve phase bound: how long the capture may spend re-navigating
+# and settling after a challenge clears, clamped to the caller deadline.
+_RENDER_POST_SOLVE_SECONDS = 30.0
 
 # The only content types whose serialized DOM is the resource. Everything else
 # Chrome shows inside a generated viewer document.
@@ -566,6 +569,83 @@ def _capture_navigation_passthrough(
         set_cookie=set_cookie,
     )
 
+
+def _capture_tmd_browser_passthrough(
+    response,
+    page,
+    requested_url: str,
+    max_size: int | None,
+) -> "CapturedResponse | None":
+    """Capture a challenge-free TMD application document from Chrome.
+
+    This is deliberately not transport clearance. Alibaba can finish a browser
+    navigation without minting a transferable ``x5sec``; in that case wafer
+    may return the validated browser document for this GET, but must not claim
+    that a subsequent wreq replay is unlocked.
+    """
+
+    try:
+        requested = urlparse(requested_url)
+        page_url = str(page.url)
+        current = urlparse(page_url)
+        if (
+            requested.scheme not in {"http", "https"}
+            or _network_url_identity(requested) != _network_url_identity(current)
+        ):
+            return None
+    except (TypeError, ValueError):
+        return None
+
+    status = 200
+    matched_response = None
+    if response is not None:
+        try:
+            response_url = urlparse(str(response.url))
+            if _network_url_identity(response_url) == _network_url_identity(current):
+                status = int(response.status)
+                matched_response = response
+        except (TypeError, ValueError):
+            status = 200
+    if not 200 <= status < 300:
+        return None
+
+    lowered_url = page_url.lower()
+    if "invitation" in lowered_url or "siteclosed" in lowered_url:
+        return None
+
+    try:
+        html = page.content()
+    except Exception:
+        return None
+    if not isinstance(html, str) or not html:
+        return None
+    body = html.encode("utf-8")
+    if max_size is not None and len(body) > max_size:
+        raise ResponseTooLarge(page_url, len(body), max_size)
+
+    from wafer._challenge import detect_challenge
+
+    headers, set_cookie = _rendered_headers(matched_response)
+    if (
+        detect_challenge(status, headers, html) is not None
+        or _is_passthrough_challenge_html(html)
+    ):
+        return None
+
+    return CapturedResponse(
+        url=page_url,
+        status=status,
+        headers=headers,
+        body=body,
+        set_cookie=set_cookie,
+    )
+
+
+# How long to wait for TMD's x5sec cookie after a solved widget. It appears
+# within milliseconds when the host mints one at all; a host that clears by
+# navigation never does, and this bound is what keeps that case from consuming
+# the whole solve budget.
+_TMD_CLEARANCE_POLL_SECONDS = 8.0
 
 _TMD_MTOP_RETRY_URL = "https://acs.aliexpress.com/h5/mtop.aliexpress.pdp.pc.query/1.0/"
 
@@ -1050,9 +1130,10 @@ class SolveResult:
     # this carries the true build the session needs to reproduce the browser's
     # sec-ch-ua-full-version-list when replaying UA/CH-bound WAF cookies.
     browser_version: str | None = None
-    # True only when Cloudflare was absent and the browser's validated main
-    # document is being returned directly. No clearance identity was earned,
-    # so the session must merge cookies without pinning or rebuilding.
+    # True when the browser's validated main document is returned without a
+    # transferable clearance identity (Cloudflare was absent, or TMD reached
+    # real browser content without minting x5sec). The session must merge
+    # cookies without pinning or rebuilding.
     challenge_absent: bool = False
 
 
@@ -2940,6 +3021,26 @@ class BrowserSolver:
 
                     setup_kasada_listener(page)
 
+                # Keep the response metadata for the document that a TMD solve
+                # actually leaves in the main frame. The initial goto response
+                # can be the punishment document while a later client-side
+                # navigation supplies the real application page.
+                tmd_document_responses = []
+                if challenge_type == "tmd":
+
+                    def _record_tmd_document(response) -> None:
+                        try:
+                            request = response.request
+                            if request.resource_type != "document":
+                                return
+                            if request.frame != page.main_frame:
+                                return
+                        except Exception:
+                            return
+                        tmd_document_responses.append(response)
+
+                    page.on("response", _record_tmd_document)
+
                 # Snapshot target-scoped TMD clearance before navigation.
                 # A punishment page may mint x5sec or automatically redirect
                 # during ``goto`` itself; taking the baseline afterward would
@@ -3007,31 +3108,60 @@ class BrowserSolver:
                     )
 
                 cookies = context.cookies()
+                captured = None
+                passthrough_without_clearance = False
+                passthrough_method = (
+                    str(replay.get("method", "GET")).upper()
+                    if isinstance(replay, dict)
+                    else "GET"
+                )
 
                 if challenge_type == "tmd":
                     # Widget/token delivery is only an intermediate event.
-                    # The authoritative outcome is a new/changed x5sec that
-                    # applies to the exact application retry: AliExpress's
-                    # native MTop endpoint or Alibaba's strict callback from
-                    # the issued punishment URL.  Inspect it after either
-                    # widget outcome because TMD can mint clearance without
-                    # leaving an observable widget token in the page.
+                    # A new/changed x5sec is authoritative TRANSPORT clearance.
+                    # A challenge-free exact application document is a separate
+                    # browser-only outcome: it may be returned for this GET but
+                    # cannot be used to claim that wreq replay is unlocked.
                     widget_solved = solved
                     x5sec_ready = False
-                    if tmd_retry_target is not None:
-                        clearance_deadline = overall_deadline
-                        while time.monotonic() < clearance_deadline:
+                    reached_target = False
+                    # Bounded on its own, not on the whole solve budget. Poll
+                    # both outcomes because a successful navigation can detach
+                    # the widget before its handler reports success.
+                    clearance_deadline = min(
+                        overall_deadline,
+                        time.monotonic() + _TMD_CLEARANCE_POLL_SECONDS,
+                    )
+                    while time.monotonic() < clearance_deadline:
+                        if tmd_retry_target is not None:
                             if (
                                 _tmd_x5sec_signatures(cookies, tmd_retry_target)
                                 - tmd_x5sec_before
                             ):
+                                x5sec_ready = True
                                 break
-                            if not _sleep_before_deadline(
+                        from wafer.browser._drag import _page_reached_baxia_target
+
+                        try:
+                            reached_target = _page_reached_baxia_target(
+                                page,
+                                url,
                                 clearance_deadline,
-                                0.2,
-                            ):
-                                break
+                            )
+                        except Exception:
+                            logger.debug(
+                                "TMD target-navigation check failed",
+                                exc_info=True,
+                            )
+                        if reached_target:
+                            break
+                        if not _sleep_before_deadline(clearance_deadline, 0.2):
+                            break
+                        if tmd_retry_target is not None:
                             cookies = context.cookies()
+
+                    if tmd_retry_target is not None and not x5sec_ready:
+                        cookies = context.cookies()
                         x5sec_ready = bool(
                             _tmd_x5sec_signatures(cookies, tmd_retry_target)
                             - tmd_x5sec_before
@@ -3040,27 +3170,59 @@ class BrowserSolver:
                         logger.info(
                             "TMD diagnostic: widget_solved=%s "
                             "x5sec_target_new_or_changed=%s "
+                            "challenge_free_target=%s "
                             "cookie_structure=%s",
                             widget_solved,
                             x5sec_ready,
+                            reached_target,
                             _cookie_structure(cookies),
                         )
+                    if (
+                        reached_target
+                        and not x5sec_ready
+                        and nav_target == url
+                        and embedder is None
+                        and passthrough_method == "GET"
+                    ):
+                        self._wait_for_hydration(page, overall_deadline)
+                        if size_guard["exceeded"]:
+                            raise ResponseTooLarge(
+                                url,
+                                int(size_guard["size"]),
+                                max_size,
+                            )
+                        final_document = (
+                            tmd_document_responses[-1]
+                            if tmd_document_responses
+                            else navigation_response
+                        )
+                        captured = _capture_tmd_browser_passthrough(
+                            final_document,
+                            page,
+                            url,
+                            max_size,
+                        )
+                        if captured is not None:
+                            cookies = context.cookies()
+                            passthrough_without_clearance = True
+                            logger.info(
+                                "TMD reached challenge-free browser content "
+                                "without x5sec; returning passthrough (%d bytes)",
+                                len(captured.body),
+                            )
                     solved = x5sec_ready
-                    if not x5sec_ready:
+                    if not solved and captured is None:
                         logger.warning(
-                            "TMD challenge produced no new target-scoped "
-                            "x5sec clearance (widget_solved=%s)",
+                            "TMD challenge produced neither new target-scoped "
+                            "x5sec nor validated browser content "
+                            "(widget_solved=%s target_reached=%s)",
                             widget_solved,
+                            reached_target,
                         )
 
-                captured = None
-                passthrough_method = (
-                    str(replay.get("method", "GET")).upper()
-                    if isinstance(replay, dict)
-                    else "GET"
-                )
                 if (
-                    challenge_absent
+                    captured is None
+                    and challenge_absent
                     and nav_target == url
                     and embedder is None
                     and passthrough_method == "GET"
@@ -3163,7 +3325,10 @@ class BrowserSolver:
                     extras=extras,
                     response=captured,
                     browser_version=self._browser_version,
-                    challenge_absent=challenge_absent and captured is not None,
+                    challenge_absent=(
+                        passthrough_without_clearance
+                        or (challenge_absent and captured is not None)
+                    ),
                 )
 
             except ResponseTooLarge:
@@ -3343,24 +3508,92 @@ class BrowserSolver:
                 # the same per-WAF handler the solve path uses, then let the
                 # page settle again. Returning the interstitial without trying
                 # would make render useless on any protected site.
+                # Gated on the SAME classifier the session applies to the
+                # returned body, not on a narrower structural marker list. The
+                # old prefilter knew nothing about TMD, so an Alibaba punish
+                # page skipped the solve entirely and was handed back for the
+                # session to reject as a challenge -- render could never clear
+                # a WAF the transport path clears routinely. Solving in place
+                # is a no-op when the classifier finds nothing.
                 solved_challenge = False
-                if html and _is_passthrough_challenge_html(html):
+                if html:
+                    nav_status = 200
+                    if navigation_response is not None:
+                        try:
+                            nav_status = int(navigation_response.status)
+                        except (TypeError, ValueError):
+                            nav_status = 200
                     solved = self._solve_challenge_in_place(
                         page,
                         url,
                         html,
                         overall_deadline,
+                        nav_status,
                     )
                     if solved:
                         solved_challenge = True
-                        self._wait_for_hydration(page, overall_deadline)
-                        if size_guard["exceeded"]:
-                            raise ResponseTooLarge(
+                        from wafer._challenge import detect_challenge
+
+                        # Replay the original navigation with the clearance
+                        # state the solve just earned. The solve's own target
+                        # navigation can leave a same-URL transition document
+                        # in the page; waiting on that document alone was
+                        # intermittent, while the transport solve path
+                        # reliably retries the original request with the new
+                        # cookies. Keep navigation, hydration, and capture
+                        # inside one short post-solve budget.
+                        # A phase bound, clamped to the caller's deadline. Two
+                        # measured failure modes bracket this: at 20s a heavy
+                        # page (Alibaba search is ~2.5MB) was captured mid
+                        # re-navigation and a working solve was discarded,
+                        # while with no bound at all a page that never clears
+                        # polled to the caller's timeout and returned no
+                        # document, turning an informative ChallengeDetected at
+                        # 44s into a ConnectionFailed at 155s. Worst case is
+                        # now solve time plus this window.
+                        settle_deadline = min(
+                            overall_deadline,
+                            time.monotonic() + _RENDER_POST_SOLVE_SECONDS,
+                        )
+                        try:
+                            refreshed_response = page.goto(
                                 url,
-                                int(size_guard["size"]),
-                                max_size,
+                                wait_until="domcontentloaded",
+                                timeout=_navigation_budget_ms(settle_deadline),
                             )
-                        html = self._bounded_page_content(page, max_size)
+                            if refreshed_response is not None:
+                                navigation_response = refreshed_response
+                                try:
+                                    nav_status = int(refreshed_response.status)
+                                except (TypeError, ValueError):
+                                    nav_status = 200
+                        except Exception as exc:
+                            logger.debug(
+                                "Post-solve render navigation timeout/error (%s)",
+                                type(exc).__name__,
+                            )
+                        self._wait_for_hydration(page, settle_deadline)
+                        while True:
+                            if size_guard["exceeded"]:
+                                raise ResponseTooLarge(
+                                    url,
+                                    int(size_guard["size"]),
+                                    max_size,
+                                )
+                            candidate = self._bounded_page_content(page, max_size)
+                            if candidate:
+                                html = candidate
+                                if (
+                                    detect_challenge(
+                                        nav_status,
+                                        {"content-type": "text/html"},
+                                        html,
+                                    )
+                                    is None
+                                ):
+                                    break
+                            if not _sleep_before_deadline(settle_deadline, 0.5):
+                                break
                 if not html and max_size is not None:
                     # _bounded_page_content returns "" for both an absent
                     # document and one over the cap. Ask which it was, so a DOM
@@ -3507,6 +3740,7 @@ class BrowserSolver:
         url: str,
         html: str,
         deadline: float,
+        status: int = 200,
     ) -> bool:
         """Run the per-WAF handler on the interstitial a render landed on.
 
@@ -3521,15 +3755,19 @@ class BrowserSolver:
         remaining_ms = int((deadline - time.monotonic()) * 1000)
         if remaining_ms <= 0:
             return False
-        # Classified against 403 rather than the real navigation status: the
-        # DOM already tested positive as an interstitial, and several WAFs'
-        # body markers are gated on a blocking status, so a challenge served
-        # in place as 200 would hide them from the detector.
-        challenge = detect_challenge(
-            403,
-            {"content-type": "text/html"},
-            html,
-        )
+        # The real status first: TMD's punish page is only recognized at 200,
+        # so classifying everything as 403 turned every Alibaba slider into a
+        # generic JS wait that never ran the drag. Then 403 as a fallback,
+        # because other WAFs gate their body markers on a blocking status and
+        # would hide from a challenge served in place as 200.
+        headers = {"content-type": "text/html"}
+        challenge = detect_challenge(status, headers, html)
+        if (
+            challenge is None
+            and status != 403
+            and _is_passthrough_challenge_html(html)
+        ):
+            challenge = detect_challenge(403, headers, html)
         if challenge is None:
             return False
         logger.info(
@@ -3566,7 +3804,10 @@ class BrowserSolver:
         capped and both fall through instead of failing.
         """
 
-        idle_ms = int(max(0.0, deadline - time.monotonic()) * 1000 * 0.5)
+        settle_deadline = min(deadline, time.monotonic() + _RENDER_SETTLE_CAP)
+        idle_ms = int(
+            max(0.0, settle_deadline - time.monotonic()) * 1000 * 0.5
+        )
         if idle_ms > 0:
             try:
                 page.wait_for_load_state("networkidle", timeout=idle_ms)
@@ -3575,7 +3816,6 @@ class BrowserSolver:
                     "Render: network did not go idle within %dms",
                     idle_ms,
                 )
-        settle_deadline = min(deadline, time.monotonic() + _RENDER_SETTLE_CAP)
         previous = -1
         stable = 0
         while stable < _RENDER_STABLE_POLLS and time.monotonic() < settle_deadline:

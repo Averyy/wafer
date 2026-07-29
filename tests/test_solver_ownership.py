@@ -131,3 +131,44 @@ class TestAutoCreatedSolver:
         with pytest.raises(ValueError, match="IOS_SAFARI"):
             session._ensure_browser_solver()
         assert session._browser_solver is None
+
+
+class TestOwnedSolverCloseIsBounded:
+    """A wedged browser worker must not hang the caller on the way out.
+
+    close() defaults to waiting forever. A render that correctly honoured its
+    own timeout still hung the process for 15+ minutes because __exit__ then
+    waited unbounded on a worker stuck against a dead browser.
+    """
+
+    class _RecordingSolver:
+        def __init__(self):
+            self.close_kwargs = None
+
+        def close(self, timeout=None):
+            self.close_kwargs = {"timeout": timeout}
+
+    def test_exit_passes_a_bound(self):
+        solver = self._RecordingSolver()
+        session, _ = make_sync_session([ok()], browser_solver=solver, owns_solver=True)
+        with session:
+            pass
+        assert solver.close_kwargs is not None, "owned solver must be closed"
+        bound = solver.close_kwargs["timeout"]
+        assert bound is not None and 0 < bound <= 30
+
+    def test_solver_without_a_timeout_kwarg_is_still_closed(self):
+        """A custom solver must not be left open by an unexpected keyword."""
+        solver = FakeSolver()
+        session, _ = make_sync_session([ok()], browser_solver=solver, owns_solver=True)
+        with session:
+            pass
+        assert solver.close_calls == 1
+
+    async def test_async_exit_passes_a_bound(self):
+        solver = self._RecordingSolver()
+        session, _ = make_async_session([ok()], browser_solver=solver, owns_solver=True)
+        async with session:
+            pass
+        assert solver.close_kwargs is not None
+        assert 0 < solver.close_kwargs["timeout"] <= 30

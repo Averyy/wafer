@@ -72,6 +72,10 @@ from wafer._solvers import (
 
 logger = logging.getLogger("wafer")
 
+# Bound on closing a solver the session created itself, so a wedged
+# browser worker cannot hang the caller during shutdown.
+_OWNED_SOLVER_CLOSE_SECONDS = 10.0
+
 
 class SyncSession(BaseSession):
     """Synchronous HTTP session with anti-detection defaults.
@@ -430,7 +434,16 @@ class SyncSession(BaseSession):
             remaining = deadline - time.monotonic()
             solve_timeout = _browser_solve_timeout(remaining)
             if solve_timeout <= 0:
-                logger.debug("No time budget left for browser solve")
+                # Warning, not debug: this is the one path where a detected
+                # challenge produces no solver output at all, and at INFO the
+                # silence reads as "the solver never engaged" rather than
+                # "the budget was already spent".
+                logger.warning(
+                    "Skipping browser solve for %s: no time budget left "
+                    "(challenge_type=%s)",
+                    url,
+                    challenge.value,
+                )
                 return False
 
         # solve_origin generalizes the Imperva embedder to every challenge:
@@ -659,14 +672,17 @@ class SyncSession(BaseSession):
             except Exception as exc:
                 logger.debug("Failed to seed native-TLS jar (%s)", type(exc).__name__)
 
-        # Passthrough: browser got real content without solving. TMD/Baxia is
-        # different: Alibaba's post-slider page can be a small CSR shell while
-        # the same cookies unlock the authoritative SSR response over wreq.
-        # Always replay TMD through the normal transport instead of returning
-        # that incomplete shell as successful content.
-        if result.response is not None and challenge not in (
-            ChallengeType.TMD,
-            ChallengeType.REDDIT,
+        # Passthrough: browser got validated real content. TMD normally replays
+        # a new x5sec through wreq, but some Alibaba pages mint no transferable
+        # token; BrowserSolver marks only a challenge-free, exact-URL GET as a
+        # no-clearance passthrough. Never return an unvalidated TMD shell.
+        if (
+            result.response is not None
+            and challenge is not ChallengeType.REDDIT
+            and (
+                challenge is not ChallengeType.TMD
+                or challenge_absent_passthrough
+            )
         ):
             body_bytes = result.response.body
             # Enforce the response-size cap on the browser body too (it never
@@ -2082,6 +2098,22 @@ class SyncSession(BaseSession):
         # here would tear it down for every other session holding it.
         if self._browser_solver is not None and self._owns_solver:
             try:
-                self._browser_solver.close()
+                # Bounded: close() defaults to waiting forever, and a worker
+                # wedged on a dead browser then hangs the caller on the way
+                # out -- turning a render that correctly honoured its own
+                # timeout into a process that never returns. The queued close
+                # stays ordered behind the stuck task and reaps the browser
+                # when it unwedges; the caller does not wait for it.
+                # A custom solver whose close() takes no timeout still gets
+                # closed rather than dying on an unexpected keyword.
+                if _callable_accepts_keyword(
+                    self._browser_solver.close,
+                    "timeout",
+                ):
+                    self._browser_solver.close(
+                        timeout=_OWNED_SOLVER_CLOSE_SECONDS
+                    )
+                else:
+                    self._browser_solver.close()
             except Exception:
                 logger.debug("BrowserSolver.close() failed")

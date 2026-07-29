@@ -25,6 +25,32 @@ transport client hints must carry the same four-part Chrome version; startup
 achieves that by pinning wafer's UA and hints onto the installed browser, so a
 Chrome auto-update logs a warning rather than disabling every solver.
 
+**Transport clearance vs browser content (2026-07-29)**: a new/changed
+target-scoped `x5sec` is authoritative evidence that the HTTP transport can
+replay the request. Exact target navigation is a separate browser-only outcome:
+the DOM must no longer classify as TMD, and the validated document may be
+returned for that GET without claiming future wreq requests are cleared.
+
+This distinction fixed a false success on `alibaba.com/trade/search`. The page
+could remain at the exact application URL after the slider iframe disappeared
+while its main DOM was still the 119KB `Captcha Interception` punishment page.
+The old predicate called that solved, imported only `arms_uid`/`tfstk`, and then
+received TMD on every transport replay. Iframe disappearance is now
+intermediate evidence only, and the cookie/target poll is independently bounded
+by `_TMD_CLEARANCE_POLL_SECONDS`.
+
+Live verification after the fix triggered TMD on the first Alibaba search:
+the first drag minted a fresh target-scoped `x5sec`, and wreq replay returned
+200 / 706,018 bytes of real results in 21.05s. `session.render()` independently
+triggered and solved TMD, then returned the settled 2,563,704-byte search page
+in 27.1s.
+
+A budget already spent by such a wasted attempt makes a *later* request skip
+its browser solve entirely, which is why a failing capture can show
+`Challenge detected: tmd` with zero Baxia lines. That skip now logs at WARNING
+rather than DEBUG, so the silence is explained in the log rather than looking
+like the drag solver never engaging.
+
 **Dispatch**: `challenge_type="tmd"` or `"baxia"` routes to `solve_baxia()` in `_solver.py`.
 
 ## Architecture
@@ -61,10 +87,11 @@ wafer/browser/
 2. Punish page has no `<head>` -bare `<script>` tag with redirect + config
 3. Redirect loads NoCaptcha SDK which renders slider widget
 4. User drags slider → behavioral payload sent server-side
-5. On success: the page reaches the exact safe callback from the immutable
-   issued URL, or mints a new/changed target-scoped `x5sec`
-6. The outer solver independently checks that clearance against Alibaba's
-   strict callback or AliExpress's native MTop retry before replaying HTTP
+5. On success, the browser either mints a new/changed target-scoped `x5sec` or
+   reaches a challenge-free exact application document
+6. The outer solver replays HTTP only for `x5sec`; a challenge-free document
+   without transferable clearance is returned as browser passthrough for that
+   GET
 
 Wafer is normally invoked with the original application URL whose response
 contains the punishment redirect. That immutable URL is the exact retry
@@ -108,19 +135,21 @@ voices natively.
 
 ### Authoritative Result Detection
 
-Widget text/classes are intermediate signals only. A solve requires either:
+Widget text/classes, iframe disappearance, and an unchanged application URL are
+intermediate signals only. Transport replay requires:
 
-- navigation to the exact credential-free HTTPS callback encoded in the
-  immutable issued punishment URL, on the same Alibaba/AliExpress family, or
 - a new/changed, non-empty, unexpired `x5sec` whose domain and path apply to
   the exact original application URL (or the strictly parsed callback when the
   solver was explicitly given a punishment URL).
 
-Arbitrary navigation away from the punishment page (including login, error,
-captcha, or cousin-domain URLs) is not success. The outer TMD gate repeats the
-cookie-scope check against the original application target, Alibaba's strict
-callback, or AliExpress's native MTop endpoint as appropriate; cookies never
-cross those domain families.
+An exact application target/callback whose main DOM no longer detects as TMD
+can instead be captured as browser-only content for a GET. It is not treated as
+transferable clearance. Arbitrary navigation away from the punishment page
+(including login, error, captcha, or cousin-domain URLs), a missing iframe with
+punishment markup still present, and a small transition shell are not success.
+The outer TMD gate repeats the cookie-scope check against the original
+application target, Alibaba's strict callback, or AliExpress's native MTop
+endpoint as appropriate; cookies never cross those domain families.
 
 ### Widget Destruction = Rejection
 

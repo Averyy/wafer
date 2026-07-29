@@ -394,11 +394,14 @@ bootstrap fails:
 - **Amazon CAPTCHA** -Parses the captcha form and submits it programmatically.
 - **TMD (Alibaba TMD)** -First warms the session by fetching the homepage.
   If the issued punishment flow persists, the configured browser handles its
-  Baxia slider or reCAPTCHA and must return a new target-scoped `x5sec`.
-  A rejected Baxia document is discarded. When the total request deadline can
-  fund them, wafer tries up to three fresh browser contexts with distinct
-  recorded drags and a fair share of the remaining time, reserving up to 15
-  seconds for the authoritative native-HTTP replay.
+  Baxia slider or reCAPTCHA. A new target-scoped `x5sec` is imported for the
+  authoritative native-HTTP replay. If Chrome instead reaches a validated,
+  challenge-free exact GET document without transferable clearance, wafer
+  returns that browser response directly and does not claim later HTTP requests
+  are unlocked. A rejected or still-challenged Baxia document is discarded.
+  When the total request deadline can fund them, wafer tries up to three fresh
+  browser contexts with distinct recorded drags and a fair share of the
+  remaining time, reserving up to 15 seconds for HTTP replay.
 - **Reddit** -On a cold-session JSON block or direct 200 HTML verification
   page, performs New Reddit's logged-out verification at
   `https://www.reddit.com/` in the same TLS session, then replays the original
@@ -724,6 +727,11 @@ clearance survives the next ordinary request. Verified on `miata.net`
 page in ~7s, and the follow-up `session.get()` returns 200 with no challenge. If the document is still a challenge
 after that, `ChallengeDetected` is raised rather than the interstitial being
 returned as content.
+
+Rendered challenge classification starts with the document's real status.
+Blocking-status fallback detection is limited to structurally recognized
+interstitials, so an ordinary 200 page that merely references a WAF-related
+script name is not routed into the wrong solver.
 
 ### Solving on an origin page (`solve_origin`)
 
