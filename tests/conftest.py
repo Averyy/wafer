@@ -9,6 +9,7 @@ from wafer._base import (
     DEFAULT_EMULATION,
     DEFAULT_HEADERS,
     DEFAULT_TIMEOUT,
+    _new_reddit_bootstrap_stats,
     _normalize_timeout,
 )
 from wafer._fingerprint import FingerprintManager
@@ -385,6 +386,7 @@ def make_sync_session(responses, **session_kwargs):
     session._pool_strikes = {}
     session._cookie_cache = session_kwargs.get("cookie_cache", None)
     session._cookie_scopes = {}
+    session._reddit_bootstrap_stats = _new_reddit_bootstrap_stats()
     session._rate_limiter = session_kwargs.get("rate_limiter", None)
     session._domain_failures = {}
     session._last_url = {}
@@ -486,6 +488,7 @@ def make_async_session(responses, **session_kwargs):
     session._pool_strikes = {}
     session._cookie_cache = session_kwargs.get("cookie_cache", None)
     session._cookie_scopes = {}
+    session._reddit_bootstrap_stats = _new_reddit_bootstrap_stats()
     session._rate_limiter = session_kwargs.get("rate_limiter", None)
     session._domain_failures = {}
     session._last_url = {}

@@ -57,9 +57,22 @@ from wafer._profiles import Profile
 from wafer._response import HistoryEntry, WaferResponse, resolve_charset
 from wafer._retry import RetryState, calculate_backoff, parse_retry_after
 from wafer._solvers import (
+    REDDIT_BROWSER_OUTCOME_ESTABLISHED,
+    REDDIT_BROWSER_OUTCOME_FAILED,
+    REDDIT_BROWSER_OUTCOME_NO_TIME_BUDGET,
+    REDDIT_BROWSER_OUTCOME_UNAVAILABLE,
     REDDIT_CACHE_DOMAIN,
     REDDIT_GATE_MAX_BYTES,
+    REDDIT_OUTCOME_COOKIE_EVIDENCE,
+    REDDIT_OUTCOME_ESTABLISHED,
+    REDDIT_OUTCOME_SUBMISSION_STATUS,
+    REDDIT_OUTCOME_TRANSPORT,
+    REDDIT_OUTCOME_VERIFICATION_ENCODING,
+    REDDIT_OUTCOME_VERIFICATION_STATUS,
+    REDDIT_OUTCOME_VERIFICATION_STRUCTURE,
+    REDDIT_OUTCOME_VERIFICATION_TOO_LARGE,
     REDDIT_VERIFICATION_MAX_BYTES,
+    format_reddit_cookie_names,
     parse_amazon_captcha,
     parse_reddit_verification,
     reddit_cookie_names,
@@ -193,6 +206,7 @@ class SyncSession(BaseSession):
         origin = reddit_solve_origin(url)
         if origin is None:
             return False
+        self._record_reddit_bootstrap_attempt()
         try:
             verification_resp = self._client.get(
                 origin,
@@ -204,25 +218,81 @@ class SyncSession(BaseSession):
                 verification_resp,
                 cache_domain=REDDIT_CACHE_DOMAIN,
             )
-            if not 200 <= verification_resp.status.as_int() < 300:
-                logger.debug("Reddit bootstrap failed due to verification status")
+            verification_status = verification_resp.status.as_int()
+            verification_names = reddit_cookie_names(verification_cookies)
+            if not 200 <= verification_status < 300:
+                self._record_reddit_bootstrap_outcome(
+                    REDDIT_OUTCOME_VERIFICATION_STATUS,
+                    status=verification_status,
+                    cookie_names=verification_names,
+                )
+                logger.warning(
+                    "Reddit bootstrap failed: GET %s answered HTTP %d "
+                    "(cookies=%s)",
+                    origin,
+                    verification_status,
+                    format_reddit_cookie_names(verification_names),
+                )
                 return False
-            if reddit_has_cookie_evidence(reddit_cookie_names(verification_cookies)):
+            if reddit_has_cookie_evidence(verification_names):
+                self._record_reddit_bootstrap_outcome(
+                    REDDIT_OUTCOME_ESTABLISHED,
+                    status=verification_status,
+                    cookie_names=verification_names,
+                )
                 logger.info("Reddit anonymous cookies established")
                 return True
 
             logger.info("Reddit verification page fetched")
             try:
-                verification_body = _read_body_capped(
+                verification_bytes = _read_body_capped(
                     verification_resp,
                     REDDIT_VERIFICATION_MAX_BYTES,
-                ).decode("utf-8")
-            except (_CapExceeded, UnicodeDecodeError):
-                logger.debug("Reddit bootstrap failed due to verification structure")
+                )
+            except _CapExceeded as exc:
+                self._record_reddit_bootstrap_outcome(
+                    REDDIT_OUTCOME_VERIFICATION_TOO_LARGE,
+                    status=verification_status,
+                    cookie_names=verification_names,
+                )
+                logger.warning(
+                    "Reddit bootstrap failed: %s body passed the %d-byte "
+                    "verification cap (bytes=%d, cookies=%s)",
+                    origin,
+                    REDDIT_VERIFICATION_MAX_BYTES,
+                    exc.size,
+                    format_reddit_cookie_names(verification_names),
+                )
+                return False
+            try:
+                verification_body = verification_bytes.decode("utf-8")
+            except UnicodeDecodeError:
+                self._record_reddit_bootstrap_outcome(
+                    REDDIT_OUTCOME_VERIFICATION_ENCODING,
+                    status=verification_status,
+                    cookie_names=verification_names,
+                )
+                logger.warning(
+                    "Reddit bootstrap failed: %s body was not UTF-8 "
+                    "(bytes=%d)",
+                    origin,
+                    len(verification_bytes),
+                )
                 return False
             verification = parse_reddit_verification(verification_body)
             if verification is None:
-                logger.debug("Reddit bootstrap failed due to verification structure")
+                self._record_reddit_bootstrap_outcome(
+                    REDDIT_OUTCOME_VERIFICATION_STRUCTURE,
+                    status=verification_status,
+                    cookie_names=verification_names,
+                )
+                logger.warning(
+                    "Reddit bootstrap failed: %s served no recognizable "
+                    "verification form (bytes=%d, cookies=%s)",
+                    origin,
+                    len(verification_bytes),
+                    format_reddit_cookie_names(verification_names),
+                )
                 return False
 
             # Build the query into the URL. Raw wreq requests silently ignore
@@ -240,24 +310,61 @@ class SyncSession(BaseSession):
                 solved_resp,
                 cache_domain=REDDIT_CACHE_DOMAIN,
             )
-            if not 200 <= solved_resp.status.as_int() < 300:
-                logger.debug("Reddit bootstrap failed due to submission status")
+            solved_status = solved_resp.status.as_int()
+            solved_names = reddit_cookie_names(solved_cookies)
+            # Log the validated action URL, never ``submission_url``: the query
+            # carries the verification token and its solution.
+            if not 200 <= solved_status < 300:
+                self._record_reddit_bootstrap_outcome(
+                    REDDIT_OUTCOME_SUBMISSION_STATUS,
+                    status=solved_status,
+                    cookie_names=solved_names,
+                )
+                logger.warning(
+                    "Reddit bootstrap failed: verification submitted to %s "
+                    "answered HTTP %d (cookies=%s)",
+                    verification.action_url,
+                    solved_status,
+                    format_reddit_cookie_names(solved_names),
+                )
                 return False
-            if not reddit_has_cookie_evidence(reddit_cookie_names(solved_cookies)):
-                logger.debug("Reddit bootstrap failed due to cookie evidence")
+            if not reddit_has_cookie_evidence(solved_names):
+                self._record_reddit_bootstrap_outcome(
+                    REDDIT_OUTCOME_COOKIE_EVIDENCE,
+                    status=solved_status,
+                    cookie_names=solved_names,
+                )
+                logger.warning(
+                    "Reddit bootstrap failed: %s accepted the verification "
+                    "(HTTP %d) but set no anonymous cookies (cookies=%s, "
+                    "expected loid plus token_v2 or csv)",
+                    verification.action_url,
+                    solved_status,
+                    format_reddit_cookie_names(solved_names),
+                )
                 return False
             logger.info("Reddit verification submitted")
+            self._record_reddit_bootstrap_outcome(
+                REDDIT_OUTCOME_ESTABLISHED,
+                status=solved_status,
+                cookie_names=solved_names,
+            )
             logger.info("Reddit anonymous cookies established")
             # Do not consume the normal New Reddit homepage body.
             return True
         except WaferTimeout:
             raise
-        except Exception:
-            # Never attach exc_info here: wreq exceptions may contain the
-            # solved query URL, including its token and solution.
+        except Exception as exc:
+            # Report the exception type only -- never exc_info or the message:
+            # wreq exceptions may contain the solved query URL, including its
+            # token and solution.
             if deadline is not None and time.monotonic() >= deadline:
                 raise WaferTimeout(url, total_timeout) from None
-            logger.debug("Reddit bootstrap failed during transport")
+            self._record_reddit_bootstrap_outcome(REDDIT_OUTCOME_TRANSPORT)
+            logger.warning(
+                "Reddit bootstrap failed during transport (%s)",
+                type(exc).__name__,
+            )
             return False
 
     def _try_reddit_browser_bootstrap(
@@ -268,8 +375,26 @@ class SyncSession(BaseSession):
         """Recover a failed inline bootstrap on Reddit's fixed HTML origin."""
 
         origin = reddit_solve_origin(url)
-        if self._browser_solver is None or origin is None:
+        if origin is None:
             return False
+        if self._browser_solver is None:
+            self._record_reddit_browser_outcome(
+                REDDIT_BROWSER_OUTCOME_UNAVAILABLE,
+                attempted=False,
+            )
+            logger.debug("No browser solver to recover the Reddit bootstrap")
+            return False
+        # A browser solve that starts with no budget left is skipped inside
+        # _try_browser_solve; classify it here so the failure is not reported
+        # as "the browser tried and could not solve it". Report the budget
+        # either way: a solve given two seconds cannot load Reddit's root, and
+        # that is indistinguishable from a blocked browser without the number.
+        budget = (
+            None
+            if deadline is None
+            else _browser_solve_timeout(deadline - time.monotonic())
+        )
+        no_budget = budget is not None and budget <= 0
         # Deliberately do not pass the caller's max_response_size. This fixed
         # HTML root is internal challenge overhead and is never returned; the
         # cap still applies to the original response replayed through wreq.
@@ -281,8 +406,24 @@ class SyncSession(BaseSession):
             use_solve_origin=False,
         )
         if not result:
-            logger.debug("Reddit browser bootstrap failed")
+            self._record_reddit_browser_outcome(
+                REDDIT_BROWSER_OUTCOME_NO_TIME_BUDGET
+                if no_budget
+                else REDDIT_BROWSER_OUTCOME_FAILED,
+                attempted=not no_budget,
+                budget=budget,
+            )
+            logger.warning(
+                "Reddit browser bootstrap established no anonymous cookies "
+                "(reason=%s, budget=%s)",
+                "no_time_budget" if no_budget else "solve_failed",
+                "unbounded" if budget is None else f"{budget:.1f}s",
+            )
             return False
+        self._record_reddit_browser_outcome(
+            REDDIT_BROWSER_OUTCOME_ESTABLISHED,
+            budget=budget,
+        )
         logger.info("Reddit anonymous cookies established in browser")
         return True
 

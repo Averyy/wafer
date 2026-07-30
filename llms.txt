@@ -321,6 +321,41 @@ session.cookie_scope_summary(url: str) -> list[dict]
 # Cookie values are never included. Returns [] for profiles with no wreq jar
 # (Opera Mini) and never raises.
 
+session.reddit_bootstrap_state() -> dict
+# Value-free state of the anonymous Reddit bootstrap for this session:
+#   "attempts": int          - inline bootstraps that reached the network
+#   "successes": int         - bootstraps (inline or browser) that established
+#                              the anonymous cookie set
+#   "last_outcome": str|None - branch that ended the last inline bootstrap:
+#                              "established", "verification_status",
+#                              "verification_too_large",
+#                              "verification_encoding",
+#                              "verification_structure", "submission_status",
+#                              "cookie_evidence", "transport",
+#                              "client_rotated" (abandoned mid-leg by a
+#                              concurrent rotation, then retried)
+#   "last_status": int|None  - HTTP status of the leg that outcome came from
+#   "last_cookie_names": list[str] - Set-Cookie names seen on that leg
+#   "browser_attempts": int  - browser recoveries started
+#   "last_browser_outcome": str|None - "established", "failed",
+#                              "no_time_budget", "unavailable"
+#   "last_browser_budget": float|None - seconds the last browser recovery was
+#                              given (None when the request carried no deadline
+#                              or no recovery ran). A small number here is why
+#                              a browser solve failed.
+#   "cookie_names": list[str] - reddit.com cookie names in the jar right now,
+#                              including a warm cache_dir hydrated at
+#                              construction
+#   "has_cookie_evidence": bool - whether those names prove anonymous setup
+#                              (loid plus token_v2 or csv). This is the
+#                              hydration-aware answer to "is this session set
+#                              up for Reddit"; cookie_scope_summary() reflects
+#                              only cookies observed so far.
+# Names, counts, and labels only - never cookie values, the verification token,
+# or the solved submission query. Counters are per session and never reset.
+# Each failure branch also logs one WARNING carrying the same context, so a
+# consumer that configures logging sees the reason without polling this.
+
 # Browser-free reCAPTCHA v3 token minting (sync on SyncSession; coroutine on AsyncSession):
 session.mint_recaptcha_v3(sitekey: str, action: str, *, origin=None, referer=None,
                           v=None, enterprise=False) -> str
@@ -887,7 +922,11 @@ original method/body through wreq. It never browser-navigates the JSON URL or
 returns browser HTML as the API response. Reddit's fixed root overrides
 `solve_origin` for this recovery. `cache_dir`
 persists the durable cookie-setting response legs so later processes can start
-warm. Explicit `old.reddit.com` requests are fetched normally, but wafer never
+warm. A bootstrap that fails logs one WARNING naming the branch (verification
+status, oversize or non-UTF-8 body, unrecognized form, submission status,
+missing cookie evidence, transport) with the HTTP status and the Set-Cookie
+names observed; `session.reddit_bootstrap_state()` returns the same information
+for a caller that needs it programmatically. Explicit `old.reddit.com` requests are fetched normally, but wafer never
 selects Old Reddit automatically or uses it as a fallback. A login wall from
 an explicit Old Reddit request is returned normally.
 

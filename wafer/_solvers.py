@@ -167,6 +167,30 @@ REDDIT_VERIFICATION_MAX_BYTES = 32 * 1024
 # response.
 REDDIT_GATE_MAX_BYTES = 256 * 1024
 
+# Value-free outcome labels for one anonymous-bootstrap attempt. Surfaced by
+# BaseSession.reddit_bootstrap_state() and used in the bootstrap's log lines so
+# a failed anonymous setup names the branch that produced it.
+REDDIT_OUTCOME_ESTABLISHED = "established"
+REDDIT_OUTCOME_VERIFICATION_STATUS = "verification_status"
+REDDIT_OUTCOME_VERIFICATION_TOO_LARGE = "verification_too_large"
+REDDIT_OUTCOME_VERIFICATION_ENCODING = "verification_encoding"
+REDDIT_OUTCOME_VERIFICATION_STRUCTURE = "verification_structure"
+REDDIT_OUTCOME_SUBMISSION_STATUS = "submission_status"
+REDDIT_OUTCOME_COOKIE_EVIDENCE = "cookie_evidence"
+REDDIT_OUTCOME_TRANSPORT = "transport"
+REDDIT_OUTCOME_CLIENT_ROTATED = "client_rotated"
+REDDIT_BROWSER_OUTCOME_ESTABLISHED = "established"
+REDDIT_BROWSER_OUTCOME_FAILED = "failed"
+REDDIT_BROWSER_OUTCOME_NO_TIME_BUDGET = "no_time_budget"
+REDDIT_BROWSER_OUTCOME_UNAVAILABLE = "unavailable"
+
+# Cookie names are safe to report (unlike values), but they arrive from a
+# response header, so bound the count and reject anything outside the RFC 6265
+# token characters actually used by Reddit rather than putting header bytes in
+# a log line.
+_REDDIT_MAX_REPORTED_COOKIE_NAMES = 32
+_REDDIT_SAFE_COOKIE_NAME = re.compile(r"[A-Za-z0-9_.-]{1,64}")
+
 _REDDIT_TITLE = "Reddit - Please wait for verification"
 _REDDIT_FIELDS = frozenset({
     "solution",
@@ -287,6 +311,27 @@ def reddit_cookie_names(raw_values) -> frozenset[str]:
         if separator and name:
             names.add(name)
     return frozenset(names)
+
+
+def reddit_cookie_name_summary(names) -> tuple[str, ...]:
+    """Sort and bound cookie names for logs and diagnostics.
+
+    Names only; a value never reaches this function. Names that are not plain
+    tokens are dropped: they cannot be part of Reddit's anonymous cookie set,
+    and reporting them would put arbitrary header bytes in a log line. Decide
+    cookie evidence from the full set, never from this summary.
+    """
+    safe = sorted(
+        name
+        for name in names
+        if _REDDIT_SAFE_COOKIE_NAME.fullmatch(str(name))
+    )
+    return tuple(safe[:_REDDIT_MAX_REPORTED_COOKIE_NAMES])
+
+
+def format_reddit_cookie_names(names) -> str:
+    """Render a cookie-name summary for one log line."""
+    return ",".join(reddit_cookie_name_summary(names)) or "none"
 
 
 def reddit_has_cookie_evidence(names) -> bool:

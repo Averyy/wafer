@@ -1409,3 +1409,492 @@ class TestRedditBootstrapAsync:
         assert session._reddit_bootstrap_client_generation == (
             session._client_generation
         )
+
+
+class _NonUtf8Response(MockResponse):
+    """Verification leg whose body is not decodable as UTF-8."""
+
+    def stream(self):
+        from tests.conftest import _MockStreamer
+
+        return _MockStreamer(b"\xff\xfe<html>not utf-8</html>")
+
+
+class _AsyncNonUtf8Response(AsyncMockResponse):
+    def stream(self):
+        from tests.conftest import _MockStreamer
+
+        return _MockStreamer(b"\xff\xfe<html>not utf-8</html>")
+
+
+def _oversize_verification_html():
+    # Past REDDIT_VERIFICATION_MAX_BYTES (32 KiB) so the capped read aborts.
+    return _verification_html() + "<!--" + "x" * (33 * 1024) + "-->"
+
+
+def _assert_value_free(state, caplog):
+    """No cookie value, token, or solved solution may be exposed."""
+    rendered = repr(state) + caplog.text
+    assert _TOKEN not in rendered
+    assert _SEED not in rendered
+    assert _SEED + _SEED not in rendered
+    for value in ("loid-value", "token_v2-value", "token", "csrf"):
+        assert f"{value}=" not in rendered.replace("token_v2=", "")
+
+
+class TestRedditBootstrapDiagnostics:
+    """reddit_bootstrap_state() and the named bootstrap failure branches."""
+
+    def test_cold_state_is_empty(self):
+        session, _ = make_sync_session([], use_cookie_jar=True)
+
+        assert session.reddit_bootstrap_state() == {
+            "attempts": 0,
+            "successes": 0,
+            "last_outcome": None,
+            "last_status": None,
+            "last_cookie_names": [],
+            "browser_attempts": 0,
+            "last_browser_outcome": None,
+            "last_browser_budget": None,
+            "cookie_names": [],
+            "has_cookie_evidence": False,
+        }
+
+    @patch("wafer._sync.time.sleep")
+    def test_success_records_established_with_observed_names(
+        self, mock_sleep, caplog
+    ):
+        caplog.set_level(logging.DEBUG, logger="wafer")
+        responses = [
+            _gate_response(),
+            MockResponse(200, {}, _verification_html()),
+            _solved_response(),
+            MockResponse(200, {"content-type": "application/json"}, "{}"),
+        ]
+        session, _ = make_sync_session(responses, use_cookie_jar=True)
+
+        assert session.get(_JSON_URL).status_code == 200
+
+        state = session.reddit_bootstrap_state()
+        assert state["attempts"] == 1
+        assert state["successes"] == 1
+        assert state["last_outcome"] == "established"
+        assert state["last_status"] == 200
+        assert state["last_cookie_names"] == [
+            "csrf_token",
+            "loid",
+            "session_tracker",
+            "token_v2",
+        ]
+        assert state["has_cookie_evidence"] is True
+        _assert_value_free(state, caplog)
+
+    @patch("wafer._sync.time.sleep")
+    def test_verification_status_branch(self, mock_sleep, caplog):
+        caplog.set_level(logging.WARNING, logger="wafer")
+        responses = [
+            _gate_response(),
+            MockResponse(503, {}, "upstream unavailable"),
+            MockResponse(200, {"content-type": "application/json"}, "{}"),
+        ]
+        session, _ = make_sync_session(responses, max_rotations=1)
+
+        assert session.get(_JSON_URL).status_code == 200
+
+        state = session.reddit_bootstrap_state()
+        assert state["last_outcome"] == "verification_status"
+        assert state["last_status"] == 503
+        assert state["last_cookie_names"] == []
+        assert state["successes"] == 0
+        assert (
+            f"GET {REDDIT_SOLVE_ORIGIN} answered HTTP 503" in caplog.text
+        )
+        assert "cookies=none" in caplog.text
+        assert caplog.records[0].levelno == logging.WARNING
+
+    @patch("wafer._sync.time.sleep")
+    def test_oversize_verification_branch_is_distinct(
+        self, mock_sleep, caplog
+    ):
+        caplog.set_level(logging.WARNING, logger="wafer")
+        responses = [
+            _gate_response(),
+            MockResponse(200, {}, _oversize_verification_html()),
+            MockResponse(200, {"content-type": "application/json"}, "{}"),
+        ]
+        session, _ = make_sync_session(responses, max_rotations=1)
+
+        assert session.get(_JSON_URL).status_code == 200
+
+        state = session.reddit_bootstrap_state()
+        assert state["last_outcome"] == "verification_too_large"
+        assert state["last_status"] == 200
+        assert "passed the 32768-byte verification cap" in caplog.text
+        assert "bytes=32784" in caplog.text
+        _assert_value_free(state, caplog)
+
+    @patch("wafer._sync.time.sleep")
+    def test_non_utf8_verification_branch_is_distinct(
+        self, mock_sleep, caplog
+    ):
+        caplog.set_level(logging.WARNING, logger="wafer")
+        responses = [
+            _gate_response(),
+            _NonUtf8Response(200, {}, ""),
+            MockResponse(200, {"content-type": "application/json"}, "{}"),
+        ]
+        session, _ = make_sync_session(responses, max_rotations=1)
+
+        assert session.get(_JSON_URL).status_code == 200
+
+        state = session.reddit_bootstrap_state()
+        assert state["last_outcome"] == "verification_encoding"
+        assert "was not UTF-8" in caplog.text
+        assert "bytes=24" in caplog.text
+
+    @patch("wafer._sync.time.sleep")
+    def test_structure_branch_reports_body_length(self, mock_sleep, caplog):
+        caplog.set_level(logging.WARNING, logger="wafer")
+        unknown = "<html>unknown verification</html>"
+        responses = [
+            _gate_response(),
+            MockResponse(200, {}, unknown),
+            MockResponse(200, {"content-type": "application/json"}, "{}"),
+        ]
+        session, _ = make_sync_session(responses, max_rotations=1)
+
+        assert session.get(_JSON_URL).status_code == 200
+
+        state = session.reddit_bootstrap_state()
+        assert state["last_outcome"] == "verification_structure"
+        assert "no recognizable verification form" in caplog.text
+        assert f"bytes={len(unknown)}" in caplog.text
+
+    @patch("wafer._sync.time.sleep")
+    def test_submission_status_branch(self, mock_sleep, caplog):
+        caplog.set_level(logging.WARNING, logger="wafer")
+        responses = [
+            _gate_response(),
+            MockResponse(200, {}, _verification_html()),
+            _UnreadableResponse(429, {}, ""),
+            MockResponse(200, {"content-type": "application/json"}, "{}"),
+        ]
+        session, _ = make_sync_session(responses, max_rotations=1)
+
+        assert session.get(_JSON_URL).status_code == 200
+
+        state = session.reddit_bootstrap_state()
+        assert state["last_outcome"] == "submission_status"
+        assert state["last_status"] == 429
+        assert (
+            f"verification submitted to {REDDIT_SOLVE_ORIGIN} answered "
+            "HTTP 429" in caplog.text
+        )
+        # The solved query must never reach a log line.
+        _assert_value_free(state, caplog)
+
+    @patch("wafer._sync.time.sleep")
+    def test_cookie_evidence_branch_reports_observed_names(
+        self, mock_sleep, caplog
+    ):
+        caplog.set_level(logging.WARNING, logger="wafer")
+        responses = [
+            _gate_response(),
+            MockResponse(200, {}, _verification_html()),
+            _UnreadableResponse(
+                200,
+                {
+                    "set-cookie": [
+                        "csv=2; Domain=.reddit.com; Path=/",
+                        "edgebucket=edge; Domain=.reddit.com; Path=/",
+                    ]
+                },
+            ),
+            MockResponse(200, {"content-type": "application/json"}, "{}"),
+        ]
+        session, _ = make_sync_session(responses, max_rotations=1)
+
+        assert session.get(_JSON_URL).status_code == 200
+
+        state = session.reddit_bootstrap_state()
+        assert state["last_outcome"] == "cookie_evidence"
+        assert state["last_status"] == 200
+        assert state["last_cookie_names"] == ["csv", "edgebucket"]
+        assert "cookies=csv,edgebucket" in caplog.text
+        assert "expected loid plus token_v2 or csv" in caplog.text
+        _assert_value_free(state, caplog)
+
+    @patch("wafer._sync.time.sleep")
+    def test_transport_branch_names_the_exception_type(
+        self, mock_sleep, caplog
+    ):
+        caplog.set_level(logging.WARNING, logger="wafer")
+        responses = [
+            _gate_response(),
+            MockResponse(200, {}, _verification_html()),
+            RuntimeError("submission transport failed"),
+            MockResponse(200, {"content-type": "application/json"}, "{}"),
+        ]
+        session, _ = make_sync_session(responses, max_rotations=1)
+
+        assert session.get(_JSON_URL).status_code == 200
+
+        state = session.reddit_bootstrap_state()
+        assert state["last_outcome"] == "transport"
+        assert state["last_status"] is None
+        assert (
+            "Reddit bootstrap failed during transport (RuntimeError)"
+            in caplog.text
+        )
+        # The exception message itself stays out of the log.
+        assert "submission transport failed" not in caplog.text
+        _assert_value_free(state, caplog)
+
+    @patch("wafer._sync.time.sleep")
+    def test_browser_fallback_outcomes_are_tracked_separately(
+        self, mock_sleep
+    ):
+        solver = _RecordingBrowserSolver(
+            _browser_result("loid", "token_v2")
+        )
+        responses = [
+            _gate_response(),
+            MockResponse(200, {}, "<html>unknown verification</html>"),
+            MockResponse(200, {"content-type": "application/json"}, "{}"),
+        ]
+        session, _ = make_sync_session(
+            responses,
+            max_rotations=0,
+            browser_solver=solver,
+        )
+
+        assert session.get(_JSON_URL).status_code == 200
+
+        state = session.reddit_bootstrap_state()
+        # The inline branch that failed is still readable after the browser
+        # recovered the session.
+        assert state["last_outcome"] == "verification_structure"
+        assert state["last_browser_outcome"] == "established"
+        assert state["browser_attempts"] == 1
+        assert state["successes"] == 1
+
+    @patch("wafer._sync.time.sleep")
+    def test_failed_browser_fallback_is_reported(self, mock_sleep, caplog):
+        caplog.set_level(logging.WARNING, logger="wafer")
+        solver = _RecordingBrowserSolver(None)
+        responses = [
+            _gate_response(),
+            MockResponse(200, {}, "<html>unknown verification</html>"),
+            MockResponse(200, {"content-type": "application/json"}, "{}"),
+        ]
+        session, _ = make_sync_session(
+            responses,
+            max_rotations=0,
+            browser_solver=solver,
+        )
+
+        session.get(_JSON_URL)
+
+        state = session.reddit_bootstrap_state()
+        assert state["last_browser_outcome"] == "failed"
+        assert state["browser_attempts"] == 1
+        assert state["successes"] == 0
+        # The session's default timeout bounds the fallback, so the budget
+        # it actually got is reported alongside the failure.
+        assert state["last_browser_budget"] > 0
+        assert "reason=solve_failed, budget=" in caplog.text
+
+    @patch("wafer._sync.time.sleep")
+    def test_missing_browser_solver_is_reported_as_unavailable(
+        self, mock_sleep
+    ):
+        responses = [
+            _gate_response(),
+            MockResponse(200, {}, "<html>unknown verification</html>"),
+            MockResponse(200, {"content-type": "application/json"}, "{}"),
+        ]
+        session, _ = make_sync_session(responses, max_rotations=1)
+
+        assert session.get(_JSON_URL).status_code == 200
+
+        state = session.reddit_bootstrap_state()
+        assert state["last_browser_outcome"] == "unavailable"
+        assert state["browser_attempts"] == 0
+
+    def test_exhausted_budget_is_not_reported_as_a_browser_failure(
+        self, caplog
+    ):
+        caplog.set_level(logging.WARNING, logger="wafer")
+        solver = _RecordingBrowserSolver(None)
+        session, _ = make_sync_session([], browser_solver=solver)
+
+        assert (
+            session._try_reddit_browser_bootstrap(
+                _JSON_URL,
+                time.monotonic() - 1,
+            )
+            is False
+        )
+
+        state = session.reddit_bootstrap_state()
+        assert state["last_browser_outcome"] == "no_time_budget"
+        assert state["browser_attempts"] == 0
+        assert state["last_browser_budget"] == 0.0
+        assert solver.calls == []
+        assert "reason=no_time_budget, budget=0.0s" in caplog.text
+
+    def test_state_is_hydration_aware_before_any_request(self, tmp_path):
+        cache = CookieCache(str(tmp_path))
+        cache.save_from_headers(
+            REDDIT_CACHE_DOMAIN,
+            [
+                "loid=anon; Max-Age=63072000; Domain=.reddit.com; Path=/",
+                "token_v2=token; Max-Age=63072000; Domain=.reddit.com; Path=/",
+            ],
+            REDDIT_SOLVE_ORIGIN,
+        )
+        session, _ = make_sync_session(
+            [],
+            cookie_cache=cache,
+            use_cookie_jar=True,
+        )
+        session._hydrate_jar_from_cache()
+
+        state = session.reddit_bootstrap_state()
+        assert state["attempts"] == 0
+        assert state["cookie_names"] == ["loid", "token_v2"]
+        assert state["has_cookie_evidence"] is True
+
+    def test_state_ignores_cookies_outside_the_reddit_namespace(self):
+        session, mock = make_sync_session([], use_cookie_jar=True)
+        mock.cookie_jar.add(
+            "loid=anon; Domain=.example.com; Path=/",
+            "https://www.example.com/",
+        )
+        mock.cookie_jar.add(
+            "token_v2=token; Domain=.notreddit.com; Path=/",
+            "https://www.notreddit.com/",
+        )
+
+        state = session.reddit_bootstrap_state()
+        assert state["cookie_names"] == []
+        assert state["has_cookie_evidence"] is False
+
+    @pytest.mark.asyncio
+    @patch("wafer._async.asyncio.sleep")
+    async def test_async_records_the_same_branch_labels(
+        self, mock_sleep, caplog
+    ):
+        caplog.set_level(logging.WARNING, logger="wafer")
+        responses = [
+            _async_gate_response(),
+            AsyncMockResponse(200, {}, "<html>unknown verification</html>"),
+            AsyncMockResponse(
+                200, {"content-type": "application/json"}, "{}"
+            ),
+        ]
+        session, _ = make_async_session(responses, max_rotations=1)
+
+        resp = await session.get(_JSON_URL)
+
+        assert resp.status_code == 200
+        state = session.reddit_bootstrap_state()
+        assert state["attempts"] == 1
+        assert state["last_outcome"] == "verification_structure"
+        assert state["last_status"] == 200
+        assert state["last_browser_outcome"] == "unavailable"
+        assert "no recognizable verification form" in caplog.text
+
+    @pytest.mark.asyncio
+    @patch("wafer._async.asyncio.sleep")
+    async def test_async_records_established_and_browser_recovery(
+        self, mock_sleep
+    ):
+        solver = _RecordingBrowserSolver(
+            _browser_result("loid", "token_v2")
+        )
+        responses = [
+            _async_gate_response(),
+            AsyncMockResponse(200, {}, "<html>unknown verification</html>"),
+            AsyncMockResponse(
+                200, {"content-type": "application/json"}, "{}"
+            ),
+        ]
+        session, _ = make_async_session(
+            responses,
+            max_rotations=0,
+            browser_solver=solver,
+        )
+
+        resp = await session.get(_JSON_URL)
+
+        assert resp.status_code == 200
+        state = session.reddit_bootstrap_state()
+        assert state["last_outcome"] == "verification_structure"
+        assert state["last_browser_outcome"] == "established"
+        assert state["browser_attempts"] == 1
+        assert state["successes"] == 1
+
+    @pytest.mark.asyncio
+    @patch("wafer._async.asyncio.sleep")
+    async def test_async_non_utf8_branch(self, mock_sleep, caplog):
+        caplog.set_level(logging.WARNING, logger="wafer")
+        responses = [
+            _async_gate_response(),
+            _AsyncNonUtf8Response(200, {}, ""),
+            AsyncMockResponse(
+                200, {"content-type": "application/json"}, "{}"
+            ),
+        ]
+        session, _ = make_async_session(responses, max_rotations=1)
+
+        resp = await session.get(_JSON_URL)
+
+        assert resp.status_code == 200
+        assert session.reddit_bootstrap_state()["last_outcome"] == (
+            "verification_encoding"
+        )
+        assert "was not UTF-8" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_client_rotation_mid_leg_is_labeled_not_counted_as_failure(
+        self,
+    ):
+        old_started = asyncio.Event()
+        release_old = asyncio.Event()
+
+        class OldClient:
+            cookie_jar = MockJar()
+
+            async def get(self, url, **kwargs):
+                old_started.set()
+                await release_old.wait()
+                return AsyncMockResponse(200, {}, _verification_html())
+
+        class NewClient:
+            cookie_jar = MockJar()
+
+            async def get(self, url, **kwargs):
+                if url == REDDIT_SOLVE_ORIGIN:
+                    return AsyncMockResponse(200, {}, _verification_html())
+                return _async_solved_response()
+
+        session, _ = make_async_session([_gate_response()])
+        session._client = OldClient()
+        task = asyncio.create_task(
+            session._try_reddit_bootstrap(_JSON_URL, None, 30.0, 0)
+        )
+        await old_started.wait()
+        session._client = NewClient()
+        session._client_generation += 1
+        release_old.set()
+
+        assert await task == session._client_generation
+
+        state = session.reddit_bootstrap_state()
+        # Both legs counted; the abandoned one is labeled, and the retry on the
+        # replacement client is what the final outcome reflects.
+        assert state["attempts"] == 2
+        assert state["successes"] == 1
+        assert state["last_outcome"] == "established"

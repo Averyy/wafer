@@ -11,6 +11,7 @@ import socket
 import subprocess
 import time
 from html import unescape
+from typing import Any
 from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 
 from wreq import CertStore, Emulation, Method
@@ -33,6 +34,12 @@ from wafer._opera_mini import OperaMiniIdentity
 from wafer._profiles import Profile
 from wafer._ratelimit import RateLimiter
 from wafer._safari import SafariIdentity
+from wafer._solvers import (
+    REDDIT_BROWSER_OUTCOME_ESTABLISHED,
+    REDDIT_OUTCOME_ESTABLISHED,
+    reddit_cookie_name_summary,
+    reddit_has_cookie_evidence,
+)
 
 logger = logging.getLogger("wafer")
 
@@ -76,6 +83,20 @@ _MISSING = object()
 _MAX_COOKIE_SCOPES = 16384
 
 _TMD_PUNISH_SUFFIX = "/_____tmd_____/punish"
+
+
+def _new_reddit_bootstrap_stats() -> dict[str, Any]:
+    """Per-session counters behind reddit_bootstrap_state()."""
+    return {
+        "attempts": 0,
+        "successes": 0,
+        "last_outcome": None,
+        "last_status": None,
+        "last_cookie_names": (),
+        "browser_attempts": 0,
+        "last_browser_outcome": None,
+        "last_browser_budget": None,
+    }
 
 
 def _tmd_is_punish_url(candidate: str | None) -> bool:
@@ -726,6 +747,9 @@ class BaseSession:
         # parent-domain cookies without leaking host-only cookies to siblings.
         # Keyed by the RFC cookie identity (name, normalized domain, path).
         self._cookie_scopes: dict[tuple[str, str, str], bool] = {}
+
+        # Reddit anonymous-bootstrap diagnostics (see reddit_bootstrap_state).
+        self._reddit_bootstrap_stats = _new_reddit_bootstrap_stats()
 
         # Referer chain tracking: last URL fetched per hostname
         self._last_url: dict[str, str] = {}
@@ -2316,3 +2340,115 @@ class BaseSession:
             except Exception:
                 continue
         return summary
+
+    def _reddit_stats(self) -> dict[str, Any]:
+        stats = getattr(self, "_reddit_bootstrap_stats", None)
+        if stats is None:
+            stats = _new_reddit_bootstrap_stats()
+            self._reddit_bootstrap_stats = stats
+        return stats
+
+    def _record_reddit_bootstrap_attempt(self) -> None:
+        """Count one inline bootstrap that reached the network."""
+        stats = self._reddit_stats()
+        stats["attempts"] = stats["attempts"] + 1
+
+    def _record_reddit_bootstrap_outcome(
+        self,
+        outcome: str,
+        *,
+        status: int | None = None,
+        cookie_names=(),
+    ) -> None:
+        """Record which inline bootstrap branch ended the attempt."""
+        stats = self._reddit_stats()
+        stats["last_outcome"] = outcome
+        stats["last_status"] = status
+        stats["last_cookie_names"] = reddit_cookie_name_summary(cookie_names)
+        if outcome == REDDIT_OUTCOME_ESTABLISHED:
+            stats["successes"] = stats["successes"] + 1
+
+    def _record_reddit_browser_outcome(
+        self,
+        outcome: str,
+        *,
+        attempted: bool = True,
+        budget: float | None = None,
+    ) -> None:
+        """Record the browser fallback separately from the inline branch."""
+        stats = self._reddit_stats()
+        stats["last_browser_outcome"] = outcome
+        stats["last_browser_budget"] = budget
+        if attempted:
+            stats["browser_attempts"] = stats["browser_attempts"] + 1
+        if outcome == REDDIT_BROWSER_OUTCOME_ESTABLISHED:
+            stats["successes"] = stats["successes"] + 1
+
+    def _reddit_jar_cookie_names(self) -> frozenset[str]:
+        """Cookie names currently in the wreq jar for the reddit.com space."""
+        client = getattr(self, "_client", None)
+        jar = getattr(client, "cookie_jar", None) if client is not None else None
+        if jar is None:
+            return frozenset()
+        try:
+            cookies = jar.get_all()
+        except Exception:
+            return frozenset()
+        names = set()
+        for cookie in cookies:
+            try:
+                domain = str(cookie.domain).strip(".").lower()
+                name = str(cookie.name)
+            except Exception:
+                continue
+            if domain == "reddit.com" or domain.endswith(".reddit.com"):
+                names.add(name)
+        return frozenset(names)
+
+    def reddit_bootstrap_state(self) -> dict[str, object]:
+        """Return value-free diagnostics for the Reddit anonymous bootstrap.
+
+        Cookie names are reported; cookie values, verification tokens, and the
+        solved submission query never are.
+
+        Keys:
+            attempts: inline bootstraps that reached the network this session.
+            successes: bootstraps (inline or browser) that established the
+                anonymous cookie set.
+            last_outcome: label of the branch that ended the last inline
+                bootstrap -- ``"established"``, ``"verification_status"``,
+                ``"verification_too_large"``, ``"verification_encoding"``,
+                ``"verification_structure"``, ``"submission_status"``,
+                ``"cookie_evidence"``, ``"transport"``,
+                ``"client_rotated"`` (abandoned mid-leg by a concurrent
+                rotation and retried) -- or ``None`` when no bootstrap has run.
+            last_status: HTTP status behind a ``*_status`` outcome, else the
+                status of the leg the outcome came from, else ``None``.
+            last_cookie_names: Set-Cookie names observed on that leg.
+            browser_attempts: browser-fallback solves started this session.
+            last_browser_outcome: ``"established"``, ``"failed"``,
+                ``"no_time_budget"``, ``"unavailable"``, or ``None``.
+            last_browser_budget: seconds the last browser fallback was given,
+                or ``None`` when the request carried no deadline (the solver's
+                own ``solve_timeout`` applied) or no fallback has run. A small
+                number here is why a browser solve failed.
+            cookie_names: reddit.com cookie names in the client jar right now,
+                including a warm ``cache_dir`` hydrated at construction.
+            has_cookie_evidence: whether ``cookie_names`` proves anonymous
+                setup (``loid`` plus ``token_v2`` or ``csv``). This is the
+                hydration-aware answer to "is this session set up for Reddit".
+        """
+        stats = self._reddit_stats()
+        jar_names = self._reddit_jar_cookie_names()
+        return {
+            "attempts": stats["attempts"],
+            "successes": stats["successes"],
+            "last_outcome": stats["last_outcome"],
+            "last_status": stats["last_status"],
+            "last_cookie_names": list(stats["last_cookie_names"]),
+            "browser_attempts": stats["browser_attempts"],
+            "last_browser_outcome": stats["last_browser_outcome"],
+            "last_browser_budget": stats["last_browser_budget"],
+            "cookie_names": list(reddit_cookie_name_summary(jar_names)),
+            "has_cookie_evidence": reddit_has_cookie_evidence(jar_names),
+        }
