@@ -206,12 +206,15 @@ class SyncSession(BaseSession):
         origin = reddit_solve_origin(url)
         if origin is None:
             return False
-        self._record_reddit_bootstrap_attempt()
         try:
-            verification_resp = self._client.get(
-                origin,
-                **self._reddit_subrequest_kwargs(url, deadline, total_timeout),
+            # Build the kwargs first: they raise WaferTimeout when the budget
+            # is already spent, and that attempt never reaches the network, so
+            # counting it would leave a bumped count beside a stale outcome.
+            request_kwargs = self._reddit_subrequest_kwargs(
+                url, deadline, total_timeout
             )
+            self._record_reddit_bootstrap_attempt()
+            verification_resp = self._client.get(origin, **request_kwargs)
             verification_cookies = verification_resp.headers.get_all("set-cookie")
             self._cache_response_cookies(
                 origin,
@@ -380,21 +383,24 @@ class SyncSession(BaseSession):
         if self._browser_solver is None:
             self._record_reddit_browser_outcome(
                 REDDIT_BROWSER_OUTCOME_UNAVAILABLE,
-                attempted=False,
             )
             logger.debug("No browser solver to recover the Reddit bootstrap")
             return False
         # A browser solve that starts with no budget left is skipped inside
-        # _try_browser_solve; classify it here so the failure is not reported
-        # as "the browser tried and could not solve it". Report the budget
-        # either way: a solve given two seconds cannot load Reddit's root, and
-        # that is indistinguishable from a blocked browser without the number.
+        # _try_browser_solve on the same predicate and the same helper; classify
+        # it here so the failure is not reported as "the browser tried and could
+        # not solve it". Keep the two in step if either changes. Report the
+        # budget either way: a solve given two seconds cannot load Reddit's
+        # root, and that is indistinguishable from a blocked browser without
+        # the number.
         budget = (
             None
             if deadline is None
             else _browser_solve_timeout(deadline - time.monotonic())
         )
         no_budget = budget is not None and budget <= 0
+        if not no_budget:
+            self._record_reddit_browser_attempt(budget)
         # Deliberately do not pass the caller's max_response_size. This fixed
         # HTML root is internal challenge overhead and is never returned; the
         # cap still applies to the original response replayed through wreq.
@@ -410,7 +416,6 @@ class SyncSession(BaseSession):
                 REDDIT_BROWSER_OUTCOME_NO_TIME_BUDGET
                 if no_budget
                 else REDDIT_BROWSER_OUTCOME_FAILED,
-                attempted=not no_budget,
                 budget=budget,
             )
             logger.warning(

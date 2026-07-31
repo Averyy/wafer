@@ -1898,3 +1898,140 @@ class TestRedditBootstrapDiagnostics:
         assert state["attempts"] == 2
         assert state["successes"] == 1
         assert state["last_outcome"] == "established"
+
+
+class TestRedditBootstrapAccounting:
+    """Counters stay truthful on the paths that leave the happy path early."""
+
+    @patch("wafer._sync.time.sleep")
+    def test_exhausted_budget_does_not_count_an_inline_attempt(
+        self, mock_sleep
+    ):
+        responses = [
+            _gate_response(),
+            MockResponse(200, {}, "<html>unknown verification</html>"),
+            MockResponse(200, {"content-type": "application/json"}, "{}"),
+        ]
+        session, _ = make_sync_session(responses, max_rotations=1)
+
+        assert session.get(_JSON_URL).status_code == 200
+        before = session.reddit_bootstrap_state()
+        assert before["attempts"] == 1
+        assert before["last_outcome"] == "verification_structure"
+
+        with pytest.raises(WaferTimeout):
+            session._try_reddit_bootstrap(_JSON_URL, time.monotonic() - 1, 30.0)
+
+        after = session.reddit_bootstrap_state()
+        # The spent-budget attempt never reached the network, so it is neither
+        # counted nor allowed to leave the previous outcome beside a bumped
+        # count.
+        assert after["attempts"] == before["attempts"]
+        assert after["last_outcome"] == before["last_outcome"]
+
+    @pytest.mark.asyncio
+    async def test_async_exhausted_budget_does_not_count_an_inline_attempt(
+        self,
+    ):
+        session, _ = make_async_session([])
+
+        with pytest.raises(WaferTimeout):
+            await session._reddit_bootstrap_on_client(
+                session._client,
+                session._client_generation,
+                _JSON_URL,
+                time.monotonic() - 1,
+                30.0,
+            )
+
+        assert session.reddit_bootstrap_state()["attempts"] == 0
+
+    @pytest.mark.asyncio
+    async def test_exception_under_rotation_is_not_a_transport_failure(self):
+        old_started = asyncio.Event()
+        release_old = asyncio.Event()
+
+        class OldClient:
+            cookie_jar = MockJar()
+
+            async def get(self, url, **kwargs):
+                old_started.set()
+                await release_old.wait()
+                # The rotation retired this client out from under the leg.
+                raise RuntimeError("connection reset")
+
+        class NewClient:
+            cookie_jar = MockJar()
+
+            async def get(self, url, **kwargs):
+                if url == REDDIT_SOLVE_ORIGIN:
+                    return AsyncMockResponse(200, {}, _verification_html())
+                return _async_solved_response()
+
+        session, _ = make_async_session([_gate_response()])
+        session._client = OldClient()
+        task = asyncio.create_task(
+            session._try_reddit_bootstrap(_JSON_URL, None, 30.0, 0)
+        )
+        await old_started.wait()
+        session._client = NewClient()
+        session._client_generation += 1
+        release_old.set()
+
+        assert await task == session._client_generation
+
+        state = session.reddit_bootstrap_state()
+        # The exception said nothing about Reddit -- it came from the retired
+        # client -- so it is labeled as the rotation it was and retried on the
+        # replacement instead of being charged to transport.
+        assert state["last_outcome"] == "established"
+        assert state["successes"] == 1
+
+    def test_solver_exception_leaves_the_browser_attempt_recorded(self):
+        class _RaisingSolver(_RecordingBrowserSolver):
+            def solve(self, url, challenge_type=None, **kwargs):
+                self.calls.append((url, challenge_type, kwargs))
+                raise RuntimeError("browser crashed")
+
+        solver = _RaisingSolver()
+        session, _ = make_sync_session([], browser_solver=solver)
+
+        with pytest.raises(RuntimeError):
+            session._try_reddit_browser_bootstrap(_JSON_URL, None)
+
+        state = session.reddit_bootstrap_state()
+        # Counted before the solver ran, so a raise cannot leave the count and
+        # the outcome describing some earlier recovery.
+        assert solver.calls != []
+        assert state["browser_attempts"] == 1
+        assert state["last_browser_outcome"] == "interrupted"
+        assert state["successes"] == 0
+
+    @pytest.mark.asyncio
+    async def test_async_solver_exception_leaves_the_attempt_recorded(self):
+        class _RaisingSolver(_RecordingBrowserSolver):
+            async def asolve(self, url, challenge_type=None, **kwargs):
+                self.calls.append((url, challenge_type, kwargs))
+                raise RuntimeError("browser crashed")
+
+        solver = _RaisingSolver()
+        session, _ = make_async_session([], browser_solver=solver)
+
+        with pytest.raises(RuntimeError):
+            await session._try_reddit_browser_bootstrap(_JSON_URL, None)
+
+        state = session.reddit_bootstrap_state()
+        assert state["browser_attempts"] == 1
+        assert state["last_browser_outcome"] == "interrupted"
+        assert state["successes"] == 0
+
+    def test_a_completed_recovery_overwrites_the_provisional_outcome(self):
+        solver = _RecordingBrowserSolver(_browser_result("loid", "token_v2"))
+        session, _ = make_sync_session([], browser_solver=solver)
+
+        assert session._try_reddit_browser_bootstrap(_JSON_URL, None) is True
+
+        state = session.reddit_bootstrap_state()
+        assert state["browser_attempts"] == 1
+        assert state["last_browser_outcome"] == "established"
+        assert state["successes"] == 1

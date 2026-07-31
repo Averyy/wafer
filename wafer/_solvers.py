@@ -183,6 +183,9 @@ REDDIT_BROWSER_OUTCOME_ESTABLISHED = "established"
 REDDIT_BROWSER_OUTCOME_FAILED = "failed"
 REDDIT_BROWSER_OUTCOME_NO_TIME_BUDGET = "no_time_budget"
 REDDIT_BROWSER_OUTCOME_UNAVAILABLE = "unavailable"
+# Recorded when the recovery starts, and left in place only by a solver that
+# raised: every normal return overwrites it with a real outcome.
+REDDIT_BROWSER_OUTCOME_INTERRUPTED = "interrupted"
 
 # Cookie names are safe to report (unlike values), but they arrive from a
 # response header, so bound the count and reject anything outside the RFC 6265

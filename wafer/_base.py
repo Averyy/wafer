@@ -36,6 +36,7 @@ from wafer._ratelimit import RateLimiter
 from wafer._safari import SafariIdentity
 from wafer._solvers import (
     REDDIT_BROWSER_OUTCOME_ESTABLISHED,
+    REDDIT_BROWSER_OUTCOME_INTERRUPTED,
     REDDIT_OUTCOME_ESTABLISHED,
     reddit_cookie_name_summary,
     reddit_has_cookie_evidence,
@@ -2368,19 +2369,33 @@ class BaseSession:
         if outcome == REDDIT_OUTCOME_ESTABLISHED:
             stats["successes"] = stats["successes"] + 1
 
+    def _record_reddit_browser_attempt(self, budget: float | None = None) -> None:
+        """Count a browser recovery before the solver is invoked.
+
+        Counting on return instead would lose the attempt entirely when the
+        solver raises, leaving ``browser_attempts`` and
+        ``last_browser_outcome`` describing some earlier recovery. The
+        provisional outcome recorded here is what survives that raise; every
+        normal return path overwrites it.
+        """
+        stats = self._reddit_stats()
+        stats["browser_attempts"] = stats["browser_attempts"] + 1
+        stats["last_browser_outcome"] = REDDIT_BROWSER_OUTCOME_INTERRUPTED
+        stats["last_browser_budget"] = budget
+
     def _record_reddit_browser_outcome(
         self,
         outcome: str,
         *,
-        attempted: bool = True,
         budget: float | None = None,
     ) -> None:
-        """Record the browser fallback separately from the inline branch."""
+        """Record how the browser fallback ended, separately from the inline
+        branch. The attempt itself is counted by
+        ``_record_reddit_browser_attempt`` before the solver runs.
+        """
         stats = self._reddit_stats()
         stats["last_browser_outcome"] = outcome
         stats["last_browser_budget"] = budget
-        if attempted:
-            stats["browser_attempts"] = stats["browser_attempts"] + 1
         if outcome == REDDIT_BROWSER_OUTCOME_ESTABLISHED:
             stats["successes"] = stats["successes"] + 1
 
@@ -2427,7 +2442,9 @@ class BaseSession:
             last_cookie_names: Set-Cookie names observed on that leg.
             browser_attempts: browser-fallback solves started this session.
             last_browser_outcome: ``"established"``, ``"failed"``,
-                ``"no_time_budget"``, ``"unavailable"``, or ``None``.
+                ``"no_time_budget"``, ``"unavailable"``, ``"interrupted"``
+                (the solver raised, so the recovery has no result), or
+                ``None``.
             last_browser_budget: seconds the last browser fallback was given,
                 or ``None`` when the request carried no deadline (the solver's
                 own ``solve_timeout`` applied) or no fallback has run. A small
