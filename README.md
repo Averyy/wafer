@@ -816,7 +816,7 @@ How it works:
 
 ## Mouse Recorder (Mousse)
 
-Dev tool for recording human mouse movements and labeling reCAPTCHA training data. Recordings drive PerimeterX press-and-hold, drag/slide puzzle solvers (GeeTest, Baxia/AliExpress), reCAPTCHA grid tile clicking, and browse replay (background mouse/scroll activity during all solver wait loops). Seven recording modes: idle, path, hold, drag (puzzle), slide (full-width "slide to verify"), grid (short tile-to-tile hops for reCAPTCHA 3x3 grids), and browse. Two labeling modes: DET (annotate 4x4 detection grids with ground truth cells, auto-copies to CLS training data) and CLS (label individual 3x3 classification tiles into 16 object classes). See [`wafer/browser/mousse/README.md`](wafer/browser/mousse/README.md) for full documentation.
+Dev tool for recording human mouse movements and labeling reCAPTCHA training data. Recordings drive PerimeterX press-and-hold, drag/slide puzzle solvers (GeeTest, Baxia/AliExpress), reCAPTCHA grid tile clicking, and browse replay (background mouse/scroll activity during all solver wait loops). Seven recording modes: idle, path, hold, drag (puzzle), slide (full-width "slide to verify"), grid (short tile-to-tile hops for reCAPTCHA 3x3 grids), and browse. Slide takes are pace-checked at record time -a slide is a fast confident flick that overshoots the end (0.35-1.40s pressed phase), not a puzzle drag, and takes outside that envelope are discarded. Two labeling modes: DET (annotate 4x4 detection grids with ground truth cells, auto-copies to CLS training data) and CLS (label individual 3x3 classification tiles into 16 object classes). See [`wafer/browser/mousse/README.md`](wafer/browser/mousse/README.md) for full documentation.
 
 ```bash
 uv run python -m wafer.browser.mousse

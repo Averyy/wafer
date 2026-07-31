@@ -1,5 +1,12 @@
 /* Mousse — mouse movement recorder */
 
+// Accepted pressed-phase duration for a slide-to-verify take. Bracketed
+// around a human slide measured on the live Alibaba Baxia widget: 258px in
+// 0.76s. Replay compresses toward the same envelope (_SLIDE_DRAG_SECONDS in
+// wafer/browser/_solver.py); keep the two in step.
+const SLIDE_MIN_DRAG_S = 0.35;
+const SLIDE_MAX_DRAG_S = 1.40;
+
 // ── State ──────────────────────────────────────────────────────────────
 let mode = "idle"; // idle | path | hold | drag | slide_drag | grid | browse | det | cls
 let state = "ready"; // ready | countdown | recording | preview
@@ -576,19 +583,21 @@ function drawGuides() {
       ctx.fillStyle = "#808090";
       ctx.font = "16px monospace";
       ctx.textAlign = "center";
-      ctx.fillText("Slide to verify — approach, pause, then slide right", canvas.width / 2, canvas.height / 2 - 10);
+      ctx.fillText("Slide to verify \u2014 approach, pause, then FLICK right", canvas.width / 2, canvas.height / 2 - 10);
       ctx.font = "12px monospace";
-      ctx.fillText("Press Space to begin (300px track, full-width drag)", canvas.width / 2, canvas.height / 2 + 16);
+      ctx.fillText("Press Space to begin \u2014 300px track, fast confident flick", canvas.width / 2, canvas.height / 2 + 16);
+      ctx.fillStyle = "#e94560";
+      ctx.fillText(`Drag must take ${SLIDE_MIN_DRAG_S}-${SLIDE_MAX_DRAG_S}s \u2014 slower takes are discarded`, canvas.width / 2, canvas.height / 2 + 36);
     } else {
       drawSlideTrack();
       ctx.font = "14px monospace";
       ctx.textAlign = "center";
       if (dragStarted) {
         ctx.fillStyle = "#e94560";
-        ctx.fillText("Slide all the way right \u2014 release at the end!", canvas.width / 2, canvas.height - 20);
+        ctx.fillText("FLICK to the right \u2014 push PAST the end and release!", canvas.width / 2, canvas.height - 20);
       } else if (dragApproached) {
         ctx.fillStyle = "#4ecca3";
-        ctx.fillText("Pause naturally, then click and slide to the right", canvas.width / 2, canvas.height - 20);
+        ctx.fillText("Brief pause, then one fast confident flick right", canvas.width / 2, canvas.height - 20);
       } else {
         ctx.fillStyle = "#808090";
         ctx.fillText("Move cursor to the slider handle", canvas.width / 2, canvas.height - 20);
@@ -2421,6 +2430,29 @@ async function acceptRecording() {
 
     if (Math.abs(dxRange) < 1) {
       showStatus("Slide too short — discarding", "error");
+      discardRecording();
+      return;
+    }
+
+    // A slide-to-verify is a confident flick, not a careful creep. A human
+    // slide captured on the live Alibaba widget crossed a 258px track in
+    // 0.76s (421px/s). The first 15 recordings in this corpus were saved at
+    // 3.1-5.4s (48-84px/s) because nothing here checked, and Baxia rejected
+    // every replay of them. Reject a mis-paced take at record time rather
+    // than discovering it in a live solve.
+    const dragT = points[points.length - 1].t - (dragMousedownT ?? points[0].t);
+    const slidePps = Math.abs(dxRange) / Math.max(dragT, 1e-6);
+    if (dragT > SLIDE_MAX_DRAG_S) {
+      showStatus(
+        `Too slow: ${dragT.toFixed(2)}s at ${slidePps.toFixed(0)}px/s. ` +
+        `Flick it — aim for under ${SLIDE_MAX_DRAG_S}s. Discarded.`, "error");
+      discardRecording();
+      return;
+    }
+    if (dragT < SLIDE_MIN_DRAG_S) {
+      showStatus(
+        `Too fast: ${dragT.toFixed(2)}s. A real hand cannot teleport; ` +
+        `aim for ${SLIDE_MIN_DRAG_S}-${SLIDE_MAX_DRAG_S}s. Discarded.`, "error");
       discardRecording();
       return;
     }

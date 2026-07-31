@@ -1837,6 +1837,7 @@ def _attempt_baxia_drag(
                 exclude_recordings=used_drag_recordings,
                 recording_pool_size=15,
                 approach_from=(bx, by),
+                full_track_slide=True,
             )
             selected_recording = getattr(solver, "_last_drag_recording_name", None)
             if isinstance(selected_recording, str):
@@ -2157,6 +2158,15 @@ def solve_baxia(
     # retry creates a fresh browser context and revisits the immutable
     # application URL; retrying several recordings inside this dead document
     # cannot obtain a new authoritative clearance.
+    #
+    # Measured 2026-07-31, because the widget looks retryable and invites
+    # this change: after a rejection Baxia destroys the widget and recreates
+    # it reset in place (handle back at left == 0), so the retry loop's reset
+    # poll does find a fresh handle. It is not worth taking. Across 5 live
+    # gated requests at max_attempts=2, every single in-widget attempt 2/2
+    # was rejected and every success came from attempt 1 in a fresh context,
+    # while failures grew from ~67s to ~120s -- the retry only spent the
+    # deadline that pays for the fresh context which actually works.
     return _attempt_baxia_drag(
         solver,
         page,

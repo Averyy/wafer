@@ -3632,7 +3632,47 @@ class TestReplayDrag:
         assert "time_scale=" in caplog.text
         solver.close()
 
-    def test_pressed_pointer_is_clamped_to_slider_endpoint(self):
+    def test_puzzle_drag_release_is_still_clamped_to_target(self):
+        """A placement drag must land where the caller aimed.
+
+        ``end_x`` is a CV-computed notch offset with no physical stop, and 6
+        of the 26 shipped puzzle recordings release past their own target
+        (up to rx=1.074). Replaying that overshoot drops the piece past the
+        notch, so the default path still constrains a pressed pointer.
+        """
+        solver = BrowserSolver()
+        solver._drag_recordings = [
+            {
+                "name": "overshooting-puzzle.csv",
+                "meta": {"start": "100,100", "end": "200,100", "mousedown_t": "0.1"},
+                "rows": [
+                    {"t": 0.0, "rx": -0.1, "ry": 0.0},
+                    {"t": 0.1, "rx": 0.0, "ry": 0.0},
+                    {"t": 0.2, "rx": 1.12, "ry": 0.0},
+                    {"t": 0.3, "rx": 1.074, "ry": 0.0},
+                ],
+            }
+        ]
+        page = MagicMock()
+
+        assert solver._replay_drag(page, 100, 100, 200, 100)
+
+        moves = [call.args for call in page.mouse.move.call_args_list]
+        # Pre-click hover keeps its natural overshoot to the left.
+        assert (90.0, 100.0) in moves
+        # Nothing pressed may travel past the notch, release included.
+        assert all(m[0] <= 200.0 for m in moves[1:])
+        assert moves[-1] == (200.0, 100.0)
+        solver.close()
+
+    def test_full_track_slide_overshoot_is_replayed_not_clamped(self):
+        """Overshoot survives replay, including on the release sample.
+
+        A human slide captured on the live Alibaba widget released at
+        rx=1.26 -- 64px past full travel -- and the SDK accepted it. Clamping
+        a pressed pointer to the track erased behavioral signal 3 in
+        docs/ref-baxia.md and is what Baxia began rejecting.
+        """
         solver = BrowserSolver()
         solver._drag_recordings = [
             {
@@ -3647,15 +3687,55 @@ class TestReplayDrag:
         ]
         page = MagicMock()
 
-        assert solver._replay_drag(page, 100, 100, 200, 100)
+        assert solver._replay_drag(
+            page, 100, 100, 200, 100, full_track_slide=True
+        )
 
         moves = [call.args for call in page.mouse.move.call_args_list]
         # Pre-click hover retains natural overshoot to the left.
         assert (90.0, 100.0) in moves
-        # Once held, the physical slider cannot be released beyond its track.
-        assert moves[-1] == (200, 100.0)
+        # The release carries the recorded overshoot past the track end.
+        assert moves[-1] == (210.0, 100.0)
         page.mouse.down.assert_called_once()
         page.mouse.up.assert_called_once()
+        solver.close()
+
+    def test_full_track_slide_compresses_the_pressed_phase_only(self):
+        """A slide replay flicks; a puzzle drag keeps its recorded pacing."""
+        rows = [{"t": 0.0, "rx": -0.05, "ry": 0.0}]
+        # 1.0s hover, then a 4.0s creep across the track in 200 samples.
+        rows += [{"t": 0.1 * i, "rx": -0.05, "ry": 0.0} for i in range(1, 10)]
+        rows += [
+            {"t": 1.0 + 4.0 * (i / 200.0), "rx": i / 200.0, "ry": 0.0}
+            for i in range(1, 201)
+        ]
+        recording = {
+            "name": "slow-slide.csv",
+            "meta": {"start": "100,100", "end": "200,100", "mousedown_t": "1.0"},
+            "rows": rows,
+        }
+
+        solver = BrowserSolver()
+        solver._drag_recordings = [dict(recording)]
+        page = MagicMock()
+        with patch("wafer.browser._solver.time.sleep"):
+            assert solver._replay_drag(
+                page, 100, 100, 200, 100, full_track_slide=True
+            )
+        slide_moves = len(page.mouse.move.call_args_list)
+
+        solver._drag_recordings = [dict(recording)]
+        page2 = MagicMock()
+        with patch("wafer.browser._solver.time.sleep"):
+            assert solver._replay_drag(page2, 100, 100, 200, 100)
+        drag_moves = len(page2.mouse.move.call_args_list)
+
+        # The slide drops pressed samples to a human event rate; the puzzle
+        # drag emits every one of them.
+        assert slide_moves < drag_moves
+        assert drag_moves >= 200
+        # It still travels the full track and releases past it.
+        assert page.mouse.move.call_args_list[-1].args[0] >= 200.0
         solver.close()
 
 

@@ -649,6 +649,13 @@ _TMD_CLEARANCE_POLL_SECONDS = 8.0
 
 _TMD_MTOP_RETRY_URL = "https://acs.aliexpress.com/h5/mtop.aliexpress.pdp.pc.query/1.0/"
 
+# Human slide envelope, measured on the live Alibaba Baxia widget
+# (2026-07-31): a slide accepted by the SDK crossed the 258px track in 0.764s
+# emitting 34 pointermoves, i.e. 421px/s at 44 events/s. These bracket that
+# observation and are applied to the pressed phase of a slide replay only.
+_SLIDE_DRAG_SECONDS = (0.62, 1.05)
+_SLIDE_EVENT_RATE = (38.0, 58.0)
+
 
 def _tmd_retry_target(challenge_url: str) -> str | None:
     """Return the exact application URL that a TMD cookie must unlock.
@@ -2405,6 +2412,7 @@ class BrowserSolver:
         exclude_recordings: set[str] | None = None,
         recording_pool_size: int = 3,
         approach_from: tuple[float, float] | None = None,
+        full_track_slide: bool = False,
     ) -> bool:
         """Replay a recorded drag from start to end.
 
@@ -2466,13 +2474,42 @@ class BrowserSolver:
         meta = recording.get("meta", {})
         mousedown_t = float(meta.get("mousedown_t", "0"))
         time_scale = random.uniform(0.85, 1.15)
+
+        # A "slide to verify" drag is a confident flick, not the careful creep
+        # a puzzle drag needs.  A human slide captured on the live Alibaba
+        # widget crossed the 258px track in 0.76s (421px/s) emitting 34 moves
+        # (44/s); the shipped slide corpus runs 3.07-5.42s (48-84px/s), so
+        # replaying it natively is ~7x too slow.  mousse's own recording
+        # instructions call for "confident and fast", so treat the corpus
+        # timing as mis-recorded and normalize the *pressed* phase to human
+        # slide speed.  The pre-mousedown hover is left alone: that is
+        # deliberate thinking time and the human's was a comparable ~1s.
+        #
+        # Subsampling is not cosmetic.  CDP move dispatch costs ~8-10ms, so a
+        # 250-event drag cannot physically be emitted in 0.76s; without
+        # dropping events the compression would silently not happen.
+        drag_scale = time_scale
+        keep_every = 1
+        if full_track_slide:
+            native_drag = rows[-1]["t"] - mousedown_t
+            pressed_rows = sum(1 for row in rows if row["t"] >= mousedown_t)
+            if native_drag > 0 and pressed_rows > 2:
+                target_drag = random.uniform(*_SLIDE_DRAG_SECONDS)
+                drag_scale = target_drag / native_drag
+                target_events = max(
+                    2, int(target_drag * random.uniform(*_SLIDE_EVENT_RATE))
+                )
+                keep_every = max(1, round(pressed_rows / target_events))
         if telemetry_label is not None:
             # Recording filenames and timing contain no page/request content.
             logger.info(
-                "%s drag trace: recording=%s time_scale=%.3f",
+                "%s drag trace: recording=%s time_scale=%.3f "
+                "drag_scale=%.3f keep_every=%d",
                 telemetry_label,
                 recording.get("name", "unknown"),
                 time_scale,
+                drag_scale,
+                keep_every,
             )
 
         first = rows[0]
@@ -2500,12 +2537,37 @@ class BrowserSolver:
             page.mouse.down()
             mouse_down = True
 
+        rest = rows[1:]
+        last_index = len(rest) - 1
+        pressed_seen = 0
         try:
-            for row in rows[1:]:
+            for index, row in enumerate(rest):
                 if deadline is not None and time.monotonic() >= deadline:
                     return False
 
-                target_t = row["t"] * time_scale
+                pressed = row["t"] >= mousedown_t
+                if pressed:
+                    pressed_seen += 1
+                    # Never drop the row that carries the button transition or
+                    # the final sample: one owns the mousedown coordinate, the
+                    # other owns the release.
+                    if (
+                        keep_every > 1
+                        and mouse_down
+                        and index != last_index
+                        and pressed_seen % keep_every
+                    ):
+                        continue
+
+                # Compress only the pressed phase; the hover keeps its own
+                # recorded pacing.
+                if pressed:
+                    target_t = (
+                        mousedown_t * time_scale
+                        + (row["t"] - mousedown_t) * drag_scale
+                    )
+                else:
+                    target_t = row["t"] * time_scale
                 elapsed = time.monotonic() - t0
                 delay = target_t - elapsed
                 if delay > 0:
@@ -2521,13 +2583,20 @@ class BrowserSolver:
 
                 x = start_x + row["rx"] * dx
                 y = start_y + row["ry"] * abs(dx)
-                if mouse_down:
-                    # Slider recordings deliberately contain small natural
-                    # overshoots.  A generic drag can safely preserve those,
-                    # but a full-track Baxia release is validated against the
-                    # raw pointer coordinate as well as the visual handle.
-                    # Keep pre-click hover movement natural, then constrain a
-                    # pressed pointer to the actual slider interval.
+                if mouse_down and not full_track_slide:
+                    # A placement drag must land where the caller aimed.
+                    # ``end_x`` is a CV-computed notch offset (GeeTest) with no
+                    # physical stop, and 6 of the 26 shipped puzzle recordings
+                    # release past their own target -- up to rx=1.074 -- so
+                    # replaying that overshoot would drop the piece past the
+                    # notch.  Constrain the pressed pointer to the interval.
+                    #
+                    # A full-track slide is the opposite case and is exempt:
+                    # its handle pins at the track maximum, so overshoot only
+                    # changes the pointer trace, and erasing it removed
+                    # behavioral signal 3 in docs/ref-baxia.md.  The human
+                    # slide accepted by Baxia on 2026-07-31 released at
+                    # rx=1.26, 64px beyond full travel.
                     x = min(max(x, min(start_x, end_x)), max(start_x, end_x))
                 page.mouse.move(x, y)
                 # A recorded mousedown row is a button event at its recorded

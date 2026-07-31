@@ -45,14 +45,16 @@ The pause before clicking is critical -it captures real human "thinking time" an
 
 Stored as `t,rx,ry` normalized fractions with `mousedown_t` in metadata marking when the drag phase begins. Pre-drag events have `rx ≈ 0` (hovering near handle).
 
-### Slide (15 needed)
-Simulate a "slide to verify" CAPTCHA -a confident full-width left-to-right drag. The slider matches real Baxia/AliExpress NoCaptcha dimensions (300px track, 42px handle, 34px height). Press Space to see the slider, then:
+### Slide (16 recorded; re-record all of them at true slide pace)
+Simulate a "slide to verify" CAPTCHA -a confident full-width left-to-right flick. The slider matches real Baxia/AliExpress NoCaptcha dimensions (300px track, 42px handle, 34px height). Press Space to see the slider, then:
 
 1. **Approach**: Move cursor to the handle (recording starts when you enter the handle zone)
 2. **Pause**: Hover briefly near the handle -quick natural pause, no puzzle to study
-3. **Slide**: Click and drag all the way to the right edge, release at the end
+3. **Flick**: Click and throw the handle to the right in one fast motion, pushing **past** the end before releasing
 
-Unlike puzzle drags (which require careful placement), slides should be confident and fast -the real CAPTCHA checks behavioral signals, not positional accuracy.
+**Speed is the point.** A slide is not a puzzle drag. A human slide captured on the live Alibaba widget (2026-07-31) crossed the 258px track in **0.76s (421px/s)** and released **64px past full travel**. The recorder discards any take whose pressed phase falls outside **0.35-1.40s**, because the original 15 recordings were saved at 3.1-5.4s (48-84px/s) when nothing checked -and Baxia rejected every replay of them. See `docs/ref-baxia.md`.
+
+Don't decelerate onto the endpoint. Overshoot and let the handle pin at the track maximum, exactly as you would on a real one. Absence of overshoot-and-correction is behavioral signal 3.
 
 Stored as `t,rx,ry` normalized fractions (same format as puzzle drags) with `mousedown_t` in metadata. Saved to `slide_drags/` directory.
 

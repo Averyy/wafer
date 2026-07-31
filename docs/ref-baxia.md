@@ -63,7 +63,7 @@ wafer/browser/
                       #   _check_baxia_result,
                       #   _page_left_punish, solve_baxia
   _recordings/
-    slide_drags/      # 15 full-width "slide to verify" drags (300px track, 42px handle)
+    slide_drags/      # 16 full-width "slide to verify" drags (300px track, 42px handle)
     drags/            # 26 variable-width drags (32-301px, fallback for slide)
 ```
 
@@ -186,11 +186,92 @@ excludes rejected recordings across those contexts.
 6. **Acceleration profile** -smooth, continuous. High-frequency noise = bot.
 7. **Micro-jitter during pauses** -hand tremor at 3-25 Hz. Entirely absent in bots.
 
-All 7 naturally present in recorded human trajectories from mousse.
+All 7 naturally present in recorded human trajectories from mousse -but only
+if replay preserves them.
+
+### Signal 3 was being replayed away (fixed 2026-07-31)
+
+`_replay_drag` clamped **every** pressed pointer sample to the slider interval,
+when only the release coordinate needs constraining. All 15 original slide recordings
+overshoot the endpoint and correct back (2-11% of their pressed samples,
+0.2-8.4px past at a 258px track); the clamp flattened every one, so wafer's
+drag decelerated onto the endpoint and never passed it -the exact absence
+signal 3 looks for. The handle pins at the track maximum either way, so the
+overshoot only ever changed the pointer trace, never the result.
+
+Alibaba began rejecting every drag with a rotating `sdk_error_code` while the
+drag itself was mechanically perfect: trusted events, full 258px travel,
+`max_fill=279`, correct geometry. Restoring the overshoot took live gated
+`alibaba.com/trade/search` from 0/2 requests (0/6 drags accepted) to 4/5
+requests. Constrain only the final release sample.
+
+When a drag is refused with the mechanics provably correct, suspect the
+replay pipeline flattening a signal this list says humans emit -not geometry.
+
+### The slide corpus was recorded at puzzle-drag pace (fixed 2026-07-31)
+
+A human slide captured on the live Alibaba widget and **accepted by the SDK**:
+
+| | Human | Shipped corpus |
+|---|---|---|
+| Pressed duration | 0.76s | 3.07-5.42s |
+| Speed | 421 px/s | 48-84 px/s |
+| Release | rx 1.26 (64px past travel) | clamped to 1.0 |
+| Event rate | 44/s | 34-49/s |
+
+Event *rate* matched, so this was never sampling -the corpus is simply ~7x
+too slow. `mousse/README.md` specifies slide mode as "confident and fast";
+the recordings did not follow it and nothing checked. wafer was replaying
+mis-recorded data faithfully.
+
+`_replay_drag(full_track_slide=True)` (set only at the Baxia call site) compresses
+the **pressed** phase into `_SLIDE_DRAG_SECONDS` and subsamples to
+`_SLIDE_EVENT_RATE`. The pre-mousedown hover is untouched: it is deliberate
+thinking time and the human's was a comparable ~1s. Subsampling is
+load-bearing, not cosmetic -CDP move dispatch costs ~8-10ms, so a 250-event
+drag cannot physically be emitted in 0.76s and the compression would silently
+not happen. Live traces show `drag_scale` 0.127-0.170, `keep_every` 4-7.
+
+Mousse now rejects a take outside 0.35-1.40s at record time. Re-recording the
+corpus at true slide pace is the durable fix; compression of the old traces is
+the interim one. Result after the change: a 10-query burst returned 10/10 real
+result pages, TMD triggered and solved on the first request and the earned
+`x5sec` replayed for the remaining nine at ~2s each.
+
+### Both changes are scoped to full-track slides
+
+`_replay_drag` is shared with GeeTest/PerimeterX puzzle drags, so BOTH the
+speed compression and the unclamped release ride the single
+`full_track_slide=True` flag set at the Baxia call site. Neither reaches
+`solve_drag`.
+
+That scoping is load-bearing, not tidiness. A placement drag aims at a
+CV-computed notch offset with no physical stop, and 6 of the 26 shipped
+puzzle recordings in `_recordings/drags/` release past their own target (up
+to rx=1.074). An unconditional clamp removal would drop the piece past the
+notch and silently regress GeeTest, whose 12/12 live result predates this
+work. The pressed-pointer clamp is therefore still applied on the default
+path; only a full-track slide, whose handle pins at the track maximum, is
+exempt.
+
+### Do not retry inside a rejected document
+
+Lines above describe Baxia destroying and recreating the widget, which reads
+as an invitation to retry in place, and `_attempt_baxia_drag` defaults to
+`max_attempts=5`. `solve_baxia` deliberately passes 1.
+
+Measured 2026-07-31 at `max_attempts=2` over 5 live gated requests: the reset
+poll does find a recreated handle at `left == 0`, and **every** in-widget
+attempt 2/2 was rejected. Every success came from attempt 1 in a fresh browser
+context. Failure latency doubled (~67s to ~120s) because the retry spent the
+deadline that pays for the fresh context. The document is spent for clearance
+even though the widget looks alive.
 
 ## Test Infrastructure
 
 - **Mock**: `tests/mocks/baxia/slide.html` -canvas-generated slider, exact Baxia dimensions
 - **Demo**: `tests/demo_baxia_solve.py` -offline solve against mock
 - **Live test**: `tests/live_baxia.py` -triggers TMD via wreq, solves with Patchright
-- **Recordings**: 15 slide_drags (3-5.4s, 196-380 events each) in `_recordings/slide_drags/`
+- **Recordings**: 16 slide_drags in `_recordings/slide_drags/`. slide_001-015 are the
+  original mis-paced takes (3-5.4s, 196-380 events); slide_016 is the live human
+  reference (0.76s, 87 events). Replay compresses the former toward the latter.
