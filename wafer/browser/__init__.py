@@ -9,8 +9,11 @@ from wafer.browser._recaptcha_grid import (
 from wafer.browser._solver import (
     BrowserSolver,
     CapturedResponse,
+    HardenedLaunch,
     InterceptResult,
     SolveResult,
+    hardened_launch_config,
+    scrub_headless_ua,
 )
 
 
@@ -49,9 +52,12 @@ def format_cookie_str(cookie: dict) -> str:
 __all__ = [
     "BrowserSolver",
     "CapturedResponse",
+    "HardenedLaunch",
     "InterceptResult",
     "SolveResult",
     "format_cookie_str",
+    "hardened_launch_config",
     "preflight_recaptcha_models",
     "preload_recaptcha_models",
+    "scrub_headless_ua",
 ]

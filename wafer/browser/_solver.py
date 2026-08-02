@@ -1093,6 +1093,138 @@ _VIEWPORTS = [
 ]
 
 
+@dataclass(frozen=True)
+class HardenedLaunch:
+    """Chromium launch settings that keep an automated browser unremarkable.
+
+    ``args`` and ``ignore_default_args`` go straight to Playwright's
+    ``chromium.launch`` or ``launch_persistent_context``.
+
+    ``init_scripts`` are registered per page through CDP
+    ``Page.addScriptToEvaluateOnNewDocument``, which needs ``Page.enable``
+    first and must not have its CDP session detached afterwards -detaching
+    unregisters them.
+    """
+
+    args: tuple[str, ...]
+    ignore_default_args: tuple[str, ...]
+    init_scripts: tuple[str, ...]
+
+
+def hardened_launch_config(
+    *,
+    headless: bool,
+    proxied: bool = False,
+    platform: str | None = None,
+) -> HardenedLaunch:
+    """The launch settings wafer's own solver browser uses.
+
+    Exposed for callers that drive their own Playwright because they need the
+    exchange log rather than a settled document, which :meth:`BrowserSolver.render`
+    cannot give them. The alternative is reimplementing this set, and drift is
+    silent in the worst way: a site that answers a flagged browser differently
+    gets recorded as a fact about the site rather than about the browser.
+
+    ``proxied`` mirrors wafer's own rule of disabling page-controlled UDP only
+    when a proxy is configured, so a direct browser's launch fingerprint stays
+    unchanged. ``platform`` defaults to :data:`sys.platform`; pass it to build
+    another host's configuration, which is also how this gets tested off-target.
+
+    Pair this with :func:`scrub_headless_ua`. ``--headless=new`` fixes the
+    compositor and timer resolution but leaves ``HeadlessChrome`` in the user
+    agent, and that token alone is enough to earn degraded service from sites
+    that never present a challenge at all.
+
+    The CDP screenX/screenY compatibility patch is deliberately absent. It is
+    only correct on a Chrome whose event descriptors are already wrong, which
+    wafer establishes with a real-input probe at solve time; applying it
+    unconditionally double-counts the window offset on a native-correct build.
+    """
+    host = sys.platform if platform is None else platform
+    args = [
+        "--disable-blink-features=AutomationControlled",
+        "--enable-gpu",
+    ]
+    if host == "linux":
+        # Pin ANGLE to Mesa's OpenGL backend. Its automatic Linux backend
+        # selection can resolve to ``gl=none`` under Xvfb, making WebGL
+        # disappear entirely even though the image includes Mesa DRI.
+        args.extend(
+            [
+                "--use-gl=angle",
+                "--use-angle=gl",
+                "--ignore-gpu-blocklist",
+            ]
+        )
+    else:
+        args.append("--use-gl=angle")
+    if proxied:
+        # The configured proxy is TCP-only. Disable page-controlled UDP paths
+        # that could otherwise bypass it.
+        args.extend(
+            [
+                "--disable-quic",
+                "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+            ]
+        )
+    if host == "darwin":
+        args.append("--use-angle=metal")
+
+    ignored = [
+        # --enable-automation: sets internal automation state,
+        # removes chrome.runtime from window.chrome.
+        "--enable-automation",
+        # --force-color-profile=srgb: alters canvas fingerprint
+        # (real Chrome uses system profile).
+        "--force-color-profile=srgb",
+    ]
+
+    init_scripts = []
+    if headless:
+        # Use --headless=new (Chrome 112+) instead of the old --headless mode.
+        # The new mode uses Chrome's real compositor pipeline, which gives full
+        # performance.now timer resolution (old mode clamps to 100us - a known
+        # timing-based detection signal).
+        args.append("--headless=new")
+        ignored.append("--headless")
+
+        if host == "darwin":
+            # Force scRGB-linear so the rendering pipeline reports 10-bit color
+            # (color: 10) and HDR (dynamic-range: high). Without this, headless
+            # Chrome on macOS reports 8-bit sRGB, and WAFs like Kasada
+            # cross-check CSS computed styles against screen.colorDepth.
+            args.append("--force-color-profile=scrgb-linear")
+        # Self-guarding: the script returns immediately unless it finds the
+        # macOS headless signature, so registering it off-target is inert.
+        init_scripts.append(_HEADLESS_FIX_SCRIPT)
+    elif host.startswith("linux"):
+        # Headful browsers run under a real window manager. Start with the
+        # conventional maximized desktop state so screen, outer-window, and
+        # viewport geometry form one coherent envelope.
+        args.append("--start-maximized")
+
+    return HardenedLaunch(
+        args=tuple(args),
+        ignore_default_args=tuple(ignored),
+        init_scripts=tuple(init_scripts),
+    )
+
+
+def scrub_headless_ua(user_agent: str) -> str:
+    """Remove the ``HeadlessChrome`` token a headless build puts in its UA.
+
+    Headless Chrome advertises ``HeadlessChrome/<version>`` where headed Chrome
+    says ``Chrome/<version>``. Read the real value from the launched browser
+    (``navigator.userAgent``) rather than composing one, so the version stays
+    truthful, then apply this and hand the result to ``new_context(user_agent=…)``.
+
+    Returns the input unchanged when there is nothing to scrub.
+    """
+    if not user_agent:
+        return user_agent
+    return user_agent.replace("HeadlessChrome", "Chrome")
+
+
 @dataclass
 class _BrowseState:
     """Tracks playback position within a browse recording."""
@@ -1454,69 +1586,14 @@ class BrowserSolver:
         if deadline is not None and time.monotonic() >= deadline:
             raise TimeoutError("Browser startup exceeded solve timeout")
 
-        launch_args = [
-            "--disable-blink-features=AutomationControlled",
-            "--enable-gpu",
-        ]
-        if sys.platform == "linux":
-            # Pin ANGLE to Mesa's OpenGL backend. Its automatic Linux backend
-            # selection can resolve to ``gl=none`` under Xvfb, making WebGL
-            # disappear entirely even though the image includes Mesa DRI.
-            launch_args.extend(
-                [
-                    "--use-gl=angle",
-                    "--use-angle=gl",
-                    "--ignore-gpu-blocklist",
-                ]
-            )
-        else:
-            launch_args.append("--use-gl=angle")
-        if self._proxy_server or self._egress_guard_proxy:
-            # The configured proxy is TCP-only. Disable page-controlled UDP
-            # paths that could otherwise bypass it. These switches are omitted
-            # for direct browsers so their launch fingerprint stays unchanged.
-            launch_args.extend(
-                [
-                    "--disable-quic",
-                    "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
-                ]
-            )
-        if sys.platform == "darwin":
-            launch_args.append("--use-angle=metal")
-
-        ignored = [
-            # --enable-automation: sets internal automation state,
-            # removes chrome.runtime from window.chrome.
-            "--enable-automation",
-            # --force-color-profile=srgb: alters canvas fingerprint
-            # (real Chrome uses system profile).
-            "--force-color-profile=srgb",
-        ]
-
-        if self._headless:
-            # Use --headless=new (Chrome 112+) instead of the old
-            # --headless mode.  The new mode uses Chrome's real
-            # compositor pipeline, which gives full performance.now
-            # timer resolution (old mode clamps to 100us - a known
-            # timing-based detection signal).
-            launch_args.append("--headless=new")
-            ignored.append("--headless")
-
-            if sys.platform == "darwin":
-                # Force scRGB-linear color profile so the rendering
-                # pipeline reports 10-bit color (color: 10) and HDR
-                # (dynamic-range: high).  Without this, headless
-                # Chrome on macOS reports 8-bit sRGB, and WAFs like
-                # Kasada cross-check CSS computed styles against
-                # screen.colorDepth to detect headless.
-                launch_args.append("--force-color-profile=scrgb-linear")
-        elif sys.platform.startswith("linux"):
-            # Headful challenge browsers run under a real window manager.
-            # Start with the conventional maximized desktop state so screen,
-            # outer-window, and viewport geometry form one coherent envelope;
-            # JWM's generic tiled placement otherwise opens Chrome at half of
-            # the Xvfb screen despite there being no user-selected split.
-            launch_args.append("--start-maximized")
+        # Single source of truth, shared with callers driving their own
+        # Playwright: see hardened_launch_config for why it is exported.
+        launch_config = hardened_launch_config(
+            headless=self._headless,
+            proxied=bool(self._proxy_server or self._egress_guard_proxy),
+        )
+        launch_args = list(launch_config.args)
+        ignored = list(launch_config.ignore_default_args)
 
         try:
             logger.debug("Starting playwright driver...")
@@ -1592,10 +1669,15 @@ class BrowserSolver:
                     probe.close()
                 except Exception:
                     logger.debug("Could not close UA probe page", exc_info=True)
-            if "HeadlessChrome" in raw_ua:
-                self._browser_ua = raw_ua.replace("HeadlessChrome", "Chrome")
-            else:
-                self._browser_ua = raw_ua
+            if not isinstance(raw_ua, str) or not raw_ua:
+                # Fail loudly. Leaving _browser_ua unset makes _create_context
+                # skip the override, and the browser then leaks
+                # "HeadlessChrome" on every request -a silent degradation of
+                # the exact property this probe exists to protect.
+                raise RuntimeError(
+                    f"Browser did not report a user agent (got {raw_ua!r})"
+                )
+            self._browser_ua = scrub_headless_ua(raw_ua)
 
         self._publish_browser_identity()
         self._runtime_ready.set()

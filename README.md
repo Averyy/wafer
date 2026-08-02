@@ -747,6 +747,44 @@ resp = session.get("https://api.example.com/v1/data")  # JSON API
 
 On a challenge, the browser navigates `solve_origin`, runs the challenge there, earns the (registrable-domain-scoped) cookies, and they replay to the API host on the retried TLS request. Applies to **all** challenge types (it generalizes the Imperva "Error 15" origin-page solve); an explicit `solve_origin` overrides Imperva's auto-derived origin. Where to earn the token is wafer's job; the per-site *value* of `solve_origin` (which page mints it) is yours to supply.
 
+### Driving your own browser (`hardened_launch_config`)
+
+`session.render()` returns the settled document. When you need the per-exchange
+request/response log instead -observing which XHR a page issues, and what it
+answered -you have to drive Playwright yourself. wafer exports the launch
+configuration its own solver uses so you don't reimplement it:
+
+```python
+from wafer.browser import hardened_launch_config, scrub_headless_ua
+
+config = hardened_launch_config(headless=True)   # proxied=False, platform=sys.platform
+browser = await pw.chromium.launch(
+    headless=True,
+    args=list(config.args),
+    ignore_default_args=list(config.ignore_default_args),
+)
+```
+
+`config.init_scripts` holds the per-page CDP scripts (empty when `headless=False`);
+register each with `Page.addScriptToEvaluateOnNewDocument` after `Page.enable`, and
+do not detach the CDP session afterwards -that unregisters them.
+
+`--headless=new` does not remove the `HeadlessChrome` token from the user agent, so
+scrub it separately. Read the launched browser's own value rather than composing
+one, which keeps the version truthful:
+
+```python
+raw = await page.evaluate("navigator.userAgent")
+context = await browser.new_context(user_agent=scrub_headless_ua(raw))
+```
+
+That token alone is enough to earn throttling or challenges from sites that present
+neither to an ordinary browser. Set `proxied=True` only when the browser runs behind
+a proxy: it adds UDP-containment switches that otherwise change the launch
+fingerprint for no benefit. The CDP screenX/screenY patch is deliberately excluded,
+because it is only correct on a Chrome whose event descriptors are already wrong -
+wafer establishes that with a real-input probe at solve time.
+
 ## Imperva / Incapsula (no-browser bypass)
 
 Some Imperva deployments (e.g. `api2.realtor.ca`) fingerprint the **TLS stack

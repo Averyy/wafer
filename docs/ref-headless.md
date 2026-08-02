@@ -53,6 +53,21 @@ execution, which is the thing Patchright is currently preventing.
 
 Passed to `chromium.launch(args=[...])`.
 
+Built by `hardened_launch_config(headless=…, proxied=…)` in `wafer/browser/_solver.py`,
+which `_ensure_browser` consumes and which is exported from `wafer.browser` for
+callers driving their own Playwright. This table and that function must agree;
+`tests/test_hardened_launch.py` asserts the solver launches with exactly what
+the function returns.
+
+### Removed
+
+`--disable-site-isolation-trials` and its companion
+`--disable-features=IsolateOrigins,site-per-process` were dropped. They forced
+all frames into one process so CDP scripts reached cross-origin iframes, but
+Cloudflare detects the flag and Turnstile would not resolve while it was set
+(researchgate.net, 2026-03-06 -see `docs/site-list.md`). Cross-origin frames are
+now reached with `patch_frame_headless()` / `patch_frame_screenxy()` instead.
+
 | Arg | Purpose | Mode |
 |---|---|---|
 | `--disable-blink-features=AutomationControlled` | Makes `navigator.webdriver` return `false` via native getter. | Both |
@@ -60,8 +75,8 @@ Passed to `chromium.launch(args=[...])`.
 | `--use-gl=angle` | Uses ANGLE for GPU rendering (pairs with `--enable-gpu`). | Both |
 | `--use-angle=gl` + `--ignore-gpu-blocklist` | On Linux/Xvfb, selects Mesa OpenGL explicitly; automatic ANGLE selection can yield `gl=none` and remove WebGL. | Linux |
 | `--use-angle=metal` | Selects Metal backend on macOS. Only on `sys.platform == "darwin"`. | Both (macOS) |
-| `--disable-site-isolation-trials` | Forces all frames into one process so CDP scripts reach cross-origin iframes (e.g. DataDome's `geo.captcha-delivery.com`). | Both |
-| `--disable-features=IsolateOrigins,site-per-process` | Companion to site isolation disable. | Both |
+| `--disable-quic` + `--force-webrtc-ip-handling-policy=disable_non_proxied_udp` | Disables page-controlled UDP paths that would bypass the TCP-only proxy. Omitted for direct browsers so their launch fingerprint stays unchanged. | Proxied only |
+| `--start-maximized` | Headed browsers run under a real window manager; gives screen, outer-window and viewport geometry one coherent envelope instead of JWM's half-screen tiling. | Headed (Linux) |
 | `--headless=new` | Chrome 112+ new headless mode. Uses real compositor pipeline - fixes `performance.now` timer resolution (old `--headless` clamps to 100us, detectable via timing loop). | Headless |
 | `--force-color-profile=scrgb-linear` | Makes the rendering pipeline report 10-bit color (`(color: 10)` true, `(color: 8)` false) and HDR (`(dynamic-range: high)` true). Without this, headless Chrome on macOS reports 8-bit sRGB. Kasada cross-checks CSS computed styles against `screen.colorDepth` to detect headless. macOS only. | Headless |
 

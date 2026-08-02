@@ -942,11 +942,14 @@ Requires `pip install wafer-py[browser]`. Uses Patchright (patched Playwright).
 from wafer.browser import (
     BrowserSolver,
     CapturedResponse,
+    HardenedLaunch,
     InterceptResult,
     SolveResult,
     format_cookie_str,
+    hardened_launch_config,
     preflight_recaptcha_models,
     preload_recaptcha_models,
+    scrub_headless_ua,
 )
 
 # Convert one Playwright/Patchright cookie dict to a Set-Cookie string.
@@ -960,6 +963,31 @@ format_cookie_str(cookie: dict) -> str
 models_ready = preload_recaptcha_models(timeout=60.0)
 # Raising deployment gate: returns None only when both pinned models loaded.
 preflight_recaptcha_models(timeout=60.0)
+
+# Chromium launch settings for driving your own Playwright, when you need the
+# per-exchange request/response log rather than the settled document that
+# session.render() returns. Everything else about the browser stays yours.
+config: HardenedLaunch = hardened_launch_config(
+    headless=True,      # required
+    proxied=False,      # True only when the browser runs behind a proxy; it
+                        # adds UDP-containment switches that otherwise change
+                        # the launch fingerprint for no benefit
+    platform=None,      # defaults to sys.platform
+)
+config.args                 # tuple[str, ...] -> chromium.launch(args=[...])
+config.ignore_default_args  # tuple[str, ...] -> ignore_default_args=[...]
+config.init_scripts         # tuple[str, ...] -> register each via CDP
+                            # Page.addScriptToEvaluateOnNewDocument after
+                            # Page.enable; do not detach the CDP session
+                            # afterwards, which unregisters them. Empty when
+                            # headless=False.
+
+# --headless=new leaves "HeadlessChrome" in the user agent, and that token alone
+# earns degraded service (throttling, challenges) from sites that present no
+# challenge to a normal browser. Read the launched browser's own UA and scrub it
+# rather than composing one, so the version stays truthful.
+raw = page.evaluate("navigator.userAgent")
+context = browser.new_context(user_agent=scrub_headless_ua(raw))
 
 solver = BrowserSolver(
     headless=False,       # default; headless has lower solve coverage
