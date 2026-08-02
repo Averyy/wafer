@@ -5,6 +5,7 @@ import random
 import time
 from urllib.parse import urlparse
 
+from wafer._challenge import is_imperva_interstitial
 from wafer._cookies import registrable_domain as _registrable_domain
 from wafer._errors import ResponseTooLarge
 
@@ -28,7 +29,9 @@ def _is_ip_host(host: str) -> bool:
     )
 
 
-def imperva_embedder(url: str, headers: dict | None) -> str | None:
+def imperva_embedder(
+    url: str, headers: dict | None, body: str | None = None
+) -> str | None:
     """Pick the origin page to load for an Imperva reese84 browser solve.
 
     Imperva serves a *top-level navigation* to an API host (e.g.
@@ -43,6 +46,10 @@ def imperva_embedder(url: str, headers: dict | None) -> str | None:
     already a normal page, e.g. www.realtor.ca / amadeus / hkbea).
 
     Priority:
+      0. ``None`` when ``body`` (the challenge we actually received) is the
+         reese sensor interstitial. The WAF handing us that page is proof
+         the challenged host will let a browser solve in place, and doing so
+         earns cookies for the *right* Imperva site.
       1. The request's ``Referer``/``Origin`` header, when it is same-site
          (same registrable domain) but a *different host* than the target -
          i.e. the API was called as a cross-host XHR. This is the actual
@@ -50,7 +57,18 @@ def imperva_embedder(url: str, headers: dict | None) -> str | None:
       2. Heuristic ``https://www.<registrable>/`` when the target is a
          non-www subdomain (an API host) and no usable Referer/Origin was
          supplied.
+
+    Rules 1 and 2 pick a *sibling host*, which is only sound when the target
+    itself cannot be navigated. Sibling hosts are frequently separate Imperva
+    sites (``support.lutron.com`` is site 2477703, ``www.lutron.com`` is
+    1555970, and the latter never challenges), so cookies earned there do
+    nothing for the target and the solve fails while reporting success.
+    Rule 0 keeps that guess for the case it was built for: a hookless block
+    with no sensor to run.
     """
+    if body and is_imperva_interstitial(body):
+        return None
+
     target = urlparse(url)
     target_host = (target.hostname or "").lower()
     # No registrable domain for a bare IP, and an https embedder is the only

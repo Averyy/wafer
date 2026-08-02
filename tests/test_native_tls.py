@@ -662,6 +662,84 @@ def test_imperva_embedder_hardening():
     ) == "http://www.realtor.ca/"
 
 
+# The reese sensor interstitial support.lutron.com serves (HTTP 200, ~6.2KB),
+# reduced to the structural hooks. Imperva handing us this page means the
+# challenged host will let a browser solve in place.
+LUTRON_INTERSTITIAL = """<!DOCTYPE html><html><head>
+    <noscript><title>Pardon Our Interruption</title></noscript>
+    <script>window.reeseSkipExpirationCheck = true;</script>
+    <script>scriptElement.src = "/eaftend-that-Sir/6syJkRl2?s=lF9GD";</script>
+</head><body><div id="interstitial-inprogress" style="display: none">
+    <style>#interstitial-inprogress { background:white
+      url("/_Incapsula_Resource?NWFURVBO=images/error_pages/bg.png"); }</style>
+</div></body></html>"""
+
+# What api2.realtor.ca actually returns (HTTP 403, ~960B): the Imperva resource
+# loader and edet=15, but NO interstitial hook - there is no sensor to run, so
+# navigating the challenged URL cannot solve it.
+REALTOR_EDET15_BLOCK = (
+    "<html><head><meta name=\"robots\" content=\"noindex,nofollow\"/>"
+    "<script src=\"/_Incapsula_Resource?SWJIYLWA=719d34d31c8e3a6e6fffd425f7e032f3\">"
+    "</script></head><body>Request unsuccessful. Incapsula incident ID: "
+    "9056018-0#edet=15</body></html>"
+)
+
+
+def test_imperva_embedder_skips_sibling_host_for_solvable_interstitial():
+    """A host serving the reese interstitial is solved in place, not via a sibling.
+
+    Regression: support.lutron.com (Imperva site 2477703) was routed to
+    www.lutron.com, a DIFFERENT Imperva site (1555970) that never challenges.
+    The solve "succeeded" against the wrong site and the replay stayed blocked.
+    """
+    pytest.importorskip("wafer.browser")
+    from wafer.browser._imperva import imperva_embedder
+
+    lutron = (
+        "https://support.lutron.com/us/en/product/casetawireless"
+        "/article/product-selection/Diva-Smart-Dimmer"
+    )
+    # Without the body, the www heuristic still fires (unchanged behaviour).
+    assert imperva_embedder(lutron, None) == "https://www.lutron.com/"
+    # With the interstitial body, direct navigation wins.
+    assert imperva_embedder(lutron, None, LUTRON_INTERSTITIAL) is None
+    # A same-site Referer cannot override it either: the interstitial is proof
+    # the target host itself is navigable, and it owns the right Imperva site.
+    assert imperva_embedder(
+        lutron, {"Referer": "https://www.lutron.com/us/en"}, LUTRON_INTERSTITIAL
+    ) is None
+
+
+def test_imperva_embedder_still_derived_for_hookless_block():
+    """The edet=15 API-host block keeps the embedder path (no in-place sensor)."""
+    pytest.importorskip("wafer.browser")
+    from wafer.browser._imperva import imperva_embedder
+
+    assert imperva_embedder(URL, HDRS, REALTOR_EDET15_BLOCK) == (
+        "https://www.realtor.ca/"
+    )
+    assert imperva_embedder(URL, None, REALTOR_EDET15_BLOCK) == (
+        "https://www.realtor.ca/"
+    )
+    # An empty/binary body (body=None) must not disturb the derivation.
+    assert imperva_embedder(URL, None, None) == "https://www.realtor.ca/"
+    assert imperva_embedder(URL, None, "") == "https://www.realtor.ca/"
+
+
+def test_imperva_interstitial_predicate():
+    """Both signals are required: the loader alone is on real pages too."""
+    from wafer._challenge import is_imperva_interstitial
+
+    assert is_imperva_interstitial(LUTRON_INTERSTITIAL)
+    assert not is_imperva_interstitial(REALTOR_EDET15_BLOCK)
+    # Real protected page: embeds the sensor loader, no interstitial hook.
+    assert not is_imperva_interstitial(
+        '<html><body>real content<script src="/_Incapsula_Resource?SWJIYLWA=1">'
+        "</script></body></html>"
+    )
+    assert not is_imperva_interstitial("")
+
+
 def test_registrable_domain_and_cookie_match():
     from wafer._cookies import cookie_domain_matches, registrable_domain
 

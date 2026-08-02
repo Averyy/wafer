@@ -29,7 +29,8 @@ running the reese84 sensor, which sets/updates a solve cookie. `wait_for_imperva
 drives a real browser, replays human-like movement, and polls for the solve
 cookie (`reese84` / `___utmvc` / `incap_ses_*`) to appear or change, then the
 request is replayed. Live: amadeus, hkbea, appdev.pwc.com, realtor.**ca** (the
-www site).
+www site), support.lutron.com (a non-www content host -verified 2026-08-02:
+`session.get()` returns the real 110KB article after an in-place solve).
 
 **API hosts -> solve on the origin page, not the API URL (`imperva_embedder`).**
 A top-level navigation to an *API* host (e.g. `api2.realtor.ca/Location.svc/...`)
@@ -37,14 +38,54 @@ is something no real browser does, and Imperva answers it with its interactive
 "Error 15" block ("Access Denied / Error 15 / I'm not a robot", Incapsula
 `edet=15`) - for the deep path *and* the host root. A real browser only ever
 touches an API host via same-site XHR from the site's main page. So before
-navigating, the solve calls `imperva_embedder(url, headers)`:
+navigating, the solve calls `imperva_embedder(url, headers, body)`:
 
+- **First: if the challenge body we received is the reese sensor interstitial
+  (`is_imperva_interstitial`), return `None` and solve on the challenged URL.**
+  See "Sibling hosts are different Imperva sites" below.
 - If the request carried a `Referer`/`Origin` that is same-site but a different
   host than the target (i.e. it was a cross-host XHR), navigate that origin - the
   actual embedder the consuming app uses.
 - Else, for a non-www subdomain (an API host), fall back to `https://www.<reg>/`.
 - Else (the target is already a normal page like www.realtor.ca / amadeus /
   hkbea) return `None`, keeping the legacy direct-navigation behaviour.
+
+**Sibling hosts are different Imperva sites -only guess one when there is no
+sensor to run.** Both derivation rules pick a *sibling host*, which is sound
+only when the target itself cannot be navigated. Imperva sites are provisioned
+per host: `support.lutron.com` is site 2477703 while `www.lutron.com` is site
+1555970 and never challenges at all. Solving on the sibling therefore earned
+cookies for the wrong site, reported `solved=True` (the origin page sets
+`incap_ses_*`/`nlbi_*` whether or not anything was challenged), and the replay
+stayed on the interstitial forever - the request failed with `ChallengeDetected`
+while every log line claimed success.
+
+The discriminator is the challenge body, which the request loop already has and
+now passes through `_imperva_embedder(..., body)`. Measured on both live sites:
+
+| | `support.lutron.com` | `api2.realtor.ca` |
+|---|---|---|
+| status | 200 | 403 |
+| body | ~6.2KB reese interstitial | ~960B `edet=15` block |
+| interstitial hooks | present | absent |
+| solvable by navigating the URL | yes | no |
+
+Imperva serving the interstitial *is* the invitation to run the sensor on that
+host, so direct navigation both works and earns cookies for the right site. The
+hookless block (`edet=15`) carries no sensor, so the embedder guess remains the
+only option there. Never widen the guess back to "any non-www subdomain": normal
+content hosts (`support.`, `help.`, `docs.`, `shop.`) are the common case, not
+API hosts.
+
+**`is_imperva_interstitial` is deliberately narrower than detection.** Detection
+also treats a tiny (<5KB) hookless body as `IMPERVA`; the predicate requires a
+hook. Do not "unify" them. Detection is asking *is this a challenge*, where a
+false positive merely costs a solve attempt. The predicate is asking *will
+navigating this URL produce a sensor I can run*, where a false positive sends
+the solve at a page with nothing to solve. `api2.realtor.ca` is exactly that
+case: ~860B, `_Incapsula_Resource` present, no hook - and it stays hookless
+under burst escalation too (verified 2026-08-02, 8 rapid requests, `edet=15`
+every time), so the embedder path it depends on is unaffected.
 
 `solve_imperva_embedder` then loads that origin (which passes the WAF as a normal
 navigation) and earns the `.<registrable>` reese84/incap cookies. From there the

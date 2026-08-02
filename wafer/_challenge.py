@@ -16,6 +16,33 @@ from wafer._solvers import is_reddit_verification
 
 logger = logging.getLogger("wafer")
 
+# JS hooks unique to the modern reese "Pardon Our Interruption" interstitial -
+# the page that carries the reese84 sensor. They never appear on real content
+# pages, so they hold at any body size. Shared with the browser solver, which
+# reads them as proof the challenged host will hand a browser a challenge it
+# can pass in place (see wafer/browser/_imperva.py).
+IMPERVA_INTERSTITIAL_HOOKS = (
+    "reeseskipexpirationcheck",
+    "__imperva_interstitial_started__",
+    'id="interstitial-inprogress"',
+    "x-spa-interstitial",
+)
+
+
+def is_imperva_interstitial(body: str) -> bool:
+    """True for the reese sensor interstitial, which a browser can solve in place.
+
+    Requires both the Imperva resource loader and an interstitial-only hook.
+    The loader alone appears on real protected pages too, and a hookless
+    Imperva block (e.g. the ``edet=15`` "Access Denied" page an API host
+    returns) carries no sensor to run - neither is solvable by navigating the
+    challenged URL.
+    """
+    body_lower = body.lower()
+    return "_incapsula_resource" in body_lower and any(
+        hook in body_lower for hook in IMPERVA_INTERSTITIAL_HOOKS
+    )
+
 
 class ChallengeType(enum.Enum):
     """WAF/challenge types that wafer can detect."""
@@ -423,11 +450,8 @@ def detect_challenge(
     #      Interruption" template (e.g. realtor.ca, ~6.4KB). These hooks
     #      never appear on real content pages, so they hold at any size.
     if status_code == 200 and "_incapsula_resource" in body_lower:
-        interstitial_markers = (
-            "reeseskipexpirationcheck" in body_lower
-            or "__imperva_interstitial_started__" in body_lower
-            or 'id="interstitial-inprogress"' in body_lower
-            or "x-spa-interstitial" in body_lower
+        interstitial_markers = any(
+            hook in body_lower for hook in IMPERVA_INTERSTITIAL_HOOKS
         )
         if len(body) < 5_000 or interstitial_markers:
             logger.info("Challenge detected (body): imperva interstitial")

@@ -1874,7 +1874,7 @@ class SyncSession(BaseSession):
                         current_url,
                         deadline,
                         embedder=self._imperva_embedder(
-                            challenge, current_url, extra_headers, kwargs
+                            challenge, current_url, extra_headers, kwargs, body
                         ),
                         replay=self._browser_replay(method, kwargs),
                         max_size=max_response_size,
@@ -1946,7 +1946,7 @@ class SyncSession(BaseSession):
                             current_url,
                             deadline,
                             embedder=self._imperva_embedder(
-                                challenge, current_url, extra_headers, kwargs
+                                challenge, current_url, extra_headers, kwargs, body
                             ),
                             replay=self._browser_replay(method, kwargs),
                             max_size=max_response_size,

@@ -1906,7 +1906,7 @@ class BaseSession:
             return True
         return urlparse(self._proxy_url).scheme == "http"
 
-    def _imperva_embedder(self, challenge, url, extra_headers, kwargs):
+    def _imperva_embedder(self, challenge, url, extra_headers, kwargs, body=None):
         """Origin page to browser-solve an Imperva API-host challenge, or None.
 
         Imperva serves a top-level navigation to an API host its interactive
@@ -1914,6 +1914,10 @@ class BaseSession:
         the registrable-domain reese84/incap cookies) and calls the API via
         same-site XHR. Returns that embedder origin for Imperva when a browser
         solver is present, else None - callers pass it unconditionally.
+
+        ``body`` is the challenge response we received. When it is the reese
+        sensor interstitial the target is navigable, so no embedder is derived
+        and the browser solves on the challenged URL itself.
         """
         from wafer._challenge import ChallengeType
 
@@ -1927,7 +1931,7 @@ class BaseSession:
         hdrs = kwargs.get("headers")
         if hdrs:
             merged.update(hdrs)
-        return imperva_embedder(url, merged)
+        return imperva_embedder(url, merged, body)
 
     def _browser_replay(self, method, kwargs) -> dict:
         """Replay descriptor (method/body/content-type) for an in-page XHR.
