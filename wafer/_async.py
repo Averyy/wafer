@@ -543,8 +543,18 @@ class AsyncSession(BaseSession):
         body: str,
         url: str,
         deadline: float | None = None,
+        origin_url: str | None = None,
+        seen_clearance: str | None = None,
     ) -> bool:
-        """Attempt inline challenge solving. Returns True if solved."""
+        """Attempt inline challenge solving. Returns True if solved.
+
+        ``url`` is where the challenge was served, which after a redirect is
+        not necessarily what the caller asked for. ``origin_url`` carries the
+        original request URL for solvers whose clearance belongs to the origin
+        host rather than the WAF's own (Radware). ``seen_clearance`` is the
+        clearance fingerprint a previous attempt in THIS request already
+        replayed with, so an unchanged one is not mistaken for a fresh solve.
+        """
         # Bound any solver sub-request (Amazon submit, TMD/Reddit bootstrap) by
         # the caller's remaining budget so a slow response can't overshoot the
         # overall timeout. ACW is pure computation -- no sub-request, no clamp.
@@ -606,6 +616,45 @@ class AsyncSession(BaseSession):
                     return True
                 except Exception:
                     logger.debug("Amazon inline solve failed")
+
+        elif challenge == ChallengeType.RADWARE:
+            # No sub-request and no JS: the interstitial already banked the
+            # __uzm* clearance on the origin host during the 302 that fronted
+            # it, so the solve is simply to let the caller replay on this jar.
+            #
+            # Two things have to hold before claiming a solve. The clearance
+            # must exist - an interstitial that handed over nothing leaves
+            # nothing to replay with. And it must DIFFER from the clearance the
+            # last attempt already rode on: a deployment whose clearance does
+            # not work re-serves the block with the same cookies, and replaying
+            # those cannot produce a different answer. Checking only existence
+            # would spend the whole inline budget rediscovering that.
+            #
+            # The lookup MUST use the origin, not ``url``: by the time the
+            # captcha page is in hand the request has been redirected to
+            # validate.perfdrive.com, which sets a __uzm* family of its own.
+            # Reading those would confirm a clearance for the WAF's host while
+            # the origin still had none.
+            target = origin_url or url
+            cleared = self._radware_clearance_cookies(target)
+            if cleared and self._radware_fingerprint(cleared) == seen_clearance:
+                logger.debug(
+                    "Radware re-issued an identical clearance, not replaying"
+                )
+                return False
+            if cleared:
+                if self._cookie_cache:
+                    domain = extract_domain(target)
+                    if domain:
+                        await asyncio.to_thread(
+                            self._cookie_cache.save, domain, cleared
+                        )
+                logger.info(
+                    "Radware clearance banked (%s), replaying",
+                    ",".join(entry["name"] for entry in cleared),
+                )
+                return True
+            logger.debug("Radware interstitial issued no clearance cookies")
 
         elif challenge == ChallengeType.TMD:
             homepage = tmd_homepage_url(url)
@@ -1367,9 +1416,26 @@ class AsyncSession(BaseSession):
         domain = extract_domain(url) or url
         current_url = url
 
+        # Snapshot of the caller's request as it stood before any redirect.
+        # Following a 301/302/303 downgrades a POST to GET per RFC, drops the
+        # body, and strips sensitive headers - correct for a real redirect, but
+        # a Radware challenge is not one, and its replay has to go back out as
+        # the request the caller actually made.
+        original_m = m
+        original_method = method
+        original_body_kwargs = {
+            key: kwargs[key]
+            for key in ("body", "form", "json")
+            if key in kwargs
+        }
+        original_extra_headers = extra_headers
+
         browser_attempted_type: str | None = None
         reddit_bootstrap_attempted = False
         tmd_inline_attempted = False
+        # Clearance the last Radware replay rode on, so an identical reissue is
+        # not counted as a fresh solve.
+        radware_clearance_seen: str | None = None
         observed_reddit_bootstrap_generation = self._reddit_bootstrap_generation
         reddit_replay_client_generation: int | None = None
         native_attempted = False
@@ -1921,6 +1987,24 @@ class AsyncSession(BaseSession):
 
             # Challenge or bare 403 → try inline solver, then rotate
             if challenge is not None or (status == 403 and body is not None):
+                # Radware serves its interstitial from its OWN host, so by now
+                # the loop is parked on validate.perfdrive.com with the request
+                # rewritten for a redirect that was never a real one. Rewind
+                # before anything else looks at this state: the resource the
+                # caller wants is the original URL, the failure belongs to the
+                # origin's health record rather than the WAF's, and every path
+                # out of here - inline replay, rotation, or the raised error -
+                # has to name the caller's request, not the captcha page.
+                if challenge is ChallengeType.RADWARE and current_url != url:
+                    current_url = url
+                    domain = extract_domain(url) or url
+                    redirects_followed = 0
+                    history = []
+                    m = original_m
+                    method = original_method
+                    kwargs.update(original_body_kwargs)
+                    extra_headers = original_extra_headers
+
                 # Session health: track failure (defer retirement
                 # until after budget check to avoid destroying
                 # state before raising)
@@ -1967,10 +2051,21 @@ class AsyncSession(BaseSession):
                     and state.inline_solves < state.max_inline_solves
                 ):
                     inline_solved = await self._try_inline_solve(
-                        challenge, body, current_url, deadline
+                        challenge,
+                        body,
+                        current_url,
+                        deadline,
+                        origin_url=url,
+                        seen_clearance=radware_clearance_seen,
                     )
                 if challenge is not None and inline_solved:
                     state.inline_solves += 1
+                    if challenge is ChallengeType.RADWARE:
+                        # Remember what this replay rides on, so a block that
+                        # comes back with the same cookies stops the loop.
+                        radware_clearance_seen = (
+                            self._radware_clearance_fingerprint(url)
+                        )
                     if solved_client_generation is not None:
                         reddit_replay_client_generation = solved_client_generation
                     delay = calculate_backoff(

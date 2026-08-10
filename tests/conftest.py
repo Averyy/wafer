@@ -1,7 +1,9 @@
 """Shared mock objects and session factories for wafer tests."""
 
 import asyncio
+import datetime
 import json
+from email.utils import parsedate_to_datetime
 from urllib.parse import urlparse
 
 from wafer._base import (
@@ -168,12 +170,18 @@ class AsyncMockResponse:
 
 
 class MockCookie:
-    def __init__(self, name, value, domain, path, secure):
+    # expires/max_age mirror wreq's Cookie: a datetime and a timedelta, both
+    # None for a session cookie. wreq also strips the leading dot from every
+    # Domain, so this mock stores the bare domain the same way.
+    def __init__(self, name, value, domain, path, secure,
+                 expires=None, max_age=None):
         self.name = name
         self.value = value
         self.domain = domain
         self.path = path
         self.secure = secure
+        self.expires = expires
+        self.max_age = max_age
 
 
 class MockJar:
@@ -193,6 +201,8 @@ class MockJar:
         domain = parsed.hostname or ""
         path = "/"
         secure = False
+        max_age = None
+        expires = None
         for part in parts[1:]:
             attr, attr_separator, attr_value = part.partition("=")
             attr = attr.strip().lower()
@@ -202,8 +212,20 @@ class MockJar:
                 path = attr_value.strip() or "/"
             elif attr == "secure":
                 secure = True
+            elif attr == "max-age" and attr_separator:
+                try:
+                    max_age = datetime.timedelta(seconds=int(attr_value.strip()))
+                except ValueError:
+                    max_age = None
+            elif attr == "expires" and attr_separator:
+                parsed_expires = parsedate_to_datetime(attr_value.strip())
+                if parsed_expires is not None and parsed_expires.tzinfo is None:
+                    parsed_expires = parsed_expires.replace(
+                        tzinfo=datetime.timezone.utc
+                    )
+                expires = parsed_expires
         self._cookies[(domain, path, name)] = MockCookie(
-            name, value, domain, path, secure
+            name, value, domain, path, secure, expires=expires, max_age=max_age
         )
 
     def get(self, name, url):

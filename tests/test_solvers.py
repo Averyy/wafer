@@ -1,6 +1,7 @@
-"""Tests for inline challenge solvers (ACW, Amazon, TMD)."""
+"""Tests for inline challenge solvers (ACW, Amazon, TMD, Radware)."""
 
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from unittest.mock import patch
 from urllib.parse import urlparse
@@ -12,6 +13,7 @@ from tests.conftest import (
     make_async_session,
     make_sync_session,
 )
+from wafer._errors import ChallengeDetected
 from wafer._solvers import (
     _is_amazon_domain,
     parse_amazon_captcha,
@@ -695,3 +697,497 @@ class TestTMDE2E:
             assert "Real TMD content" in resp.text
         finally:
             server.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Radware Bot Manager — clearance replay
+# ---------------------------------------------------------------------------
+
+# The captcha interstitial: sensor bootstrap plus the captcha template.
+_RADWARE_BLOCK_BODY = (
+    "<html><head><title>Radware Captcha Page</title>"
+    '<link rel="stylesheet" href="https://captcha.perfdrive.com/'
+    'captcha-public/css/shieldsquare_styles.min.css">'
+    '<script>window.SSJSInternal = 1; var __uzdbm_1 = "x";'
+    'w["SSJSConnectorObj"] = {};</script></head><body></body></html>'
+)
+# Real content still ships the sensor - that is exactly why detection cannot
+# key on it.
+_RADWARE_REAL_BODY = (
+    '<html><head><script>var __uzdbm_1 = "x";'
+    'w["SSJSConnectorObj"] = {};</script></head>'
+    "<body>Ontario Public Service Careers</body></html>"
+)
+# The interstitial hands the clearance over on the origin host.
+_RADWARE_CLEARANCE = {
+    "set-cookie": [
+        "__uzma=abc; Path=/",
+        "__uzmb=123; Path=/",
+        "__uzmc=456; Path=/",
+    ]
+}
+_RADWARE_URL = "https://www.gojobs.gov.on.ca/Preview.aspx"
+
+
+class TestRadwareClearanceReplay:
+    @patch("wafer._sync.time.sleep")
+    def test_block_then_replay_returns_real_content(self, mock_sleep):
+        """The block clears on a same-jar replay - no browser, no rotation."""
+        session, mock = make_sync_session(
+            [
+                MockResponse(200, _RADWARE_CLEARANCE, _RADWARE_BLOCK_BODY),
+                MockResponse(200, {}, _RADWARE_REAL_BODY),
+            ],
+            use_cookie_jar=True,
+        )
+        resp = session.request("GET", _RADWARE_URL)
+        assert "Ontario Public Service Careers" in resp.text
+        assert mock.request_count == 2
+
+    @patch("wafer._sync.time.sleep")
+    def test_replay_keeps_the_identity_that_earned_the_cookies(self, mock_sleep):
+        """The inline path must not rotate - rotation discards the clearance."""
+        session, _ = make_sync_session(
+            [
+                MockResponse(200, _RADWARE_CLEARANCE, _RADWARE_BLOCK_BODY),
+                MockResponse(200, {}, _RADWARE_REAL_BODY),
+            ],
+            use_cookie_jar=True,
+        )
+        before = session._fingerprint.current
+        session.request("GET", _RADWARE_URL)
+        assert session._fingerprint.current == before
+
+    @patch("wafer._sync.time.sleep")
+    def test_solved_page_does_not_re_detect(self, mock_sleep):
+        """The replay's body carries the sensor and must read as success."""
+        session, mock = make_sync_session(
+            [
+                MockResponse(200, _RADWARE_CLEARANCE, _RADWARE_BLOCK_BODY),
+                MockResponse(
+                    200,
+                    {"set-cookie": "__uzmc=999; Path=/"},
+                    _RADWARE_REAL_BODY,
+                ),
+            ],
+            use_cookie_jar=True,
+        )
+        resp = session.request("GET", _RADWARE_URL)
+        assert resp.challenge_type is None
+        assert mock.request_count == 2
+
+    @patch("wafer._sync.time.sleep")
+    def test_no_clearance_cookies_is_not_claimed_as_solved(self, mock_sleep):
+        """An interstitial that hands over nothing must not burn replays.
+
+        With no __uzm* banked there is nothing for a replay to ride on, so the
+        request falls through to rotation instead of repeating an identical
+        request until the inline budget is gone.
+        """
+        session, mock = make_sync_session(
+            [MockResponse(200, {}, _RADWARE_BLOCK_BODY)],
+            use_cookie_jar=True,
+            max_rotations=1,
+        )
+        with pytest.raises(ChallengeDetected) as excinfo:
+            session.request("GET", _RADWARE_URL)
+        assert excinfo.value.challenge_type == "radware"
+        # One block + one rotation attempt: no inline replays in between.
+        assert mock.request_count == 2
+
+    @patch("wafer._sync.time.sleep")
+    def test_persistent_block_raises_challenge_detected(self, mock_sleep):
+        """A site that never clears is an honest error, not a silent 200."""
+        session, _ = make_sync_session(
+            [MockResponse(200, _RADWARE_CLEARANCE, _RADWARE_BLOCK_BODY)],
+            use_cookie_jar=True,
+            max_rotations=1,
+        )
+        with pytest.raises(ChallengeDetected) as excinfo:
+            session.request("GET", _RADWARE_URL)
+        assert excinfo.value.challenge_type == "radware"
+
+    def test_clearance_is_scoped_to_the_request_host(self):
+        """A sibling host's __uzma must never be credited to this one."""
+        session, _ = make_sync_session([], use_cookie_jar=True)
+        session._client.cookie_jar.add("__uzma=abc; Path=/", "https://other.example/")
+        assert session._radware_clearance_cookies(_RADWARE_URL) == []
+
+    def test_clearance_ignores_unrelated_cookies(self):
+        session, _ = make_sync_session([], use_cookie_jar=True)
+        jar = session._client.cookie_jar
+        jar.add("PHPSESSID=abc; Path=/", _RADWARE_URL)
+        jar.add("__uzma=xyz; Path=/", _RADWARE_URL)
+        found = session._radware_clearance_cookies(_RADWARE_URL)
+        assert [entry["name"] for entry in found] == ["__uzma"]
+
+
+class TestRadwareClearanceReplayAsync:
+    @pytest.mark.asyncio
+    @patch("wafer._async.asyncio.sleep")
+    async def test_block_then_replay_returns_real_content(self, mock_sleep):
+        session, mock = make_async_session(
+            [
+                MockResponse(200, _RADWARE_CLEARANCE, _RADWARE_BLOCK_BODY),
+                MockResponse(200, {}, _RADWARE_REAL_BODY),
+            ],
+            use_cookie_jar=True,
+        )
+        resp = await session.request("GET", _RADWARE_URL)
+        assert "Ontario Public Service Careers" in resp.text
+        assert mock.request_count == 2
+
+
+class TestRadwareRedirectRewind:
+    """The interstitial lives on Radware's host, not the origin's.
+
+    wafer follows the 302 before it ever sees the captcha, so by detection time
+    the retry loop is parked on validate.perfdrive.com. Replaying THAT just
+    re-serves the captcha - a silent block until the inline budget runs out.
+    """
+
+    _INTERSTITIAL = "https://validate.perfdrive.com/?ssa=abc&ssc=encoded"
+
+    def _responses(self):
+        return [
+            # The origin's 302 is what issues the clearance.
+            MockResponse(302, {**_RADWARE_CLEARANCE,
+                               "location": self._INTERSTITIAL}, ""),
+            # Radware's host serves the captcha, and sets a __uzm* of its own.
+            MockResponse(200, {"set-cookie": "__uzma=perfdrive; Path=/"},
+                         _RADWARE_BLOCK_BODY),
+            MockResponse(200, {}, _RADWARE_REAL_BODY),
+        ]
+
+    @patch("wafer._sync.time.sleep")
+    def test_replay_targets_the_original_url(self, mock_sleep):
+        session, mock = make_sync_session(self._responses(), use_cookie_jar=True)
+        resp = session.request("GET", _RADWARE_URL)
+        assert "Ontario Public Service Careers" in resp.text
+        assert mock.request_count == 3
+        requested = [entry[1] for entry in mock.request_log]
+        assert requested[1] == self._INTERSTITIAL
+        # The replay must rewind to the caller's URL, not repeat the captcha.
+        assert requested[2] == _RADWARE_URL
+
+    @patch("wafer._sync.time.sleep")
+    def test_history_is_rewound_for_the_replay(self, mock_sleep):
+        """The successful attempt made no hops, so it reports none."""
+        session, _ = make_sync_session(self._responses(), use_cookie_jar=True)
+        resp = session.request("GET", _RADWARE_URL)
+        assert resp.history == []
+
+    @patch("wafer._sync.time.sleep")
+    def test_perfdrive_cookies_do_not_count_as_origin_clearance(self, mock_sleep):
+        """Only the origin's __uzm* clears the origin.
+
+        Radware's own host sets the same cookie family. If the solve credited
+        those, it would claim a clearance the origin never issued.
+        """
+        session, mock = make_sync_session(
+            [
+                MockResponse(302, {"location": self._INTERSTITIAL}, ""),
+                MockResponse(200, {"set-cookie": "__uzma=perfdrive; Path=/"},
+                             _RADWARE_BLOCK_BODY),
+            ],
+            use_cookie_jar=True,
+            max_rotations=1,
+        )
+        with pytest.raises(ChallengeDetected) as excinfo:
+            session.request("GET", _RADWARE_URL)
+        assert excinfo.value.challenge_type == "radware"
+        # The captcha host's own __uzm* must not be read as the origin's, so
+        # the solve declines and the next request is a rotation back to the
+        # origin - not another inline replay of the captcha page.
+        assert [entry[1] for entry in mock.request_log][:3] == [
+            _RADWARE_URL,
+            self._INTERSTITIAL,
+            _RADWARE_URL,
+        ]
+
+
+class TestRadwareNoRedirectFollowing:
+    """A ``follow_redirects=False`` caller never reaches the captcha page.
+
+    It sees only the origin's 302 - which is where the clearance is issued, so
+    the replay works from there and Radware's host is never contacted.
+    """
+
+    _INTERSTITIAL = "https://validate.perfdrive.com/?ssa=abc&ssc=encoded"
+
+    @patch("wafer._sync.time.sleep")
+    def test_302_is_cleared_without_fetching_the_captcha(self, mock_sleep):
+        session, mock = make_sync_session(
+            [
+                MockResponse(302, {**_RADWARE_CLEARANCE,
+                                   "location": self._INTERSTITIAL},
+                             '<html><title>302 Found</title></html>'),
+                MockResponse(200, {}, _RADWARE_REAL_BODY),
+            ],
+            use_cookie_jar=True,
+            follow_redirects=False,
+        )
+        resp = session.request("GET", _RADWARE_URL)
+        assert resp.status_code == 200
+        assert "Ontario Public Service Careers" in resp.text
+        requested = [entry[1] for entry in mock.request_log]
+        # Radware's host is never contacted.
+        assert requested == [_RADWARE_URL, _RADWARE_URL]
+
+    @patch("wafer._sync.time.sleep")
+    def test_ordinary_redirect_is_returned_untouched(self, mock_sleep):
+        """Disabling redirects still means redirects come back as redirects."""
+        session, mock = make_sync_session(
+            [MockResponse(302, {"location": "https://example.com/new"}, "")],
+            use_cookie_jar=True,
+            follow_redirects=False,
+        )
+        resp = session.request("GET", "https://example.com/old")
+        assert resp.status_code == 302
+        assert resp.challenge_type is None
+        assert mock.request_count == 1
+
+
+class TestRadwareClearancePersistence:
+    """A clearance written to cache_dir has to be readable back.
+
+    CookieCache.load() discards entries whose ``expires`` is 0, treating them
+    as session cookies. Recording the durable __uzm* family without its real
+    lifetime would write files that could never be used.
+    """
+
+    _DURABLE = "__uzma=abc; Path=/; Max-Age=15724800"
+
+    def test_durable_cookie_round_trips_through_the_cache(self, tmp_path):
+        from wafer._cookies import CookieCache
+
+        session, _ = make_sync_session([], use_cookie_jar=True)
+        session._client.cookie_jar.add(self._DURABLE, _RADWARE_URL)
+        entries = session._radware_clearance_cookies(_RADWARE_URL)
+        assert [e["name"] for e in entries] == ["__uzma"]
+        assert entries[0]["expires"] > time.time()
+
+        cache = CookieCache(cache_dir=str(tmp_path))
+        cache.save("gojobs.gov.on.ca", entries)
+        reloaded = cache.load("gojobs.gov.on.ca")
+        assert [e["name"] for e in reloaded] == ["__uzma"]
+        assert "__uzma=abc" in reloaded[0]["raw"]
+
+    def test_session_cookie_is_not_given_a_fake_lifetime(self):
+        """No Max-Age/Expires means expires stays 0 and the cache skips it."""
+        session, _ = make_sync_session([], use_cookie_jar=True)
+        session._client.cookie_jar.add("__uzmc=xyz; Path=/", _RADWARE_URL)
+        entries = session._radware_clearance_cookies(_RADWARE_URL)
+        assert [e["name"] for e in entries] == ["__uzmc"]
+        assert entries[0]["expires"] == 0
+
+    def test_secure_flag_is_preserved(self):
+        """A Secure clearance must not be resurrected for plain http."""
+        session, _ = make_sync_session([], use_cookie_jar=True)
+        session._client.cookie_jar.add(
+            "__uzma=abc; Path=/; Secure; Max-Age=600", _RADWARE_URL
+        )
+        raw = session._radware_clearance_cookies(_RADWARE_URL)[0]["raw"]
+        assert "Secure" in raw
+
+
+class TestRadwareRedirectRewindAsync:
+    """Async mirror of the rewind: the replay must leave Radware's host."""
+
+    _INTERSTITIAL = "https://validate.perfdrive.com/?ssa=abc&ssc=encoded"
+
+    @pytest.mark.asyncio
+    @patch("wafer._async.asyncio.sleep")
+    async def test_replay_targets_the_original_url(self, mock_sleep):
+        session, mock = make_async_session(
+            [
+                MockResponse(302, {**_RADWARE_CLEARANCE,
+                                   "location": self._INTERSTITIAL}, ""),
+                MockResponse(200, {"set-cookie": "__uzma=perfdrive; Path=/"},
+                             _RADWARE_BLOCK_BODY),
+                MockResponse(200, {}, _RADWARE_REAL_BODY),
+            ],
+            use_cookie_jar=True,
+        )
+        resp = await session.request("GET", _RADWARE_URL)
+        assert "Ontario Public Service Careers" in resp.text
+        requested = [entry[1] for entry in mock.request_log]
+        assert requested[1] == self._INTERSTITIAL
+        assert requested[2] == _RADWARE_URL
+        assert resp.history == []
+
+
+class TestRadwareClearanceIsNotReplayedTwice:
+    """Existing cookies are not proof of a fresh solve.
+
+    A deployment whose clearance does not work re-serves the block with the
+    same __uzm* values. Replaying those cannot produce a different answer, so
+    the inline budget must not be spent rediscovering that.
+    """
+
+    def _block(self, cookie):
+        return MockResponse(200, {"set-cookie": [cookie]}, _RADWARE_BLOCK_BODY)
+
+    @patch("wafer._sync.time.sleep")
+    def test_identical_reissue_stops_after_one_replay(self, mock_sleep):
+        session, mock = make_sync_session(
+            [self._block("__uzma=same; Path=/")],
+            use_cookie_jar=True,
+            max_rotations=1,
+        )
+        with pytest.raises(ChallengeDetected) as excinfo:
+            session.request("GET", _RADWARE_URL)
+        assert excinfo.value.challenge_type == "radware"
+        # block + one replay + one rotation attempt. Without the fingerprint
+        # check this spends the full inline budget instead (5 requests).
+        assert mock.request_count == 3
+
+    @patch("wafer._sync.time.sleep")
+    def test_a_rotated_clearance_still_earns_another_replay(self, mock_sleep):
+        """gojobs needed two rounds live, each with fresh cookies.
+
+        The guard must reject only an UNCHANGED clearance, never a new one.
+        """
+        session, mock = make_sync_session(
+            [
+                self._block("__uzma=v1; Path=/"),
+                self._block("__uzma=v2; Path=/"),
+                MockResponse(200, {}, _RADWARE_REAL_BODY),
+            ],
+            use_cookie_jar=True,
+            max_rotations=1,
+        )
+        resp = session.request("GET", _RADWARE_URL)
+        assert "Ontario Public Service Careers" in resp.text
+        assert mock.request_count == 3
+
+    def test_fingerprint_tracks_values_not_just_names(self):
+        session, _ = make_sync_session([], use_cookie_jar=True)
+        jar = session._client.cookie_jar
+        jar.add("__uzma=v1; Path=/", _RADWARE_URL)
+        first = session._radware_clearance_fingerprint(_RADWARE_URL)
+        jar.add("__uzma=v2; Path=/", _RADWARE_URL)
+        assert session._radware_clearance_fingerprint(_RADWARE_URL) != first
+
+    def test_fingerprint_is_order_independent(self):
+        """Jar order is not guaranteed; the fingerprint must not depend on it."""
+        session, _ = make_sync_session([], use_cookie_jar=True)
+        jar = session._client.cookie_jar
+        jar.add("__uzmb=2; Path=/", _RADWARE_URL)
+        jar.add("__uzma=1; Path=/", _RADWARE_URL)
+        first = session._radware_clearance_fingerprint(_RADWARE_URL)
+
+        other, _ = make_sync_session([], use_cookie_jar=True)
+        other._client.cookie_jar.add("__uzma=1; Path=/", _RADWARE_URL)
+        other._client.cookie_jar.add("__uzmb=2; Path=/", _RADWARE_URL)
+        assert other._radware_clearance_fingerprint(_RADWARE_URL) == first
+
+
+class TestRadwareRewindRestoresTheRequest:
+    """The interstitial's 3xx rewrites the request; the replay must not inherit it.
+
+    A 301/302/303 downgrades POST to GET, drops the body, and strips sensitive
+    headers. That is right for a real redirect, but the Radware hop is not one -
+    replaying the rewritten form would silently turn a caller's POST into a
+    bodyless GET and still return 200, which reads as success.
+    """
+
+    _INTERSTITIAL = "https://validate.perfdrive.com/?ssa=abc"
+
+    def _responses(self):
+        return [
+            MockResponse(302, {**_RADWARE_CLEARANCE,
+                               "location": self._INTERSTITIAL}, ""),
+            MockResponse(200, {"set-cookie": "__uzma=perfdrive; Path=/"},
+                         _RADWARE_BLOCK_BODY),
+            MockResponse(200, {}, _RADWARE_REAL_BODY),
+        ]
+
+    @patch("wafer._sync.time.sleep")
+    def test_post_body_and_method_survive_the_replay(self, mock_sleep):
+        session, mock = make_sync_session(self._responses(), use_cookie_jar=True)
+        session.request("POST", _RADWARE_URL, json={"q": "engineer"})
+        methods = [str(entry[0]) for entry in mock.request_log]
+        assert methods[0] == "Method.POST"
+        assert methods[1] == "Method.GET"      # the hop, per RFC
+        assert methods[2] == "Method.POST"     # the replay, as the caller sent it
+        assert mock.request_log[2][2].get("json") == {"q": "engineer"}
+
+    @patch("wafer._sync.time.sleep")
+    def test_sensitive_headers_return_for_the_replay_only(self, mock_sleep):
+        """Credentials must come back for the origin, never go to the WAF."""
+        session, mock = make_sync_session(self._responses(), use_cookie_jar=True)
+        session.request(
+            "POST", _RADWARE_URL, json={"q": "x"},
+            headers={"Authorization": "Bearer token"},
+        )
+        sent = [(entry[2].get("headers") or {}) for entry in mock.request_log]
+        assert sent[0].get("Authorization") == "Bearer token"
+        assert sent[1].get("Authorization") is None   # perfdrive never sees it
+        assert sent[2].get("Authorization") == "Bearer token"
+
+    @patch("wafer._async.asyncio.sleep")
+    @pytest.mark.asyncio
+    async def test_async_post_survives_the_replay(self, mock_sleep):
+        session, mock = make_async_session(self._responses(), use_cookie_jar=True)
+        await session.request("POST", _RADWARE_URL, json={"q": "engineer"})
+        methods = [str(entry[0]) for entry in mock.request_log]
+        assert methods == ["Method.POST", "Method.GET", "Method.POST"]
+        assert mock.request_log[2][2].get("json") == {"q": "engineer"}
+
+
+class TestRadwareFailurePathReturnsToOrigin:
+    """A declined solve must not leave the loop parked on the WAF's host.
+
+    Rotation, session-health accounting and the raised error all have to name
+    the caller's request - retrying validate.perfdrive.com only re-serves the
+    captcha, and an error naming it is misleading.
+    """
+
+    _INTERSTITIAL = "https://validate.perfdrive.com/?ssa=abc"
+
+    @patch("wafer._sync.time.sleep")
+    def test_rotation_retries_the_origin_not_the_captcha_host(self, mock_sleep):
+        session, mock = make_sync_session(
+            [
+                # No clearance issued, so the solve declines.
+                MockResponse(302, {"location": self._INTERSTITIAL}, ""),
+                MockResponse(200, {}, _RADWARE_BLOCK_BODY),
+            ],
+            use_cookie_jar=True,
+            max_rotations=1,
+        )
+        with pytest.raises(ChallengeDetected) as excinfo:
+            session.request("GET", _RADWARE_URL)
+        assert excinfo.value.url == _RADWARE_URL
+        assert [entry[1] for entry in mock.request_log] == [
+            _RADWARE_URL,
+            self._INTERSTITIAL,
+            _RADWARE_URL,
+        ]
+
+
+class TestRadwareClearanceScoping:
+    """Only cookies the replay would actually send count as clearance."""
+
+    def test_other_path_is_not_credited(self):
+        session, _ = make_sync_session([], use_cookie_jar=True)
+        session._client.cookie_jar.add(
+            "__uzma=abc; Path=/other", "https://www.gojobs.gov.on.ca/other"
+        )
+        assert session._radware_clearance_cookies(_RADWARE_URL) == []
+
+    def test_matching_path_is_credited(self):
+        session, _ = make_sync_session([], use_cookie_jar=True)
+        session._client.cookie_jar.add("__uzma=abc; Path=/", _RADWARE_URL)
+        found = session._radware_clearance_cookies(_RADWARE_URL)
+        assert [e["name"] for e in found] == ["__uzma"]
+
+    def test_secure_cookie_is_not_credited_on_plain_http(self):
+        session, _ = make_sync_session([], use_cookie_jar=True)
+        session._client.cookie_jar.add(
+            "__uzma=abc; Path=/; Secure", "https://www.gojobs.gov.on.ca/x"
+        )
+        assert session._radware_clearance_cookies(
+            "http://www.gojobs.gov.on.ca/x"
+        ) == []

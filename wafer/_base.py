@@ -85,6 +85,11 @@ _MAX_COOKIE_SCOPES = 16384
 
 _TMD_PUNISH_SUFFIX = "/_____tmd_____/punish"
 
+# Radware Bot Manager's cookie family (__uzma/__uzmb/__uzmc/__uzmd/__uzme/
+# __uzmf). Its interstitial issues these on the origin host, and they are the
+# clearance the replay rides on.
+_RADWARE_COOKIE_PREFIX = "__uzm"
+
 
 def _new_reddit_bootstrap_stats() -> dict[str, Any]:
     """Per-session counters behind reddit_bootstrap_state()."""
@@ -2172,6 +2177,118 @@ class BaseSession:
         # get_cookie() its parent-domain lookup for that cookie.
         while len(self._cookie_scopes) > _MAX_COOKIE_SCOPES:
             self._cookie_scopes.pop(next(iter(self._cookie_scopes)), None)
+
+    @staticmethod
+    def _radware_fingerprint(entries: list[dict]) -> str:
+        """Identity of a Radware clearance, from entries already in hand.
+
+        Sorted, so jar ordering cannot fake a change, and reduced to
+        name=value, so a reissue that only refreshes Max-Age is not mistaken
+        for fresh clearance.
+        """
+
+        return "|".join(
+            sorted(
+                f"{entry['name']}={entry['raw'].partition('=')[2].partition(';')[0]}"
+                for entry in entries
+            )
+        )
+
+    def _radware_clearance_fingerprint(self, url: str) -> str:
+        """Identity of the Radware clearance currently held for ``url``.
+
+        Compared across inline attempts so a replay is only claimed when the
+        interstitial actually handed over something NEW. A deployment whose
+        clearance does not work re-serves the block with the same cookies;
+        without this, each pass would see cookies present, call it solved, and
+        spend the whole inline budget on replays that cannot differ.
+
+        Callers that already hold the entries should use ``_radware_fingerprint``
+        directly rather than paying for a second jar read.
+        """
+
+        return self._radware_fingerprint(self._radware_clearance_cookies(url))
+
+    def _radware_clearance_cookies(self, url: str) -> list[dict]:
+        """Radware ``__uzm*`` cookies the jar now holds for ``url``'s host.
+
+        The Radware interstitial issues its own clearance: the 302 that fronts
+        the captcha page sets the ``__uzm*`` family on the ORIGIN host before
+        redirecting to validate.perfdrive.com. Those cookies are the entire
+        solve - replaying the request with them present returns real content.
+
+        Reading them back out of the jar is what keeps the inline solve honest.
+        An interstitial that handed over nothing leaves this empty, and the
+        caller declines to claim a solve rather than replaying a request that
+        cannot have changed.
+
+        Returns cache-ready entries in whatever order the jar yields them.
+        """
+
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower().rstrip(".")
+        if not host:
+            return []
+        request_path = parsed.path or "/"
+        secure_ok = parsed.scheme == "https"
+        try:
+            cookies = self._client.cookie_jar.get_all()
+        except Exception:
+            logger.debug("Failed to read cookie jar for %s", url, exc_info=True)
+            return []
+
+        now = time.time()
+        entries: list[dict] = []
+        for cookie in cookies:
+            name = cookie.name or ""
+            if not name.startswith(_RADWARE_COOKIE_PREFIX):
+                continue
+            # Only cookies the replay would actually SEND count as clearance.
+            # A __uzm* scoped to another path, or a Secure one on a plain-http
+            # request, is never transmitted, so crediting it would claim a
+            # clearance the origin will not see and spend an attempt proving it.
+            if not self._cookie_path_matches(cookie.path, request_path):
+                continue
+            if getattr(cookie, "secure", False) and not secure_ok:
+                continue
+            # wreq reports every cookie's Domain with the leading dot already
+            # stripped, so a host-only cookie is indistinguishable from a
+            # Domain one here and the subdomain match is the only rule
+            # available. It errs permissive on purpose: the worst case is one
+            # replay riding on a parent-domain cookie the jar then declines to
+            # send, which costs a retry and nothing else.
+            domain = (cookie.domain or "").lower().rstrip(".")
+            if not domain:
+                continue
+            if not (host == domain or host.endswith("." + domain)):
+                continue
+            attributes = f"; Path={cookie.path or '/'}"
+            if getattr(cookie, "secure", False):
+                attributes += "; Secure"
+            # Carry the real lifetime through. CookieCache.load() drops
+            # entries whose ``expires`` is 0 as session cookies, so a durable
+            # clearance recorded without one would be written to disk and
+            # never read back - persistence that silently does nothing.
+            # Max-Age wins over Expires, per RFC 6265.
+            expires = 0.0
+            max_age = getattr(cookie, "max_age", None)
+            cookie_expires = getattr(cookie, "expires", None)
+            if max_age is not None:
+                expires = now + max_age.total_seconds()
+            elif cookie_expires is not None:
+                expires = cookie_expires.timestamp()
+            if expires > now:
+                attributes += f"; Max-Age={int(expires - now)}"
+            entries.append(
+                {
+                    "name": name,
+                    "raw": f"{name}={cookie.value}{attributes}",
+                    "url": url,
+                    "expires": expires,
+                    "last_used": now,
+                }
+            )
+        return entries
 
     def _record_response_cookie_scopes(self, url: str, resp) -> list[str]:
         """Record Set-Cookie scope metadata and return the raw header values."""

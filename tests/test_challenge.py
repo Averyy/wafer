@@ -269,6 +269,139 @@ class TestShape:
 
 
 # ---------------------------------------------------------------------------
+# Radware Bot Manager (formerly ShieldSquare)
+# ---------------------------------------------------------------------------
+
+
+_RADWARE_CAPTCHA_FIXTURE = (
+    pathlib.Path(__file__).parent / "fixtures" / "radware_gojobs_captcha.html"
+)
+# The SAME site's real job page, captured on the request right after the block
+# cleared. It carries Radware's sensor and the __uzdbm_* globals, which is
+# precisely why it is here: it is the false-positive the cheap detections
+# would have produced.
+_RADWARE_REAL_PAGE_FIXTURE = (
+    pathlib.Path(__file__).parent / "fixtures" / "radware_gojobs_real_page.html"
+)
+
+
+class TestRadware:
+    def test_real_captcha_page(self):
+        """The live gojobs.gov.on.ca interstitial, captured verbatim."""
+        body = _RADWARE_CAPTCHA_FIXTURE.read_text()
+        assert detect_challenge(200, {}, body) == ChallengeType.RADWARE
+
+    def test_real_page_is_not_a_challenge(self):
+        """A real Radware-protected page must never re-detect.
+
+        This is the regression that matters: the page ships the sensor and the
+        __uzm* cookies, so any detection keyed on those would re-flag every
+        page the site serves and spin the retry loop forever.
+        """
+        body = _RADWARE_REAL_PAGE_FIXTURE.read_text()
+        assert detect_challenge(200, {}, body) is None
+
+    def test_sensor_without_template_is_not_a_challenge(self):
+        body = (
+            '<html><head><script>var __uzdbm_1 = "x";'
+            'w["SSJSConnectorObj"] = {};</script></head>'
+            "<body>Real content</body></html>"
+        )
+        assert detect_challenge(200, {}, body) is None
+
+    def test_template_marker_without_sensor_is_not_a_challenge(self):
+        """A page merely writing about the vendor is not a block."""
+        body = (
+            "<html><body><h1>How we bypassed ShieldSquare</h1>"
+            "<p>Radware Captcha Page internals explained.</p></body></html>"
+        )
+        assert detect_challenge(200, {}, body) is None
+
+    def test_uzm_cookies_alone_are_not_a_challenge(self):
+        """The cookie family is set on successful responses too."""
+        headers = _h(set_cookie="__uzmc=123; __uzmd=456; __uzmf=789; Path=/")
+        assert detect_challenge(200, headers, "<html>Real content</html>") is None
+
+    def test_captcha_host_marker(self):
+        body = (
+            '<html><head><link rel="stylesheet" href='
+            '"https://captcha.perfdrive.com/captcha-public/css/x.css">'
+            '<script>w["SSJSConnectorObj"] = {};</script></head></html>'
+        )
+        assert detect_challenge(200, {}, body) == ChallengeType.RADWARE
+
+    def test_detected_on_403_not_swallowed_by_generic_js(self):
+        """Deployments that serve the block as 403 must still classify."""
+        body = _RADWARE_CAPTCHA_FIXTURE.read_text()
+        assert detect_challenge(403, {}, body) == ChallengeType.RADWARE
+
+    def test_not_js_only(self):
+        """Radware clears on a same-jar replay, so it must not be JS-only.
+
+        Listing it would make a browser-less session raise ChallengeDetected
+        before the free replay ever ran.
+        """
+        assert ChallengeType.RADWARE not in JS_ONLY_CHALLENGES
+
+    def test_not_terminal(self):
+        assert ChallengeType.RADWARE not in TERMINAL_CHALLENGES
+
+
+class TestRadwareChallengeRedirect:
+    """The 3xx a ``follow_redirects=False`` caller sees instead of the captcha.
+
+    That hop is where the __uzm* clearance is issued, so classifying it lets
+    such a caller replay without ever fetching the captcha page.
+    """
+
+    _LOC = (
+        "https://validate.perfdrive.com/?ssa=1537b852-92b4-419a-837a-762c2daf8157"
+        "&ssc=https%3A%2F%2Fwww.gojobs.gov.on.ca%2FPreview.aspx"
+    )
+
+    def test_origin_302_into_the_vendor_host(self):
+        headers = _h(location=self._LOC, server="rdwr")
+        body = '<html><head><title>302 Found</title></head></html>'
+        assert detect_challenge(302, headers, body) == ChallengeType.RADWARE
+
+    def test_ordinary_redirect_is_not_a_challenge(self):
+        headers = _h(location="https://example.com/new")
+        assert detect_challenge(302, headers, "") is None
+
+    def test_same_site_redirect_from_the_radware_edge(self):
+        """Captured live from sedarplus.ca, a different Radware tenant.
+
+        The edge serves ordinary redirects too, stamped with its own
+        ``server: rdwr``. Only the Location host separates those from a
+        challenge, which is why the server header is not part of the signal.
+        """
+        headers = _h(location="https://www.sedarplus.ca", server="rdwr")
+        body = "<html><head><title>301 Moved Permanently</title></head></html>"
+        assert detect_challenge(301, headers, body) is None
+
+    def test_same_site_redirect_is_not_a_challenge(self):
+        headers = _h(location="https://www.gojobs.gov.on.ca/Search.aspx")
+        assert detect_challenge(302, headers, "") is None
+
+    def test_lookalike_domain_is_not_matched(self):
+        """Boundary-aware: only perfdrive.com and its subdomains."""
+        for host in ("https://evil-perfdrive.com/", "https://perfdrive.com.evil.test/"):
+            assert detect_challenge(302, _h(location=host), "") is None
+
+    def test_bare_domain_and_subdomains_match(self):
+        for host in ("https://perfdrive.com/", "https://cdn.perfdrive.com/x"):
+            assert detect_challenge(302, _h(location=host), "") == ChallengeType.RADWARE
+
+    def test_malformed_location_is_ignored(self):
+        assert detect_challenge(302, _h(location="not a url"), "") is None
+        assert detect_challenge(302, _h(location=""), "") is None
+
+    def test_only_on_redirect_status(self):
+        """A 200 that merely mentions the host is not this signal."""
+        assert detect_challenge(200, _h(location=self._LOC), "") is None
+
+
+# ---------------------------------------------------------------------------
 # DataDome
 # ---------------------------------------------------------------------------
 
@@ -1064,3 +1197,24 @@ class TestDetectionPriority:
         headers = _h(set_cookie="datadome=abc; Path=/")
         body = '<script>datadome challenge</script>'
         assert detect_challenge(403, headers, body) == ChallengeType.DATADOME
+
+
+class TestRadwareRedirectScheme:
+    """Only a web redirect can be a Radware challenge hop."""
+
+    def test_non_web_scheme_is_ignored(self):
+        for loc in ("ftp://perfdrive.com/", "javascript:alert(1)//perfdrive.com"):
+            assert detect_challenge(302, _h(location=loc), "") is None
+
+    def test_http_and_https_both_match(self):
+        for loc in ("https://validate.perfdrive.com/x",
+                    "http://validate.perfdrive.com/x"):
+            assert detect_challenge(302, _h(location=loc), "") == ChallengeType.RADWARE
+
+    def test_userinfo_cannot_spoof_the_host(self):
+        """The real host wins: userinfo before '@' is not the destination."""
+        spoof = "https://validate.perfdrive.com@evil.example/"
+        assert detect_challenge(302, _h(location=spoof), "") is None
+        # ...and the converse is a genuine Radware host, so it does match.
+        real = "https://evil.example@validate.perfdrive.com/"
+        assert detect_challenge(302, _h(location=real), "") == ChallengeType.RADWARE

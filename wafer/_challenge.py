@@ -1,4 +1,4 @@
-"""Challenge detection for 18 WAF types.
+"""Challenge detection for 20 WAF types.
 
 Pure logic, no I/O. Inspects status code, headers, and body to identify
 which WAF/challenge system is blocking a request.
@@ -11,6 +11,7 @@ Detection order is intentional:
 
 import enum
 import logging
+from urllib.parse import urlparse
 
 from wafer._solvers import is_reddit_verification
 
@@ -44,6 +45,96 @@ def is_imperva_interstitial(body: str) -> bool:
     )
 
 
+# Radware Bot Manager (the vendor formerly shipped as ShieldSquare) splits
+# cleanly into a sensor that rides on ORDINARY protected pages and a captcha
+# template that only ever appears on a block.
+#
+# The sensor bootstrap is the loader: it declares ``SSJSConnectorObj`` and the
+# ``__uzdbm_*`` globals, then pulls Radware's behavioural script. Measured on
+# gojobs.gov.on.ca, it is present on the real job page as well as the block -
+# exactly like Imperva's _Incapsula_Resource - so it identifies the vendor and
+# nothing more. The same goes for the ``__uzm*`` cookie family: the successful
+# page sets __uzmc/__uzmd/__uzmf of its own accord, so keying detection on the
+# cookies (or on the sensor) would re-flag every page the site serves and spin
+# the retry loop forever.
+RADWARE_SENSOR_MARKERS = (
+    "ssjsconnectorobj",
+    "__uzdbm_",
+)
+
+# Template-only markers, none of which appear on a real protected page:
+# ``captcha.perfdrive.com`` hosts the captcha stylesheet and its ss_captcha.png
+# artwork, "shieldsquare" survives in that stylesheet's filename,
+# ``SSJSInternal`` is set only by the challenge document, and the title is the
+# vendor's own brand string.
+RADWARE_CHALLENGE_MARKERS = (
+    "captcha.perfdrive.com",
+    "shieldsquare",
+    "ssjsinternal",
+    "radware captcha page",
+)
+
+
+# Radware's bot-management infrastructure. A blocked request is answered by the
+# ORIGIN with a 3xx into this domain, and the captcha is then served from
+# validate.perfdrive.com. A site has no reason to redirect a visitor into the
+# vendor's host for anything else, which is what makes this signal safe on its
+# own where the sensor and cookie markers are not.
+RADWARE_CHALLENGE_DOMAIN = "perfdrive.com"
+
+
+def is_radware_challenge_redirect(location: str) -> bool:
+    """True for the 3xx hop that fronts the Radware captcha.
+
+    Only a ``follow_redirects=False`` caller ever sees this: with redirects on,
+    wafer follows the hop internally and classifies the captcha page instead.
+    It matters because that redirect is where the ``__uzm*`` clearance is
+    issued, so a caller can replay straight from here and never fetch the
+    captcha at all.
+    """
+    if not location:
+        return False
+    parsed = urlparse(location)
+    # Only a web redirect can be a challenge hop. ``urlparse`` resolves
+    # userinfo correctly - "https://validate.perfdrive.com@evil.com/" has
+    # hostname evil.com and is rejected here, which is the direction that
+    # matters.
+    if parsed.scheme not in ("http", "https"):
+        return False
+    host = (parsed.hostname or "").lower().rstrip(".")
+    return host == RADWARE_CHALLENGE_DOMAIN or host.endswith(
+        "." + RADWARE_CHALLENGE_DOMAIN
+    )
+
+
+def _matches_radware_markers(body_lower: str) -> bool:
+    """Marker test against an ALREADY-lowercased body.
+
+    Split out so ``detect_challenge`` can reuse the single ``body_lower`` it
+    computes for every response. Lowercasing an 85KB body costs ~0.14ms and is
+    linear in body size, so doing it a second time here would have added that
+    to every response wafer handles, Radware-protected or not.
+    """
+    return any(m in body_lower for m in RADWARE_SENSOR_MARKERS) and any(
+        m in body_lower for m in RADWARE_CHALLENGE_MARKERS
+    )
+
+
+def is_radware_challenge(body: str) -> bool:
+    """True for the Radware Bot Manager captcha interstitial.
+
+    Requires the sensor bootstrap AND a captcha-template marker. Either half
+    alone is unsafe: the sensor rides on real content, and a bare template
+    string could be quoted by a page merely writing about the vendor. Demanding
+    both is what keeps a solved Radware site from re-detecting on every
+    subsequent page.
+
+    Takes a raw body and lowercases it, so callers cannot silently get
+    case-sensitive matching wrong.
+    """
+    return _matches_radware_markers(body.lower())
+
+
 class ChallengeType(enum.Enum):
     """WAF/challenge types that wafer can detect."""
 
@@ -54,6 +145,7 @@ class ChallengeType(enum.Enum):
     IMPERVA = "imperva"
     KASADA = "kasada"
     SHAPE = "shape"
+    RADWARE = "radware"
     AWSWAF = "awswaf"
     ACW = "acw"
     TMD = "tmd"
@@ -75,6 +167,12 @@ class ChallengeType(enum.Enum):
 TERMINAL_CHALLENGES = frozenset({ChallengeType.CLOUDFLARE_BLOCK})
 
 
+# Radware is deliberately absent from JS_ONLY_CHALLENGES below. Its
+# interstitial hands over the clearance cookies itself, so replaying the
+# request on the same jar clears it without running any JS. Listing it would
+# invert that: with no browser configured, JS_ONLY raises ChallengeDetected
+# immediately and the free replay never runs.
+#
 # Challenge types that require JS execution to solve. Fingerprint
 # rotation alone cannot help — browser solver should be tried early.
 # DataDome is included because its cookie is TLS+IP bound: when the
@@ -111,6 +209,14 @@ def _header_fast_path(
     Returns a ChallengeType if we can definitively identify the WAF from
     headers alone, otherwise None to fall through to body inspection.
     """
+    # Radware — the origin's own 3xx into the vendor's challenge host. Reached
+    # only when the caller disabled redirect following; otherwise wafer has
+    # already followed this hop and sees the captcha page instead.
+    if 300 <= status_code < 400 and is_radware_challenge_redirect(
+        headers.get("location", "")
+    ):
+        return ChallengeType.RADWARE
+
     # Cloudflare explicit challenge header
     if headers.get("cf-mitigated") == "challenge":
         return ChallengeType.CLOUDFLARE
@@ -347,6 +453,18 @@ def detect_challenge(
     if "istlwashere" in body_lower or "_imp_apg_r_" in body:
         logger.info("Challenge detected (body): shape")
         return ChallengeType.SHAPE
+
+    # Radware Bot Manager — checked on any status code, and ahead of the
+    # 403/429 block below so the generic-JS fallback can never swallow a
+    # Radware block that arrives as 403. The measured gojobs.gov.on.ca
+    # deployment serves it as a plain HTTP 200: the origin answers the first
+    # request with a 302 that sets the __uzm* cookies, then redirects to
+    # validate.perfdrive.com, which returns the captcha template as 200. To a
+    # caller that is a clean, ordinary success — which is exactly why this
+    # needs a body check rather than a status or header one.
+    if _matches_radware_markers(body_lower):
+        logger.info("Challenge detected (body): radware")
+        return ChallengeType.RADWARE
 
     # Body-based detection for 403/429
     if status_code in (403, 429):

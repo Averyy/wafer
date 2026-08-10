@@ -343,7 +343,7 @@ and limitations.
 
 ## Challenge Detection
 
-Wafer detects 19 WAF challenge types from response status, headers, and body.
+Wafer detects 20 WAF challenge types from response status, headers, and body.
 **Detection is not the same as solving** - the "Solved by" column shows how each
 type is actually handled: `inline` (over HTTP, no browser), `browser` (needs a
 configured `browser_solver`), or `detect-only` (raises `ChallengeDetected`; no
@@ -358,6 +358,7 @@ solver - you must handle it yourself).
 | Imperva / Incapsula | `reese84`/`___utmvc` cookie, `_Incapsula_Resource` script, 200 "Pardon Our Interruption" interstitial | inline (native-TLS) + browser under load |
 | Kasada | `429` with Kasada script markers | browser |
 | F5 Shape | `istlWasHere` interstitial page | browser |
+| Radware Bot Manager | Radware sensor plus a captcha-template marker (`captcha.perfdrive.com`, `SSJSInternal`); served as a plain 200 | inline (clearance replay) |
 | AWS WAF | `aws-waf-token` cookie, `AwsWafIntegration` script | browser |
 | ACW (Alibaba) | `acw_sc__v2` challenge script | inline |
 | TMD | TMD session validation pattern | inline (+ browser slider) |
@@ -372,7 +373,8 @@ solver - you must handle it yourself).
 | Cloudflare WAF block | Error 1020 / IP-ban page: `cf.errors.css` present, `challenge-platform` absent | **terminal** -raises `RequestBlocked` at once, no retry or rotation |
 
 When a challenge is detected, wafer escalates automatically:
-1. Inline solving/warm-up (ACW, Amazon, Reddit, and the first TMD warm-up)
+1. Inline solving/warm-up (ACW, Amazon, Reddit, Radware, and the first TMD
+   warm-up)
 2. For Imperva, a native OpenSSL transport that TLS-fingerprinting sites
    free-pass (no browser - see [Imperva bypass](#imperva--incapsula-no-browser-bypass))
 3. Browser solver if configured (JS challenges: Cloudflare, DataDome, reCAPTCHA,
@@ -938,7 +940,7 @@ wafer/
   _sync.py          # SyncSession -wraps wreq.blocking.Client
   _async.py         # AsyncSession -wraps wreq.Client
   _response.py      # WaferResponse wrapper
-  _challenge.py     # Challenge detection (18 WAF types)
+  _challenge.py     # Challenge detection (20 WAF types)
   _solvers.py       # Inline solvers (ACW, Amazon, TMD, Reddit)
   _cookies.py       # JSON disk cache with TTL and LRU
   _fingerprint.py   # Emulation profiles, sec-ch-ua generation

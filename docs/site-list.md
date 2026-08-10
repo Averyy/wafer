@@ -140,6 +140,33 @@ Passes with wreq Chrome Emulation (JA3/JA4 + H2 fingerprint match).
 |---|---|---|---|
 | `chase.com` | Shape (unverified) | pass | 2026-02-21: 200 403KB via TLS. Banking; no Shape interstitial on homepage |
 
+### Radware Bot Manager
+
+Interstitial is an HTTP **200**, so a status-only check reads it as success. The
+302 that fronts it sets the `__uzm*` clearance on the origin; wafer replays the
+original URL inline. See `docs/ref-radware.md`.
+
+| URL | Challenge Type | Status | Notes |
+|---|---|---|---|
+| `gojobs.gov.on.ca/Preview.aspx?JobID=232882` | Radware Bot Manager | pass | 2026-08-10: inline clearance replay verified. Cold `wafer.get()` -> 302 sets `__uzm*` -> 200 captcha at `validate.perfdrive.com` -> replay -> 200 85KB real job page. No browser. Job ID will eventually close |
+| `gojobs.gov.on.ca/Preview.aspx` with `follow_redirects=False` | Radware Bot Manager | pass | 2026-08-10: 302 detected by `Location` host; replayed to 200 85KB without ever fetching the captcha |
+| `gojobs.gov.on.ca/Search.aspx` | Radware Bot Manager | pass | 2026-08-10: 200 66KB after inline replay |
+| `gojobs.gov.on.ca/JobsAlert.aspx` | Radware Bot Manager | pass | 2026-08-10: 200 88KB on a warm session, no re-challenge |
+| `sos.state.mn.us` | Radware Bot Manager | pass | 2026-08-10: 200 62KB, no challenge issued. Different tenant; sensor + `__uzm*` cookies present on the real page and correctly NOT detected |
+| `sedarplus.ca/landingpage/` | Radware Bot Manager | pass | 2026-08-10: 200 42KB, no challenge issued. Also serves an ordinary same-site 301 stamped `server: rdwr` -a real negative control for the redirect signal, correctly not detected |
+| `mndor.state.mn.us/ecrv_search/...` | Radware Bot Manager | pass | 2026-08-10: real 404 with the sensor present, correctly not detected |
+
+Detection was exercised against four distinct Radware tenants. Only gojobs
+served a block; the other three confirm the sensor and `__uzm*` cookies ride on
+ordinary 200/301/404 responses without tripping detection. The block-side
+markers are therefore backed by **one** deployment -treat a new Radware site
+that fails as a marker-coverage question first.
+
+The gojobs block is reputation-gated: after the verification runs above it
+stopped challenging this egress altogether, and cold sessions now return the
+real page on the first request. Not reproducing the block does not mean the
+solver broke -it needs an egress without recent standing.
+
 ### Unknown / Other
 
 | URL | Challenge Type | Status | Notes |
@@ -374,6 +401,7 @@ Wafer has **no Arkose Labs solver**. Arkose presents 3D puzzle CAPTCHAs (rotate,
 | **Imperva** | Yes | 6 | Browser solve + cookie replay. Handles modern reese84, legacy ___utmvc, and classic incap_ses. |
 | **Kasada** | Yes | 9 | Browser solve extracts CT from ips.js/p.js. Cookie auth for simple deployments. Passthrough for dual-WAF (Chewy: Akamai+Kasada). CD PoW rewritten to match spec (hash chaining). |
 | **F5 Shape** | Yes | 3 | Browser solve -passive wait for istlWasHere interstitial to clear. |
+| **Radware Bot Manager** | Yes | 4 | Inline clearance replay, no browser. The interstitial's own 302 sets the `__uzm*` cookies on the origin; wafer replays the original URL. Detection needs sensor + captcha-template markers together -the sensor and cookies ride on real pages too. |
 | **GeeTest v4** (slide) | Yes | 4 | Browser solve with CV notch detection + recorded mouse replay. **SOLVED** 12/12+ on demo. bilibili NOT GeeTest; aerlingus is GeeTest v3. |
 | **hCaptcha** (checkbox) | Yes | 1 | Browser solve -checkbox click + token poll. Image escalation detected, not solved. |
 | **reCAPTCHA v2** (checkbox + image grid) | Yes | 1 | Browser solve -checkbox click, image grid via ONNX classifier (dynamic 3x3 + static 3x3). Demo: `google.com/recaptcha/api2/demo`. **2026-07-27 live-verified on system Chrome 150.0.7871.182**: solved a real `dynamic_3x3` grid (keyword `bus`) on attempt 1 in 26.1s -- classifier scored all 9 tiles (3:0.974, 7:0.860, 6:0.581), all three clicks acknowledged, one dynamic-replacement round handled, Verify returned `statuses=200 classifications=protocol_solved`, token 2,340 chars. Note HTTP detection is gated on **403/429**, so a 200 page that merely embeds a widget is correctly not a challenge -- exercising the solver requires driving `wait_for_recaptcha` directly, as the demo returns 200. reCAPTCHA **v3** minting also verified: 2,105-char token in 0.4s, browser-free. |
