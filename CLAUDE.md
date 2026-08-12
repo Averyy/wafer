@@ -58,6 +58,8 @@ Wraps wreq **0.12.0+** (the `Emulation` API, formerly rnet). See `docs/ref-wreq.
 
 There are exactly two install modes: `pip install wafer-py` (core) and `pip install wafer-py[browser]` (everything). **Never create additional extras** like `[audio]`, `[vision]`, `[models]`, etc. If a dependency is needed for browser solving or advanced challenge solving (Whisper, ONNX, Pillow, OpenCV, Patchright), it goes in `[browser]`. The only question is: does it need a browser or not?
 
+Core dependencies are `wreq` and `cryptography`. `cryptography` backs AIA chasing (`wafer/_aia.py`), which must verify that a fetched intermediate is signed by a root already in the trust store -stdlib `ssl` enumerates roots but cannot verify a signature, and anchoring an unverified certificate turns a fail-closed handshake into a fail-open one. It does not belong in `[browser]`: nothing about certificate paths needs a browser. See `docs/ref-tls-chain.md`.
+
 ## What NOT to Build
 
 - Proxy rotation/pooling -separate concern, just accept a proxy URL

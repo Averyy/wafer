@@ -17,6 +17,7 @@ from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 from wreq import CertStore, Emulation, Method
 
 from wafer import _psl
+from wafer._aia import merge_pem_stacks
 from wafer._cookies import CookieCache, _default_cookie_path
 from wafer._dart import DartIdentity
 from wafer._fingerprint import (
@@ -242,8 +243,14 @@ def _to_method(method: str) -> Method:
         raise ValueError(f"Unknown HTTP method: {method}") from None
 
 
-def _load_system_cert_store() -> CertStore | None:
-    """Load system CA certificates into a wreq CertStore."""
+def _load_system_cert_pems() -> bytes | None:
+    """Read the system CA certificates as a PEM stack.
+
+    The raw bytes are kept, not just the CertStore built from them, because
+    AIA chasing needs the same material twice: to verify a fetched
+    intermediate against the roots this client actually trusts, and to build
+    an augmented store once it is proven.
+    """
     try:
         if platform.system() == "Darwin":
             result = subprocess.run(
@@ -257,7 +264,7 @@ def _load_system_cert_store() -> CertStore | None:
                 capture_output=True,
             )
             if result.returncode == 0 and result.stdout:
-                return CertStore.from_pem_stack(result.stdout)
+                return result.stdout
         elif platform.system() == "Linux":
             for path in [
                 "/etc/ssl/certs/ca-certificates.crt",
@@ -266,7 +273,7 @@ def _load_system_cert_store() -> CertStore | None:
             ]:
                 try:
                     with open(path, "rb") as f:
-                        return CertStore.from_pem_stack(f.read())
+                        return f.read()
                 except FileNotFoundError:
                     continue
         # Fallback: try certifi if available
@@ -274,7 +281,7 @@ def _load_system_cert_store() -> CertStore | None:
             import certifi
 
             with open(certifi.where(), "rb") as f:
-                return CertStore.from_pem_stack(f.read())
+                return f.read()
         except ImportError:
             pass
     except Exception:
@@ -282,8 +289,20 @@ def _load_system_cert_store() -> CertStore | None:
     return None
 
 
+def _cert_store_from_pems(pem_stack: bytes | None) -> CertStore | None:
+    """Build a wreq CertStore from a PEM stack, or None if unusable."""
+    if not pem_stack:
+        return None
+    try:
+        return CertStore.from_pem_stack(pem_stack)
+    except Exception:
+        logger.debug("Failed to build cert store", exc_info=True)
+        return None
+
+
 # Cache the cert store at module load time
-_SYSTEM_CERT_STORE = _load_system_cert_store()
+_SYSTEM_CERT_PEMS = _load_system_cert_pems()
+_SYSTEM_CERT_STORE = _cert_store_from_pems(_SYSTEM_CERT_PEMS)
 if _SYSTEM_CERT_STORE:
     logger.debug("Loaded system CA certificate store")
 else:
@@ -781,6 +800,13 @@ class BaseSession:
         self._embed = embed
         self._embed_origin = embed_origin
         self._embed_referers = embed_referers or []
+
+        # AIA chasing state. Intermediates proven to be signed by a root in
+        # the system store, the store built from them, and the hosts already
+        # chased (attempted, not necessarily completed -- one try each).
+        self._aia_extra_pems: list[bytes] = []
+        self._aia_cert_store = None
+        self._aia_attempted: set[str] = set()
 
         # Proxy
         self._proxy = None
@@ -1774,6 +1800,61 @@ class BaseSession:
         defaults.update(kwargs)
         return cls(**defaults)
 
+    def _cert_store(self):
+        """Return the trust store this session's client should verify against.
+
+        Normally the shared system store. A session that has completed a
+        server's chain by AIA chasing gets its own store with the proven
+        intermediates added -- built once and cached, since _build_client_kwargs
+        runs on every fingerprint rotation.
+        """
+
+        if not self._aia_extra_pems:
+            return _SYSTEM_CERT_STORE
+        if self._aia_cert_store is None:
+            self._aia_cert_store = _cert_store_from_pems(
+                merge_pem_stacks(_SYSTEM_CERT_PEMS or b"", self._aia_extra_pems)
+            )
+        return self._aia_cert_store or _SYSTEM_CERT_STORE
+
+    def _complete_chain_via_aia(self, url: str, timeout: float | None = None) -> bool:
+        """Try once to complete a host's certificate chain, returning success.
+
+        Returns True only when new, verified intermediates were added, which
+        is the caller's signal to rebuild the client and retry. One attempt
+        per host per session: a chain that could not be completed from
+        trusted material will not complete on a second try either, and
+        retrying would turn every genuinely bad certificate into repeated
+        probe traffic against the host.
+        """
+
+        host = urlparse(url).hostname
+        if not host or host in self._aia_attempted:
+            return False
+        self._aia_attempted.add(host)
+        if not _SYSTEM_CERT_PEMS:
+            # Without a known trust store there is nothing to verify a
+            # fetched intermediate against, and unverified is not usable.
+            return False
+        try:
+            from wafer._aia import resolve_missing_intermediates
+
+            pems = resolve_missing_intermediates(
+                url, _SYSTEM_CERT_PEMS, timeout=timeout
+            )
+        except Exception:
+            logger.debug("AIA chase raised for %s", host, exc_info=True)
+            return False
+        if not pems:
+            return False
+        known = set(self._aia_extra_pems)
+        added = [pem for pem in pems if pem not in known]
+        if not added:
+            return False
+        self._aia_extra_pems.extend(added)
+        self._aia_cert_store = None
+        return True
+
     def _build_client_kwargs(self) -> dict:
         """Build kwargs for wreq Client construction.
 
@@ -1831,8 +1912,9 @@ class BaseSession:
                 "timeout": self.timeout,
                 "cookie_store": True,
             }
-        if _SYSTEM_CERT_STORE is not None:
-            kwargs["tls_verify"] = _SYSTEM_CERT_STORE
+        store = self._cert_store()
+        if store is not None:
+            kwargs["tls_verify"] = store
         if self._proxy is not None:
             kwargs["proxies"] = [self._proxy]
         if self._resolve:

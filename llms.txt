@@ -624,6 +624,7 @@ Default mode (`max_rotations > 0`):
 - 429 without challenge -> raises `RateLimited` after exhausting rotations
 - 200 with empty body -> retries; if the host already served a real body this session, also rotates to a fresh identity (within `max_rotations`); raises `EmptyResponse` once retries+rotations are exhausted (see "Stateful request replay")
 - Connection error (refused/reset/TLS failure) -> raises `ConnectionFailed` after exhausting retries. When the host resolved only to `0.0.0.0` / `::`, `.reason` says so: the resolver refused the name (sinkhole, blocklist, filtered DNS) rather than the host being unreachable. Pin the address with `resolve=` or use another resolver.
+- Certificate verification failure -> wafer first tries to complete the chain via the leaf's Authority Information Access URL (see "What Wafer Handles"). If the chain still does not verify, raises `ConnectionFailed`. A certificate that is expired, revoked, self-signed, or issued for a different hostname is never accepted; there is no option to disable verification.
 - Server hang past the total `timeout` deadline -> raises `WaferTimeout` (a timeout on any transport - the wreq path, the native-TLS Imperva bypass, or the Opera Mini path, whether during connect or read - is always bounded by your budget and surfaced as `WaferTimeout`, never `ConnectionFailed`)
 - 5xx -> returns response after exhausting retries
 - Other 4xx (400, 401, 404, etc.) -> returns response immediately (no retry)
@@ -866,6 +867,7 @@ These are all automatic. Do not write code to handle these yourself:
 - **TLS fingerprint** - sec-ch-ua headers auto-generated to match the Chrome version
 - **Binary responses** - detected via Content-Type. `resp.content` preserves the decompressed body bytes exactly on every response (safe for PDFs, images, etc.). `resp.text` decodes charset-aware (Content-Type charset, HTML meta tag, UTF-8 fallback) with replacement characters - it never raises.
 - **Decompression** - gzip/brotli/zstd response bodies are decompressed automatically; `resp.content` is the decompressed bytes.
+- **Incomplete TLS certificate chains** - a server that sends its leaf certificate without the intermediates above it fails verification in most HTTP clients while loading fine in a browser. Wafer fetches the missing certificate from the URL the leaf names in its Authority Information Access extension, confirms it is signed by a root already in the system trust store, and retries. Certificates that fail that check are discarded, so an expired, revoked, self-signed, or wrong-hostname certificate still raises `ConnectionFailed`. One attempt per hostname per session.
 
 ---
 

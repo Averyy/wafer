@@ -8,6 +8,7 @@ import wreq.blocking
 import wreq.exceptions
 from wreq import Method
 
+from wafer._aia import is_certificate_verify_failure
 from wafer._base import (
     BaseSession,
     _browser_attempt_timeout,
@@ -1423,6 +1424,22 @@ class SyncSession(BaseSession):
                 # WaferTimeout rather than a bare ConnectionFailed. The loop-top
                 # deadline check still bounds the total time.
                 attempt_timed_out = isinstance(e, wreq.exceptions.TimeoutError)
+                # A certificate path failure is not a network problem and no
+                # amount of retrying or rotating fixes it -- the server sent an
+                # incomplete chain. Complete it from the intermediate the leaf
+                # names, then retry on the same budget. Costs nothing on the
+                # normal path: this only runs after a handshake already failed
+                # verification, and only once per host.
+                if is_certificate_verify_failure(e) and self._complete_chain_via_aia(
+                    current_url,
+                    timeout=(
+                        None
+                        if deadline is None
+                        else max(0.0, deadline - time.monotonic())
+                    ),
+                ):
+                    self._rebuild_client()
+                    continue
                 # The wall-clock limit this attempt actually ran under (for
                 # logging); attempt_limit is the min(cap, remaining) bound.
                 timed_out_after = (
