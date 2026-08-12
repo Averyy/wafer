@@ -599,6 +599,62 @@ class TestResolveMissingIntermediates:
             )
         assert out == [_pem(lower), _pem(upper)]
 
+    def test_a_chain_needing_the_full_depth_still_resolves(self, pki):
+        """The last permitted hop must be tested against the store.
+
+        The root check runs at the top of each pass, so a chain needing
+        exactly _MAX_CHASE_DEPTH hops would be rejected after doing all the
+        work to complete it.
+        """
+
+        root_key = _key()
+        root = (
+            x509.CertificateBuilder()
+            .subject_name(_name("Chain Root"))
+            .issuer_name(_name("Chain Root"))
+            .public_key(root_key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(_NOW - datetime.timedelta(days=3650))
+            .not_valid_after(_NOW + datetime.timedelta(days=3650))
+            .add_extension(x509.BasicConstraints(ca=True, path_length=None), True)
+            .sign(root_key, hashes.SHA256())
+        )
+        depth = _aia._MAX_CHASE_DEPTH
+        served = {}
+        parent_name, parent_key = root.subject, root_key
+        certs = []
+        # Build depth CAs, root-most first.
+        for level in range(depth):
+            url = f"http://ca.test/lvl{level}.crt"
+            cert, key = _make_cert(
+                f"CA level {level}",
+                parent_name,
+                parent_key,
+                ca=True,
+                aia_url=None if level == 0 else f"http://ca.test/lvl{level - 1}.crt",
+            )
+            served[url] = cert
+            certs.append((url, cert, key))
+            parent_name, parent_key = cert.subject, key
+        leaf_url, _, leaf_signer = certs[-1]
+        leaf, _ = _make_cert(
+            "deep.test",
+            certs[-1][1].subject,
+            leaf_signer,
+            ca=False,
+            aia_url=leaf_url,
+        )
+        with (
+            _resolves_to("93.184.216.34"),
+            patch.object(_aia, "_probe_chain", return_value=[leaf]),
+            patch.object(
+                _aia, "_fetch_certificate", side_effect=lambda u, t, p=None: served[u]
+            ),
+            patch.object(_aia, "_completes_chain", return_value=True),
+        ):
+            out = resolve_missing_intermediates("https://deep.test/", _pem(root))
+        assert len(out) == depth
+
     def test_chase_depth_is_bounded(self, pki):
         """A certificate that names itself must not loop."""
 
@@ -729,7 +785,8 @@ class TestSessionIntegration:
             resp = session.get("https://incomplete.test/")
         assert resp.status_code == 200
         assert mock.request_count == 2
-        # The client has to be rebuilt or the retry reuses the old store.
+        # Rebuilt exactly once, by the chase itself under the lock that
+        # installed the certificate -- not again by the caller.
         assert rebuilt == [True]
         assert session._aia_extra_pems == [_pem(pki["intermediate"])]
 
@@ -1334,6 +1391,82 @@ class TestAnchorConstraints:
         )
         assert not _is_ca(cert)
 
+    def test_constrained_mid_path_certificate_aborts_the_chase(self):
+        """Every collected certificate is anchored, not just the terminal one.
+
+        A constrained certificate part-way up the walk is still a place the
+        constraints would stop being enforced, so checking only the one that
+        reaches a root would leave the hole open one hop down.
+        """
+
+        root_key = _key()
+        root = (
+            x509.CertificateBuilder()
+            .subject_name(_name("Deep Root"))
+            .issuer_name(_name("Deep Root"))
+            .public_key(root_key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(_NOW - datetime.timedelta(days=3650))
+            .not_valid_after(_NOW + datetime.timedelta(days=3650))
+            .add_extension(x509.BasicConstraints(ca=True, path_length=None), True)
+            .sign(root_key, hashes.SHA256())
+        )
+        upper, upper_key = _make_cert("Deep Upper", root.subject, root_key, ca=True)
+        # The constrained certificate sits BELOW the one that reaches the root.
+        lower_key = _key()
+        lower = (
+            x509.CertificateBuilder()
+            .subject_name(_name("Deep Lower"))
+            .issuer_name(upper.subject)
+            .public_key(lower_key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(_NOW - datetime.timedelta(days=100))
+            .not_valid_after(_NOW + datetime.timedelta(days=100))
+            .add_extension(x509.BasicConstraints(ca=True, path_length=None), True)
+            .add_extension(
+                x509.NameConstraints(
+                    permitted_subtrees=[x509.DNSName("deep.test")],
+                    excluded_subtrees=None,
+                ),
+                critical=True,
+            )
+            .add_extension(
+                x509.AuthorityInformationAccess(
+                    [
+                        x509.AccessDescription(
+                            x509.oid.AuthorityInformationAccessOID.CA_ISSUERS,
+                            x509.UniformResourceIdentifier(
+                                "http://ca.test/upper.crt"
+                            ),
+                        )
+                    ]
+                ),
+                critical=False,
+            )
+            .sign(upper_key, hashes.SHA256())
+        )
+        leaf, _ = _make_cert(
+            "deep.test",
+            lower.subject,
+            lower_key,
+            ca=False,
+            aia_url="http://ca.test/lower.crt",
+        )
+        served = {
+            "http://ca.test/lower.crt": lower,
+            "http://ca.test/upper.crt": upper,
+        }
+        with (
+            _resolves_to("93.184.216.34"),
+            patch.object(_aia, "_probe_chain", return_value=[leaf]),
+            patch.object(
+                _aia, "_fetch_certificate", side_effect=lambda u, t, p=None: served[u]
+            ),
+            patch.object(_aia, "_completes_chain", return_value=True),
+        ):
+            out = resolve_missing_intermediates("https://deep.test/", _pem(root))
+        assert out == []
+
     def test_constrained_chain_yields_nothing_end_to_end(self):
         root, key = self._constrained_root()
         inter, inter_key = _make_cert("Constrained CA", root.subject, key, ca=True)
@@ -1398,6 +1531,43 @@ class TestConcurrentChase:
         assert results["loser"] is True
         assert len(session._aia_extra_pems) == 1
 
+    def test_a_different_port_on_one_host_is_chased_separately(self):
+        """Two services on one name can present different chains.
+
+        Keying only by hostname would let a chase against :8443 suppress the
+        one :443 still needs.
+        """
+
+        session, _ = make_sync_session([MockResponse(200)])
+        with patch.object(
+            _aia, "resolve_missing_intermediates", return_value=[]
+        ) as resolve:
+            session._complete_chain_via_aia("https://one.test:8443/")
+            session._complete_chain_via_aia("https://one.test/")
+        assert resolve.call_count == 2
+        assert ("one.test", 8443) in session._aia_attempted
+        assert ("one.test", 443) in session._aia_attempted
+
+    def test_the_same_origin_is_only_chased_once(self):
+        session, _ = make_sync_session([MockResponse(200)])
+        with patch.object(
+            _aia, "resolve_missing_intermediates", return_value=[]
+        ) as resolve:
+            for _ in range(3):
+                session._complete_chain_via_aia("https://one.test/")
+        assert resolve.call_count == 1
+
+    def test_the_origin_table_is_bounded(self):
+        session, _ = make_sync_session([MockResponse(200)])
+        from wafer._base import _AIA_MAX_TRACKED_HOSTS
+
+        with patch.object(
+            _aia, "resolve_missing_intermediates", return_value=[]
+        ):
+            for i in range(_AIA_MAX_TRACKED_HOSTS + 20):
+                session._complete_chain_via_aia(f"https://h{i}.test/")
+        assert len(session._aia_attempted) == _AIA_MAX_TRACKED_HOSTS
+
     def test_waiters_are_released_when_the_chase_fails(self):
         session, _ = make_sync_session([MockResponse(200)])
         with patch.object(
@@ -1405,7 +1575,7 @@ class TestConcurrentChase:
         ):
             assert session._complete_chain_via_aia("https://broken.test/") is False
         # Event set, so a later caller answers immediately rather than blocking.
-        assert session._aia_attempted["broken.test"].is_set()
+        assert session._aia_attempted[("broken.test", 443)].done.is_set()
         assert session._complete_chain_via_aia("https://broken.test/") is False
 
     def test_waiters_are_released_when_the_chase_raises(self):
@@ -1416,7 +1586,7 @@ class TestConcurrentChase:
             side_effect=RuntimeError("boom"),
         ):
             assert session._complete_chain_via_aia("https://raising.test/") is False
-        assert session._aia_attempted["raising.test"].is_set()
+        assert session._aia_attempted[("raising.test", 443)].done.is_set()
 
 
 class TestConnectionCleanup:

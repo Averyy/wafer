@@ -248,6 +248,26 @@ def _to_method(method: str) -> Method:
 # thread dies outright.
 _AIA_WAIT_SECONDS = 30.0
 
+# Bound on the per-origin chase table. A session pointed at attacker-chosen
+# URLs would otherwise accumulate one entry per certificate-error host for as
+# long as it lives.
+_AIA_MAX_TRACKED_HOSTS = 512
+
+
+class _AiaChase:
+    """One origin's chase: who owns it, whether it finished, and its verdict.
+
+    The verdict is recorded here rather than inferred from the shared list of
+    collected certificates, which cannot distinguish "the winner succeeded"
+    from "some other origin's chase added something".
+    """
+
+    __slots__ = ("done", "succeeded")
+
+    def __init__(self):
+        self.done = threading.Event()
+        self.succeeded = False
+
 _CERT_VERIFY_MARKERS = (
     "certificate_verify_failed",
     "certificate verify failed",
@@ -1878,30 +1898,50 @@ class BaseSession:
         broken-chain host would hit.
         """
 
-        host = urlparse(url).hostname
+        parsed = urlparse(url)
+        host = parsed.hostname
         if not host:
             return False
+        # Keyed by host AND port: two services on one name can present
+        # different chains, so a chase against :8443 must not suppress the
+        # one :443 still needs.
+        try:
+            key = (_canonical_host(host), parsed.port or 443)
+        except ValueError:
+            return False
         with self._aia_lock:
-            done = self._aia_attempted.get(host)
-            if done is not None:
-                waiter = done
-            else:
-                waiter = None
-                self._aia_attempted[host] = threading.Event()
-        if waiter is not None:
-            before = len(self._aia_extra_pems)
+            state = self._aia_attempted.get(key)
+            # Ownership is decided here, inside the lock, rather than from
+            # thread identity: async runs these in a pool, so the same thread
+            # can legitimately return for an origin it already finished.
+            owner = state is None
+            if owner:
+                if len(self._aia_attempted) >= _AIA_MAX_TRACKED_HOSTS:
+                    # A caller fetching attacker-chosen URLs would otherwise
+                    # grow this map without bound. Past the cap, stop chasing
+                    # rather than stop bounding memory.
+                    logger.debug("AIA host table full; not chasing %s", host)
+                    return False
+                state = _AiaChase()
+                self._aia_attempted[key] = state
+        if not owner:
             # Bounded: the holder's own chase is deadline-capped, so this
             # cannot outlive it by much even if that thread dies.
-            waiter.wait(timeout if timeout is not None else _AIA_WAIT_SECONDS)
-            # True only if the winner actually added something, so the caller
-            # rebuilds and retries exactly when there is a reason to.
-            return len(self._aia_extra_pems) > before
+            state.done.wait(
+                timeout if timeout is not None else _AIA_WAIT_SECONDS
+            )
+            # Read the winner's own verdict. Inferring it from the length of
+            # the shared PEM list would be wrong twice over: the winner may
+            # finish before this thread samples the length, and a chase for
+            # an unrelated host adding a certificate would read as success.
+            return state.succeeded
         # Every exit from here must release the waiters, or a concurrent
         # request for this host blocks for the full wait.
         try:
-            return self._run_aia_chase(url, host, timeout)
+            state.succeeded = self._run_aia_chase(url, host, timeout)
+            return state.succeeded
         finally:
-            self._aia_attempted[host].set()
+            state.done.set()
 
     def _run_aia_chase(
         self,
@@ -1956,6 +1996,13 @@ class BaseSession:
             # intermediates. Keeping the old one would leave the Imperva
             # fallback failing on a chain the wreq path can now complete.
             self._native_tls = None
+            # Publish the client here, under the same lock that installed the
+            # certificates. Two origins completing at once would otherwise
+            # each build a client from whatever store they observed and race
+            # to assign it, letting a client that knows only the first
+            # certificate overwrite one that knows both. Building a wreq
+            # Client touches no network, so the lock is held only briefly.
+            self._rebuild_client()
         return True
 
     def _build_client_kwargs(self) -> dict:

@@ -1618,7 +1618,8 @@ class AsyncSession(BaseSession):
                         else max(0.0, deadline - time.monotonic())
                     ),
                 ):
-                    self._rebuild_client()
+                    # The chase publishes the rebuilt client itself, under the
+                    # lock that installed the certificates.
                     continue
                 # The wall-clock limit this attempt actually ran under (for
                 # logging); attempt_limit is the min(cap, remaining) bound.

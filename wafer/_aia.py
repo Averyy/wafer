@@ -532,15 +532,26 @@ def _anchoring_would_drop_constraints(
     guard against nothing.
     """
 
-    for source in (root, cert):
-        try:
-            source.extensions.get_extension_for_oid(ExtensionOID.NAME_CONSTRAINTS)
-        except x509.ExtensionNotFound:
-            continue
-        except Exception:
-            return True
+    return any(_has_name_constraints(source) for source in (root, cert))
+
+
+def _has_name_constraints(cert: x509.Certificate) -> bool:
+    """Report whether a certificate carries a name-constraints extension.
+
+    Checked for every certificate that would be anchored, not only the one
+    that reaches a root: each collected certificate goes into the store, so
+    each is a place where constraints would stop being enforced.
+    """
+
+    try:
+        cert.extensions.get_extension_for_oid(ExtensionOID.NAME_CONSTRAINTS)
+    except x509.ExtensionNotFound:
+        return False
+    except Exception:
+        # Unreadable extensions are treated as constraining: refusing to
+        # anchor costs one site, guessing wrong widens a CA.
         return True
-    return False
+    return True
 
 
 def _is_currently_valid(cert: x509.Certificate, now: float) -> bool:
@@ -734,6 +745,18 @@ def resolve_missing_intermediates(
                     "AIA certificate from %s is not a valid CA", candidate_url
                 )
                 continue
+            if _has_name_constraints(candidate):
+                # Every collected certificate is anchored, not just the one
+                # that reaches a root, so a constrained certificate anywhere
+                # in the path is a place those constraints would stop being
+                # enforced. Abandon the whole chase rather than anchor it.
+                logger.debug(
+                    "Refusing the chase for %s: %s is name-constrained and "
+                    "anchoring it would stop those constraints applying",
+                    host,
+                    candidate_url,
+                )
+                return []
             fingerprint = candidate.public_bytes(Encoding.DER)
             if fingerprint in seen:
                 # A certificate that names itself, directly or through a
@@ -750,6 +773,17 @@ def resolve_missing_intermediates(
         # unless a later pass reaches the store.
         collected.append(_to_pem(issuer))
         cert = issuer
+    else:
+        # The loop ran its full depth without breaking, so the last fetched
+        # certificate was never tested against the store -- the check happens
+        # at the top of the next pass, which never came. A chain needing
+        # exactly _MAX_CHASE_DEPTH hops would otherwise be rejected after
+        # doing all the work to complete it.
+        issuing_root = _issuing_root(cert, roots)
+        if issuing_root is not None and not _anchoring_would_drop_constraints(
+            cert, issuing_root
+        ):
+            anchored = True
 
     if not anchored or not collected:
         logger.debug("AIA chase for %s did not reach a trusted root", host)
