@@ -29,7 +29,7 @@ from wafer._aia import (
     resolve_missing_intermediates,
 )
 from wafer._base import is_certificate_verify_failure
-from wafer._errors import ConnectionFailed
+from wafer._errors import ConnectionFailed, WaferTimeout
 
 from .conftest import (
     AsyncMockResponse,
@@ -1272,61 +1272,70 @@ class TestProxiedUrlGuard:
         assert not _is_fetchable_url("file:///etc/passwd", proxied=True)
 
 
-class TestCertFailureIsTerminal:
-    """A certificate that still fails after the chase must end the request.
+class TestCertFailureIsBounded:
+    """A repaired-then-still-failing origin must not spin the retry loop.
 
-    The same certificate fails the same way on every retry and under every
-    fingerprint, so continuing costs handshakes and returns the same answer.
+    Reporting the chase's success again on each later failure told the caller
+    to retry without consuming any budget, so nothing terminated: measured at
+    412,474 handshake attempts in three seconds, surfacing as WaferTimeout
+    that hid the real certificate error. The fix is that a caller arriving
+    after the chase settled gets False, which drops it onto the ordinary
+    retry path -- bounded by retries, rotations and backoff like any other
+    connection error.
     """
 
-    def test_success_is_reported_at_most_once_per_origin(self, pki):
-        """Otherwise the retry loop spins without consuming any budget.
+    def test_attempts_are_bounded_when_the_repair_does_not_take(self, pki):
+        session, mock = make_sync_session(
+            [_VERIFY_ERROR], max_retries=2, max_rotations=0
+        )
+        session._rebuild_client = lambda: None
+        with patch.object(
+            _aia,
+            "resolve_missing_intermediates",
+            return_value=[_pem(pki["intermediate"])],
+        ):
+            with pytest.raises((ConnectionFailed, WaferTimeout)):
+                session.get("https://incomplete.test/", timeout=5)
+        # One initial attempt, one post-chase retry, then the normal ladder.
+        # The exact count does not matter; that it is small does.
+        assert mock.request_count <= 8, mock.request_count
 
-        Reporting success again on a later failure tells the caller to retry
-        a request that just failed with the certificates already installed.
-        Nothing changes between those attempts, so it never terminates: this
-        measured 412,474 handshake attempts in three seconds before the fix,
-        and surfaced as WaferTimeout hiding the real certificate error.
+    def test_the_chase_runs_once_however_many_attempts_follow(self, pki):
+        session, _ = make_sync_session([_VERIFY_ERROR], max_retries=2, max_rotations=0)
+        session._rebuild_client = lambda: None
+        with patch.object(
+            _aia,
+            "resolve_missing_intermediates",
+            return_value=[_pem(pki["intermediate"])],
+        ) as resolve:
+            with pytest.raises((ConnectionFailed, WaferTimeout)):
+                session.get("https://incomplete.test/", timeout=5)
+        resolve.assert_called_once()
+
+    def test_a_retry_can_still_recover_a_mixed_certificate_pool(self, pki):
+        """Retries must survive: one node of a pool can serve a stale cert.
+
+        A host behind several addresses can have a single node failing
+        verification after a partial deploy, and a retry re-resolves onto a
+        healthy one. Treating a certificate error as terminal would lose that.
         """
 
         session, mock = make_sync_session(
-            [_VERIFY_ERROR], max_retries=3, max_rotations=2
+            [_VERIFY_ERROR, MockResponse(200, body="ok")],
+            max_retries=2,
+            max_rotations=0,
         )
-        session._rebuild_client = lambda: None
         with patch.object(
-            _aia,
-            "resolve_missing_intermediates",
-            return_value=[_pem(pki["intermediate"])],
+            _aia, "resolve_missing_intermediates", return_value=[]
         ):
-            with pytest.raises(ConnectionFailed):
-                session.get("https://incomplete.test/", timeout=3)
-        # One attempt, one retry after the chase installed the certificate.
+            resp = session.get("https://mixed.test/", timeout=10)
+        assert resp.status_code == 200
         assert mock.request_count == 2
-
-    def test_an_unfixable_chain_does_not_burn_the_retry_ladder(self):
-        session, mock = make_sync_session(
-            [_VERIFY_ERROR], max_retries=3, max_rotations=2
-        )
-        with patch.object(
-            _aia, "resolve_missing_intermediates", return_value=[]
-        ):
-            with pytest.raises(ConnectionFailed):
-                session.get("https://broken.test/", timeout=3)
-        assert mock.request_count == 1
-
-    def test_the_caller_sees_the_certificate_error_not_a_timeout(self):
-        session, _ = make_sync_session([_VERIFY_ERROR], max_retries=3)
-        with patch.object(
-            _aia, "resolve_missing_intermediates", return_value=[]
-        ):
-            with pytest.raises(ConnectionFailed) as caught:
-                session.get("https://broken.test/", timeout=3)
-        assert "CERTIFICATE_VERIFY_FAILED" in str(caught.value)
 
     @pytest.mark.asyncio
-    async def test_async_success_is_reported_at_most_once(self, pki):
+    async def test_async_attempts_are_bounded(self, pki):
         session, mock = make_async_session(
-            [_VERIFY_ERROR], max_retries=3, max_rotations=2
+            [_VERIFY_ERROR], max_retries=2, max_rotations=0
         )
         session._rebuild_client = lambda: None
         with patch.object(
@@ -1334,9 +1343,9 @@ class TestCertFailureIsTerminal:
             "resolve_missing_intermediates",
             return_value=[_pem(pki["intermediate"])],
         ):
-            with pytest.raises(ConnectionFailed):
-                await session.get("https://incomplete.test/", timeout=3)
-        assert mock.request_count == 2
+            with pytest.raises((ConnectionFailed, WaferTimeout)):
+                await session.get("https://incomplete.test/", timeout=5)
+        assert mock.request_count <= 8, mock.request_count
 
 
 class TestFetchedCertificateGatesEndToEnd:

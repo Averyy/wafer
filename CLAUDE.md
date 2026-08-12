@@ -47,7 +47,7 @@ Wraps wreq **0.12.0+** (the `Emulation` API, formerly rnet). See `docs/ref-wreq.
 - Logging via `logging.getLogger("wafer")`, never print()
 - wreq's `Emulation` enum is the source of truth for browser fingerprints
 - Always default to the newest Chrome `Emulation` profile available (currently Chrome149)
-- Solver docs live in `docs/ref-*.md` -one per WAF type
+- Solver docs live in `docs/ref-*.md` -one per WAF type. `docs/ref-tls-chain.md` is the exception: AIA chasing is a TLS-layer fix, not a WAF solver. Read it before touching `wafer/_aia.py` -several checks there look redundant and are not, and the doc records which "hardening" ideas were tried and reverted for breaking real sites
 - **Chromium launch flags live in `hardened_launch_config()`** (`wafer/browser/_solver.py`, exported from `wafer.browser`). It is the single source of truth: `_ensure_browser` consumes it, and so do external callers driving their own Playwright. Never re-inline flags into `_ensure_browser` -a second copy drifts silently, and the failure mode is a site answering a flagged browser differently and that being recorded as a fact about the site. Changes must update `docs/ref-headless.md`, whose tables `tests/test_hardened_launch.py` backs
 - Mousse changes must update both `wafer/browser/mousse/README.md` and `README.md`
 - **Keep `llms.txt` up to date.** It is the implementation guide for LLMs helping users write code that uses wafer (not for contributors). When adding/changing public API, session params, response fields, error types, challenge types, profiles, or browser solver features, update `llms.txt` to match. Rules for what belongs:

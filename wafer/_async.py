@@ -1645,15 +1645,14 @@ class AsyncSession(BaseSession):
                         # The chase installed certificates and republished the
                         # client, so this is worth one more attempt.
                         continue
-                    # Nothing left to try. The same certificate fails the same
-                    # way on every retry and under every fingerprint, so report
-                    # it now instead of spending the retry and rotation ladder
-                    # on identical handshakes -- and so the caller sees the
-                    # certificate error rather than a WaferTimeout hiding it.
-                    raise ConnectionFailed(
-                        current_url,
-                        _connection_failure_reason(current_url, e),
-                    ) from e
+                    # The chase could not help. Fall through to the ordinary
+                    # retry path rather than failing outright: a certificate
+                    # error is deterministic for one server, but a host behind
+                    # several addresses can have a single node serving a stale
+                    # certificate after a partial deploy, and a retry
+                    # re-resolves onto a healthy one. Multi-address hosts are
+                    # common, so treating this as terminal would trade a
+                    # few seconds of waste for lost recovery.
                 # The wall-clock limit this attempt actually ran under (for
                 # logging); attempt_limit is the min(cap, remaining) bound.
                 timed_out_after = (

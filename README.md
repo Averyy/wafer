@@ -4,7 +4,7 @@
 
 Anti-detection HTTP client for Python. Built on [wreq](https://github.com/0x676e67/wreq-python) (Rust + BoringSSL).
 
-Handles TLS fingerprinting, WAF challenge detection/solving, cookie caching, retry with backoff, rate limiting, embed mode for iframe/XHR impersonation, and proxy support.
+Handles TLS fingerprinting, WAF challenge detection/solving, cookie caching, retry with backoff, rate limiting, embed mode for iframe/XHR impersonation, proxy support, and completion of incomplete certificate chains (servers that send only their leaf certificate load in a browser and fail in every other HTTP client).
 
 ```bash
 pip install wafer-py

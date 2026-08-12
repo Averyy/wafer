@@ -39,6 +39,24 @@ When updating, change the **Status** column and add a date + note. Don't assume 
 | `httpbin.org/anything` | None | pass | Full request echo |
 | `example.com` | None | pass | Static HTML |
 
+## Tier 0c: Certificate Chain Targets (no WAF, TLS-layer only)
+
+Not WAF challenges -these exercise AIA chasing (`docs/ref-tls-chain.md`).
+The negative controls matter as much as the positives: a change that makes
+them pass is a security regression, not an improvement. Verified 2026-08-12.
+
+| URL | Chain | Status | Notes |
+|---|---|---|---|
+| `incomplete-chain.badssl.com` | 1 sent, 2 hops needed | pass | Canonical control. Leaf -> `YR2` -> `Root YR`, cross-signed into `ISRG Root X1`. Any leaf-only server on a current Let's Encrypt certificate needs both hops -this is why the chase is not limited to one |
+| `www.lincoln.ca` | 1 sent, 1 hop needed | pass | Motivating case. Fetches `GeoTrust TLS RSA CA G1`, which carries pathLen:0 -do not "harden" by refusing pathLen:0, it breaks this site |
+| `www.welland.ca` | 2 sent | pass | Complete. Counting certificates sent is not a completeness test: leaf + intermediate is all that is needed when the root is in the store |
+| `www.pelham.ca`, `www.thorold.ca` | 3 sent | pass | Complete, untouched by the chase |
+| `expired.badssl.com` | complete | **must fail** | Expired leaf. Chases up to a genuine CA; must add nothing |
+| `wrong.host.badssl.com` | complete | **must fail** | Name mismatch |
+| `self-signed.badssl.com` | 1 sent | **must fail** | No path to any trusted root |
+| `untrusted-root.badssl.com` | 2 sent | **must fail** | Root not in the store |
+| `www.notl.org` | 3 sent | **must fail** | Serves a certificate for `notl.com` / `www.notl.com` only. Chrome rejects it too -not a wafer bug |
+
 ## Tier 0b: Client-Rendered Shells (no WAF, needs render)
 
 The server answers 200 with a shell; the content is written by JavaScript.

@@ -54,9 +54,11 @@ per session.
 1. **Probe.** Reopen the connection with verification off and read the chain
    the server sent (`get_unverified_chain()`, 3.13+; leaf only on 3.12). No
    request is issued over this connection.
-2. **Classify.** If the deepest certificate the server sent is already signed
-   by a trusted root, the chain is complete and the failure is something
-   else -expired, revoked, wrong hostname. Stop; that failure must stand.
+2. **Classify.** Walk the presented certificates by issuer link from the leaf
+   (`_path_top`) -- position on the wire is not reliable. If the top of that
+   walk is already signed by a trusted root, the chain is complete and the
+   failure is something else: expired, revoked, wrong hostname. Stop; that
+   failure must stand.
 3. **Chase.** Otherwise read the caIssuers URL from that certificate's AIA
    extension and fetch it. Repeat from the newly fetched certificate until a
    trusted root is reached, up to `_MAX_CHASE_DEPTH` (4).
@@ -200,10 +202,13 @@ every root along with it and silently disable chasing.
   failing cannot be helped by chasing again. Reporting success repeatedly
   spun the retry loop without consuming budget -measured at 412,474
   handshake attempts in three seconds.
-- A certificate failure the chase cannot fix is terminal. The same
-  certificate fails identically on every retry and under every fingerprint,
-  so the request ends with `ConnectionFailed` naming the certificate error
-  rather than burning the ladder and surfacing a `WaferTimeout`.
+- A certificate failure the chase cannot fix falls through to the ordinary
+  retry path. Failing fast was tried and reverted: a certificate error is
+  deterministic for one server, but a host behind several addresses can have
+  a single node serving a stale certificate after a partial deploy, and a
+  retry re-resolves onto a healthy one. Multi-address hosts are common
+  (`www.google.com` answers with eight), so a few seconds of repeated
+  handshakes is the better trade against losing that recovery.
 - Anchors are re-checked for expiry on every store rebuild. A trust anchor's
   own validity is not enforced by the verifier, so a session outliving a
   fetched intermediate would otherwise keep honouring it.
