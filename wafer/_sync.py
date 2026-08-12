@@ -8,7 +8,6 @@ import wreq.blocking
 import wreq.exceptions
 from wreq import Method
 
-from wafer._aia import is_certificate_verify_failure
 from wafer._base import (
     BaseSession,
     _browser_attempt_timeout,
@@ -27,6 +26,7 @@ from wafer._base import (
     _tmd_browser_attempt_timeout,
     _tmd_punish_url_from_body,
     _to_method,
+    is_certificate_verify_failure,
 )
 from wafer._challenge import (
     JS_ONLY_CHALLENGES,

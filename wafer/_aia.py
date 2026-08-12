@@ -83,29 +83,6 @@ _PEM_BLOCK = re.compile(
 # ~150 certificates once rather than on every chase.
 _ROOT_CACHE: dict[bytes, list[x509.Certificate]] = {}
 
-_CERT_VERIFY_MARKERS = (
-    "certificate_verify_failed",
-    "certificate verify failed",
-    "unable to get local issuer",
-    "self signed certificate",
-    "self-signed certificate",
-)
-
-
-def is_certificate_verify_failure(error: BaseException) -> bool:
-    """Report whether a transport error is a certificate path failure.
-
-    wreq surfaces BoringSSL's verdict as an opaque nested error string, so
-    this matches the reason text rather than an exception type. Matching
-    conservatively is deliberate: a false positive costs one wasted probe
-    and the original error is still raised, while a false negative leaves
-    the site permanently unreachable.
-    """
-
-    text = str(error).lower()
-    return any(marker in text for marker in _CERT_VERIFY_MARKERS)
-
-
 def _load_roots(pem_stack: bytes) -> list[x509.Certificate]:
     """Parse the trust store wafer actually uses into certificates.
 
@@ -160,12 +137,39 @@ def proxy_supports_chasing(proxy_url: str | None) -> bool:
     return scheme == "http"
 
 
+def _pin_connection(conn, port: int, pinned_ips: list[str]) -> None:
+    """Dial pre-validated addresses instead of re-resolving the hostname.
+
+    Mirrors ``NativeTLSTransport._pin_socket``: only the socket's connect
+    target moves, so ``conn.host`` stays the hostname and the TLS wrap still
+    passes ``server_hostname=<host>`` for correct SNI and certificate
+    matching. This is what keeps a ``resolve=`` session's pin absolute -- the
+    probe reaches the exact address the transport was pinned to, never a
+    re-resolved one, so the DNS-rebinding window the pin exists to close is
+    not reopened here.
+    """
+
+    def _connect_to_pinned(address, timeout=None, source_address=None):
+        last_err = None
+        for ip in pinned_ips:
+            try:
+                return socket.create_connection(
+                    (ip, port), timeout, source_address
+                )
+            except OSError as exc:
+                last_err = exc
+        raise last_err if last_err else OSError("no pinned address reachable")
+
+    conn._create_connection = _connect_to_pinned
+
+
 def _tls_connection(
     host: str,
     port: int,
     ctx: ssl.SSLContext,
     timeout: float,
     proxy_url: str | None,
+    resolve: dict[str, list[str]] | None = None,
 ):
     """Open a TLS connection to host:port, through the proxy when there is one.
 
@@ -175,6 +179,9 @@ def _tls_connection(
     """
 
     if proxy_url:
+        # Through a proxy the socket goes to the proxy, which resolves the
+        # target itself -- the same place the wreq path's pin also stops
+        # applying, so there is nothing to pin here.
         parsed = urlparse(proxy_url)
         conn = http.client.HTTPSConnection(
             parsed.hostname,
@@ -186,6 +193,12 @@ def _tls_connection(
         conn.connect()
         return conn
     conn = http.client.HTTPSConnection(host, port, context=ctx, timeout=timeout)
+    if resolve:
+        from wafer._base import _canonical_host
+
+        pinned = resolve.get(_canonical_host(host))
+        if pinned:
+            _pin_connection(conn, port, [str(a) for a in pinned])
     conn.connect()
     return conn
 
@@ -195,6 +208,7 @@ def _probe_chain(
     port: int,
     timeout: float,
     proxy_url: str | None = None,
+    resolve: dict[str, list[str]] | None = None,
 ) -> list[x509.Certificate]:
     """Read the chain a server presents, leaf first, without trusting it.
 
@@ -216,7 +230,7 @@ def _probe_chain(
     ctx.verify_mode = ssl.CERT_NONE
     conn = None
     try:
-        conn = _tls_connection(host, port, ctx, timeout, proxy_url)
+        conn = _tls_connection(host, port, ctx, timeout, proxy_url, resolve)
         tls = conn.sock
         try:
             ders = list(tls.get_unverified_chain() or ())
@@ -250,6 +264,7 @@ def _completes_chain(
     extra_pems: list[bytes],
     timeout: float,
     proxy_url: str | None = None,
+    resolve: dict[str, list[str]] | None = None,
 ) -> bool:
     """Confirm the fetched intermediates actually make this host verify.
 
@@ -275,7 +290,7 @@ def _completes_chain(
         return False
     conn = None
     try:
-        conn = _tls_connection(host, port, ctx, timeout, proxy_url)
+        conn = _tls_connection(host, port, ctx, timeout, proxy_url, resolve)
         return True
     except (OSError, ssl.SSLError, ValueError, http.client.HTTPException):
         logger.debug(
@@ -539,6 +554,7 @@ def resolve_missing_intermediates(
     *,
     timeout: float | None = None,
     proxy_url: str | None = None,
+    resolve: dict[str, list[str]] | None = None,
 ) -> list[bytes]:
     """Return PEM certificates that complete this host's chain, if any.
 
@@ -571,7 +587,7 @@ def resolve_missing_intermediates(
     probe_timeout = remaining(_PROBE_TIMEOUT)
     if probe_timeout <= 0:
         return []
-    chain = _probe_chain(host, port, probe_timeout, proxy_url)
+    chain = _probe_chain(host, port, probe_timeout, proxy_url, resolve)
     if not chain:
         return []
     # Chase from the top of the path the server actually sent. A server that
@@ -656,7 +672,13 @@ def resolve_missing_intermediates(
 
     verify_timeout = remaining(_PROBE_TIMEOUT)
     if verify_timeout <= 0 or not _completes_chain(
-        host, port, trust_store_pems, collected, verify_timeout, proxy_url
+        host,
+        port,
+        trust_store_pems,
+        collected,
+        verify_timeout,
+        proxy_url,
+        resolve,
     ):
         return []
 

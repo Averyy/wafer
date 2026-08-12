@@ -176,9 +176,16 @@ every root along with it and silently disable chasing.
   nothing is shared between sessions. The native-TLS transport is rebuilt when
   they change, so one host does not behave differently on two transports.
 - There is no public API and no opt-out. Verification cannot be disabled.
-- **Skipped entirely when `resolve=` is set.** That pin exists for URLs from
-  untrusted sources, and chasing must fetch from whatever host a
-  not-yet-trusted certificate names -a destination the operator never pinned.
+- **Honors `resolve=` rather than skipping under it.** The probe and the
+  confirmation handshake dial the pinned address with SNI intact, the same
+  way `NativeTLSTransport._pin_socket` does, so the pin stays absolute and no
+  DNS-rebinding window is reopened. The issuer fetch goes to a host the pin
+  never covered and is guarded instead by the public-address rule in
+  `_is_fetchable_url`, applied to the URL and to every redirect -the same
+  class of check a pinning caller performs before pinning. Skipping under
+  `resolve=` was the first design and it was wrong: fetchaller pins every
+  fetch, so it would have meant the consumer that reported the bug never
+  received the fix.
 - **Skipped for socks and https proxies.** Plain HTTP proxies are tunnelled
   through with CONNECT; the others cannot be, here or on the native-TLS path,
   and a direct probe would leak around the operator's egress path.
@@ -192,6 +199,17 @@ every root along with it and silently disable chasing.
   only the leaf is readable and a complete-but-otherwise-broken chain cannot
   be recognised up front. Step 5 still discards the result, so the cost is one
   wasted probe and fetch per host, not a wrong outcome.
+
+## Cost when nothing is broken
+
+Zero. The chase runs only after a handshake has already failed verification,
+and `is_certificate_verify_failure` -the predicate that decides whether to
+start -lives in `_base.py` precisely so that `wafer._aia`, and through it
+`cryptography`, never loads on a session that meets no broken chain.
+`cryptography` is about a third of what wafer's import would otherwise cost,
+so importing it eagerly would tax every consumer for a path most never take.
+`import wafer` measures the same as before this feature, and
+`"cryptography" in sys.modules` is False afterwards.
 
 ## Verified
 

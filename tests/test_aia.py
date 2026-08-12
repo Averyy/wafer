@@ -24,10 +24,10 @@ from wafer._aia import (
     _is_fetchable_url,
     _load_roots,
     _signed_by_trusted_root,
-    is_certificate_verify_failure,
     merge_pem_stacks,
     resolve_missing_intermediates,
 )
+from wafer._base import is_certificate_verify_failure
 from wafer._errors import ConnectionFailed
 
 from .conftest import (
@@ -1002,7 +1002,7 @@ class TestChaseBudget:
     def test_takes_only_a_share_of_the_callers_remaining_time(self, pki):
         seen = {}
 
-        def _probe(host, port, timeout, proxy=None):
+        def _probe(host, port, timeout, proxy=None, resolve=None):
             seen["timeout"] = timeout
             return []
 
@@ -1023,7 +1023,7 @@ class TestChaseBudget:
     def test_a_small_caller_budget_is_respected(self, pki):
         seen = {}
 
-        def _probe(host, port, timeout, proxy=None):
+        def _probe(host, port, timeout, proxy=None, resolve=None):
             seen["timeout"] = timeout
             return []
 
@@ -1060,14 +1060,53 @@ class TestEgressContracts:
     that dialled directly would break either one silently.
     """
 
-    def test_resolve_pin_disables_chasing(self):
+    def test_resolve_pin_is_passed_to_the_chase_not_used_to_skip_it(self):
+        """A pinned session must still get the fix, with the pin honored.
+
+        fetchaller pins every fetch, so skipping the chase whenever resolve=
+        is set would mean the consumer that reported the bug never sees it
+        fixed. The pin is threaded into the probe instead.
+        """
+
+        pins = {"pinned.test": ["93.184.216.34"]}
         session, _ = make_sync_session(
-            [_VERIFY_ERROR], max_retries=0, resolve={"pinned.test": ["93.184.216.34"]}
+            [_VERIFY_ERROR], max_retries=0, resolve=pins
         )
-        with patch.object(_aia, "resolve_missing_intermediates") as resolve:
+        with patch.object(
+            _aia, "resolve_missing_intermediates", return_value=[]
+        ) as resolve:
             with pytest.raises(ConnectionFailed):
                 session.get("https://pinned.test/")
-        resolve.assert_not_called()
+        resolve.assert_called_once()
+        assert resolve.call_args.kwargs["resolve"] == pins
+
+    def test_probe_dials_the_pinned_address_not_a_resolved_one(self):
+        """The pin must not be reopened by the probe's own DNS lookup."""
+
+        created = []
+
+        def _fake_create_connection(address, timeout=None, source_address=None):
+            created.append(address)
+            raise OSError("stop here")
+
+        with (
+            patch.object(_aia.http.client, "HTTPSConnection") as conn_cls,
+            patch.object(
+                _aia.socket, "create_connection", _fake_create_connection
+            ),
+        ):
+            conn = conn_cls.return_value
+            conn.connect.side_effect = lambda: conn._create_connection(
+                ("pinned.test", 443)
+            )
+            _aia._probe_chain(
+                "pinned.test",
+                443,
+                5.0,
+                None,
+                {"pinned.test": ["203.0.113.7"]},
+            )
+        assert created == [("203.0.113.7", 443)]
 
     @pytest.mark.parametrize(
         "proxy", ["socks5://127.0.0.1:1080", "socks4://p:1080", "https://p:8443"]

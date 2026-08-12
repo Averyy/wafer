@@ -18,7 +18,6 @@ from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 from wreq import CertStore, Emulation, Method
 
 from wafer import _psl
-from wafer._aia import merge_pem_stacks
 from wafer._cookies import CookieCache, _default_cookie_path
 from wafer._dart import DartIdentity
 from wafer._fingerprint import (
@@ -242,6 +241,35 @@ def _to_method(method: str) -> Method:
         return _METHOD_MAP[method.upper()]
     except KeyError:
         raise ValueError(f"Unknown HTTP method: {method}") from None
+
+
+_CERT_VERIFY_MARKERS = (
+    "certificate_verify_failed",
+    "certificate verify failed",
+    "unable to get local issuer",
+    "self signed certificate",
+    "self-signed certificate",
+)
+
+
+def is_certificate_verify_failure(error: BaseException) -> bool:
+    """Report whether a transport error is a certificate path failure.
+
+    wreq surfaces BoringSSL's verdict as an opaque nested error string, so
+    this matches the reason text rather than an exception type. Matching
+    conservatively is deliberate: a false positive costs one wasted probe
+    and the original error is still raised, while a false negative leaves
+    the site permanently unreachable.
+
+    Kept here rather than in ``wafer._aia`` because it runs on every
+    transport error, while ``_aia`` pulls in ``cryptography`` -- roughly a
+    third of wafer's import time, and pure waste for a session that never
+    meets a broken chain. This predicate is what decides whether that cost
+    is paid at all.
+    """
+
+    text = str(error).lower()
+    return any(marker in text for marker in _CERT_VERIFY_MARKERS)
 
 
 def _load_system_cert_pems() -> bytes | None:
@@ -1818,6 +1846,8 @@ class BaseSession:
         if not self._aia_extra_pems:
             return _SYSTEM_CERT_STORE
         if self._aia_cert_store is None:
+            from wafer._aia import merge_pem_stacks
+
             self._aia_cert_store = _cert_store_from_pems(
                 merge_pem_stacks(_SYSTEM_CERT_PEMS or b"", self._aia_extra_pems)
             )
@@ -1845,18 +1875,6 @@ class BaseSession:
             # Without a known trust store there is nothing to verify a
             # fetched intermediate against, and unverified is not usable.
             return False
-        if self._resolve:
-            # resolve= is an SSRF guard for URLs that come from somewhere
-            # untrusted. Chasing has to fetch from whatever host a
-            # not-yet-trusted certificate names, which is a destination the
-            # operator never pinned -- exactly what the guard exists to
-            # prevent. Refusing to chase keeps the pin absolute.
-            logger.debug(
-                "Skipping AIA chase for %s: resolve= pins this session's "
-                "destinations and the issuer URL is not among them",
-                host,
-            )
-            return False
         from wafer._aia import proxy_supports_chasing
 
         if not proxy_supports_chasing(self._proxy_url):
@@ -1874,6 +1892,12 @@ class BaseSession:
                 _SYSTEM_CERT_PEMS,
                 timeout=timeout,
                 proxy_url=self._proxy_url,
+                # The probe honors this session's DNS pin, so a pinned host is
+                # reached at exactly the pre-validated address. The issuer
+                # fetch goes to a host the pin never covered, and is guarded
+                # instead by the same public-address rule the pin enforces
+                # (see _is_fetchable_url) on the URL and on every redirect.
+                resolve=self._resolve,
             )
         except Exception:
             logger.debug("AIA chase raised for %s", host, exc_info=True)
