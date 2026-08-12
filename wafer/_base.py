@@ -243,6 +243,11 @@ def _to_method(method: str) -> Method:
         raise ValueError(f"Unknown HTTP method: {method}") from None
 
 
+# Ceiling on how long a concurrent caller waits for another thread's chase.
+# The holder's own work is deadline-capped, so this only matters if that
+# thread dies outright.
+_AIA_WAIT_SECONDS = 30.0
+
 _CERT_VERIFY_MARKERS = (
     "certificate_verify_failed",
     "certificate verify failed",
@@ -835,7 +840,9 @@ class BaseSession:
         # chased (attempted, not necessarily completed -- one try each).
         self._aia_extra_pems: list[bytes] = []
         self._aia_cert_store = None
-        self._aia_attempted: set[str] = set()
+        # host -> Event, set once that host's chase has finished. Doubles as
+        # the "already attempted" record and the gate concurrent callers wait on.
+        self._aia_attempted: dict[str, threading.Event] = {}
         # AsyncSession runs the chase in a worker thread, so two concurrent
         # requests failing on the same host could both pass the "already
         # attempted" test before either recorded it and each run a full probe
@@ -1862,15 +1869,48 @@ class BaseSession:
         trusted material will not complete on a second try either, and
         retrying would turn every genuinely bad certificate into repeated
         probe traffic against the host.
+
+        Concurrent callers for the same host do not race and do not give up.
+        The first claims the host and does the work; the rest wait for it and
+        then answer from its result. Letting them return False immediately
+        would fail requests that a chase already in flight was about to fix,
+        which is precisely what a caller issuing parallel requests to one
+        broken-chain host would hit.
         """
 
         host = urlparse(url).hostname
         if not host:
             return False
         with self._aia_lock:
-            if host in self._aia_attempted:
-                return False
-            self._aia_attempted.add(host)
+            done = self._aia_attempted.get(host)
+            if done is not None:
+                waiter = done
+            else:
+                waiter = None
+                self._aia_attempted[host] = threading.Event()
+        if waiter is not None:
+            before = len(self._aia_extra_pems)
+            # Bounded: the holder's own chase is deadline-capped, so this
+            # cannot outlive it by much even if that thread dies.
+            waiter.wait(timeout if timeout is not None else _AIA_WAIT_SECONDS)
+            # True only if the winner actually added something, so the caller
+            # rebuilds and retries exactly when there is a reason to.
+            return len(self._aia_extra_pems) > before
+        # Every exit from here must release the waiters, or a concurrent
+        # request for this host blocks for the full wait.
+        try:
+            return self._run_aia_chase(url, host, timeout)
+        finally:
+            self._aia_attempted[host].set()
+
+    def _run_aia_chase(
+        self,
+        url: str,
+        host: str,
+        timeout: float | None,
+    ) -> bool:
+        """Do the chase for a host this caller has claimed."""
+
         if not _SYSTEM_CERT_PEMS:
             # Without a known trust store there is nothing to verify a
             # fetched intermediate against, and unverified is not usable.
@@ -1904,17 +1944,18 @@ class BaseSession:
             return False
         if not pems:
             return False
-        known = set(self._aia_extra_pems)
-        added = [pem for pem in pems if pem not in known]
-        if not added:
-            return False
-        self._aia_extra_pems.extend(added)
-        self._aia_cert_store = None
-        # The native-TLS transport builds its SSL context once at construction,
-        # so drop it and let it be rebuilt with the new intermediates. Keeping
-        # the old one would leave the Imperva fallback failing on a chain the
-        # wreq path can now complete.
-        self._native_tls = None
+        with self._aia_lock:
+            known = set(self._aia_extra_pems)
+            added = [pem for pem in pems if pem not in known]
+            if not added:
+                return False
+            self._aia_extra_pems.extend(added)
+            self._aia_cert_store = None
+            # The native-TLS transport builds its SSL context once at
+            # construction, so drop it and let it be rebuilt with the new
+            # intermediates. Keeping the old one would leave the Imperva
+            # fallback failing on a chain the wreq path can now complete.
+            self._native_tls = None
         return True
 
     def _build_client_kwargs(self) -> dict:

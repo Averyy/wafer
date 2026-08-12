@@ -190,7 +190,7 @@ def _tls_connection(
             timeout=timeout,
         )
         conn.set_tunnel(host, port)
-        conn.connect()
+        _connect_or_close(conn)
         return conn
     conn = http.client.HTTPSConnection(host, port, context=ctx, timeout=timeout)
     if resolve:
@@ -199,8 +199,27 @@ def _tls_connection(
         pinned = resolve.get(_canonical_host(host))
         if pinned:
             _pin_connection(conn, port, [str(a) for a in pinned])
-    conn.connect()
+    _connect_or_close(conn)
     return conn
+
+
+def _connect_or_close(conn) -> None:
+    """Connect, closing the half-open connection if the handshake fails.
+
+    http.client assigns the TCP socket before wrapping it in TLS, so a
+    handshake that fails leaves that socket open on a connection object the
+    caller never receives and therefore cannot close. That is the *expected*
+    path here, not an edge case: ``_completes_chain`` deliberately connects
+    to hosts whose certificates are still bad, and a leak there would
+    accumulate one socket per such host.
+    """
+
+    try:
+        conn.connect()
+    except BaseException:
+        with contextlib.suppress(Exception):
+            conn.close()
+        raise
 
 
 def _probe_chain(
@@ -464,7 +483,12 @@ def _fetch_certificate(
 
 
 def _is_ca(cert: x509.Certificate) -> bool:
-    """Require the fetched certificate to actually claim to be a CA."""
+    """Require the fetched certificate to be a CA allowed to sign certificates.
+
+    basicConstraints CA:TRUE is the claim; keyUsage keyCertSign is the
+    permission. A certificate lacking keyCertSign may not issue certificates
+    at all, so anchoring it would grant an authority its own issuer withheld.
+    """
 
     try:
         constraints = cert.extensions.get_extension_for_oid(
@@ -472,7 +496,51 @@ def _is_ca(cert: x509.Certificate) -> bool:
         ).value
     except Exception:
         return False
-    return bool(getattr(constraints, "ca", False))
+    if not getattr(constraints, "ca", False):
+        return False
+    try:
+        usage = cert.extensions.get_extension_for_oid(ExtensionOID.KEY_USAGE).value
+    except x509.ExtensionNotFound:
+        # keyUsage is optional; absent means unrestricted.
+        return True
+    except Exception:
+        return False
+    return bool(getattr(usage, "key_cert_sign", False))
+
+
+def _anchoring_would_drop_constraints(
+    cert: x509.Certificate,
+    root: x509.Certificate,
+) -> bool:
+    """Detect authority a root withheld that anchoring would hand back.
+
+    A certificate in the store is a trust *anchor*, and validation stops
+    there -- so restrictions the root placed on this intermediate stop being
+    enforced. Name constraints are the case that matters: a root trusted
+    only for the namespaces it lists would, once an intermediate beneath it
+    is anchored, effectively vouch for names it never could. Rather than
+    reimplement constraint enforcement, refuse to anchor at all when
+    constraints are present. Such a chain is rare in the public web PKI, and
+    failing on one site beats silently widening a CA's reach for a session.
+
+    pathLenConstraint is deliberately *not* treated this way. Real
+    intermediates carry pathLen:0 as a matter of course -- GeoTrust TLS RSA
+    CA G1, the certificate this whole feature exists to fetch, is one -- and
+    it constrains how many CAs may appear *below* the certificate, which
+    anchoring does not widen in any way an attacker can reach without the
+    CA's private key. Refusing on it would reject the motivating case to
+    guard against nothing.
+    """
+
+    for source in (root, cert):
+        try:
+            source.extensions.get_extension_for_oid(ExtensionOID.NAME_CONSTRAINTS)
+        except x509.ExtensionNotFound:
+            continue
+        except Exception:
+            return True
+        return True
+    return False
 
 
 def _is_currently_valid(cert: x509.Certificate, now: float) -> bool:
@@ -542,10 +610,19 @@ def _signed_by_trusted_root(
     fails is indistinguishable from one an attacker minted, and is dropped.
     """
 
-    return any(
-        root.subject == cert.issuer and _directly_issued(cert, root)
-        for root in roots
-    )
+    return _issuing_root(cert, roots) is not None
+
+
+def _issuing_root(
+    cert: x509.Certificate,
+    roots: list[x509.Certificate],
+) -> x509.Certificate | None:
+    """Return the store root that signed this certificate, if any."""
+
+    for root in roots:
+        if root.subject == cert.issuer and _directly_issued(cert, root):
+            return root
+    return None
 
 
 def resolve_missing_intermediates(
@@ -609,9 +686,17 @@ def resolve_missing_intermediates(
     seen: set[bytes] = set()
     anchored = False
     for _ in range(_MAX_CHASE_DEPTH):
-        if _signed_by_trusted_root(cert, roots):
+        issuing_root = _issuing_root(cert, roots)
+        if issuing_root is not None:
             # The path terminates in the existing trust store; everything
             # gathered on the way is proven material.
+            if _anchoring_would_drop_constraints(cert, issuing_root):
+                logger.debug(
+                    "Refusing to anchor %s: its root constrains it and "
+                    "anchoring would stop those constraints being enforced",
+                    host,
+                )
+                return []
             anchored = True
             break
         urls = _ca_issuer_urls(cert, proxied=bool(proxy_url))

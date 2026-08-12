@@ -8,6 +8,7 @@ were deleted, which is the one thing that must never happen quietly.
 
 import datetime
 import ipaddress
+import ssl
 from unittest.mock import patch
 
 import pytest
@@ -1224,6 +1225,240 @@ class TestTransportConsistency:
             assert session._complete_chain_via_aia("https://incomplete.test/")
         assert session._native_tls is None
         assert session._native_transport() is not first
+
+
+class TestAnchorConstraints:
+    """Anchoring must not hand back authority a root withheld."""
+
+    def _constrained_root(self):
+        key = _key()
+        root = (
+            x509.CertificateBuilder()
+            .subject_name(_name("Constrained Root"))
+            .issuer_name(_name("Constrained Root"))
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(_NOW - datetime.timedelta(days=3650))
+            .not_valid_after(_NOW + datetime.timedelta(days=3650))
+            .add_extension(x509.BasicConstraints(ca=True, path_length=None), True)
+            .add_extension(
+                x509.NameConstraints(
+                    permitted_subtrees=[x509.DNSName("example.gov")],
+                    excluded_subtrees=None,
+                ),
+                critical=True,
+            )
+            .sign(key, hashes.SHA256())
+        )
+        return root, key
+
+    def test_name_constrained_root_blocks_anchoring(self, pki):
+        """Anchoring below a name-constrained root would widen its reach.
+
+        Validation stops at an anchor, so the root's permitted namespaces
+        would no longer be enforced against anything the intermediate signs.
+        """
+
+        root, key = self._constrained_root()
+        inter, _ = _make_cert("Constrained CA", root.subject, key, ca=True)
+        assert _aia._anchoring_would_drop_constraints(inter, root)
+
+    def test_unconstrained_root_allows_anchoring(self, pki):
+        assert not _aia._anchoring_would_drop_constraints(
+            pki["intermediate"], pki["root"]
+        )
+
+    def test_path_length_zero_is_not_treated_as_a_constraint(self, pki):
+        """Real intermediates carry pathLen:0 and must still be usable.
+
+        GeoTrust TLS RSA CA G1 -the certificate this feature exists to
+        fetch- has pathLen:0. Refusing on it would reject the motivating
+        case to guard against something an attacker cannot reach anyway.
+        """
+
+        root_key = _key()
+        root = (
+            x509.CertificateBuilder()
+            .subject_name(_name("PathLen Root"))
+            .issuer_name(_name("PathLen Root"))
+            .public_key(root_key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(_NOW - datetime.timedelta(days=3650))
+            .not_valid_after(_NOW + datetime.timedelta(days=3650))
+            .add_extension(x509.BasicConstraints(ca=True, path_length=None), True)
+            .sign(root_key, hashes.SHA256())
+        )
+        inter_key = _key()
+        inter = (
+            x509.CertificateBuilder()
+            .subject_name(_name("PathLen CA"))
+            .issuer_name(root.subject)
+            .public_key(inter_key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(_NOW - datetime.timedelta(days=100))
+            .not_valid_after(_NOW + datetime.timedelta(days=100))
+            .add_extension(x509.BasicConstraints(ca=True, path_length=0), True)
+            .sign(root_key, hashes.SHA256())
+        )
+        assert not _aia._anchoring_would_drop_constraints(inter, root)
+        assert _is_ca(inter)
+
+    def test_ca_without_key_cert_sign_is_refused(self):
+        """CA:TRUE is the claim; keyCertSign is the permission."""
+
+        key = _key()
+        cert = (
+            x509.CertificateBuilder()
+            .subject_name(_name("No Signing CA"))
+            .issuer_name(_name("Some Root"))
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(_NOW - datetime.timedelta(days=10))
+            .not_valid_after(_NOW + datetime.timedelta(days=100))
+            .add_extension(x509.BasicConstraints(ca=True, path_length=None), True)
+            .add_extension(
+                x509.KeyUsage(
+                    digital_signature=True,
+                    content_commitment=False,
+                    key_encipherment=False,
+                    data_encipherment=False,
+                    key_agreement=False,
+                    key_cert_sign=False,
+                    crl_sign=False,
+                    encipher_only=False,
+                    decipher_only=False,
+                ),
+                critical=True,
+            )
+            .sign(key, hashes.SHA256())
+        )
+        assert not _is_ca(cert)
+
+    def test_constrained_chain_yields_nothing_end_to_end(self):
+        root, key = self._constrained_root()
+        inter, inter_key = _make_cert("Constrained CA", root.subject, key, ca=True)
+        leaf, _ = _make_cert(
+            "site.example.gov",
+            inter.subject,
+            inter_key,
+            ca=False,
+            aia_url="http://ca.test/inter.crt",
+        )
+        with (
+            _resolves_to("93.184.216.34"),
+            patch.object(_aia, "_probe_chain", return_value=[leaf]),
+            patch.object(
+                _aia, "_fetch_certificate", side_effect=lambda u, t, p=None: inter
+            ),
+            patch.object(_aia, "_completes_chain", return_value=True),
+        ):
+            out = resolve_missing_intermediates("https://site.example.gov/", _pem(root))
+        assert out == []
+
+
+class TestConcurrentChase:
+    """Parallel requests to one broken host must not fail the losers."""
+
+    def test_second_caller_waits_and_reports_the_winners_result(self, pki):
+        import threading as _t
+
+        session, _ = make_sync_session([MockResponse(200)])
+        started = _t.Event()
+        release = _t.Event()
+
+        def _slow(url, pems, **kw):
+            started.set()
+            release.wait(5)
+            return [_pem(pki["intermediate"])]
+
+        results = {}
+        with patch.object(
+            _aia, "resolve_missing_intermediates", side_effect=_slow
+        ):
+            winner = _t.Thread(
+                target=lambda: results.__setitem__(
+                    "winner", session._complete_chain_via_aia("https://slow.test/")
+                )
+            )
+            winner.start()
+            assert started.wait(5)
+            loser = _t.Thread(
+                target=lambda: results.__setitem__(
+                    "loser", session._complete_chain_via_aia("https://slow.test/")
+                )
+            )
+            loser.start()
+            release.set()
+            winner.join(10)
+            loser.join(10)
+
+        # The loser must not report failure for work that succeeded: it waited
+        # and saw the certificate the winner installed.
+        assert results["winner"] is True
+        assert results["loser"] is True
+        assert len(session._aia_extra_pems) == 1
+
+    def test_waiters_are_released_when_the_chase_fails(self):
+        session, _ = make_sync_session([MockResponse(200)])
+        with patch.object(
+            _aia, "resolve_missing_intermediates", return_value=[]
+        ):
+            assert session._complete_chain_via_aia("https://broken.test/") is False
+        # Event set, so a later caller answers immediately rather than blocking.
+        assert session._aia_attempted["broken.test"].is_set()
+        assert session._complete_chain_via_aia("https://broken.test/") is False
+
+    def test_waiters_are_released_when_the_chase_raises(self):
+        session, _ = make_sync_session([MockResponse(200)])
+        with patch.object(
+            _aia,
+            "resolve_missing_intermediates",
+            side_effect=RuntimeError("boom"),
+        ):
+            assert session._complete_chain_via_aia("https://raising.test/") is False
+        assert session._aia_attempted["raising.test"].is_set()
+
+
+class TestConnectionCleanup:
+    """A failed handshake must not leave its socket behind.
+
+    _completes_chain connects on purpose to hosts whose certificates are
+    still bad, so this is the common path rather than an edge case.
+    """
+
+    def test_failed_handshake_closes_the_connection(self):
+        with patch.object(_aia.http.client, "HTTPSConnection") as conn_cls:
+            conn = conn_cls.return_value
+            conn.connect.side_effect = ssl.SSLError("handshake failed")
+            with pytest.raises(ssl.SSLError):
+                _aia._tls_connection(
+                    "origin.test", 443, ssl.create_default_context(), 5.0, None
+                )
+            conn.close.assert_called_once()
+
+    def test_failed_probe_does_not_leak(self):
+        with patch.object(_aia.http.client, "HTTPSConnection") as conn_cls:
+            conn = conn_cls.return_value
+            conn.connect.side_effect = OSError("refused")
+            assert _aia._probe_chain("origin.test", 443, 5.0) == []
+            conn.close.assert_called_once()
+
+    def test_failed_confirmation_does_not_leak(self, pki):
+        with patch.object(_aia.http.client, "HTTPSConnection") as conn_cls:
+            conn = conn_cls.return_value
+            conn.connect.side_effect = ssl.SSLError("still invalid")
+            assert not _aia._completes_chain(
+                "origin.test", 443, pki["root_pems"], [], 5.0
+            )
+            conn.close.assert_called_once()
+
+    def test_successful_probe_closes_the_connection(self, pki):
+        with patch.object(_aia.http.client, "HTTPSConnection") as conn_cls:
+            conn = conn_cls.return_value
+            conn.sock.get_unverified_chain.return_value = [_der(pki["leaf"])]
+            got = _aia._probe_chain("origin.test", 443, 5.0)
+            assert len(got) == 1
+            conn.close.assert_called_once()
 
 
 class TestCertStoreSelection:

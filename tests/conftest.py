@@ -440,7 +440,7 @@ def make_sync_session(responses, **session_kwargs):
     session._proxy_url = None
     session._aia_extra_pems = []
     session._aia_cert_store = None
-    session._aia_attempted = set()
+    session._aia_attempted = {}
     session._aia_lock = threading.Lock()
     session._rotate_every = session_kwargs.get("rotate_every", None)
     session._request_count = 0
@@ -546,7 +546,7 @@ def make_async_session(responses, **session_kwargs):
     session._proxy_url = None
     session._aia_extra_pems = []
     session._aia_cert_store = None
-    session._aia_attempted = set()
+    session._aia_attempted = {}
     session._aia_lock = threading.Lock()
     session._rotate_every = session_kwargs.get("rotate_every", None)
     session._request_count = 0
