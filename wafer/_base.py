@@ -9,6 +9,7 @@ import random
 import re
 import socket
 import subprocess
+import threading
 import time
 from html import unescape
 from typing import Any
@@ -807,6 +808,11 @@ class BaseSession:
         self._aia_extra_pems: list[bytes] = []
         self._aia_cert_store = None
         self._aia_attempted: set[str] = set()
+        # AsyncSession runs the chase in a worker thread, so two concurrent
+        # requests failing on the same host could both pass the "already
+        # attempted" test before either recorded it and each run a full probe
+        # and fetch. The lock makes claiming a host one step.
+        self._aia_lock = threading.Lock()
 
         # Proxy
         self._proxy = None
@@ -1829,18 +1835,45 @@ class BaseSession:
         """
 
         host = urlparse(url).hostname
-        if not host or host in self._aia_attempted:
+        if not host:
             return False
-        self._aia_attempted.add(host)
+        with self._aia_lock:
+            if host in self._aia_attempted:
+                return False
+            self._aia_attempted.add(host)
         if not _SYSTEM_CERT_PEMS:
             # Without a known trust store there is nothing to verify a
             # fetched intermediate against, and unverified is not usable.
+            return False
+        if self._resolve:
+            # resolve= is an SSRF guard for URLs that come from somewhere
+            # untrusted. Chasing has to fetch from whatever host a
+            # not-yet-trusted certificate names, which is a destination the
+            # operator never pinned -- exactly what the guard exists to
+            # prevent. Refusing to chase keeps the pin absolute.
+            logger.debug(
+                "Skipping AIA chase for %s: resolve= pins this session's "
+                "destinations and the issuer URL is not among them",
+                host,
+            )
+            return False
+        from wafer._aia import proxy_supports_chasing
+
+        if not proxy_supports_chasing(self._proxy_url):
+            logger.debug(
+                "Skipping AIA chase for %s: cannot tunnel through the "
+                "configured proxy without leaking around it",
+                host,
+            )
             return False
         try:
             from wafer._aia import resolve_missing_intermediates
 
             pems = resolve_missing_intermediates(
-                url, _SYSTEM_CERT_PEMS, timeout=timeout
+                url,
+                _SYSTEM_CERT_PEMS,
+                timeout=timeout,
+                proxy_url=self._proxy_url,
             )
         except Exception:
             logger.debug("AIA chase raised for %s", host, exc_info=True)
@@ -1853,6 +1886,11 @@ class BaseSession:
             return False
         self._aia_extra_pems.extend(added)
         self._aia_cert_store = None
+        # The native-TLS transport builds its SSL context once at construction,
+        # so drop it and let it be rebuilt with the new intermediates. Keeping
+        # the old one would leave the Imperva fallback failing on a chain the
+        # wreq path can now complete.
+        self._native_tls = None
         return True
 
     def _build_client_kwargs(self) -> dict:
@@ -2044,6 +2082,7 @@ class BaseSession:
                 proxy_url=self._proxy_url,
                 max_redirects=self.max_redirects,
                 resolve=self._resolve,
+                extra_ca_pems=list(self._aia_extra_pems),
             )
         return self._native_tls
 

@@ -50,10 +50,13 @@ hostname per session.
 3. **Chase.** Otherwise read the caIssuers URL from that certificate's AIA
    extension and fetch it. Repeat from the newly fetched certificate until a
    trusted root is reached, up to `_MAX_CHASE_DEPTH` (4).
-4. **Verify.** Each fetched certificate must be the issuer the previous one
-   names, must be a CA (basicConstraints), must be inside its validity
-   window, and must be **signed by a root already in the trust store**
-   (`_signed_by_trusted_root`, using `verify_directly_issued_by`).
+4. **Verify.** Each fetched certificate must have **actually signed** the
+   certificate that named it (`_directly_issued`, not a subject/issuer name
+   comparison), must be a CA (basicConstraints), and must be inside its
+   validity window. The walk terminates only when a certificate is **signed
+   by a root already in the trust store** (`_signed_by_trusted_root`). Every
+   hop being signature-linked is what makes the whole path provable, not just
+   its top -see "Why every hop is checked" below.
 5. **Confirm.** Reconnect with full verification against system roots plus
    the collected certificates. If the host still does not verify, discard
    everything.
@@ -84,6 +87,29 @@ subject and the real root's issuer name, self-signed, and asserts it is
 refused. Certificates in those tests are signed for real rather than mocked,
 so deleting the signature check fails the suite rather than passing it.
 
+## Why every hop is checked
+
+Each collected certificate is added to the store, so each one becomes an
+anchor -not only the one that reached a root. Verifying just the top of the
+walk leaves a hole: an attacker answering the fetch returns `I1'` carrying
+the leaf's issuer name, a CA flag, valid dates, their own key, and an AIA URL
+pointing at a genuine root-signed intermediate `I2`. The walk collects `I1'`,
+fetches the real `I2`, terminates at a trusted root, and anchors both. `I1'`
+signed nothing, and the confirmation handshake in step 5 is no barrier -the
+same on-path attacker answers it with a leaf signed by `I1'`.
+
+Linking each hop by signature closes this. `tests/test_aia.py` builds exactly
+that certificate and asserts the chase returns nothing.
+
+## Why the top of the path is walked, not read off the end
+
+The last certificate on the wire is not reliably the top. TLS 1.3 drops the
+ordering requirement, and a common misconfiguration appends the *root* while
+omitting the intermediate. Reading `chain[-1]` there finds a self-signed,
+trusted certificate and concludes the chain is complete -when the piece that
+matters is precisely what is missing. `_path_top` follows issuer links from
+the leaf instead, so that site gets chased the way Chrome chases it.
+
 ## Why step 5 exists
 
 Proving an intermediate is root-signed says it is safe to trust. It does not
@@ -104,13 +130,28 @@ attacker-influenced input naming a URL wafer will fetch.
   only literal addresses would still allow `localhost` or an
   attacker-controlled name pointing into private space, including
   `169.254.169.254`.
+- **Redirects are re-checked.** urllib follows them by default, so without
+  `_GuardedRedirectHandler` the guard would apply only to the URL named in
+  the certificate: a public AIA URL answering 302 to
+  `http://169.254.169.254/` would walk straight past it. Every hop is
+  re-validated.
 - Responses are capped at `_MAX_CERT_BYTES` (64 KB).
-- Probe and fetch each take a slice of the caller's remaining budget, so a
-  stalled CA endpoint cannot consume the deadline the retry still needs.
+- The whole chase is capped at `min(remaining * _MAX_BUDGET_SHARE,
+  _MAX_CHASE_SECONDS)`. Per-operation caps do not bound the total: four hops
+  with several caIssuers URLs each could otherwise spend the entire request
+  budget, turning a `ConnectionFailed` into a `WaferTimeout` with no retries
+  used.
 
 Resolving here and again inside urllib leaves a small window where the answer
 could change. That gap is why nothing fetched is trusted on the strength of
 where it came from.
+
+Behind a proxy the name lookup is skipped: the proxy resolves the name and
+enforces its own egress policy, so a local answer describes neither where the
+request goes nor what is reachable from there. Insisting on it would also
+disable chasing outright in the egress-restricted environments that motivate
+running a proxy. Literal addresses are still refused, since those name a
+destination regardless of who resolves.
 
 ## Trust store handling
 
@@ -125,12 +166,32 @@ root with a non-positive serial number that `cryptography` warns about today
 and intends to reject outright; parsing the stack in one call would drop
 every root along with it and silently disable chasing.
 
-## Scope
+## Scope and limits
 
-- One attempt per hostname per session, successful or not.
+- One attempt per hostname per session, successful or not. The claim on a
+  hostname is taken under a lock, because `AsyncSession` runs the chase in a
+  worker thread and two concurrent failures on the same host would otherwise
+  both proceed.
 - Certificates live on the session, in memory. Nothing is written to disk and
-  nothing is shared between sessions.
+  nothing is shared between sessions. The native-TLS transport is rebuilt when
+  they change, so one host does not behave differently on two transports.
 - There is no public API and no opt-out. Verification cannot be disabled.
+- **Skipped entirely when `resolve=` is set.** That pin exists for URLs from
+  untrusted sources, and chasing must fetch from whatever host a
+  not-yet-trusted certificate names -a destination the operator never pinned.
+- **Skipped for socks and https proxies.** Plain HTTP proxies are tunnelled
+  through with CONNECT; the others cannot be, here or on the native-TLS path,
+  and a direct probe would leak around the operator's egress path.
+- **The probe uses CPython's TLS stack**, not wafer's browser fingerprint.
+  wreq exposes the peer certificate only on a *successful* handshake, and the
+  handshake in question is the one that failed, so the chain has to be read
+  some other way. On a host that resets or blackholes non-browser TLS the
+  probe returns nothing and the chase never starts -the one case where wafer
+  can still fail on a site a browser loads. Visible at debug level only.
+- **Python 3.12 loses the fast path.** `get_unverified_chain()` is 3.13+, so
+  only the leaf is readable and a complete-but-otherwise-broken chain cannot
+  be recognised up front. Step 5 still discards the result, so the cost is one
+  wasted probe and fetch per host, not a wrong outcome.
 
 ## Verified
 

@@ -27,6 +27,8 @@ issuing root did not already delegate. Anything that fails a check is
 dropped and the original handshake failure stands.
 """
 
+import contextlib
+import http.client
 import ipaddress
 import logging
 import re
@@ -61,6 +63,15 @@ _PROBE_TIMEOUT = 10.0
 # than the whole thing, so a stalled CA endpoint cannot consume the request
 # deadline that the retry after a successful chase still needs.
 _FETCH_TIMEOUT = 10.0
+
+# Ceiling on the whole chase, and the largest share of the caller's remaining
+# budget it may take. Per-operation caps alone do not bound the total: at
+# _MAX_CHASE_DEPTH hops with several caIssuers URLs each, a tarpitting CA
+# endpoint could spend every second available and leave nothing for the retry
+# the chase exists to enable -- turning a ConnectionFailed into a WaferTimeout
+# with no attempts used.
+_MAX_CHASE_SECONDS = 25.0
+_MAX_BUDGET_SHARE = 0.5
 
 _PEM_BLOCK = re.compile(
     rb"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----",
@@ -129,7 +140,62 @@ def _load_roots(pem_stack: bytes) -> list[x509.Certificate]:
     return roots
 
 
-def _probe_chain(host: str, port: int, timeout: float) -> list[x509.Certificate]:
+def proxy_supports_chasing(proxy_url: str | None) -> bool:
+    """Report whether chasing can run without leaving the configured proxy.
+
+    A session with a proxy has an egress path the operator chose, and every
+    connection has to stay on it -- a direct probe would leak the real
+    address to the origin and sidestep the egress policy entirely. Plain
+    HTTP proxies can be tunnelled through with CONNECT; socks and https
+    proxies cannot, here or on the native-TLS path, so chasing is skipped
+    rather than quietly bypassing them.
+    """
+
+    if not proxy_url:
+        return True
+    try:
+        scheme = urlparse(proxy_url).scheme
+    except ValueError:
+        return False
+    return scheme == "http"
+
+
+def _tls_connection(
+    host: str,
+    port: int,
+    ctx: ssl.SSLContext,
+    timeout: float,
+    proxy_url: str | None,
+):
+    """Open a TLS connection to host:port, through the proxy when there is one.
+
+    Returns a connected object with ``.sock`` (the SSLSocket) and ``.close()``.
+    http.client sets SNI from the tunnel target, so the certificate presented
+    is the origin's and not the proxy's.
+    """
+
+    if proxy_url:
+        parsed = urlparse(proxy_url)
+        conn = http.client.HTTPSConnection(
+            parsed.hostname,
+            parsed.port or 80,
+            context=ctx,
+            timeout=timeout,
+        )
+        conn.set_tunnel(host, port)
+        conn.connect()
+        return conn
+    conn = http.client.HTTPSConnection(host, port, context=ctx, timeout=timeout)
+    conn.connect()
+    return conn
+
+
+def _probe_chain(
+    host: str,
+    port: int,
+    timeout: float,
+    proxy_url: str | None = None,
+) -> list[x509.Certificate]:
     """Read the chain a server presents, leaf first, without trusting it.
 
     The chain cannot be completed without knowing what is missing, and the
@@ -148,21 +214,26 @@ def _probe_chain(host: str, port: int, timeout: float) -> list[x509.Certificate]
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
+    conn = None
     try:
-        with socket.create_connection((host, port), timeout=timeout) as sock:
-            with ctx.wrap_socket(sock, server_hostname=host) as tls:
-                try:
-                    ders = list(tls.get_unverified_chain() or ())
-                except AttributeError:
-                    # get_unverified_chain is 3.13+. On 3.12 only the leaf is
-                    # reachable, so a server that sent a complete chain is not
-                    # detectable here -- _completes_chain catches that case
-                    # before anything is added to the trust store.
-                    leaf = tls.getpeercert(binary_form=True)
-                    ders = [leaf] if leaf else []
-    except (OSError, ssl.SSLError, ValueError):
+        conn = _tls_connection(host, port, ctx, timeout, proxy_url)
+        tls = conn.sock
+        try:
+            ders = list(tls.get_unverified_chain() or ())
+        except AttributeError:
+            # get_unverified_chain is 3.13+. On 3.12 only the leaf is
+            # reachable, so a server that sent a complete chain is not
+            # detectable here -- _completes_chain catches that case
+            # before anything is added to the trust store.
+            leaf = tls.getpeercert(binary_form=True)
+            ders = [leaf] if leaf else []
+    except (OSError, ssl.SSLError, ValueError, http.client.HTTPException):
         logger.debug("AIA probe failed for %s:%d", host, port, exc_info=True)
         return []
+    finally:
+        if conn is not None:
+            with contextlib.suppress(Exception):
+                conn.close()
     chain: list[x509.Certificate] = []
     for der in ders:
         try:
@@ -178,6 +249,7 @@ def _completes_chain(
     trust_store_pems: bytes,
     extra_pems: list[bytes],
     timeout: float,
+    proxy_url: str | None = None,
 ) -> bool:
     """Confirm the fetched intermediates actually make this host verify.
 
@@ -201,18 +273,22 @@ def _completes_chain(
     except Exception:
         logger.debug("Could not build verification context", exc_info=True)
         return False
+    conn = None
     try:
-        with socket.create_connection((host, port), timeout=timeout) as sock:
-            with ctx.wrap_socket(sock, server_hostname=host):
-                return True
-    except (OSError, ssl.SSLError, ValueError):
+        conn = _tls_connection(host, port, ctx, timeout, proxy_url)
+        return True
+    except (OSError, ssl.SSLError, ValueError, http.client.HTTPException):
         logger.debug(
             "%s still does not verify with the fetched intermediates", host
         )
         return False
+    finally:
+        if conn is not None:
+            with contextlib.suppress(Exception):
+                conn.close()
 
 
-def _ca_issuer_urls(cert: x509.Certificate) -> list[str]:
+def _ca_issuer_urls(cert: x509.Certificate, proxied: bool = False) -> list[str]:
     """Extract the caIssuers URLs a certificate names for its own issuer."""
 
     try:
@@ -231,7 +307,7 @@ def _ca_issuer_urls(cert: x509.Certificate) -> list[str]:
         if not isinstance(location, x509.UniformResourceIdentifier):
             continue
         url = location.value
-        if isinstance(url, str) and _is_fetchable_url(url):
+        if isinstance(url, str) and _is_fetchable_url(url, proxied=proxied):
             urls.append(url)
     return urls
 
@@ -253,7 +329,7 @@ def _is_public_address(host: str) -> bool:
     )
 
 
-def _is_fetchable_url(url: str) -> bool:
+def _is_fetchable_url(url: str, proxied: bool = False) -> bool:
     """Allow only plain http/https AIA URLs that resolve to public addresses.
 
     The AIA location comes from a certificate that has not been trusted yet,
@@ -268,6 +344,14 @@ def _is_fetchable_url(url: str) -> bool:
     Resolving here and again in urllib leaves a small window where an answer
     could change between the two, which is why nothing fetched is trusted on
     the strength of where it came from.
+
+    ``proxied`` skips the name lookup. When a proxy carries the fetch, the
+    proxy resolves the name and enforces its own egress policy, so a local
+    answer describes neither where the request goes nor what is reachable
+    from there. Insisting on it would also disable chasing outright in the
+    egress-restricted environments that motivate running a proxy, where the
+    local resolver may not answer at all. Literal addresses are still
+    refused, since those name a destination regardless of who resolves.
     """
 
     try:
@@ -285,6 +369,8 @@ def _is_fetchable_url(url: str) -> bool:
         pass
     else:
         return _is_public_address(host)
+    if proxied:
+        return True
     try:
         infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
     except OSError:
@@ -295,7 +381,33 @@ def _is_fetchable_url(url: str) -> bool:
     )
 
 
-def _fetch_certificate(url: str, timeout: float) -> x509.Certificate | None:
+class _GuardedRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Re-run the URL guard on every redirect hop.
+
+    urllib follows redirects by default, and the checks in
+    ``_is_fetchable_url`` would otherwise apply only to the URL the
+    certificate named. An attacker who controls that certificate could
+    publish a perfectly public AIA URL that answers 302 to
+    ``http://169.254.169.254/`` and reach straight past the guard into the
+    network wafer runs in.
+    """
+
+    def __init__(self, proxy_url: str | None = None):
+        super().__init__()
+        self._proxy_url = proxy_url
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not _is_fetchable_url(newurl, proxied=bool(self._proxy_url)):
+            logger.debug("AIA redirect to %s refused by the URL guard", newurl)
+            return None
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _fetch_certificate(
+    url: str,
+    timeout: float,
+    proxy_url: str | None = None,
+) -> x509.Certificate | None:
     """Fetch one certificate from an AIA URL, DER or PEM.
 
     CAs publish DER at these URLs (``.crt``/``.cer``) but PEM appears often
@@ -308,8 +420,16 @@ def _fetch_certificate(url: str, timeout: float) -> x509.Certificate | None:
         url,
         headers={"User-Agent": "wafer", "Accept": "*/*"},
     )
+    handlers = [_GuardedRedirectHandler(proxy_url)]
+    if proxy_url:
+        # Same rule as the probe: the fetch is wafer traffic and must leave
+        # by the operator's egress path, not around it.
+        handlers.append(
+            urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
+        )
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        opener = urllib.request.build_opener(*handlers)
+        with opener.open(request, timeout=timeout) as response:
             payload = response.read(_MAX_CERT_BYTES + 1)
     except (urllib.error.URLError, OSError, ValueError):
         logger.debug("AIA fetch failed for %s", url, exc_info=True)
@@ -355,6 +475,46 @@ def _is_currently_valid(cert: x509.Certificate, now: float) -> bool:
     return not_before <= now <= not_after
 
 
+def _path_top(chain: list[x509.Certificate]) -> x509.Certificate:
+    """Walk from the leaf through the presented certificates and return the top.
+
+    The last certificate on the wire is not reliably the top of the path.
+    TLS 1.3 drops the ordering requirement, and a common misconfiguration is
+    to append the *root* while omitting the intermediate -- which would make
+    the final certificate self-signed and trusted, and the chain look
+    complete when the piece that matters is exactly what is missing. Chrome
+    chases such a site; reading position rather than issuer links would mean
+    wafer never does.
+    """
+
+    by_subject: dict[bytes, x509.Certificate] = {}
+    for cert in chain[1:]:
+        by_subject.setdefault(cert.subject.public_bytes(), cert)
+    current = chain[0]
+    for _ in range(len(chain)):
+        if current.issuer == current.subject:
+            break
+        issuer = by_subject.get(current.issuer.public_bytes())
+        if issuer is None or not _directly_issued(current, issuer):
+            break
+        current = issuer
+    return current
+
+
+def _directly_issued(cert: x509.Certificate, issuer: x509.Certificate) -> bool:
+    """Prove ``issuer`` signed ``cert``, by signature rather than by name.
+
+    Subject and issuer names are just fields in a document an attacker can
+    author, so a name match proves nothing on its own.
+    """
+
+    try:
+        cert.verify_directly_issued_by(issuer)
+    except Exception:
+        return False
+    return True
+
+
 def _signed_by_trusted_root(
     cert: x509.Certificate,
     roots: list[x509.Certificate],
@@ -367,17 +527,10 @@ def _signed_by_trusted_root(
     fails is indistinguishable from one an attacker minted, and is dropped.
     """
 
-    for root in roots:
-        if root.subject != cert.issuer:
-            continue
-        try:
-            cert.verify_directly_issued_by(root)
-        except (ValueError, TypeError):
-            continue
-        except Exception:
-            continue
-        return True
-    return False
+    return any(
+        root.subject == cert.issuer and _directly_issued(cert, root)
+        for root in roots
+    )
 
 
 def resolve_missing_intermediates(
@@ -385,6 +538,7 @@ def resolve_missing_intermediates(
     trust_store_pems: bytes,
     *,
     timeout: float | None = None,
+    proxy_url: str | None = None,
 ) -> list[bytes]:
     """Return PEM certificates that complete this host's chain, if any.
 
@@ -403,7 +557,12 @@ def resolve_missing_intermediates(
     if not roots:
         return []
 
-    budget = timeout if timeout is not None else _PROBE_TIMEOUT + _FETCH_TIMEOUT
+    if timeout is None:
+        budget = _PROBE_TIMEOUT + _FETCH_TIMEOUT
+    else:
+        # Never take more than a share of what the caller has left: the retry
+        # after a successful chase still needs budget to run in.
+        budget = min(timeout * _MAX_BUDGET_SHARE, _MAX_CHASE_SECONDS)
     deadline = time.monotonic() + budget
 
     def remaining(cap: float) -> float:
@@ -412,13 +571,13 @@ def resolve_missing_intermediates(
     probe_timeout = remaining(_PROBE_TIMEOUT)
     if probe_timeout <= 0:
         return []
-    chain = _probe_chain(host, port, probe_timeout)
+    chain = _probe_chain(host, port, probe_timeout, proxy_url)
     if not chain:
         return []
-    # Chase from the deepest certificate the server actually sent. A server
-    # that sent part of its chain is missing only what comes above it, and
+    # Chase from the top of the path the server actually sent. A server that
+    # sent part of its chain is missing only what comes above it, and
     # starting from the leaf would re-fetch what is already on the wire.
-    cert = chain[-1]
+    cert = _path_top(chain)
     if _signed_by_trusted_root(cert, roots):
         # The chain reaches the trust store on its own, so nothing is
         # missing and the handshake failed for some other reason -- an
@@ -439,7 +598,7 @@ def resolve_missing_intermediates(
             # gathered on the way is proven material.
             anchored = True
             break
-        urls = _ca_issuer_urls(cert)
+        urls = _ca_issuer_urls(cert, proxied=bool(proxy_url))
         if not urls:
             break
         issuer = None
@@ -447,17 +606,23 @@ def resolve_missing_intermediates(
             fetch_timeout = remaining(_FETCH_TIMEOUT)
             if fetch_timeout <= 0:
                 return []
-            candidate = _fetch_certificate(candidate_url, fetch_timeout)
+            candidate = _fetch_certificate(
+                candidate_url, fetch_timeout, proxy_url
+            )
             if candidate is None:
                 continue
-            # The fetched certificate must be the issuer this certificate
-            # actually names, a CA, and unexpired. None of these establish
-            # trust on their own -- _signed_by_trusted_root does that on the
-            # next pass -- they just refuse obvious junk before spending
-            # another round trip on it.
-            if candidate.subject != cert.issuer:
+            # The fetched certificate must have actually signed the one that
+            # named it, by signature and not by name. Checking only that the
+            # subject matches would let an attacker who answers the fetch
+            # insert a CA of their own here: the pass that reaches a trusted
+            # root proves the certificate at the *top* of the walk, and every
+            # link below it would ride in unverified while still being
+            # anchored. Linking each hop by signature makes the whole path
+            # provable from the leaf up.
+            if not _directly_issued(cert, candidate):
                 logger.debug(
-                    "AIA certificate from %s is not the named issuer",
+                    "AIA certificate from %s did not sign the certificate "
+                    "that named it",
                     candidate_url,
                 )
                 continue
@@ -491,7 +656,7 @@ def resolve_missing_intermediates(
 
     verify_timeout = remaining(_PROBE_TIMEOUT)
     if verify_timeout <= 0 or not _completes_chain(
-        host, port, trust_store_pems, collected, verify_timeout
+        host, port, trust_store_pems, collected, verify_timeout, proxy_url
     ):
         return []
 

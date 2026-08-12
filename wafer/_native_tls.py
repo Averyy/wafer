@@ -158,8 +158,21 @@ class NativeTLSTransport:
         proxy_url: str | None = None,
         max_redirects: int = 10,
         resolve: dict[str, list[str]] | None = None,
+        extra_ca_pems: list[bytes] | None = None,
     ):
         self._ctx = ssl.create_default_context()
+        if extra_ca_pems:
+            # Intermediates the session already proved are signed by a root in
+            # the trust store (see wafer/_aia.py). Without these, a host whose
+            # incomplete chain the wreq path completed would still fail here,
+            # so the same URL would succeed or fail depending on which
+            # transport happened to carry it.
+            try:
+                self._ctx.load_verify_locations(
+                    cadata=b"\n".join(extra_ca_pems).decode("ascii")
+                )
+            except Exception:
+                logger.debug("Could not load AIA intermediates", exc_info=True)
         self._jar = CookieJar()
         self._follow_redirects = follow_redirects
         self._proxy_url = proxy_url

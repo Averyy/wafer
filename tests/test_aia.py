@@ -587,7 +587,9 @@ class TestResolveMissingIntermediates:
         with (
             patch.object(_aia, "_probe_chain", return_value=[leaf]),
             patch.object(
-                _aia, "_fetch_certificate", side_effect=lambda url, _t: fetched[url]
+                _aia,
+                "_fetch_certificate",
+                side_effect=lambda url, _t, _p=None: fetched[url],
             ),
             patch.object(_aia, "_completes_chain", return_value=True),
         ):
@@ -640,7 +642,8 @@ class TestFetchCertificate:
             def __exit__(self, *exc):
                 return False
 
-        with patch.object(_aia.urllib.request, "urlopen", return_value=_Response()):
+        with patch.object(_aia.urllib.request, "build_opener") as build:
+            build.return_value.open.return_value = _Response()
             assert _aia._fetch_certificate("http://ca.test/big.crt", 5.0) is None
 
     def test_non_certificate_payload_is_refused(self):
@@ -654,7 +657,8 @@ class TestFetchCertificate:
             def __exit__(self, *exc):
                 return False
 
-        with patch.object(_aia.urllib.request, "urlopen", return_value=_Response()):
+        with patch.object(_aia.urllib.request, "build_opener") as build:
+            build.return_value.open.return_value = _Response()
             assert _aia._fetch_certificate("http://ca.test/x.crt", 5.0) is None
 
     def test_der_payload_is_parsed(self, pki):
@@ -670,7 +674,8 @@ class TestFetchCertificate:
             def __exit__(self, *exc):
                 return False
 
-        with patch.object(_aia.urllib.request, "urlopen", return_value=_Response()):
+        with patch.object(_aia.urllib.request, "build_opener") as build:
+            build.return_value.open.return_value = _Response()
             got = _aia._fetch_certificate("http://ca.test/x.crt", 5.0)
         assert got is not None
         assert got.subject == pki["intermediate"].subject
@@ -688,15 +693,15 @@ class TestFetchCertificate:
             def __exit__(self, *exc):
                 return False
 
-        with patch.object(_aia.urllib.request, "urlopen", return_value=_Response()):
+        with patch.object(_aia.urllib.request, "build_opener") as build:
+            build.return_value.open.return_value = _Response()
             got = _aia._fetch_certificate("http://ca.test/x.crt", 5.0)
         assert got is not None
         assert got.subject == pki["intermediate"].subject
 
     def test_network_error_is_swallowed(self):
-        with patch.object(
-            _aia.urllib.request, "urlopen", side_effect=OSError("boom")
-        ):
+        with patch.object(_aia.urllib.request, "build_opener") as build:
+            build.return_value.open.side_effect = OSError("boom")
             assert _aia._fetch_certificate("http://ca.test/x.crt", 5.0) is None
 
 
@@ -784,6 +789,402 @@ class TestSessionIntegration:
             with pytest.raises(ConnectionFailed):
                 await session.get("https://down.test/")
         resolve.assert_not_called()
+
+
+class TestChainLinkVerification:
+    """Every hop must be signature-linked, not just the top one.
+
+    Each collected certificate becomes a trust anchor, so verifying only the
+    certificate that reaches a root would let an attacker who answers the
+    plain-HTTP fetch insert a CA of their own underneath it.
+    """
+
+    def test_forged_link_under_a_genuine_root_signed_ca_is_refused(self, pki):
+        # I1' claims the leaf's issuer name and points its AIA at the real,
+        # root-signed intermediate, so the walk still terminates at a trusted
+        # root -- but I1' signed nothing in the path.
+        forged_key = _key()
+        forged = (
+            x509.CertificateBuilder()
+            .subject_name(pki["leaf"].issuer)
+            .issuer_name(pki["intermediate"].subject)
+            .public_key(forged_key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(_NOW - datetime.timedelta(days=10))
+            .not_valid_after(_NOW + datetime.timedelta(days=300))
+            .add_extension(x509.BasicConstraints(ca=True, path_length=None), True)
+            .add_extension(
+                x509.AuthorityInformationAccess(
+                    [
+                        x509.AccessDescription(
+                            x509.oid.AuthorityInformationAccessOID.CA_ISSUERS,
+                            x509.UniformResourceIdentifier(
+                                "http://ca.test/real.crt"
+                            ),
+                        )
+                    ]
+                ),
+                critical=False,
+            )
+            .sign(forged_key, hashes.SHA256())
+        )
+        assert forged.subject == pki["leaf"].issuer  # name matches
+        served = {
+            "http://ca.test/intermediate.crt": forged,
+            "http://ca.test/real.crt": pki["intermediate"],
+        }
+        with (
+            _resolves_to("93.184.216.34"),
+            patch.object(_aia, "_probe_chain", return_value=[pki["leaf"]]),
+            patch.object(
+                _aia,
+                "_fetch_certificate",
+                side_effect=lambda url, _t, _p=None: served[url],
+            ),
+            patch.object(_aia, "_completes_chain", return_value=True),
+        ):
+            out = resolve_missing_intermediates(
+                "https://leaf.test/", pki["root_pems"]
+            )
+        assert out == []
+
+    def test_genuine_two_deep_chain_still_resolves(self, pki):
+        """The linkage check must not break legitimate multi-hop chains."""
+
+        root_key = _key()
+        root = (
+            x509.CertificateBuilder()
+            .subject_name(_name("Deep Root"))
+            .issuer_name(_name("Deep Root"))
+            .public_key(root_key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(_NOW - datetime.timedelta(days=3650))
+            .not_valid_after(_NOW + datetime.timedelta(days=3650))
+            .add_extension(x509.BasicConstraints(ca=True, path_length=None), True)
+            .sign(root_key, hashes.SHA256())
+        )
+        upper, upper_key = _make_cert("Deep Upper", root.subject, root_key, ca=True)
+        lower, lower_key = _make_cert(
+            "Deep Lower",
+            upper.subject,
+            upper_key,
+            ca=True,
+            aia_url="http://ca.test/upper.crt",
+        )
+        leaf, _ = _make_cert(
+            "deep.test",
+            lower.subject,
+            lower_key,
+            ca=False,
+            aia_url="http://ca.test/lower.crt",
+        )
+        served = {
+            "http://ca.test/lower.crt": lower,
+            "http://ca.test/upper.crt": upper,
+        }
+        with (
+            _resolves_to("93.184.216.34"),
+            patch.object(_aia, "_probe_chain", return_value=[leaf]),
+            patch.object(
+                _aia,
+                "_fetch_certificate",
+                side_effect=lambda url, _t, _p=None: served[url],
+            ),
+            patch.object(_aia, "_completes_chain", return_value=True),
+        ):
+            out = resolve_missing_intermediates("https://deep.test/", _pem(root))
+        assert out == [_pem(lower), _pem(upper)]
+
+
+class TestPathTop:
+    """Position on the wire does not determine the top of the path."""
+
+    def test_leaf_plus_root_is_still_treated_as_incomplete(self, pki):
+        """Appending the root while omitting the intermediate is a real error.
+
+        chain[-1] would be the self-signed, trusted root, making the chain
+        look complete when the piece that matters is exactly what is missing.
+        Chrome chases such a site.
+        """
+
+        top = _aia._path_top([pki["leaf"], pki["root"]])
+        assert top is pki["leaf"]
+        assert not _signed_by_trusted_root(top, [pki["root"]])
+
+    def test_ordered_chain_walks_to_the_intermediate(self, pki):
+        top = _aia._path_top([pki["leaf"], pki["intermediate"]])
+        assert top is pki["intermediate"]
+
+    def test_unordered_complete_chain_walks_to_the_root(self, pki):
+        """TLS 1.3 drops the ordering requirement, so position means nothing.
+
+        Sent out of order this chain is still complete, and the walk has to
+        reach the root rather than stopping at whatever came last.
+        """
+
+        top = _aia._path_top([pki["leaf"], pki["root"], pki["intermediate"]])
+        assert top is pki["root"]
+        assert _signed_by_trusted_root(top, [pki["root"]])
+
+    def test_unordered_incomplete_chain_stops_below_the_gap(self, pki):
+        """An unrelated certificate sent last must not end the walk."""
+
+        unrelated, _ = _make_cert(
+            "Unrelated CA", _name("Somewhere Else"), _key(), ca=True
+        )
+        top = _aia._path_top([pki["leaf"], unrelated])
+        assert top is pki["leaf"]
+
+    def test_single_certificate_chain_is_its_own_top(self, pki):
+        assert _aia._path_top([pki["leaf"]]) is pki["leaf"]
+
+    def test_self_signed_leaf_terminates_the_walk(self, pki):
+        assert _aia._path_top([pki["root"], pki["root"]]) is pki["root"]
+
+
+class TestRedirectGuard:
+    """urllib follows redirects; the URL guard must run on every hop."""
+
+    def test_redirect_into_private_space_is_refused(self):
+        handler = _aia._GuardedRedirectHandler()
+        assert (
+            handler.redirect_request(
+                None, None, 302, "Found", {}, "http://169.254.169.254/latest/"
+            )
+            is None
+        )
+
+    def test_redirect_to_a_non_http_scheme_is_refused(self):
+        handler = _aia._GuardedRedirectHandler()
+        assert (
+            handler.redirect_request(None, None, 302, "Found", {}, "file:///etc/passwd")
+            is None
+        )
+
+    def test_public_redirect_is_allowed(self):
+        handler = _aia._GuardedRedirectHandler()
+        with (
+            _resolves_to("93.184.216.34"),
+            patch.object(
+                _aia.urllib.request.HTTPRedirectHandler,
+                "redirect_request",
+                return_value="allowed",
+            ),
+        ):
+            got = handler.redirect_request(
+                None, None, 302, "Found", {}, "http://cdn.ca.test/inter.crt"
+            )
+        assert got == "allowed"
+
+    def test_the_guarded_handler_is_installed_on_every_fetch(self):
+        class _Response:
+            def read(self, size):
+                return b""
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        with patch.object(_aia.urllib.request, "build_opener") as build:
+            build.return_value.open.return_value = _Response()
+            _aia._fetch_certificate("http://ca.test/x.crt", 5.0)
+        assert any(
+            isinstance(h, _aia._GuardedRedirectHandler)
+            for h in build.call_args.args
+        )
+
+
+class TestChaseBudget:
+    """The chase must not spend the budget the retry needs."""
+
+    def test_takes_only_a_share_of_the_callers_remaining_time(self, pki):
+        seen = {}
+
+        def _probe(host, port, timeout, proxy=None):
+            seen["timeout"] = timeout
+            return []
+
+        with patch.object(_aia, "_probe_chain", side_effect=_probe):
+            resolve_missing_intermediates(
+                "https://leaf.test/", pki["root_pems"], timeout=60.0
+            )
+        # Not the full 60s, and never above the per-probe cap.
+        assert seen["timeout"] <= _aia._PROBE_TIMEOUT
+
+    def test_total_chase_is_capped_even_on_a_huge_budget(self, pki):
+        with patch.object(_aia, "_probe_chain", return_value=[]) as probe:
+            resolve_missing_intermediates(
+                "https://leaf.test/", pki["root_pems"], timeout=3600.0
+            )
+        probe.assert_called_once()
+
+    def test_a_small_caller_budget_is_respected(self, pki):
+        seen = {}
+
+        def _probe(host, port, timeout, proxy=None):
+            seen["timeout"] = timeout
+            return []
+
+        with patch.object(_aia, "_probe_chain", side_effect=_probe):
+            resolve_missing_intermediates(
+                "https://leaf.test/", pki["root_pems"], timeout=4.0
+            )
+        assert seen["timeout"] <= 4.0 * _aia._MAX_BUDGET_SHARE + 0.1
+
+
+class TestProxiedUrlGuard:
+    """Behind a proxy the local resolver describes neither route nor policy."""
+
+    def test_names_are_not_locally_resolved_when_proxied(self):
+        with patch.object(
+            _aia.socket, "getaddrinfo", side_effect=OSError("no DNS here")
+        ) as resolve:
+            assert _is_fetchable_url("http://ca.test/x.crt", proxied=True)
+        resolve.assert_not_called()
+
+    def test_literal_private_addresses_are_still_refused_when_proxied(self):
+        assert not _is_fetchable_url("http://169.254.169.254/x", proxied=True)
+        assert not _is_fetchable_url("http://127.0.0.1/x", proxied=True)
+
+    def test_non_http_schemes_are_still_refused_when_proxied(self):
+        assert not _is_fetchable_url("file:///etc/passwd", proxied=True)
+
+
+class TestEgressContracts:
+    """Chasing must never make a connection the session would not make.
+
+    Both guards protect documented contracts: resolve= pins destinations for
+    untrusted URLs, and proxy= is the egress path the operator chose. A probe
+    that dialled directly would break either one silently.
+    """
+
+    def test_resolve_pin_disables_chasing(self):
+        session, _ = make_sync_session(
+            [_VERIFY_ERROR], max_retries=0, resolve={"pinned.test": ["93.184.216.34"]}
+        )
+        with patch.object(_aia, "resolve_missing_intermediates") as resolve:
+            with pytest.raises(ConnectionFailed):
+                session.get("https://pinned.test/")
+        resolve.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "proxy", ["socks5://127.0.0.1:1080", "socks4://p:1080", "https://p:8443"]
+    )
+    def test_untunnelable_proxies_disable_chasing(self, proxy):
+        session, _ = make_sync_session([_VERIFY_ERROR], max_retries=0)
+        session._proxy_url = proxy
+        with patch.object(_aia, "resolve_missing_intermediates") as resolve:
+            with pytest.raises(ConnectionFailed):
+                session.get("https://broken.test/")
+        resolve.assert_not_called()
+
+    def test_http_proxy_is_passed_through_to_the_chase(self, pki):
+        session, _ = make_sync_session(
+            [_VERIFY_ERROR, MockResponse(200, body="page")]
+        )
+        session._proxy_url = "http://proxy.test:8080"
+        session._rebuild_client = lambda: None
+        with patch.object(
+            _aia,
+            "resolve_missing_intermediates",
+            return_value=[_pem(pki["intermediate"])],
+        ) as resolve:
+            session.get("https://incomplete.test/")
+        assert resolve.call_args.kwargs["proxy_url"] == "http://proxy.test:8080"
+
+    @pytest.mark.parametrize(
+        "proxy,supported",
+        [
+            (None, True),
+            ("http://p:8080", True),
+            ("https://p:8443", False),
+            ("socks5://p:1080", False),
+            ("socks5h://p:1080", False),
+            ("socks4://p:1080", False),
+        ],
+    )
+    def test_proxy_scheme_support(self, proxy, supported):
+        assert _aia.proxy_supports_chasing(proxy) is supported
+
+    def test_probe_tunnels_through_an_http_proxy(self):
+        """The probe must reach the origin via CONNECT, not a direct socket."""
+
+        with patch.object(_aia.http.client, "HTTPSConnection") as conn_cls:
+            _aia._probe_chain("origin.test", 443, 5.0, "http://proxy.test:8080")
+        # Dialled the proxy, then tunnelled to the origin.
+        assert conn_cls.call_args.args[0] == "proxy.test"
+        assert conn_cls.call_args.args[1] == 8080
+        conn_cls.return_value.set_tunnel.assert_called_once_with(
+            "origin.test", 443
+        )
+
+    def test_probe_connects_directly_without_a_proxy(self):
+        with patch.object(_aia.http.client, "HTTPSConnection") as conn_cls:
+            _aia._probe_chain("origin.test", 443, 5.0, None)
+        assert conn_cls.call_args.args[0] == "origin.test"
+        conn_cls.return_value.set_tunnel.assert_not_called()
+
+    def test_fetch_uses_the_proxy_when_one_is_set(self, pki):
+        payload = _der(pki["intermediate"])
+
+        class _Response:
+            def read(self, size):
+                return payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        with patch.object(_aia.urllib.request, "build_opener") as build:
+            build.return_value.open.return_value = _Response()
+            _aia._fetch_certificate(
+                "http://ca.test/x.crt", 5.0, "http://proxy.test:8080"
+            )
+        proxies = [
+            h for h in build.call_args.args
+            if isinstance(h, _aia.urllib.request.ProxyHandler)
+        ]
+        assert len(proxies) == 1
+        assert proxies[0].proxies == {
+            "http": "http://proxy.test:8080",
+            "https": "http://proxy.test:8080",
+        }
+
+
+class TestTransportConsistency:
+    def test_native_transport_gets_the_proven_intermediates(self, pki):
+        """One URL must not succeed or fail depending on the transport.
+
+        The Imperva fallback builds its own SSL context, so without this a
+        host whose chain the wreq path completed would still fail there.
+        """
+
+        session, _ = make_sync_session([MockResponse(200)])
+        session._aia_extra_pems = [_pem(pki["intermediate"])]
+        session._native_tls = None
+        transport = session._native_transport()
+        loaded = {
+            cert["serialNumber"] for cert in transport._ctx.get_ca_certs()
+        }
+        assert f"{pki['intermediate'].serial_number:X}" in loaded
+
+    def test_a_completed_chain_rebuilds_the_native_transport(self, pki):
+        """A cached context would keep failing on the chain just fixed."""
+
+        session, _ = make_sync_session([MockResponse(200)])
+        first = session._native_transport()
+        with patch.object(
+            _aia,
+            "resolve_missing_intermediates",
+            return_value=[_pem(pki["intermediate"])],
+        ):
+            assert session._complete_chain_via_aia("https://incomplete.test/")
+        assert session._native_tls is None
+        assert session._native_transport() is not first
 
 
 class TestCertStoreSelection:
