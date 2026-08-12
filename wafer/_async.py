@@ -1609,18 +1609,24 @@ class AsyncSession(BaseSession):
                 # than stalling the event loop for every other request in
                 # flight. Only runs after a handshake already failed
                 # verification, and only once per host.
-                if is_certificate_verify_failure(e) and await asyncio.to_thread(
-                    self._complete_chain_via_aia,
-                    current_url,
-                    (
-                        None
-                        if deadline is None
-                        else max(0.0, deadline - time.monotonic())
-                    ),
-                ):
-                    # The chase publishes the rebuilt client itself, under the
-                    # lock that installed the certificates.
-                    continue
+                if is_certificate_verify_failure(e):
+                    if await asyncio.to_thread(
+                        self._complete_chain_via_aia,
+                        current_url,
+                        max(0.0, deadline - time.monotonic()),
+                    ):
+                        # The chase installed certificates and republished the
+                        # client, so this is worth one more attempt.
+                        continue
+                    # Nothing left to try. The same certificate fails the same
+                    # way on every retry and under every fingerprint, so report
+                    # it now instead of spending the retry and rotation ladder
+                    # on identical handshakes -- and so the caller sees the
+                    # certificate error rather than a WaferTimeout hiding it.
+                    raise ConnectionFailed(
+                        current_url,
+                        _connection_failure_reason(current_url, e),
+                    ) from e
                 # The wall-clock limit this attempt actually ran under (for
                 # logging); attempt_limit is the min(cap, remaining) bound.
                 timed_out_after = (

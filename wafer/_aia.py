@@ -523,16 +523,47 @@ def _anchoring_would_drop_constraints(
     constraints are present. Such a chain is rare in the public web PKI, and
     failing on one site beats silently widening a CA's reach for a session.
 
-    pathLenConstraint is deliberately *not* treated this way. Real
-    intermediates carry pathLen:0 as a matter of course -- GeoTrust TLS RSA
-    CA G1, the certificate this whole feature exists to fetch, is one -- and
-    it constrains how many CAs may appear *below* the certificate, which
-    anchoring does not widen in any way an attacker can reach without the
-    CA's private key. Refusing on it would reject the motivating case to
-    guard against nothing.
+    pathLenConstraint is handled separately, by ``_path_length_ok``, because
+    a blanket refusal here would reject the motivating case: real
+    intermediates carry pathLen:0 as a matter of course, GeoTrust TLS RSA CA
+    G1 among them.
     """
 
     return any(_has_name_constraints(source) for source in (root, cert))
+
+
+def _path_length_ok(cert: x509.Certificate, cas_below: int) -> bool:
+    """Enforce pathLenConstraint against the certificates below this one.
+
+    pathLen caps how many CA certificates may sit between this one and the
+    end entity. Anchoring stops that being enforced, and every certificate
+    collected here is anchored -- so a path like
+
+        root -> upper(pathLen=0) -> lower(CA) -> leaf
+
+    which RFC 5280 validation rejects, would be accepted once ``lower`` is
+    anchored, because validation simply starts there and never looks at
+    ``upper``. The confirmation handshake cannot catch it either: it runs
+    against the same anchors and so shares the blind spot.
+
+    Reaching that state requires a CA to have misissued ``lower`` in the
+    first place, which is rare -- but "rare" is not the standard for a check
+    whose absence turns a chain the PKI rejects into one wafer accepts.
+    Both real chains this feature was built for satisfy the rule: GeoTrust
+    TLS RSA CA G1 sits at pathLen:0 with nothing below it, and Let's
+    Encrypt's YR2/Root YR pair is pathLen:0 then unconstrained.
+    """
+
+    try:
+        basic = cert.extensions.get_extension_for_oid(
+            ExtensionOID.BASIC_CONSTRAINTS
+        ).value
+    except Exception:
+        return False
+    limit = getattr(basic, "path_length", None)
+    if limit is None:
+        return True
+    return isinstance(limit, int) and limit >= cas_below
 
 
 def _has_name_constraints(cert: x509.Certificate) -> bool:
@@ -693,6 +724,10 @@ def resolve_missing_intermediates(
         )
         return []
 
+    # CA certificates the server already sent between the leaf and the point
+    # the chase starts from. They sit below everything fetched, so they count
+    # against each fetched certificate's pathLen.
+    sent_cas_below = max(0, len(chain) - 1)
     collected: list[bytes] = []
     seen: set[bytes] = set()
     anchored = False
@@ -745,6 +780,17 @@ def resolve_missing_intermediates(
                     "AIA certificate from %s is not a valid CA", candidate_url
                 )
                 continue
+            # CA certificates already below this candidate in the path: the
+            # ones the server sent above the leaf, plus everything collected
+            # so far. Anchoring the candidate stops its pathLen being
+            # enforced against them, so it has to be enforced here.
+            if not _path_length_ok(candidate, sent_cas_below + len(collected)):
+                logger.debug(
+                    "AIA certificate from %s has pathLen below the "
+                    "certificates already under it",
+                    candidate_url,
+                )
+                return []
             if _has_name_constraints(candidate):
                 # Every collected certificate is anchored, not just the one
                 # that reaches a root, so a constrained certificate anywhere
@@ -761,7 +807,10 @@ def resolve_missing_intermediates(
             if fingerprint in seen:
                 # A certificate that names itself, directly or through a
                 # cycle, would otherwise be re-fetched until the depth cap.
-                break
+                # Try this certificate's other caIssuers URLs rather than
+                # abandoning them: a duplicate from the first URL says
+                # nothing about what the second would return.
+                continue
             seen.add(fingerprint)
             issuer = candidate
             break

@@ -676,8 +676,10 @@ class TestResolveMissingIntermediates:
                 "https://loop.test/", pki["root_pems"]
             )
         assert out == []
-        # The loop ran and was stopped by the cap, not skipped beforehand.
-        assert 0 < fetch.call_count <= _aia._MAX_CHASE_DEPTH
+        # Exactly one fetch: the first candidate is recorded, the second pass
+        # sees a duplicate and stops. A looser bound (<= _MAX_CHASE_DEPTH) is
+        # satisfied whether or not the dedupe works at all.
+        assert fetch.call_count == 1
 
 
 # ---------------------------------------------------------------------------
@@ -1110,6 +1112,148 @@ class TestProxiedUrlGuard:
         assert not _is_fetchable_url("file:///etc/passwd", proxied=True)
 
 
+class TestCertFailureIsTerminal:
+    """A certificate that still fails after the chase must end the request.
+
+    The same certificate fails the same way on every retry and under every
+    fingerprint, so continuing costs handshakes and returns the same answer.
+    """
+
+    def test_success_is_reported_at_most_once_per_origin(self, pki):
+        """Otherwise the retry loop spins without consuming any budget.
+
+        Reporting success again on a later failure tells the caller to retry
+        a request that just failed with the certificates already installed.
+        Nothing changes between those attempts, so it never terminates: this
+        measured 412,474 handshake attempts in three seconds before the fix,
+        and surfaced as WaferTimeout hiding the real certificate error.
+        """
+
+        session, mock = make_sync_session(
+            [_VERIFY_ERROR], max_retries=3, max_rotations=2
+        )
+        session._rebuild_client = lambda: None
+        with patch.object(
+            _aia,
+            "resolve_missing_intermediates",
+            return_value=[_pem(pki["intermediate"])],
+        ):
+            with pytest.raises(ConnectionFailed):
+                session.get("https://incomplete.test/", timeout=3)
+        # One attempt, one retry after the chase installed the certificate.
+        assert mock.request_count == 2
+
+    def test_an_unfixable_chain_does_not_burn_the_retry_ladder(self):
+        session, mock = make_sync_session(
+            [_VERIFY_ERROR], max_retries=3, max_rotations=2
+        )
+        with patch.object(
+            _aia, "resolve_missing_intermediates", return_value=[]
+        ):
+            with pytest.raises(ConnectionFailed):
+                session.get("https://broken.test/", timeout=3)
+        assert mock.request_count == 1
+
+    def test_the_caller_sees_the_certificate_error_not_a_timeout(self):
+        session, _ = make_sync_session([_VERIFY_ERROR], max_retries=3)
+        with patch.object(
+            _aia, "resolve_missing_intermediates", return_value=[]
+        ):
+            with pytest.raises(ConnectionFailed) as caught:
+                session.get("https://broken.test/", timeout=3)
+        assert "CERTIFICATE_VERIFY_FAILED" in str(caught.value)
+
+    @pytest.mark.asyncio
+    async def test_async_success_is_reported_at_most_once(self, pki):
+        session, mock = make_async_session(
+            [_VERIFY_ERROR], max_retries=3, max_rotations=2
+        )
+        session._rebuild_client = lambda: None
+        with patch.object(
+            _aia,
+            "resolve_missing_intermediates",
+            return_value=[_pem(pki["intermediate"])],
+        ):
+            with pytest.raises(ConnectionFailed):
+                await session.get("https://incomplete.test/", timeout=3)
+        assert mock.request_count == 2
+
+
+class TestFetchedCertificateGatesEndToEnd:
+    """The CA gates must be reachable through the chase, not just unit-tested.
+
+    Call-site mutation showed deleting this gate from resolve_missing_
+    intermediates left the whole suite green: both helpers had direct unit
+    tests, but nothing drove a bad candidate through the chase itself.
+    """
+
+    def test_a_root_signed_non_ca_is_refused(self):
+        # Signed by a trusted root, so only the CA gate can reject it.
+        root_key = _key()
+        root = (
+            x509.CertificateBuilder()
+            .subject_name(_name("Gate Root"))
+            .issuer_name(_name("Gate Root"))
+            .public_key(root_key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(_NOW - datetime.timedelta(days=3650))
+            .not_valid_after(_NOW + datetime.timedelta(days=3650))
+            .add_extension(x509.BasicConstraints(ca=True, path_length=None), True)
+            .sign(root_key, hashes.SHA256())
+        )
+        not_a_ca, key = _make_cert("Gate CA", root.subject, root_key, ca=False)
+        leaf, _ = _make_cert(
+            "gate.test", not_a_ca.subject, key, ca=False,
+            aia_url="http://ca.test/gate.crt",
+        )
+        with (
+            _resolves_to("93.184.216.34"),
+            patch.object(_aia, "_probe_chain", return_value=[leaf]),
+            patch.object(
+                _aia, "_fetch_certificate", side_effect=lambda u, t, p=None: not_a_ca
+            ),
+            patch.object(_aia, "_completes_chain", return_value=True),
+        ):
+            out = resolve_missing_intermediates("https://gate.test/", _pem(root))
+        assert out == []
+
+    def test_a_root_signed_expired_ca_is_refused(self):
+        root_key = _key()
+        root = (
+            x509.CertificateBuilder()
+            .subject_name(_name("Gate Root"))
+            .issuer_name(_name("Gate Root"))
+            .public_key(root_key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(_NOW - datetime.timedelta(days=3650))
+            .not_valid_after(_NOW + datetime.timedelta(days=3650))
+            .add_extension(x509.BasicConstraints(ca=True, path_length=None), True)
+            .sign(root_key, hashes.SHA256())
+        )
+        expired, key = _make_cert(
+            "Gate CA",
+            root.subject,
+            root_key,
+            ca=True,
+            not_before=datetime.datetime(2000, 1, 1, tzinfo=datetime.timezone.utc),
+            not_after=datetime.datetime(2001, 1, 1, tzinfo=datetime.timezone.utc),
+        )
+        leaf, _ = _make_cert(
+            "gate.test", expired.subject, key, ca=False,
+            aia_url="http://ca.test/gate.crt",
+        )
+        with (
+            _resolves_to("93.184.216.34"),
+            patch.object(_aia, "_probe_chain", return_value=[leaf]),
+            patch.object(
+                _aia, "_fetch_certificate", side_effect=lambda u, t, p=None: expired
+            ),
+            patch.object(_aia, "_completes_chain", return_value=True),
+        ):
+            out = resolve_missing_intermediates("https://gate.test/", _pem(root))
+        assert out == []
+
+
 class TestEgressContracts:
     """Chasing must never make a connection the session would not make.
 
@@ -1264,10 +1408,15 @@ class TestTransportConsistency:
         session._aia_extra_pems = [_pem(pki["intermediate"])]
         session._native_tls = None
         transport = session._native_transport()
+        # Compare on subject, not serial: OpenSSL zero-pads serialNumber to an
+        # even number of hex digits while Python's int formatting does not, so
+        # a serial of odd hex length would mismatch at random.
         loaded = {
-            cert["serialNumber"] for cert in transport._ctx.get_ca_certs()
+            tuple(sorted(part for rdn in cert["subject"] for part in rdn))
+            for cert in transport._ctx.get_ca_certs()
         }
-        assert f"{pki['intermediate'].serial_number:X}" in loaded
+        expected = ("commonName", "Test Intermediate")
+        assert any(expected in subject for subject in loaded)
 
     def test_a_completed_chain_rebuilds_the_native_transport(self, pki):
         """A cached context would keep failing on the chain just fixed."""
@@ -1489,6 +1638,203 @@ class TestAnchorConstraints:
         assert out == []
 
 
+class TestPathLengthEnforcement:
+    """pathLen must be enforced because anchoring stops it being enforced.
+
+    root -> upper(pathLen=0) -> lower(CA) -> leaf is a path RFC 5280
+    rejects. Anchoring `lower` makes validation start there and never look
+    at `upper`, so it would be accepted. The confirmation handshake shares
+    the same blind spot, since it runs against the same anchors.
+    """
+
+    def _hierarchy(self, upper_path_len):
+        root_key = _key()
+        root = (
+            x509.CertificateBuilder()
+            .subject_name(_name("PL Root"))
+            .issuer_name(_name("PL Root"))
+            .public_key(root_key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(_NOW - datetime.timedelta(days=3650))
+            .not_valid_after(_NOW + datetime.timedelta(days=3650))
+            .add_extension(x509.BasicConstraints(ca=True, path_length=None), True)
+            .sign(root_key, hashes.SHA256())
+        )
+        upper_key = _key()
+        upper = (
+            x509.CertificateBuilder()
+            .subject_name(_name("PL Upper"))
+            .issuer_name(root.subject)
+            .public_key(upper_key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(_NOW - datetime.timedelta(days=100))
+            .not_valid_after(_NOW + datetime.timedelta(days=100))
+            .add_extension(
+                x509.BasicConstraints(ca=True, path_length=upper_path_len), True
+            )
+            .sign(root_key, hashes.SHA256())
+        )
+        lower_key = _key()
+        lower = (
+            x509.CertificateBuilder()
+            .subject_name(_name("PL Lower"))
+            .issuer_name(upper.subject)
+            .public_key(lower_key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(_NOW - datetime.timedelta(days=100))
+            .not_valid_after(_NOW + datetime.timedelta(days=100))
+            .add_extension(x509.BasicConstraints(ca=True, path_length=None), True)
+            .add_extension(
+                x509.AuthorityInformationAccess(
+                    [
+                        x509.AccessDescription(
+                            x509.oid.AuthorityInformationAccessOID.CA_ISSUERS,
+                            x509.UniformResourceIdentifier(
+                                "http://ca.test/upper.crt"
+                            ),
+                        )
+                    ]
+                ),
+                critical=False,
+            )
+            .sign(upper_key, hashes.SHA256())
+        )
+        leaf, _ = _make_cert(
+            "pl.test", lower.subject, lower_key, ca=False,
+            aia_url="http://ca.test/lower.crt",
+        )
+        served = {
+            "http://ca.test/lower.crt": lower,
+            "http://ca.test/upper.crt": upper,
+        }
+        return root, leaf, served
+
+    def _chase(self, root, leaf, served):
+        with (
+            _resolves_to("93.184.216.34"),
+            patch.object(_aia, "_probe_chain", return_value=[leaf]),
+            patch.object(
+                _aia, "_fetch_certificate", side_effect=lambda u, t, p=None: served[u]
+            ),
+            patch.object(_aia, "_completes_chain", return_value=True),
+        ):
+            return resolve_missing_intermediates("https://pl.test/", _pem(root))
+
+    def test_path_length_violation_is_refused(self):
+        root, leaf, served = self._hierarchy(upper_path_len=0)
+        assert self._chase(root, leaf, served) == []
+
+    def test_sufficient_path_length_is_accepted(self):
+        root, leaf, served = self._hierarchy(upper_path_len=1)
+        assert len(self._chase(root, leaf, served)) == 2
+
+    def test_unconstrained_path_length_is_accepted(self):
+        root, leaf, served = self._hierarchy(upper_path_len=None)
+        assert len(self._chase(root, leaf, served)) == 2
+
+    def test_sent_intermediates_count_against_path_length(self, pki):
+        """Certificates the server sent sit below the fetched one too."""
+
+        root_key = _key()
+        root = (
+            x509.CertificateBuilder()
+            .subject_name(_name("PL2 Root"))
+            .issuer_name(_name("PL2 Root"))
+            .public_key(root_key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(_NOW - datetime.timedelta(days=3650))
+            .not_valid_after(_NOW + datetime.timedelta(days=3650))
+            .add_extension(x509.BasicConstraints(ca=True, path_length=None), True)
+            .sign(root_key, hashes.SHA256())
+        )
+        # pathLen=0 permits no CA below it, but the server sends one.
+        upper_key = _key()
+        upper = (
+            x509.CertificateBuilder()
+            .subject_name(_name("PL2 Upper"))
+            .issuer_name(root.subject)
+            .public_key(upper_key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(_NOW - datetime.timedelta(days=100))
+            .not_valid_after(_NOW + datetime.timedelta(days=100))
+            .add_extension(x509.BasicConstraints(ca=True, path_length=0), True)
+            .sign(root_key, hashes.SHA256())
+        )
+        sent_ca, sent_key = _make_cert(
+            "PL2 Sent", upper.subject, upper_key, ca=True,
+            aia_url="http://ca.test/upper.crt",
+        )
+        leaf, _ = _make_cert("pl.test", sent_ca.subject, sent_key, ca=False)
+        with (
+            _resolves_to("93.184.216.34"),
+            patch.object(_aia, "_probe_chain", return_value=[leaf, sent_ca]),
+            patch.object(
+                _aia, "_fetch_certificate", side_effect=lambda u, t, p=None: upper
+            ),
+            patch.object(_aia, "_completes_chain", return_value=True),
+        ):
+            out = resolve_missing_intermediates("https://pl.test/", _pem(root))
+        assert out == []
+
+
+class TestTerminalRootSignature:
+    """The terminal certificate must be SIGNED by a store root, not just name it.
+
+    The rogue fixture elsewhere is rejected one step earlier, by the
+    per-hop signature check, so it never reaches this gate. This builds a
+    chain whose lower links are all genuinely signed and whose terminal
+    certificate only claims a trusted issuer.
+    """
+
+    def test_terminal_certificate_naming_a_root_it_lacks_a_signature_from(self, pki):
+        fake_root_key = _key()
+        # Same subject as the real trusted root, different key.
+        impostor_top_key = _key()
+        impostor_top = (
+            x509.CertificateBuilder()
+            .subject_name(_name("Impostor CA"))
+            .issuer_name(pki["root"].subject)  # names the trusted root
+            .public_key(impostor_top_key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(_NOW - datetime.timedelta(days=100))
+            .not_valid_after(_NOW + datetime.timedelta(days=100))
+            .add_extension(x509.BasicConstraints(ca=True, path_length=None), True)
+            .sign(fake_root_key, hashes.SHA256())  # but signed by nobody real
+        )
+        lower, lower_key = _make_cert(
+            "Impostor Lower",
+            impostor_top.subject,
+            impostor_top_key,
+            ca=True,
+            aia_url="http://ca.test/top.crt",
+        )
+        leaf, _ = _make_cert(
+            "imp.test", lower.subject, lower_key, ca=False,
+            aia_url="http://ca.test/lower.crt",
+        )
+        served = {
+            "http://ca.test/lower.crt": lower,
+            "http://ca.test/top.crt": impostor_top,
+        }
+        # Every hop below is genuinely signed, so only the terminal
+        # root-signature check can reject this.
+        assert _aia._directly_issued(leaf, lower)
+        assert _aia._directly_issued(lower, impostor_top)
+        assert impostor_top.issuer == pki["root"].subject
+        with (
+            _resolves_to("93.184.216.34"),
+            patch.object(_aia, "_probe_chain", return_value=[leaf]),
+            patch.object(
+                _aia, "_fetch_certificate", side_effect=lambda u, t, p=None: served[u]
+            ),
+            patch.object(_aia, "_completes_chain", return_value=True),
+        ):
+            out = resolve_missing_intermediates(
+                "https://imp.test/", pki["root_pems"]
+            )
+        assert out == []
+
+
 class TestConcurrentChase:
     """Parallel requests to one broken host must not fail the losers."""
 
@@ -1642,12 +1988,12 @@ class TestCertStoreSelection:
         session, _ = make_sync_session([MockResponse(200)])
         from wafer._base import _SYSTEM_CERT_STORE
 
+        assert _SYSTEM_CERT_STORE is not None, "no system trust store to test against"
         session._aia_extra_pems = [_pem(pki["intermediate"])]
         session._aia_cert_store = None
         store = session._cert_store()
         assert store is not None
-        if _SYSTEM_CERT_STORE is not None:
-            assert store is not _SYSTEM_CERT_STORE
+        assert store is not _SYSTEM_CERT_STORE
 
     def test_store_is_built_once_and_reused(self, pki):
         """_build_client_kwargs runs on every rotation; rebuilding is waste."""

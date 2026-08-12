@@ -11,6 +11,7 @@ import socket
 import subprocess
 import threading
 import time
+from collections import OrderedDict
 from html import unescape
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urljoin, urlparse
@@ -860,9 +861,10 @@ class BaseSession:
         # chased (attempted, not necessarily completed -- one try each).
         self._aia_extra_pems: list[bytes] = []
         self._aia_cert_store = None
-        # host -> Event, set once that host's chase has finished. Doubles as
-        # the "already attempted" record and the gate concurrent callers wait on.
-        self._aia_attempted: dict[str, threading.Event] = {}
+        # (canonical host, port) -> _AiaChase. Doubles as the "already
+        # attempted" record and the gate concurrent callers wait on. Ordered so
+        # the bound can evict the oldest origin instead of refusing new ones.
+        self._aia_attempted: OrderedDict[tuple[str, int], _AiaChase] = OrderedDict()
         # AsyncSession runs the chase in a worker thread, so two concurrent
         # requests failing on the same host could both pass the "already
         # attempted" test before either recorded it and each run a full probe
@@ -1915,21 +1917,37 @@ class BaseSession:
             # thread identity: async runs these in a pool, so the same thread
             # can legitimately return for an origin it already finished.
             owner = state is None
+            # Whether this origin's chase had already finished before this
+            # caller arrived, as opposed to being in flight right now.
+            settled = not owner and state.done.is_set()
             if owner:
                 if len(self._aia_attempted) >= _AIA_MAX_TRACKED_HOSTS:
                     # A caller fetching attacker-chosen URLs would otherwise
-                    # grow this map without bound. Past the cap, stop chasing
-                    # rather than stop bounding memory.
-                    logger.debug("AIA host table full; not chasing %s", host)
-                    return False
+                    # grow this map without bound. Evict the oldest rather
+                    # than disabling chasing for every new origin forever.
+                    self._aia_attempted.pop(next(iter(self._aia_attempted)), None)
                 state = _AiaChase()
                 self._aia_attempted[key] = state
+            else:
+                self._aia_attempted.move_to_end(key)
+        if settled:
+            # This origin was chased already and whatever it found is
+            # installed. Reporting success again would tell the caller to
+            # retry a request that just failed with the certificates already
+            # in place -- and since nothing changes between those attempts,
+            # it would retry without limit. Failing here instead lets the
+            # request end with the certificate error that is actually true.
+            return False
         if not owner:
-            # Bounded: the holder's own chase is deadline-capped, so this
-            # cannot outlive it by much even if that thread dies.
-            state.done.wait(
-                timeout if timeout is not None else _AIA_WAIT_SECONDS
-            )
+            # Waiting on a chase in flight. Capped independently of the
+            # request deadline: async runs this in a pool thread, so a long
+            # wait parks a worker that every other to_thread call in the
+            # process -- cookie-cache writes, native TLS, browser render --
+            # then queues behind.
+            wait_for = _AIA_WAIT_SECONDS
+            if timeout is not None:
+                wait_for = min(wait_for, timeout)
+            state.done.wait(wait_for)
             # Read the winner's own verdict. Inferring it from the length of
             # the shared PEM list would be wrong twice over: the winner may
             # finish before this thread samples the length, and a chase for
@@ -1996,13 +2014,13 @@ class BaseSession:
             # intermediates. Keeping the old one would leave the Imperva
             # fallback failing on a chain the wreq path can now complete.
             self._native_tls = None
-            # Publish the client here, under the same lock that installed the
-            # certificates. Two origins completing at once would otherwise
-            # each build a client from whatever store they observed and race
-            # to assign it, letting a client that knows only the first
-            # certificate overwrite one that knows both. Building a wreq
-            # Client touches no network, so the lock is held only briefly.
-            self._rebuild_client()
+        # Rebuilt outside the lock on purpose. _rebuild_client re-hydrates the
+        # cookie jar from the on-disk cache -- up to max_entries file reads and
+        # JSON parses -- and holding _aia_lock across that would block every
+        # concurrent caller on disk I/O. The store it reads is already current,
+        # so the worst case is a client published a moment before another
+        # origin's certificate lands, which the next rebuild picks up.
+        self._rebuild_client()
         return True
 
     def _build_client_kwargs(self) -> dict:
