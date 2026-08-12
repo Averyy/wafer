@@ -441,6 +441,7 @@ def make_sync_session(responses, **session_kwargs):
     session._proxy_url = None
     session._aia_extra_pems = []
     session._aia_cert_store = None
+    session._aia_generation = 0
     session._aia_attempted = OrderedDict()
     session._aia_lock = threading.Lock()
     session._rotate_every = session_kwargs.get("rotate_every", None)
@@ -547,6 +548,7 @@ def make_async_session(responses, **session_kwargs):
     session._proxy_url = None
     session._aia_extra_pems = []
     session._aia_cert_store = None
+    session._aia_generation = 0
     session._aia_attempted = OrderedDict()
     session._aia_lock = threading.Lock()
     session._rotate_every = session_kwargs.get("rotate_every", None)

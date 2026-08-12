@@ -297,6 +297,26 @@ class TestFetchableUrl:
         with _resolves_to("93.184.216.34", "127.0.0.1"):
             assert not _is_fetchable_url("http://split-horizon.test/inter.crt")
 
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "ldap://ca.test/cn=CA",
+            "ftp://ca.test/inter.crt",
+            "gopher://ca.test/inter.crt",
+            "file://ca.test/etc/passwd",
+        ],
+    )
+    def test_non_http_schemes_are_refused_even_when_the_host_resolves(self, url):
+        """The scheme itself must be the reason, not an unresolvable host.
+
+        Testing ldap:// against a name that happens not to resolve, or
+        file:// which parses to no hostname at all, passes whether or not
+        the scheme check exists.
+        """
+
+        with _resolves_to("93.184.216.34"):
+            assert not _is_fetchable_url(url)
+
     def test_refuses_a_name_that_does_not_resolve(self):
         with patch.object(
             _aia.socket, "getaddrinfo", side_effect=OSError("no such host")
@@ -688,12 +708,65 @@ class TestResolveMissingIntermediates:
 
 
 class TestFetchCertificate:
-    def test_oversized_response_is_refused(self):
-        """A hostile AIA endpoint must not be able to stream without end."""
+    def test_the_read_is_bounded(self):
+        """A hostile endpoint must not be able to stream without end.
+
+        The bound is on the read itself; asserting only that junk is
+        rejected would pass whether or not any limit existed, because junk
+        fails to parse as a certificate anyway.
+        """
+
+        sizes = []
 
         class _Response:
             def read(self, size):
-                return b"x" * size
+                sizes.append(size)
+                return b"x" * 10
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        with patch.object(_aia.urllib.request, "build_opener") as build:
+            build.return_value.open.return_value = _Response()
+            _aia._fetch_certificate("http://ca.test/big.crt", 5.0)
+        assert sizes == [_aia._MAX_CERT_BYTES + 1]
+
+    def test_an_oversized_but_parseable_certificate_is_refused(self):
+        """Rejection must be driven by size, not by failing to parse.
+
+        A certificate stuffed with subject alternative names parses fine and
+        is still over the cap, so only the length check can reject it.
+        """
+
+        key = _key()
+        big = (
+            x509.CertificateBuilder()
+            .subject_name(_name("Enormous CA"))
+            .issuer_name(_name("Enormous CA"))
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(_NOW - datetime.timedelta(days=10))
+            .not_valid_after(_NOW + datetime.timedelta(days=100))
+            .add_extension(x509.BasicConstraints(ca=True, path_length=None), True)
+            .add_extension(
+                x509.SubjectAlternativeName(
+                    [x509.DNSName(f"h{i:05d}.padding.example") for i in range(3000)]
+                ),
+                critical=False,
+            )
+            .sign(key, hashes.SHA256())
+        )
+        payload = big.public_bytes(serialization.Encoding.DER)
+        assert len(payload) > _aia._MAX_CERT_BYTES, len(payload)
+        # Parses cleanly, so only the size check stands between it and use.
+        assert x509.load_der_x509_certificate(payload) is not None
+
+        class _Response:
+            def read(self, size):
+                return payload[:size]
 
             def __enter__(self):
                 return self
@@ -995,6 +1068,34 @@ class TestPathTop:
         top = _aia._path_top([pki["leaf"], unrelated])
         assert top is pki["leaf"]
 
+    def test_leaf_plus_root_is_chased_end_to_end(self, pki):
+        """Drive the leaf+root shape through the chase, not just the helper.
+
+        Reading the last certificate on the wire instead of walking issuer
+        links finds a self-signed trusted root and concludes the chain is
+        complete, so the chase never runs. The unit test on _path_top does
+        not catch that, because it never exercises the call site.
+        """
+
+        with (
+            _resolves_to("93.184.216.34"),
+            # Server appends the root but omits the intermediate.
+            patch.object(
+                _aia, "_probe_chain", return_value=[pki["leaf"], pki["root"]]
+            ),
+            patch.object(
+                _aia,
+                "_fetch_certificate",
+                side_effect=lambda u, t, p=None: pki["intermediate"],
+            ) as fetch,
+            patch.object(_aia, "_completes_chain", return_value=True),
+        ):
+            out = resolve_missing_intermediates(
+                "https://leaf.test/", pki["root_pems"]
+            )
+        fetch.assert_called()
+        assert out == [_pem(pki["intermediate"])]
+
     def test_single_certificate_chain_is_its_own_top(self, pki):
         assert _aia._path_top([pki["leaf"]]) is pki["leaf"]
 
@@ -1054,6 +1155,65 @@ class TestRedirectGuard:
             isinstance(h, _aia._GuardedRedirectHandler)
             for h in build.call_args.args
         )
+
+
+class TestConnectTimeAddressGuard:
+    """Validation and dialling must be one step.
+
+    Checking a hostname and letting urllib resolve it again leaves a window
+    in which the answer can change -- the certificate that named the URL is
+    untrusted, so a low-TTL record answering public once and loopback next
+    is entirely within reach.
+    """
+
+    def _conn(self, host):
+        cls = _aia._guarded_connection_factory(_aia.http.client.HTTPConnection, 80)
+        return cls(host)
+
+    def test_a_host_resolving_into_private_space_is_refused_at_connect(self):
+        conn = self._conn("rebind.test")
+        with _resolves_to("127.0.0.1"):
+            with pytest.raises(_aia.urllib.error.URLError):
+                conn.connect()
+
+    def test_a_public_host_is_dialled_at_its_validated_address(self):
+        conn = self._conn("ca.test")
+        dialled = []
+
+        def _capture(address, timeout=None, source_address=None):
+            dialled.append(address)
+            raise OSError("stop before real I/O")
+
+        with (
+            _resolves_to("93.184.216.34"),
+            patch.object(_aia.socket, "create_connection", _capture),
+        ):
+            with pytest.raises(OSError):
+                conn.connect()
+        assert dialled == [("93.184.216.34", 80)]
+
+    def test_the_guard_runs_on_the_address_actually_used(self):
+        """One resolution, and the dialled address comes from it."""
+
+        conn = self._conn("flip.test")
+        answers = iter([("93.184.216.34", 0), ("127.0.0.1", 0)])
+        dialled = []
+
+        def _flip(host, *a, **kw):
+            return [(2, 1, 6, "", next(answers))]
+
+        def _capture(address, timeout=None, source_address=None):
+            dialled.append(address)
+            raise OSError("stop")
+
+        with (
+            patch.object(_aia.socket, "getaddrinfo", _flip),
+            patch.object(_aia.socket, "create_connection", _capture),
+        ):
+            with pytest.raises(OSError):
+                conn.connect()
+        # The address dialled is the one that was checked, not a re-resolve.
+        assert dialled == [("93.184.216.34", 80)]
 
 
 class TestChaseBudget:
@@ -1935,6 +2095,31 @@ class TestConcurrentChase:
         assert session._aia_attempted[("raising.test", 443)].done.is_set()
 
 
+class TestPython312Fallback:
+    """get_unverified_chain is 3.13+; the 3.12 path must still work.
+
+    requires-python is >=3.12, so this branch ships and runs for real users
+    but never executes on this interpreter unless forced.
+    """
+
+    def test_leaf_only_fallback_when_the_chain_api_is_absent(self, pki):
+        with patch.object(_aia.http.client, "HTTPSConnection") as conn_cls:
+            sock = conn_cls.return_value.sock
+            # On 3.12 the attribute does not exist at all.
+            sock.get_unverified_chain.side_effect = AttributeError
+            sock.getpeercert.return_value = _der(pki["leaf"])
+            chain = _aia._probe_chain("origin.test", 443, 5.0)
+        assert len(chain) == 1
+        assert chain[0].subject == pki["leaf"].subject
+
+    def test_no_certificate_at_all_yields_an_empty_chain(self):
+        with patch.object(_aia.http.client, "HTTPSConnection") as conn_cls:
+            sock = conn_cls.return_value.sock
+            sock.get_unverified_chain.side_effect = AttributeError
+            sock.getpeercert.return_value = None
+            assert _aia._probe_chain("origin.test", 443, 5.0) == []
+
+
 class TestConnectionCleanup:
     """A failed handshake must not leave its socket behind.
 
@@ -1975,6 +2160,56 @@ class TestConnectionCleanup:
             got = _aia._probe_chain("origin.test", 443, 5.0)
             assert len(got) == 1
             conn.close.assert_called_once()
+
+
+class TestAnchorExpiry:
+    """An anchor's own validity is not checked by the verifier, so check here.
+
+    A session can outlive a short-lived intermediate; without this it would
+    go on trusting one the PKI has stopped vouching for.
+    """
+
+    def test_expired_anchor_is_dropped_from_the_store(self, pki):
+        root_key = _key()
+        expired, _ = _make_cert(
+            "Expired Anchor",
+            _name("Some Root"),
+            root_key,
+            ca=True,
+            not_before=datetime.datetime(2000, 1, 1, tzinfo=datetime.timezone.utc),
+            not_after=datetime.datetime(2001, 1, 1, tzinfo=datetime.timezone.utc),
+        )
+        session, _ = make_sync_session([MockResponse(200)])
+        session._aia_extra_pems = [_pem(expired), _pem(pki["intermediate"])]
+        session._aia_cert_store = None
+        session._cert_store()
+        assert session._aia_extra_pems == [_pem(pki["intermediate"])]
+
+    def test_store_falls_back_when_every_anchor_expired(self):
+        root_key = _key()
+        expired, _ = _make_cert(
+            "Expired Anchor",
+            _name("Some Root"),
+            root_key,
+            ca=True,
+            not_before=datetime.datetime(2000, 1, 1, tzinfo=datetime.timezone.utc),
+            not_after=datetime.datetime(2001, 1, 1, tzinfo=datetime.timezone.utc),
+        )
+        session, _ = make_sync_session([MockResponse(200)])
+        session._aia_extra_pems = [_pem(expired)]
+        session._aia_cert_store = None
+        from wafer._base import _SYSTEM_CERT_STORE
+
+        assert session._cert_store() is _SYSTEM_CERT_STORE
+        assert session._aia_extra_pems == []
+
+    def test_live_anchors_are_kept(self, pki):
+        assert _aia.drop_expired_pems([_pem(pki["intermediate"])]) == [
+            _pem(pki["intermediate"])
+        ]
+
+    def test_unparseable_pem_is_dropped(self):
+        assert _aia.drop_expired_pems([b"not a certificate"]) == []
 
 
 class TestCertStoreSelection:

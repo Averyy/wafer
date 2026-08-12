@@ -16,9 +16,19 @@ and some also carry a cache of intermediates seen previously. The result is
 a site that loads in a browser and fails in every HTTP library, which is
 exactly the failure mode wafer exists to eliminate.
 
-Measured on Niagara-region municipal sites, roughly one in five serves an
-incomplete chain. `www.lincoln.ca` sends 1 certificate; `www.welland.ca`
-sends 2; `www.notl.org`, `www.pelham.ca` and `www.thorold.ca` send 3.
+Measured across 13 Niagara-region municipal sites, one serves an incomplete
+chain: `www.lincoln.ca`, which sends a single certificate. An earlier
+estimate of "one in five" counted *certificates sent* rather than chain
+completeness -`www.welland.ca` sends 2 and is complete, because leaf plus
+intermediate is all that is needed when the root is in the store. The
+incidence is lower than first reported; the failure is still real and
+unfixable from outside wafer.
+
+The canonical control is `incomplete-chain.badssl.com`, which sends one
+certificate and needs **two** hops: its leaf chains through Let's Encrypt's
+`YR2` to `Root YR`, which is cross-signed into `ISRG Root X1`. Any
+leaf-only server on a current Let's Encrypt certificate needs the same two
+hops, which is why the chase is not limited to one.
 
 ## What it looks like
 
@@ -38,8 +48,8 @@ by examining the chain, not by parsing the message.
 ## The flow
 
 Triggered from the transport error handler in `_sync.py` / `_async.py`, only
-after a handshake has already failed verification, and only once per
-hostname per session.
+after a handshake has already failed verification, and only once per origin
+per session.
 
 1. **Probe.** Reopen the connection with verification off and read the chain
    the server sent (`get_unverified_chain()`, 3.13+; leaf only on 3.12). No
@@ -52,9 +62,13 @@ hostname per session.
    trusted root is reached, up to `_MAX_CHASE_DEPTH` (4).
 4. **Verify.** Each fetched certificate must have **actually signed** the
    certificate that named it (`_directly_issued`, not a subject/issuer name
-   comparison), must be a CA (basicConstraints), and must be inside its
-   validity window. The walk terminates only when a certificate is **signed
-   by a root already in the trust store** (`_signed_by_trusted_root`). Every
+   comparison); must be a CA by basicConstraints **and** carry keyUsage
+   `keyCertSign`; must be inside its validity window; must satisfy
+   `pathLenConstraint` against everything already below it
+   (`_path_length_ok`); and must carry no name constraints
+   (`_has_name_constraints`). The walk terminates only when a certificate is
+   **signed by a root already in the trust store** (`_signed_by_trusted_root`).
+   Every
    hop being signature-linked is what makes the whole path provable, not just
    its top -see "Why every hop is checked" below.
 5. **Confirm.** Reconnect with full verification against system roots plus
@@ -130,6 +144,14 @@ attacker-influenced input naming a URL wafer will fetch.
   only literal addresses would still allow `localhost` or an
   attacker-controlled name pointing into private space, including
   `169.254.169.254`.
+- **Resolution and dialling are one step.** Validating a name and then
+  letting urllib resolve it again leaves a window in which the answer can
+  change; the certificate naming the URL is untrusted, so a low-TTL record
+  answering public once and loopback next is well within reach.
+  `_guarded_connection_factory` resolves inside the connection and dials
+  those exact addresses, so every request the opener makes -- redirects
+  included -- is checked at the address it actually uses. Verified against a
+  live rebinding server: zero requests reached it.
 - **Redirects are re-checked.** urllib follows them by default, so without
   `_GuardedRedirectHandler` the guard would apply only to the URL named in
   the certificate: a public AIA URL answering 302 to
@@ -168,10 +190,23 @@ every root along with it and silently disable chasing.
 
 ## Scope and limits
 
-- One attempt per hostname per session, successful or not. The claim on a
-  hostname is taken under a lock, because `AsyncSession` runs the chase in a
-  worker thread and two concurrent failures on the same host would otherwise
-  both proceed.
+- One attempt per **origin** (canonical host *and* port) per session,
+  successful or not: two services on one name can present different chains.
+  The claim is taken under a lock, because `AsyncSession` runs the chase in a
+  worker thread and two concurrent failures on one origin would otherwise
+  both proceed. Callers that arrive while a chase is in flight wait for it
+  and answer from its verdict; callers that arrive after it settled get
+  `False`, because the certificates are already installed and a request still
+  failing cannot be helped by chasing again. Reporting success repeatedly
+  spun the retry loop without consuming budget -measured at 412,474
+  handshake attempts in three seconds.
+- A certificate failure the chase cannot fix is terminal. The same
+  certificate fails identically on every retry and under every fingerprint,
+  so the request ends with `ConnectionFailed` naming the certificate error
+  rather than burning the ladder and surfacing a `WaferTimeout`.
+- Anchors are re-checked for expiry on every store rebuild. A trust anchor's
+  own validity is not enforced by the verifier, so a session outliving a
+  fetched intermediate would otherwise keep honouring it.
 - Certificates live on the session, in memory. Nothing is written to disk and
   nothing is shared between sessions. The native-TLS transport is rebuilt when
   they change, so one host does not behave differently on two transports.
@@ -189,6 +224,14 @@ every root along with it and silently disable chasing.
 - **Skipped for socks and https proxies.** Plain HTTP proxies are tunnelled
   through with CONNECT; the others cannot be, here or on the native-TLS path,
   and a direct probe would leak around the operator's egress path.
+- **Two extra handshakes per chase, on Python's TLS stack.** The probe and
+  the confirmation each complete a stock CPython/OpenSSL handshake to the
+  origin and close without sending a request, before wreq connects with the
+  Chrome fingerprint. A TLS-fingerprinting WAF would see two Python
+  ClientHellos followed by a Chrome one. This is a real exception to wafer's
+  core invariant; it is accepted because it happens only on a host that has
+  already failed verification, which in practice is a misconfigured small
+  site rather than a WAF customer.
 - **The probe uses CPython's TLS stack**, not wafer's browser fingerprint.
   wreq exposes the peer certificate only on a *successful* handshake, and the
   handshake in question is the one that failed, so the chain has to be read
@@ -214,7 +257,14 @@ so importing it eagerly would tax every consumer for a path most never take.
 ## Verified
 
 `www.lincoln.ca` -> 200 (1 intermediate, `GeoTrust TLS RSA CA G1` via
-`http://cacerts.geotrust.com/GeoTrustTLSRSACAG1.crt`), sync and async.
+`http://cacerts.geotrust.com/GeoTrustTLSRSACAG1.crt`), sync and async, plain
+and with `resolve=` pinned. `incomplete-chain.badssl.com` -> 200 (2
+intermediates). Four concurrent pinned requests to one broken-chain host all
+returned 200 with none starved. Through a real local HTTP proxy: 200, with
+the proxy log showing every connection -probe, AIA fetch, confirmation and
+both wreq attempts -and no direct egress. A bogus `resolve=` pin blackholes
+the probe and adds zero certificates, proving the pin is honoured rather than
+bypassed. 18 rejected handshakes leaked no sockets.
 Controls `www.pelham.ca`, `www.welland.ca`, `www.thorold.ca` -> 200,
 unchanged, no chase. Negative controls `expired`, `self-signed`,
 `untrusted-root` and `wrong.host` on badssl.com -> all still rejected, zero

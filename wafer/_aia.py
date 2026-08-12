@@ -415,6 +415,76 @@ def _is_fetchable_url(url: str, proxied: bool = False) -> bool:
     )
 
 
+def _public_addresses(host: str) -> list[str] | None:
+    """Resolve a host and return its addresses only if all are public.
+
+    None means refuse. Used at connect time so the addresses that are
+    checked are the addresses that are dialled.
+    """
+
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        pass
+    else:
+        return [host] if _is_public_address(host) else None
+    try:
+        infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
+    except OSError:
+        return None
+    addresses = [info[4][0] for info in infos if info[4]]
+    if not addresses or not all(_is_public_address(a) for a in addresses):
+        return None
+    return addresses
+
+
+def _guarded_connection_factory(base_cls, default_port: int):
+    """Build a urllib connection class that validates and pins its target.
+
+    Checking a hostname and then letting urllib resolve it again leaves a
+    window in which the answer can change -- the certificate that named the
+    URL is untrusted, so a low-TTL record answering public once and
+    loopback next is entirely within reach. Resolving inside the connection
+    factory and dialling those exact addresses closes it, and because every
+    request the opener makes goes through here, redirects are covered on the
+    same terms as the original URL.
+    """
+
+    class _Guarded(base_cls):
+        def connect(self):
+            addresses = _public_addresses(self.host)
+            if addresses is None:
+                raise urllib.error.URLError(
+                    f"AIA fetch refused: {self.host} is not a public address"
+                )
+            _pin_connection(self, self.port or default_port, addresses)
+            super().connect()
+
+    return _Guarded
+
+
+class _GuardedHTTPHandler(urllib.request.HTTPHandler):
+    """Route plain-HTTP AIA fetches through a validating, pinning connection."""
+
+    def __init__(self, connection_cls):
+        super().__init__()
+        self._connection_cls = connection_cls
+
+    def http_open(self, req):
+        return self.do_open(self._connection_cls, req)
+
+
+class _GuardedHTTPSHandler(urllib.request.HTTPSHandler):
+    """The https:// counterpart; AIA URLs are usually http but may be https."""
+
+    def __init__(self, connection_cls):
+        super().__init__()
+        self._connection_cls = connection_cls
+
+    def https_open(self, req):
+        return self.do_open(self._connection_cls, req)
+
+
 class _GuardedRedirectHandler(urllib.request.HTTPRedirectHandler):
     """Re-run the URL guard on every redirect hop.
 
@@ -457,9 +527,23 @@ def _fetch_certificate(
     handlers = [_GuardedRedirectHandler(proxy_url)]
     if proxy_url:
         # Same rule as the probe: the fetch is wafer traffic and must leave
-        # by the operator's egress path, not around it.
+        # by the operator's egress path, not around it. The proxy resolves
+        # and enforces policy from there, so wafer does not also pin.
         handlers.append(
             urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
+        )
+    else:
+        # Validate and dial in one step, so the address that was checked is
+        # the address that is used -- for redirects as well as the first URL.
+        handlers.append(
+            _GuardedHTTPHandler(
+                _guarded_connection_factory(http.client.HTTPConnection, 80)
+            )
+        )
+        handlers.append(
+            _GuardedHTTPSHandler(
+                _guarded_connection_factory(http.client.HTTPSConnection, 443)
+            )
         )
     try:
         opener = urllib.request.build_opener(*handlers)
@@ -468,6 +552,10 @@ def _fetch_certificate(
     except (urllib.error.URLError, OSError, ValueError):
         logger.debug("AIA fetch failed for %s", url, exc_info=True)
         return None
+    # The bounded read above is what actually caps memory. This length test is
+    # belt-and-braces for a file-like object that returns more than it was
+    # asked for; on its own it is not observable, since a DER certificate
+    # truncated at the cap can never parse either way.
     if not payload or len(payload) > _MAX_CERT_BYTES:
         logger.debug("AIA response from %s empty or over the size cap", url)
         return None
@@ -863,6 +951,28 @@ def _to_pem(cert: x509.Certificate) -> bytes:
     """Serialize a certificate as PEM for a wreq CertStore pem stack."""
 
     return cert.public_bytes(Encoding.PEM)
+
+
+def drop_expired_pems(pems: list[bytes]) -> list[bytes]:
+    """Return only the certificates that are currently within validity.
+
+    A trust anchor's own notBefore/notAfter are not checked by the verifier,
+    so an intermediate that expires while a session is running would keep
+    being honoured after the public PKI stopped vouching for it. Anything
+    unparseable is dropped too: a certificate that cannot be read cannot be
+    shown to be valid.
+    """
+
+    now = time.time()
+    live: list[bytes] = []
+    for pem in pems:
+        try:
+            cert = x509.load_pem_x509_certificate(pem)
+        except Exception:
+            continue
+        if _is_currently_valid(cert, now):
+            live.append(pem)
+    return live
 
 
 def merge_pem_stacks(base: bytes, extra: list[bytes]) -> bytes:

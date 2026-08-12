@@ -254,6 +254,11 @@ _AIA_WAIT_SECONDS = 30.0
 # long as it lives.
 _AIA_MAX_TRACKED_HOSTS = 512
 
+# Retries when a client build races an AIA certificate install. The generation
+# only advances on a successful chase, so contention is momentary; the bound
+# exists so a pathological session cannot spin here.
+_MAX_CLIENT_PUBLISH_ATTEMPTS = 3
+
 
 class _AiaChase:
     """One origin's chase: who owns it, whether it finished, and its verdict.
@@ -861,6 +866,9 @@ class BaseSession:
         # chased (attempted, not necessarily completed -- one try each).
         self._aia_extra_pems: list[bytes] = []
         self._aia_cert_store = None
+        # Bumped whenever certificates are installed. A client build that
+        # started before a bump is stale and must not be published.
+        self._aia_generation = 0
         # (canonical host, port) -> _AiaChase. Doubles as the "already
         # attempted" record and the gate concurrent callers wait on. Ordered so
         # the bound can evict the oldest origin instead of refusing new ones.
@@ -1875,10 +1883,25 @@ class BaseSession:
         if not self._aia_extra_pems:
             return _SYSTEM_CERT_STORE
         if self._aia_cert_store is None:
-            from wafer._aia import merge_pem_stacks
+            from wafer._aia import drop_expired_pems, merge_pem_stacks
 
+            # A trust anchor's own validity period is not enforced by the
+            # verifier, so an intermediate that expires mid-session would go
+            # on being trusted here after the PKI stopped vouching for it.
+            # Sessions are long-lived (a scraper can outrun a short-lived
+            # intermediate), so re-check on every rebuild rather than only at
+            # the moment it was fetched.
+            live = drop_expired_pems(self._aia_extra_pems)
+            if len(live) != len(self._aia_extra_pems):
+                logger.debug(
+                    "Dropping %d expired AIA intermediate(s) from the store",
+                    len(self._aia_extra_pems) - len(live),
+                )
+                self._aia_extra_pems[:] = live
+            if not live:
+                return _SYSTEM_CERT_STORE
             self._aia_cert_store = _cert_store_from_pems(
-                merge_pem_stacks(_SYSTEM_CERT_PEMS or b"", self._aia_extra_pems)
+                merge_pem_stacks(_SYSTEM_CERT_PEMS or b"", live)
             )
         return self._aia_cert_store or _SYSTEM_CERT_STORE
 
@@ -2009,6 +2032,7 @@ class BaseSession:
                 return False
             self._aia_extra_pems.extend(added)
             self._aia_cert_store = None
+            self._aia_generation += 1
             # The native-TLS transport builds its SSL context once at
             # construction, so drop it and let it be rebuilt with the new
             # intermediates. Keeping the old one would leave the Imperva

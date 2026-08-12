@@ -10,6 +10,7 @@ import wreq.exceptions
 from wreq import Method
 
 from wafer._base import (
+    _MAX_CLIENT_PUBLISH_ATTEMPTS,
     BaseSession,
     _aread_body_capped,
     _browser_attempt_timeout,
@@ -167,7 +168,20 @@ class AsyncSession(BaseSession):
         fingerprint can trigger WAF flags. For rotate_every (unlinkable
         request sequences), cookie loss is the desired isolation property.
         """
-        self._client = wreq.Client(**self._build_client_kwargs())
+        # Publish only if no certificates landed while this was building.
+        # Ordinary rebuilds (rotation, retirement) do not hold _aia_lock, so
+        # without this a build that read the store before an AIA chase
+        # installed a certificate could overwrite the client that has it,
+        # and the request would fail on a chain wafer had already completed.
+        for _ in range(_MAX_CLIENT_PUBLISH_ATTEMPTS):
+            generation = self._aia_generation
+            candidate = wreq.Client(**self._build_client_kwargs())
+            with self._aia_lock:
+                if self._aia_generation == generation:
+                    self._client = candidate
+                    break
+        else:
+            self._client = candidate
         self._client_generation += 1
         self._hydrate_jar_from_cache()
         logger.debug("Client rebuilt with emulation=%s", self.emulation)
@@ -181,7 +195,20 @@ class AsyncSession(BaseSession):
             self._fingerprint.reset()
         if self._cookie_cache:
             await asyncio.to_thread(self._clear_cached_cookies, domain)
-        self._client = wreq.Client(**self._build_client_kwargs())
+        # Publish only if no certificates landed while this was building.
+        # Ordinary rebuilds (rotation, retirement) do not hold _aia_lock, so
+        # without this a build that read the store before an AIA chase
+        # installed a certificate could overwrite the client that has it,
+        # and the request would fail on a chain wafer had already completed.
+        for _ in range(_MAX_CLIENT_PUBLISH_ATTEMPTS):
+            generation = self._aia_generation
+            candidate = wreq.Client(**self._build_client_kwargs())
+            with self._aia_lock:
+                if self._aia_generation == generation:
+                    self._client = candidate
+                    break
+        else:
+            self._client = candidate
         self._client_generation += 1
         self._hydrate_jar_from_cache()
         self._domain_failures.pop(domain, None)
