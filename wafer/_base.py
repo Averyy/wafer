@@ -1874,6 +1874,33 @@ class BaseSession:
         defaults.update(kwargs)
         return cls(**defaults)
 
+    def _publish_under_generation(self, build):
+        """Build something from the trust store and publish it if still current.
+
+        Returns the object to publish. Ordinary rebuilds -- rotation,
+        retirement, the lazy native transport -- do not hold ``_aia_lock``, so
+        a build that read the store before a chase installed a certificate
+        would otherwise be assigned over the object that has it, and the
+        request would fail on a chain wafer had already completed.
+
+        Every consumer of the trust store must go through here. This existed
+        as five near-identical copies, and the copy that was missed was the
+        native-TLS transport -- which then carried exactly that bug.
+        """
+
+        candidate = None
+        for _ in range(_MAX_CLIENT_PUBLISH_ATTEMPTS):
+            with self._aia_lock:
+                generation = self._aia_generation
+            candidate = build()
+            with self._aia_lock:
+                if self._aia_generation == generation:
+                    return candidate
+        # Certificates kept landing mid-build. Publishing the last candidate
+        # is still correct -- it is only missing whatever arrived during the
+        # final attempt, and the next rebuild picks that up.
+        return candidate
+
     def _cert_store(self):
         """Return the trust store this session's client should verify against.
 
@@ -2298,22 +2325,15 @@ class BaseSession:
             return self._native_tls
         from wafer._native_tls import NativeTLSTransport
 
-        for _ in range(_MAX_CLIENT_PUBLISH_ATTEMPTS):
-            with self._aia_lock:
-                generation = self._aia_generation
-                extra = list(self._aia_extra_pems)
-            candidate = NativeTLSTransport(
+        self._native_tls = self._publish_under_generation(
+            lambda: NativeTLSTransport(
                 follow_redirects=self.follow_redirects,
                 proxy_url=self._proxy_url,
                 max_redirects=self.max_redirects,
                 resolve=self._resolve,
-                extra_ca_pems=extra,
+                extra_ca_pems=list(self._aia_extra_pems),
             )
-            with self._aia_lock:
-                if self._aia_generation == generation:
-                    self._native_tls = candidate
-                    return self._native_tls
-        self._native_tls = candidate
+        )
         return self._native_tls
 
     def _native_user_agent(self, extra_headers: dict[str, str] | None) -> str:

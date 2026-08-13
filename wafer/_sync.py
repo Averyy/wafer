@@ -9,7 +9,6 @@ import wreq.exceptions
 from wreq import Method
 
 from wafer._base import (
-    _MAX_CLIENT_PUBLISH_ATTEMPTS,
     BaseSession,
     _browser_attempt_timeout,
     _browser_solve_timeout,
@@ -159,20 +158,9 @@ class SyncSession(BaseSession):
         fingerprint can trigger WAF flags. For rotate_every (unlinkable
         request sequences), cookie loss is the desired isolation property.
         """
-        # Publish only if no certificates landed while this was building.
-        # Ordinary rebuilds (rotation, retirement) do not hold _aia_lock, so
-        # without this a build that read the store before an AIA chase
-        # installed a certificate could overwrite the client that has it,
-        # and the request would fail on a chain wafer had already completed.
-        for _ in range(_MAX_CLIENT_PUBLISH_ATTEMPTS):
-            generation = self._aia_generation
-            candidate = wreq.blocking.Client(**self._build_client_kwargs())
-            with self._aia_lock:
-                if self._aia_generation == generation:
-                    self._client = candidate
-                    break
-        else:
-            self._client = candidate
+        self._client = self._publish_under_generation(
+            lambda: wreq.blocking.Client(**self._build_client_kwargs())
+        )
         self._hydrate_jar_from_cache()
         logger.debug("Client rebuilt with emulation=%s", self.emulation)
 
@@ -189,20 +177,9 @@ class SyncSession(BaseSession):
             self._fingerprint.reset()
         if self._cookie_cache:
             self._clear_cached_cookies(domain)
-        # Publish only if no certificates landed while this was building.
-        # Ordinary rebuilds (rotation, retirement) do not hold _aia_lock, so
-        # without this a build that read the store before an AIA chase
-        # installed a certificate could overwrite the client that has it,
-        # and the request would fail on a chain wafer had already completed.
-        for _ in range(_MAX_CLIENT_PUBLISH_ATTEMPTS):
-            generation = self._aia_generation
-            candidate = wreq.blocking.Client(**self._build_client_kwargs())
-            with self._aia_lock:
-                if self._aia_generation == generation:
-                    self._client = candidate
-                    break
-        else:
-            self._client = candidate
+        self._client = self._publish_under_generation(
+            lambda: wreq.blocking.Client(**self._build_client_kwargs())
+        )
         self._hydrate_jar_from_cache()
         self._domain_failures.pop(domain, None)
         logger.warning(
