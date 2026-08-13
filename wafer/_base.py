@@ -876,8 +876,11 @@ class BaseSession:
         # AsyncSession runs the chase in a worker thread, so two concurrent
         # requests failing on the same host could both pass the "already
         # attempted" test before either recorded it and each run a full probe
-        # and fetch. The lock makes claiming a host one step.
-        self._aia_lock = threading.Lock()
+        # and fetch. The lock makes claiming a host one step. Reentrant
+        # because it guards both the chase bookkeeping and _cert_store, and a
+        # future caller holding one while reaching the other would otherwise
+        # deadlock rather than fail visibly.
+        self._aia_lock = threading.RLock()
 
         # Proxy
         self._proxy = None
@@ -1882,15 +1885,25 @@ class BaseSession:
 
         if not self._aia_extra_pems:
             return _SYSTEM_CERT_STORE
-        if self._aia_cert_store is None:
-            from wafer._aia import drop_expired_pems, merge_pem_stacks
+        from wafer._aia import drop_expired_pems, merge_pem_stacks
 
+        # Everything here runs under the lock. This method both reads and
+        # *writes* the shared certificate list, and it is reached from
+        # _build_client_kwargs on every rotation and retirement rebuild --
+        # none of which hold the lock otherwise. Unlocked, a rebuild that
+        # snapshotted the list before a chase installed a certificate would
+        # write the snapshot back, erasing the certificate that chase had
+        # just proven and overwriting its cache invalidation with a stale
+        # store. The origin is already recorded as attempted, so the host
+        # would stay unreachable for the rest of the session.
+        with self._aia_lock:
             # A trust anchor's own validity period is not enforced by the
             # verifier, so an intermediate that expires mid-session would go
-            # on being trusted here after the PKI stopped vouching for it.
-            # Sessions are long-lived (a scraper can outrun a short-lived
-            # intermediate), so re-check on every rebuild rather than only at
-            # the moment it was fetched.
+            # on being trusted after the PKI stopped vouching for it. Checked
+            # on every call rather than only when the cache is cold: after
+            # the first build the cache is only invalidated by a new chase,
+            # so a cache-gated check would never fire for the long sessions
+            # this is meant to protect.
             live = drop_expired_pems(self._aia_extra_pems)
             if len(live) != len(self._aia_extra_pems):
                 logger.debug(
@@ -1898,12 +1911,14 @@ class BaseSession:
                     len(self._aia_extra_pems) - len(live),
                 )
                 self._aia_extra_pems[:] = live
+                self._aia_cert_store = None
             if not live:
                 return _SYSTEM_CERT_STORE
-            self._aia_cert_store = _cert_store_from_pems(
-                merge_pem_stacks(_SYSTEM_CERT_PEMS or b"", live)
-            )
-        return self._aia_cert_store or _SYSTEM_CERT_STORE
+            if self._aia_cert_store is None:
+                self._aia_cert_store = _cert_store_from_pems(
+                    merge_pem_stacks(_SYSTEM_CERT_PEMS or b"", live)
+                )
+            return self._aia_cert_store or _SYSTEM_CERT_STORE
 
     def _complete_chain_via_aia(self, url: str, timeout: float | None = None) -> bool:
         """Try once to complete a host's certificate chain, returning success.
@@ -1978,9 +1993,21 @@ class BaseSession:
             return state.succeeded
         # Every exit from here must release the waiters, or a concurrent
         # request for this host blocks for the full wait.
+        from wafer._aia import ChaseInconclusive
+
         try:
             state.succeeded = self._run_aia_chase(url, host, timeout)
             return state.succeeded
+        except ChaseInconclusive as exc:
+            # The chain was never examined, so there is no verdict to record.
+            # Forget the origin: a chase starved of budget behind a slow
+            # challenge, or one whose probe met a momentary DNS or CA hiccup,
+            # would otherwise be remembered as "unfixable" and leave the host
+            # unreachable for the life of the session.
+            logger.debug("AIA chase for %s was inconclusive: %s", host, exc)
+            with self._aia_lock:
+                self._aia_attempted.pop(key, None)
+            return False
         finally:
             state.done.set()
 
@@ -2005,9 +2032,9 @@ class BaseSession:
                 host,
             )
             return False
-        try:
-            from wafer._aia import resolve_missing_intermediates
+        from wafer._aia import ChaseInconclusive, resolve_missing_intermediates
 
+        try:
             pems = resolve_missing_intermediates(
                 url,
                 _SYSTEM_CERT_PEMS,
@@ -2020,6 +2047,8 @@ class BaseSession:
                 # (see _is_fetchable_url) on the URL and on every redirect.
                 resolve=self._resolve,
             )
+        except ChaseInconclusive:
+            raise
         except Exception:
             logger.debug("AIA chase raised for %s", host, exc_info=True)
             return False

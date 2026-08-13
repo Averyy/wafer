@@ -443,7 +443,7 @@ def make_sync_session(responses, **session_kwargs):
     session._aia_cert_store = None
     session._aia_generation = 0
     session._aia_attempted = OrderedDict()
-    session._aia_lock = threading.Lock()
+    session._aia_lock = threading.RLock()
     session._rotate_every = session_kwargs.get("rotate_every", None)
     session._request_count = 0
     profile = session_kwargs.get("profile", None)
@@ -550,7 +550,7 @@ def make_async_session(responses, **session_kwargs):
     session._aia_cert_store = None
     session._aia_generation = 0
     session._aia_attempted = OrderedDict()
-    session._aia_lock = threading.Lock()
+    session._aia_lock = threading.RLock()
     session._rotate_every = session_kwargs.get("rotate_every", None)
     session._request_count = 0
     session._rotate_lock = asyncio.Lock()

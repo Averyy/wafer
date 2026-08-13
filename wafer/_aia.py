@@ -27,6 +27,7 @@ issuing root did not already delegate. Anything that fails a check is
 dropped and the original handshake failure stands.
 """
 
+import base64
 import contextlib
 import http.client
 import ipaddress
@@ -38,13 +39,28 @@ import time
 import urllib.error
 import urllib.request
 import warnings
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 from cryptography import x509
 from cryptography.hazmat.primitives.serialization import Encoding
-from cryptography.x509.oid import AuthorityInformationAccessOID, ExtensionOID
+from cryptography.x509.oid import (
+    AuthorityInformationAccessOID,
+    ExtendedKeyUsageOID,
+    ExtensionOID,
+)
 
 logger = logging.getLogger("wafer")
+
+
+class ChaseInconclusive(Exception):
+    """The chase never got far enough to judge this origin's chain.
+
+    Distinct from returning no certificates, which is a verdict: the chain
+    was examined and could not be completed from trusted material. This
+    means the examination itself did not happen -- an exhausted budget, an
+    unreachable probe, an unusable trust store -- and recording it as a
+    verdict would make a momentary condition permanent for the session.
+    """
 
 # A CA certificate is a couple of KB. This bounds a hostile or misconfigured
 # AIA endpoint that would otherwise stream indefinitely into memory.
@@ -189,7 +205,12 @@ def _tls_connection(
             context=ctx,
             timeout=timeout,
         )
-        conn.set_tunnel(host, port)
+        # Credentials in the proxy URL are the normal shape for scraping
+        # proxies. Without this the CONNECT gets a 407 and the probe dies,
+        # which the urllib fetch path would survive (ProxyHandler reads them)
+        # -- an asymmetry that would look like "chasing does not work behind
+        # my proxy" and latch the origin as unfixable.
+        conn.set_tunnel(host, port, headers=_proxy_auth_headers(parsed))
         _connect_or_close(conn)
         return conn
     conn = http.client.HTTPSConnection(host, port, context=ctx, timeout=timeout)
@@ -220,6 +241,17 @@ def _connect_or_close(conn) -> None:
         with contextlib.suppress(Exception):
             conn.close()
         raise
+
+
+def _proxy_auth_headers(parsed) -> dict:
+    """Build the Proxy-Authorization header for a credentialed proxy URL."""
+
+    if not parsed.username:
+        return {}
+    user = unquote(parsed.username)
+    password = unquote(parsed.password or "")
+    token = base64.b64encode(f"{user}:{password}".encode()).decode("ascii")
+    return {"Proxy-Authorization": f"Basic {token}"}
 
 
 def _probe_chain(
@@ -586,6 +618,11 @@ def _is_ca(cert: x509.Certificate) -> bool:
         return False
     if not getattr(constraints, "ca", False):
         return False
+    # Checked before keyUsage, not after: keyUsage is optional, and returning
+    # early on its absence skipped this entirely, so a certificate carrying no
+    # keyUsage but an EKU that bars server authentication was anchored anyway.
+    if _excludes_server_auth(cert):
+        return False
     try:
         usage = cert.extensions.get_extension_for_oid(ExtensionOID.KEY_USAGE).value
     except x509.ExtensionNotFound:
@@ -594,6 +631,30 @@ def _is_ca(cert: x509.Certificate) -> bool:
     except Exception:
         return False
     return bool(getattr(usage, "key_cert_sign", False))
+
+
+def _excludes_server_auth(cert: x509.Certificate) -> bool:
+    """Report whether EKU bars this certificate from server authentication.
+
+    Chrome and OpenSSL both enforce EKU while walking a chain, and anchoring
+    stops that happening -- the same argument that applies to name
+    constraints. An intermediate restricted to, say, code signing must not
+    become an anchor that can vouch for a TLS server.
+    """
+
+    try:
+        eku = cert.extensions.get_extension_for_oid(
+            ExtensionOID.EXTENDED_KEY_USAGE
+        ).value
+    except x509.ExtensionNotFound:
+        return False
+    except Exception:
+        return True
+    usages = set(eku)
+    return not (
+        ExtendedKeyUsageOID.SERVER_AUTH in usages
+        or ExtendedKeyUsageOID.ANY_EXTENDED_KEY_USAGE in usages
+    )
 
 
 def _anchoring_would_drop_constraints(
@@ -689,7 +750,13 @@ def _is_currently_valid(cert: x509.Certificate, now: float) -> bool:
 
 
 def _path_top(chain: list[x509.Certificate]) -> x509.Certificate:
-    """Walk from the leaf through the presented certificates and return the top.
+    """Return the top of the presented path (see _presented_path)."""
+
+    return _presented_path(chain)[-1]
+
+
+def _presented_path(chain: list[x509.Certificate]) -> list[x509.Certificate]:
+    """Walk from the leaf through the presented certificates, leaf first.
 
     The last certificate on the wire is not reliably the top of the path.
     TLS 1.3 drops the ordering requirement, and a common misconfiguration is
@@ -703,6 +770,7 @@ def _path_top(chain: list[x509.Certificate]) -> x509.Certificate:
     by_subject: dict[bytes, x509.Certificate] = {}
     for cert in chain[1:]:
         by_subject.setdefault(cert.subject.public_bytes(), cert)
+    path = [chain[0]]
     current = chain[0]
     for _ in range(len(chain)):
         if current.issuer == current.subject:
@@ -711,7 +779,8 @@ def _path_top(chain: list[x509.Certificate]) -> x509.Certificate:
         if issuer is None or not _directly_issued(current, issuer):
             break
         current = issuer
-    return current
+        path.append(current)
+    return path
 
 
 def _directly_issued(cert: x509.Certificate, issuer: x509.Certificate) -> bool:
@@ -778,7 +847,7 @@ def resolve_missing_intermediates(
     port = parsed.port or 443
     roots = _load_roots(trust_store_pems)
     if not roots:
-        return []
+        raise ChaseInconclusive("no roots parsed from the trust store")
 
     if timeout is None:
         budget = _PROBE_TIMEOUT + _FETCH_TIMEOUT
@@ -793,14 +862,17 @@ def resolve_missing_intermediates(
 
     probe_timeout = remaining(_PROBE_TIMEOUT)
     if probe_timeout <= 0:
-        return []
+        raise ChaseInconclusive("no budget left to probe")
     chain = _probe_chain(host, port, probe_timeout, proxy_url, resolve)
     if not chain:
-        return []
+        # Never saw the certificate, so nothing was concluded about it. The
+        # caller must not record this as a settled verdict.
+        raise ChaseInconclusive(f"could not read {host}'s certificate chain")
     # Chase from the top of the path the server actually sent. A server that
     # sent part of its chain is missing only what comes above it, and
     # starting from the leaf would re-fetch what is already on the wire.
-    cert = _path_top(chain)
+    path = _presented_path(chain)
+    cert = path[-1]
     if _signed_by_trusted_root(cert, roots):
         # The chain reaches the trust store on its own, so nothing is
         # missing and the handshake failed for some other reason -- an
@@ -812,10 +884,13 @@ def resolve_missing_intermediates(
         )
         return []
 
-    # CA certificates the server already sent between the leaf and the point
-    # the chase starts from. They sit below everything fetched, so they count
-    # against each fetched certificate's pathLen.
-    sent_cas_below = max(0, len(chain) - 1)
+    # CA certificates below the point the chase starts from. Counted from the
+    # walked path, not from how many certificates arrived: a server that sends
+    # its leaf plus a stale or unrelated certificate -- a common
+    # misconfiguration -- leaves the walk at the leaf, and counting the junk
+    # would make a perfectly good pathLen:0 issuer look like a violation and
+    # abort the chase for exactly the servers this feature targets.
+    sent_cas_below = max(0, len(path) - 1)
     collected: list[bytes] = []
     seen: set[bytes] = set()
     anchored = False

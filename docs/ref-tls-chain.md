@@ -64,10 +64,12 @@ per session.
    trusted root is reached, up to `_MAX_CHASE_DEPTH` (4).
 4. **Verify.** Each fetched certificate must have **actually signed** the
    certificate that named it (`_directly_issued`, not a subject/issuer name
-   comparison); must be a CA by basicConstraints **and** carry keyUsage
-   `keyCertSign`; must be inside its validity window; must satisfy
-   `pathLenConstraint` against everything already below it
-   (`_path_length_ok`); and must carry no name constraints
+   comparison); must be a CA by basicConstraints, carry keyUsage
+   `keyCertSign` when keyUsage is present, and not be barred from
+   `serverAuth` by EKU (`_excludes_server_auth`); must be inside its validity
+   window; must satisfy `pathLenConstraint` against the certificates actually
+   below it (`_path_length_ok`, counted from the walked path rather than from
+   how many certificates arrived); and must carry no name constraints
    (`_has_name_constraints`). The walk terminates only when a certificate is
    **signed by a root already in the trust store** (`_signed_by_trusted_root`).
    Every
@@ -192,8 +194,11 @@ every root along with it and silently disable chasing.
 
 ## Scope and limits
 
-- One attempt per **origin** (canonical host *and* port) per session,
-  successful or not: two services on one name can present different chains.
+- One attempt per **origin** (canonical host *and* port) per session, once a
+  verdict exists. A chase that never examined the chain -- no budget left, an
+  unreachable probe, an unusable trust store -- raises `ChaseInconclusive`
+  and the origin is forgotten rather than recorded, so a momentary condition
+  does not become a session-long outage. Otherwise, successful or not: two services on one name can present different chains.
   The claim is taken under a lock, because `AsyncSession` runs the chase in a
   worker thread and two concurrent failures on one origin would otherwise
   both proceed. Callers that arrive while a chase is in flight wait for it
@@ -209,9 +214,27 @@ every root along with it and silently disable chasing.
   retry re-resolves onto a healthy one. Multi-address hosts are common
   (`www.google.com` answers with eight), so a few seconds of repeated
   handshakes is the better trade against losing that recovery.
-- Anchors are re-checked for expiry on every store rebuild. A trust anchor's
-  own validity is not enforced by the verifier, so a session outliving a
-  fetched intermediate would otherwise keep honouring it.
+- Anchors are re-checked for expiry on every `_cert_store()` call, not only
+  when the cache is cold. A trust anchor's own validity is not enforced by
+  the verifier, and after the first build the cache is invalidated only by a
+  new chase, so a cache-gated check would never fire for the long sessions
+  this exists to protect.
+- `_cert_store()` runs entirely under `_aia_lock`, because it *writes* the
+  shared certificate list as well as reading it, and every rotation and
+  retirement rebuild reaches it without otherwise holding the lock. Unlocked,
+  a rebuild that snapshotted the list before a chase installed a certificate
+  wrote the snapshot back, erasing the proven certificate and overwriting its
+  cache invalidation -- and since the origin was already recorded as
+  attempted, the host stayed unreachable for the session. The lock is
+  reentrant so a future caller holding it while reaching `_cert_store` fails
+  visibly rather than deadlocking.
+- Client publication is guarded by a generation compare-and-set, so a build
+  that started before certificates landed cannot overwrite the client that
+  has them.
+- Credentials embedded in an http proxy URL are carried on the CONNECT as
+  `Proxy-Authorization`. Without that the probe takes a 407 while the urllib
+  fetch path survives (ProxyHandler reads them itself), an asymmetry that
+  reads as "chasing does not work behind my proxy".
 - Certificates live on the session, in memory. Nothing is written to disk and
   nothing is shared between sessions. The native-TLS transport is rebuilt when
   they change, so one host does not behave differently on two transports.

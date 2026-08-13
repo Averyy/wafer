@@ -42,7 +42,10 @@ from .conftest import (
 # Certificate fixtures
 # ---------------------------------------------------------------------------
 
-_NOW = datetime.datetime(2026, 6, 1, tzinfo=datetime.timezone.utc)
+# Anchored to the real clock, not a fixed date: the chase validates fetched
+# certificates against time.time(), so fixtures frozen to a literal would
+# start failing wholesale once real time walked past their notAfter.
+_NOW = datetime.datetime.now(datetime.timezone.utc)
 
 
 def _key():
@@ -545,31 +548,39 @@ class TestResolveMissingIntermediates:
         fetch.assert_called()
         assert out == []
 
-    def test_probe_failure_yields_nothing(self, pki):
+    def test_probe_failure_is_inconclusive_not_a_verdict(self, pki):
+        """Never seeing the certificate is not the same as judging it.
+
+        Recording it as a verdict would make a momentary probe failure -- a
+        DNS hiccup, a refused connection -- permanent for the session.
+        """
+
         with patch.object(_aia, "_probe_chain", return_value=[]):
-            out = resolve_missing_intermediates(
-                "https://leaf.test/", pki["root_pems"]
-            )
-        assert out == []
+            with pytest.raises(_aia.ChaseInconclusive):
+                resolve_missing_intermediates(
+                    "https://leaf.test/", pki["root_pems"]
+                )
 
     def test_no_roots_means_no_chasing(self, pki):
         """Without a trust store there is nothing to verify against."""
 
         with patch.object(_aia, "_probe_chain") as probe:
-            out = resolve_missing_intermediates("https://leaf.test/", b"")
-        assert out == []
+            with pytest.raises(_aia.ChaseInconclusive):
+                resolve_missing_intermediates("https://leaf.test/", b"")
         probe.assert_not_called()
 
     def test_url_without_a_host_is_ignored(self, pki):
         out = resolve_missing_intermediates("not-a-url", pki["root_pems"])
         assert out == []
 
-    def test_exhausted_budget_stops_before_probing(self, pki):
+    def test_exhausted_budget_is_inconclusive_not_a_verdict(self, pki):
+        """A chase starved of budget never looked, so it must not latch."""
+
         with patch.object(_aia, "_probe_chain") as probe:
-            out = resolve_missing_intermediates(
-                "https://leaf.test/", pki["root_pems"], timeout=0
-            )
-        assert out == []
+            with pytest.raises(_aia.ChaseInconclusive):
+                resolve_missing_intermediates(
+                    "https://leaf.test/", pki["root_pems"], timeout=0
+                )
         probe.assert_not_called()
 
     def test_walks_a_two_deep_chain(self, pki):
@@ -678,13 +689,36 @@ class TestResolveMissingIntermediates:
     def test_chase_depth_is_bounded(self, pki):
         """A certificate that names itself must not loop."""
 
-        looping, key = _make_cert(
-            "Looping CA",
-            _name("Looping CA"),
-            _key(),
-            ca=True,
-            aia_url="http://ca.test/loop.crt",
+        # Genuinely self-signed: signed with its own key, so _directly_issued
+        # accepts the link and the dedupe is what has to stop the walk. Signing
+        # with a throwaway key instead makes the signature check reject it
+        # first, and the test then passes with the dedupe deleted.
+        loop_key = _key()
+        looping = (
+            x509.CertificateBuilder()
+            .subject_name(_name("Looping CA"))
+            .issuer_name(_name("Looping CA"))
+            .public_key(loop_key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(_NOW - datetime.timedelta(days=10))
+            .not_valid_after(_NOW + datetime.timedelta(days=100))
+            .add_extension(x509.BasicConstraints(ca=True, path_length=None), True)
+            .add_extension(
+                x509.AuthorityInformationAccess(
+                    [
+                        x509.AccessDescription(
+                            x509.oid.AuthorityInformationAccessOID.CA_ISSUERS,
+                            x509.UniformResourceIdentifier(
+                                "http://ca.test/loop.crt"
+                            ),
+                        )
+                    ]
+                ),
+                critical=False,
+            )
+            .sign(loop_key, hashes.SHA256())
         )
+        assert _aia._directly_issued(looping, looping)
         with (
             patch.object(_aia, "_probe_chain", return_value=[looping]),
             patch.object(
@@ -696,10 +730,11 @@ class TestResolveMissingIntermediates:
                 "https://loop.test/", pki["root_pems"]
             )
         assert out == []
-        # Exactly one fetch: the first candidate is recorded, the second pass
-        # sees a duplicate and stops. A looser bound (<= _MAX_CHASE_DEPTH) is
-        # satisfied whether or not the dedupe works at all.
-        assert fetch.call_count == 1
+        # Two fetches: the first records the certificate, the second returns
+        # the same one and the dedupe stops the walk. Without the dedupe the
+        # loop runs to _MAX_CHASE_DEPTH, so a looser bound would pass whether
+        # or not it works.
+        assert fetch.call_count == 2
 
 
 # ---------------------------------------------------------------------------
@@ -1224,20 +1259,22 @@ class TestChaseBudget:
 
         def _probe(host, port, timeout, proxy=None, resolve=None):
             seen["timeout"] = timeout
-            return []
+            return []  # -> ChaseInconclusive, which these tests expect
 
         with patch.object(_aia, "_probe_chain", side_effect=_probe):
-            resolve_missing_intermediates(
-                "https://leaf.test/", pki["root_pems"], timeout=60.0
-            )
+            with pytest.raises(_aia.ChaseInconclusive):
+                resolve_missing_intermediates(
+                    "https://leaf.test/", pki["root_pems"], timeout=60.0
+                )
         # Not the full 60s, and never above the per-probe cap.
         assert seen["timeout"] <= _aia._PROBE_TIMEOUT
 
     def test_total_chase_is_capped_even_on_a_huge_budget(self, pki):
         with patch.object(_aia, "_probe_chain", return_value=[]) as probe:
-            resolve_missing_intermediates(
-                "https://leaf.test/", pki["root_pems"], timeout=3600.0
-            )
+            with pytest.raises(_aia.ChaseInconclusive):
+                resolve_missing_intermediates(
+                    "https://leaf.test/", pki["root_pems"], timeout=3600.0
+                )
         probe.assert_called_once()
 
     def test_a_small_caller_budget_is_respected(self, pki):
@@ -1245,12 +1282,13 @@ class TestChaseBudget:
 
         def _probe(host, port, timeout, proxy=None, resolve=None):
             seen["timeout"] = timeout
-            return []
+            return []  # -> ChaseInconclusive, which these tests expect
 
         with patch.object(_aia, "_probe_chain", side_effect=_probe):
-            resolve_missing_intermediates(
-                "https://leaf.test/", pki["root_pems"], timeout=4.0
-            )
+            with pytest.raises(_aia.ChaseInconclusive):
+                resolve_missing_intermediates(
+                    "https://leaf.test/", pki["root_pems"], timeout=4.0
+                )
         assert seen["timeout"] <= 4.0 * _aia._MAX_BUDGET_SHARE + 0.1
 
 
@@ -1527,8 +1565,40 @@ class TestEgressContracts:
         assert conn_cls.call_args.args[0] == "proxy.test"
         assert conn_cls.call_args.args[1] == 8080
         conn_cls.return_value.set_tunnel.assert_called_once_with(
-            "origin.test", 443
+            "origin.test", 443, headers={}
         )
+
+    def test_proxy_credentials_are_carried_through_the_tunnel(self):
+        """Scraping proxies normally carry credentials.
+
+        Without a Proxy-Authorization header the CONNECT gets a 407 and the
+        probe dies, while the urllib fetch path survives because ProxyHandler
+        reads the credentials itself -- an asymmetry that reads as "chasing
+        does not work behind my proxy" and latches the origin as unfixable.
+        """
+
+        with patch.object(_aia.http.client, "HTTPSConnection") as conn_cls:
+            _aia._probe_chain(
+                "origin.test", 443, 5.0, "http://bob:s3cr3t@proxy.test:8080"
+            )
+        headers = conn_cls.return_value.set_tunnel.call_args.kwargs["headers"]
+        import base64 as _b64
+
+        assert headers["Proxy-Authorization"] == "Basic " + _b64.b64encode(
+            b"bob:s3cr3t"
+        ).decode()
+
+    def test_percent_encoded_proxy_credentials_are_decoded(self):
+        with patch.object(_aia.http.client, "HTTPSConnection") as conn_cls:
+            _aia._probe_chain(
+                "origin.test", 443, 5.0, "http://bob:p%40ss%3Aword@proxy.test:8080"
+            )
+        headers = conn_cls.return_value.set_tunnel.call_args.kwargs["headers"]
+        import base64 as _b64
+
+        assert headers["Proxy-Authorization"] == "Basic " + _b64.b64encode(
+            b"bob:p@ss:word"
+        ).decode()
 
     def test_probe_connects_directly_without_a_proxy(self):
         with patch.object(_aia.http.client, "HTTPSConnection") as conn_cls:
@@ -1677,6 +1747,103 @@ class TestAnchorConstraints:
         )
         assert not _aia._anchoring_would_drop_constraints(inter, root)
         assert _is_ca(inter)
+
+    def _ca_with_eku(self, ekus):
+        key = _key()
+        builder = (
+            x509.CertificateBuilder()
+            .subject_name(_name("EKU CA"))
+            .issuer_name(_name("Some Root"))
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(_NOW - datetime.timedelta(days=10))
+            .not_valid_after(_NOW + datetime.timedelta(days=100))
+            .add_extension(x509.BasicConstraints(ca=True, path_length=None), True)
+        )
+        if ekus is not None:
+            builder = builder.add_extension(
+                x509.ExtendedKeyUsage(ekus), critical=False
+            )
+        return builder.sign(key, hashes.SHA256())
+
+    def test_a_ca_barred_from_server_auth_is_refused(self):
+        """EKU is enforced while walking a chain; anchoring stops that.
+
+        Same argument as name constraints: an intermediate restricted to
+        code signing must not become an anchor that can vouch for a TLS
+        server.
+        """
+
+        from cryptography.x509.oid import ExtendedKeyUsageOID
+
+        assert not _is_ca(self._ca_with_eku([ExtendedKeyUsageOID.CODE_SIGNING]))
+
+    def test_a_ca_permitting_server_auth_is_accepted(self):
+        from cryptography.x509.oid import ExtendedKeyUsageOID
+
+        assert _is_ca(
+            self._ca_with_eku(
+                [ExtendedKeyUsageOID.SERVER_AUTH, ExtendedKeyUsageOID.CLIENT_AUTH]
+            )
+        )
+
+    def test_any_extended_key_usage_is_accepted(self):
+        from cryptography.x509.oid import ExtendedKeyUsageOID
+
+        assert _is_ca(
+            self._ca_with_eku([ExtendedKeyUsageOID.ANY_EXTENDED_KEY_USAGE])
+        )
+
+    def test_absent_eku_is_unrestricted(self):
+        assert _is_ca(self._ca_with_eku(None))
+
+    def test_a_server_auth_barred_ca_is_refused_end_to_end(self):
+        """Drive it through the chase, not only the helper."""
+
+        from cryptography.x509.oid import ExtendedKeyUsageOID
+
+        root_key = _key()
+        root = (
+            x509.CertificateBuilder()
+            .subject_name(_name("EKU Root"))
+            .issuer_name(_name("EKU Root"))
+            .public_key(root_key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(_NOW - datetime.timedelta(days=3650))
+            .not_valid_after(_NOW + datetime.timedelta(days=3650))
+            .add_extension(x509.BasicConstraints(ca=True, path_length=None), True)
+            .sign(root_key, hashes.SHA256())
+        )
+        inter_key = _key()
+        inter = (
+            x509.CertificateBuilder()
+            .subject_name(_name("EKU CA"))
+            .issuer_name(root.subject)
+            .public_key(inter_key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(_NOW - datetime.timedelta(days=100))
+            .not_valid_after(_NOW + datetime.timedelta(days=100))
+            .add_extension(x509.BasicConstraints(ca=True, path_length=None), True)
+            .add_extension(
+                x509.ExtendedKeyUsage([ExtendedKeyUsageOID.CODE_SIGNING]),
+                critical=False,
+            )
+            .sign(root_key, hashes.SHA256())
+        )
+        leaf, _ = _make_cert(
+            "eku.test", inter.subject, inter_key, ca=False,
+            aia_url="http://ca.test/inter.crt",
+        )
+        with (
+            _resolves_to("93.184.216.34"),
+            patch.object(_aia, "_probe_chain", return_value=[leaf]),
+            patch.object(
+                _aia, "_fetch_certificate", side_effect=lambda u, t, p=None: inter
+            ),
+            patch.object(_aia, "_completes_chain", return_value=True),
+        ):
+            out = resolve_missing_intermediates("https://eku.test/", _pem(root))
+        assert out == []
 
     def test_ca_without_key_cert_sign_is_refused(self):
         """CA:TRUE is the claim; keyCertSign is the permission."""
@@ -2002,6 +2169,174 @@ class TestTerminalRootSignature:
                 "https://imp.test/", pki["root_pems"]
             )
         assert out == []
+
+
+class TestClientPublication:
+    """A rebuild must not lose a certificate a concurrent chase installed.
+
+    _cert_store both reads and writes the shared certificate list, and every
+    rotation and retirement rebuild reaches it without otherwise holding the
+    lock. Unlocked, a rebuild that snapshotted the list before an install
+    would write the snapshot back, erasing the proven certificate and
+    overwriting the cache invalidation -- and since the origin is already
+    recorded as attempted, the host stays unreachable for the session.
+    """
+
+    def test_a_rebuild_racing_an_install_keeps_the_certificate(self, pki):
+        import threading as _t
+
+        session, _ = make_sync_session([MockResponse(200)])
+        first, second = _pem(pki["intermediate"]), _pem(pki["root"])
+        session._aia_extra_pems = [first]
+        session._aia_cert_store = None
+
+        gate = _t.Event()
+        real_drop = _aia.drop_expired_pems
+
+        def _slow_drop(pems):
+            out = real_drop(pems)
+            gate.set()
+            _t.Event().wait(0.2)
+            return out
+
+        with patch.object(_aia, "drop_expired_pems", _slow_drop):
+            reader = _t.Thread(target=session._cert_store)
+            reader.start()
+            assert gate.wait(3)
+            with session._aia_lock:
+                session._aia_extra_pems.append(second)
+                session._aia_cert_store = None
+                session._aia_generation += 1
+            reader.join(5)
+
+        assert second in session._aia_extra_pems
+        assert first in session._aia_extra_pems
+
+    def test_a_stale_build_does_not_overwrite_a_newer_client(self, pki):
+        """The generation compare-and-set had no test at all before this."""
+
+        session, _ = make_sync_session([MockResponse(200)])
+        builds = []
+
+        class _Client:
+            def __init__(self, **kwargs):
+                builds.append(self)
+
+        def _bump_midway(**kwargs):
+            # A chase lands while this build is in flight.
+            if len(builds) == 0:
+                session._aia_generation += 1
+            return {}
+
+        with (
+            patch.object(_aia, "drop_expired_pems", lambda p: list(p)),
+            patch("wreq.blocking.Client", _Client),
+            patch.object(
+                type(session), "_build_client_kwargs", side_effect=_bump_midway
+            ),
+            patch.object(type(session), "_hydrate_jar_from_cache", lambda s: None),
+        ):
+            type(session)._rebuild_client(session)
+        # The first candidate was discarded and a second built, so the client
+        # that gets published is the one that saw the new generation.
+        assert len(builds) == 2
+        assert session._client is builds[-1]
+
+    def test_publication_gives_up_after_the_retry_bound(self, pki):
+        """A pathological generation churn must not spin forever."""
+
+        session, _ = make_sync_session([MockResponse(200)])
+        from wafer._base import _MAX_CLIENT_PUBLISH_ATTEMPTS
+
+        builds = []
+
+        class _Client:
+            def __init__(self, **kwargs):
+                builds.append(self)
+
+        def _always_bump(**kwargs):
+            session._aia_generation += 1
+            return {}
+
+        with (
+            patch("wreq.blocking.Client", _Client),
+            patch.object(
+                type(session), "_build_client_kwargs", side_effect=_always_bump
+            ),
+            patch.object(type(session), "_hydrate_jar_from_cache", lambda s: None),
+        ):
+            type(session)._rebuild_client(session)
+        assert len(builds) == _MAX_CLIENT_PUBLISH_ATTEMPTS
+        assert session._client is builds[-1]
+
+
+class TestPresentedPathCounting:
+    """pathLen must count what is really below, not what happened to arrive.
+
+    A server sending its leaf plus a stale or unrelated certificate is a
+    common misconfiguration. Counting those against a fetched issuer's
+    pathLen makes a perfectly good pathLen:0 CA look like a violation and
+    aborts the chase for exactly the servers this feature targets.
+    """
+
+    def _leaf_and_issuer(self):
+        root_key = _key()
+        root = (
+            x509.CertificateBuilder()
+            .subject_name(_name("Junk Root"))
+            .issuer_name(_name("Junk Root"))
+            .public_key(root_key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(_NOW - datetime.timedelta(days=3650))
+            .not_valid_after(_NOW + datetime.timedelta(days=3650))
+            .add_extension(x509.BasicConstraints(ca=True, path_length=None), True)
+            .sign(root_key, hashes.SHA256())
+        )
+        inter_key = _key()
+        inter = (
+            x509.CertificateBuilder()
+            .subject_name(_name("Junk CA"))
+            .issuer_name(root.subject)
+            .public_key(inter_key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(_NOW - datetime.timedelta(days=100))
+            .not_valid_after(_NOW + datetime.timedelta(days=100))
+            # pathLen:0 is what real intermediates carry.
+            .add_extension(x509.BasicConstraints(ca=True, path_length=0), True)
+            .sign(root_key, hashes.SHA256())
+        )
+        leaf, _ = _make_cert(
+            "junk.test", inter.subject, inter_key, ca=False,
+            aia_url="http://ca.test/inter.crt",
+        )
+        return root, leaf, inter
+
+    def _chase(self, root, chain, inter):
+        with (
+            _resolves_to("93.184.216.34"),
+            patch.object(_aia, "_probe_chain", return_value=chain),
+            patch.object(
+                _aia, "_fetch_certificate", side_effect=lambda u, t, p=None: inter
+            ),
+            patch.object(_aia, "_completes_chain", return_value=True),
+        ):
+            return resolve_missing_intermediates("https://junk.test/", _pem(root))
+
+    def test_leaf_only_resolves(self):
+        root, leaf, inter = self._leaf_and_issuer()
+        assert self._chase(root, [leaf], inter) == [_pem(inter)]
+
+    def test_an_unrelated_extra_certificate_does_not_abort_the_chase(self, pki):
+        root, leaf, inter = self._leaf_and_issuer()
+        # The walk stops at the leaf, so the junk certificate is not below
+        # the fetched issuer and must not count against its pathLen.
+        assert self._chase(root, [leaf, pki["intermediate"]], inter) == [
+            _pem(inter)
+        ]
+
+    def test_a_duplicated_leaf_does_not_abort_the_chase(self):
+        root, leaf, inter = self._leaf_and_issuer()
+        assert self._chase(root, [leaf, leaf], inter) == [_pem(inter)]
 
 
 class TestConcurrentChase:
