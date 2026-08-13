@@ -896,6 +896,19 @@ def resolve_missing_intermediates(
     anchored = False
     for _ in range(_MAX_CHASE_DEPTH):
         issuing_root = _issuing_root(cert, roots)
+        if issuing_root is not None and not _path_length_ok(
+            issuing_root, sent_cas_below + len(collected)
+        ):
+            # The same argument _path_length_ok makes for fetched hops applies
+            # to the root that terminates the walk: a root with pathLen:0 that
+            # misissued an intermediate produces a chain RFC 5280 rejects, and
+            # anchoring below it would accept.
+            logger.debug(
+                "Refusing the chase for %s: the issuing root's pathLen is "
+                "below the certificates under it",
+                host,
+            )
+            return []
         if issuing_root is not None:
             # The path terminates in the existing trust store; everything
             # gathered on the way is proven material.
@@ -915,7 +928,11 @@ def resolve_missing_intermediates(
         for candidate_url in urls:
             fetch_timeout = remaining(_FETCH_TIMEOUT)
             if fetch_timeout <= 0:
-                return []
+                # Same condition as the pre-probe check: out of budget is not
+                # a judgement about this chain. Returning a verdict here let a
+                # request that arrived with a nearly-spent deadline latch the
+                # origin as unfixable for the whole session.
+                raise ChaseInconclusive("budget exhausted mid-chase")
             candidate = _fetch_certificate(
                 candidate_url, fetch_timeout, proxy_url
             )
@@ -992,8 +1009,10 @@ def resolve_missing_intermediates(
         # exactly _MAX_CHASE_DEPTH hops would otherwise be rejected after
         # doing all the work to complete it.
         issuing_root = _issuing_root(cert, roots)
-        if issuing_root is not None and not _anchoring_would_drop_constraints(
-            cert, issuing_root
+        if (
+            issuing_root is not None
+            and _path_length_ok(issuing_root, sent_cas_below + len(collected))
+            and not _anchoring_would_drop_constraints(cert, issuing_root)
         ):
             anchored = True
 
@@ -1002,7 +1021,9 @@ def resolve_missing_intermediates(
         return []
 
     verify_timeout = remaining(_PROBE_TIMEOUT)
-    if verify_timeout <= 0 or not _completes_chain(
+    if verify_timeout <= 0:
+        raise ChaseInconclusive("budget exhausted before confirmation")
+    if not _completes_chain(
         host,
         port,
         trust_store_pems,

@@ -70,7 +70,9 @@ per session.
    window; must satisfy `pathLenConstraint` against the certificates actually
    below it (`_path_length_ok`, counted from the walked path rather than from
    how many certificates arrived); and must carry no name constraints
-   (`_has_name_constraints`). The walk terminates only when a certificate is
+   (`_has_name_constraints`). The root that terminates the walk is held to the
+   same pathLen rule: a root with pathLen:0 that issued a CA produces a chain
+   RFC 5280 rejects, which anchoring below it would accept. The walk terminates only when a certificate is
    **signed by a root already in the trust store** (`_signed_by_trusted_root`).
    Every
    hop being signature-linked is what makes the whole path provable, not just
@@ -195,10 +197,12 @@ every root along with it and silently disable chasing.
 ## Scope and limits
 
 - One attempt per **origin** (canonical host *and* port) per session, once a
-  verdict exists. A chase that never examined the chain -- no budget left, an
-  unreachable probe, an unusable trust store -- raises `ChaseInconclusive`
-  and the origin is forgotten rather than recorded, so a momentary condition
-  does not become a session-long outage. Otherwise, successful or not: two services on one name can present different chains.
+  verdict exists. A chase that never examined the chain raises
+  `ChaseInconclusive` and the origin is forgotten rather than recorded, so a
+  momentary condition does not become a session-long outage. That covers
+  budget exhaustion at every point it can occur -- before the probe, before a
+  fetch, and before the confirmation -- as well as an unreachable probe or an
+  unusable trust store. Otherwise, successful or not: two services on one name can present different chains.
   The claim is taken under a lock, because `AsyncSession` runs the chase in a
   worker thread and two concurrent failures on one origin would otherwise
   both proceed. Callers that arrive while a chase is in flight wait for it
@@ -214,6 +218,10 @@ every root along with it and silently disable chasing.
   retry re-resolves onto a healthy one. Multi-address hosts are common
   (`www.google.com` answers with eight), so a few seconds of repeated
   handshakes is the better trade against losing that recovery.
+- Withdrawing an expired anchor also forgets every settled verdict, because
+  an origin whose anchor was just pruned is failing again and would otherwise
+  never be re-chased -- so a server renewing its intermediate could not
+  repair the session. In-flight chases are left alone.
 - Anchors are re-checked for expiry on every `_cert_store()` call, not only
   when the cache is cold. A trust anchor's own validity is not enforced by
   the verifier, and after the first build the cache is invalidated only by a

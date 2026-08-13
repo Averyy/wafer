@@ -1912,6 +1912,15 @@ class BaseSession:
                 )
                 self._aia_extra_pems[:] = live
                 self._aia_cert_store = None
+                # Forget every settled verdict too. A succeeded origin whose
+                # anchor was just withdrawn is back to failing, and leaving it
+                # settled means the chase never runs again -- so the server
+                # renewing its intermediate could never repair the session.
+                self._aia_attempted = OrderedDict(
+                    (key, chase)
+                    for key, chase in self._aia_attempted.items()
+                    if not chase.done.is_set()
+                )
             if not live:
                 return _SYSTEM_CERT_STORE
             if self._aia_cert_store is None:
@@ -1949,6 +1958,12 @@ class BaseSession:
             key = (_canonical_host(host), parsed.port or 443)
         except ValueError:
             return False
+        # Imported before the claim: this is the first touch of wafer._aia and
+        # so of cryptography, and a failure here after claiming would leave an
+        # origin whose event is never set, making every later request to it
+        # wait the full timeout and then fail.
+        from wafer._aia import ChaseInconclusive
+
         with self._aia_lock:
             state = self._aia_attempted.get(key)
             # Ownership is decided here, inside the lock, rather than from
@@ -1961,9 +1976,22 @@ class BaseSession:
             if owner:
                 if len(self._aia_attempted) >= _AIA_MAX_TRACKED_HOSTS:
                     # A caller fetching attacker-chosen URLs would otherwise
-                    # grow this map without bound. Evict the oldest rather
-                    # than disabling chasing for every new origin forever.
-                    self._aia_attempted.pop(next(iter(self._aia_attempted)), None)
+                    # grow this map without bound. Evict the oldest *finished*
+                    # entry: evicting one still in flight would hand its origin
+                    # a second owner, which is the duplicate-probe race this
+                    # table exists to prevent, and the first owner could then
+                    # delete the second's verdict.
+                    for victim, chase in self._aia_attempted.items():
+                        if chase.done.is_set():
+                            del self._aia_attempted[victim]
+                            break
+                    else:
+                        logger.debug(
+                            "AIA origin table full of in-flight chases; "
+                            "not chasing %s",
+                            host,
+                        )
+                        return False
                 state = _AiaChase()
                 self._aia_attempted[key] = state
             else:
@@ -1993,8 +2021,6 @@ class BaseSession:
             return state.succeeded
         # Every exit from here must release the waiters, or a concurrent
         # request for this host blocks for the full wait.
-        from wafer._aia import ChaseInconclusive
-
         try:
             state.succeeded = self._run_aia_chase(url, host, timeout)
             return state.succeeded
@@ -2006,7 +2032,10 @@ class BaseSession:
             # unreachable for the life of the session.
             logger.debug("AIA chase for %s was inconclusive: %s", host, exc)
             with self._aia_lock:
-                self._aia_attempted.pop(key, None)
+                # Only if this caller still owns the entry: an eviction may
+                # have replaced it with a different chase's state.
+                if self._aia_attempted.get(key) is state:
+                    del self._aia_attempted[key]
             return False
         finally:
             state.done.set()
@@ -2256,17 +2285,35 @@ class BaseSession:
         }
 
     def _native_transport(self):
-        """Lazily create the per-session native-TLS transport."""
-        if self._native_tls is None:
-            from wafer._native_tls import NativeTLSTransport
+        """Lazily create the per-session native-TLS transport.
 
-            self._native_tls = NativeTLSTransport(
+        Published under the same generation check the wreq client uses. This
+        transport builds its SSL context once from a snapshot of the fetched
+        intermediates, so a build that started before a chase installed one
+        would otherwise assign itself over that chase's invalidation and go
+        on missing the certificate, with nothing left to invalidate it again.
+        """
+
+        if self._native_tls is not None:
+            return self._native_tls
+        from wafer._native_tls import NativeTLSTransport
+
+        for _ in range(_MAX_CLIENT_PUBLISH_ATTEMPTS):
+            with self._aia_lock:
+                generation = self._aia_generation
+                extra = list(self._aia_extra_pems)
+            candidate = NativeTLSTransport(
                 follow_redirects=self.follow_redirects,
                 proxy_url=self._proxy_url,
                 max_redirects=self.max_redirects,
                 resolve=self._resolve,
-                extra_ca_pems=list(self._aia_extra_pems),
+                extra_ca_pems=extra,
             )
+            with self._aia_lock:
+                if self._aia_generation == generation:
+                    self._native_tls = candidate
+                    return self._native_tls
+        self._native_tls = candidate
         return self._native_tls
 
     def _native_user_agent(self, extra_headers: dict[str, str] | None) -> str:

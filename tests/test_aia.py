@@ -17,7 +17,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 
-from wafer import _aia
+from wafer import _aia, _base
 from wafer._aia import (
     _ca_issuer_urls,
     _is_ca,
@@ -800,8 +800,11 @@ class TestFetchCertificate:
         assert x509.load_der_x509_certificate(payload) is not None
 
         class _Response:
+            # Returns more than it was asked for, which is the case the length
+            # check exists for -- truncating instead makes the payload
+            # unparseable, so the check and its absence look identical.
             def read(self, size):
-                return payload[:size]
+                return payload
 
             def __enter__(self):
                 return self
@@ -2068,6 +2071,54 @@ class TestPathLengthEnforcement:
         root, leaf, served = self._hierarchy(upper_path_len=None)
         assert len(self._chase(root, leaf, served)) == 2
 
+    def _root_with_path_len(self, limit):
+        key = _key()
+        root = (
+            x509.CertificateBuilder()
+            .subject_name(_name("RootPL"))
+            .issuer_name(_name("RootPL"))
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(_NOW - datetime.timedelta(days=3650))
+            .not_valid_after(_NOW + datetime.timedelta(days=3650))
+            .add_extension(x509.BasicConstraints(ca=True, path_length=limit), True)
+            .sign(key, hashes.SHA256())
+        )
+        inter, inter_key = _make_cert("RootPL CA", root.subject, key, ca=True)
+        leaf, _ = _make_cert(
+            "rootpl.test", inter.subject, inter_key, ca=False,
+            aia_url="http://ca.test/inter.crt",
+        )
+        return root, leaf, inter
+
+    def _run(self, root, leaf, inter):
+        with (
+            _resolves_to("93.184.216.34"),
+            patch.object(_aia, "_probe_chain", return_value=[leaf]),
+            patch.object(
+                _aia, "_fetch_certificate", side_effect=lambda u, t, p=None: inter
+            ),
+            patch.object(_aia, "_completes_chain", return_value=True),
+        ):
+            return resolve_missing_intermediates(
+                "https://rootpl.test/", _pem(root)
+            )
+
+    def test_the_issuing_roots_own_path_length_is_enforced(self):
+        """A root with pathLen:0 that issued a CA yields a chain RFC 5280
+        rejects; anchoring below it would accept."""
+
+        root, leaf, inter = self._root_with_path_len(0)
+        assert self._run(root, leaf, inter) == []
+
+    def test_a_sufficient_root_path_length_is_accepted(self):
+        root, leaf, inter = self._root_with_path_len(1)
+        assert len(self._run(root, leaf, inter)) == 1
+
+    def test_an_unconstrained_root_is_accepted(self):
+        root, leaf, inter = self._root_with_path_len(None)
+        assert len(self._run(root, leaf, inter)) == 1
+
     def test_sent_intermediates_count_against_path_length(self, pki):
         """Certificates the server sent sit below the fetched one too."""
 
@@ -2407,6 +2458,30 @@ class TestConcurrentChase:
                 session._complete_chain_via_aia("https://one.test/")
         assert resolve.call_count == 1
 
+    def test_eviction_never_removes_an_in_flight_chase(self):
+        """Evicting a running chase hands its origin a second owner.
+
+        That is the duplicate-probe race the table exists to prevent, and
+        the first owner would then delete the second owner's verdict.
+        """
+
+        session, _ = make_sync_session([MockResponse(200)])
+        from wafer._base import _AIA_MAX_TRACKED_HOSTS
+
+        # Oldest entry is in flight; the rest are settled.
+        busy = _base._AiaChase()
+        session._aia_attempted[("busy.test", 443)] = busy
+        for i in range(_AIA_MAX_TRACKED_HOSTS - 1):
+            done = _base._AiaChase()
+            done.done.set()
+            session._aia_attempted[(f"done{i}.test", 443)] = done
+
+        with patch.object(_aia, "resolve_missing_intermediates", return_value=[]):
+            session._complete_chain_via_aia("https://fresh.test/")
+
+        assert ("busy.test", 443) in session._aia_attempted
+        assert ("fresh.test", 443) in session._aia_attempted
+
     def test_the_origin_table_is_bounded(self):
         session, _ = make_sync_session([MockResponse(200)])
         from wafer._base import _AIA_MAX_TRACKED_HOSTS
@@ -2417,6 +2492,88 @@ class TestConcurrentChase:
             for i in range(_AIA_MAX_TRACKED_HOSTS + 20):
                 session._complete_chain_via_aia(f"https://h{i}.test/")
         assert len(session._aia_attempted) == _AIA_MAX_TRACKED_HOSTS
+
+    def test_an_inconclusive_chase_does_not_record_a_verdict(self):
+        """The whole `except ChaseInconclusive` path had no coverage.
+
+        Deleting the handler left the suite green, so the "origin is
+        forgotten" behaviour was correct but unpinned.
+        """
+
+        session, _ = make_sync_session([MockResponse(200)])
+        with patch.object(
+            _aia,
+            "resolve_missing_intermediates",
+            side_effect=_aia.ChaseInconclusive("no budget"),
+        ):
+            assert session._complete_chain_via_aia("https://transient.test/") is False
+        # Forgotten, not settled, so a later request tries again.
+        assert ("transient.test", 443) not in session._aia_attempted
+        with patch.object(
+            _aia, "resolve_missing_intermediates", return_value=[]
+        ) as resolve:
+            session._complete_chain_via_aia("https://transient.test/")
+        resolve.assert_called_once()
+
+    def test_an_inconclusive_chase_still_releases_waiters(self):
+        session, _ = make_sync_session([MockResponse(200)])
+        seen = {}
+
+        def _capture(*a, **kw):
+            seen["state"] = session._aia_attempted[("transient.test", 443)]
+            raise _aia.ChaseInconclusive("no budget")
+
+        with patch.object(
+            _aia, "resolve_missing_intermediates", side_effect=_capture
+        ):
+            session._complete_chain_via_aia("https://transient.test/")
+        assert seen["state"].done.is_set()
+
+    def test_budget_exhausted_before_the_fetch_is_inconclusive(self, pki):
+        """Out of budget mid-chase is the same non-verdict as before probing.
+
+        The clock is burned inside the probe so this reaches the fetch
+        check, not the pre-probe one -- ticking on every monotonic() call
+        exhausts the budget before the probe and tests nothing here.
+        """
+
+        clock = {"t": 1000.0}
+
+        def _probe(*a, **kw):
+            clock["t"] += 10_000.0  # the probe eats the whole budget
+            return [pki["leaf"]]
+
+        with (
+            _resolves_to("93.184.216.34"),
+            patch.object(_aia.time, "monotonic", lambda: clock["t"]),
+            patch.object(_aia, "_probe_chain", side_effect=_probe),
+            patch.object(_aia, "_fetch_certificate") as fetch,
+        ):
+            with pytest.raises(_aia.ChaseInconclusive):
+                resolve_missing_intermediates(
+                    "https://leaf.test/", pki["root_pems"], timeout=30.0
+                )
+        fetch.assert_not_called()
+
+    def test_budget_exhausted_before_confirmation_is_inconclusive(self, pki):
+        clock = {"t": 1000.0}
+
+        def _fetch(url, timeout, proxy=None):
+            clock["t"] += 10_000.0  # the fetch eats the rest of the budget
+            return pki["intermediate"]
+
+        with (
+            _resolves_to("93.184.216.34"),
+            patch.object(_aia.time, "monotonic", lambda: clock["t"]),
+            patch.object(_aia, "_probe_chain", return_value=[pki["leaf"]]),
+            patch.object(_aia, "_fetch_certificate", side_effect=_fetch),
+            patch.object(_aia, "_completes_chain") as confirm,
+        ):
+            with pytest.raises(_aia.ChaseInconclusive):
+                resolve_missing_intermediates(
+                    "https://leaf.test/", pki["root_pems"], timeout=30.0
+                )
+        confirm.assert_not_called()
 
     def test_waiters_are_released_when_the_chase_fails(self):
         session, _ = make_sync_session([MockResponse(200)])
@@ -2546,6 +2703,72 @@ class TestAnchorExpiry:
 
         assert session._cert_store() is _SYSTEM_CERT_STORE
         assert session._aia_extra_pems == []
+
+    def test_pruning_runs_against_a_warm_cache(self, pki):
+        """The prune must not be gated on a cold store cache.
+
+        Both other tests here start from a fresh session whose cache is
+        already None, which is the one state where a cache-gated prune would
+        also run -- so they pass whether or not the gate exists. Warming the
+        cache first is what pins the behaviour.
+        """
+
+        session, _ = make_sync_session([MockResponse(200)])
+        session._aia_extra_pems = [_pem(pki["intermediate"])]
+        session._aia_cert_store = None
+        session._cert_store()
+        assert session._aia_cert_store is not None  # cache now warm
+
+        calls = []
+
+        def _drop(pems):
+            calls.append(len(pems))
+            return []
+
+        with patch.object(_aia, "drop_expired_pems", _drop):
+            session._cert_store()
+        assert calls, "prune skipped once the store cache was warm"
+        assert session._aia_extra_pems == []
+
+    def test_withdrawing_an_anchor_clears_the_settled_verdict(self, pki):
+        """Otherwise the origin can never be repaired after a renewal.
+
+        The chase succeeded, so the origin is settled; expiry then withdraws
+        the anchor. Without clearing the verdict the host fails verification
+        forever, even though its AIA now serves a renewed intermediate.
+        """
+
+        session, _ = make_sync_session([MockResponse(200)])
+        with patch.object(
+            _aia,
+            "resolve_missing_intermediates",
+            return_value=[_pem(pki["intermediate"])],
+        ):
+            assert session._complete_chain_via_aia("https://renew.test/")
+        assert ("renew.test", 443) in session._aia_attempted
+
+        with patch.object(_aia, "drop_expired_pems", lambda p: []):
+            session._cert_store()
+        assert ("renew.test", 443) not in session._aia_attempted
+
+        # And the origin can now be chased again.
+        with patch.object(
+            _aia,
+            "resolve_missing_intermediates",
+            return_value=[_pem(pki["root"])],
+        ) as resolve:
+            assert session._complete_chain_via_aia("https://renew.test/")
+        resolve.assert_called_once()
+
+    def test_an_in_flight_chase_is_not_forgotten_by_a_prune(self, pki):
+        session, _ = make_sync_session([MockResponse(200)])
+        state = _base._AiaChase()
+        session._aia_attempted[("busy.test", 443)] = state  # done not set
+        session._aia_extra_pems = [_pem(pki["intermediate"])]
+        session._aia_cert_store = None
+        with patch.object(_aia, "drop_expired_pems", lambda p: []):
+            session._cert_store()
+        assert ("busy.test", 443) in session._aia_attempted
 
     def test_live_anchors_are_kept(self, pki):
         assert _aia.drop_expired_pems([_pem(pki["intermediate"])]) == [
