@@ -548,6 +548,40 @@ class TestResolveMissingIntermediates:
         fetch.assert_called()
         assert out == []
 
+    def test_an_unreachable_issuer_endpoint_is_inconclusive(self, pki):
+        """A CA endpoint being briefly down says nothing about the chain.
+
+        Swallowed into a verdict, a momentary outage disabled chasing for
+        that origin for the rest of the session.
+        """
+
+        with (
+            _resolves_to("93.184.216.34"),
+            patch.object(_aia, "_probe_chain", return_value=[pki["leaf"]]),
+            patch.object(
+                _aia, "_fetch_certificate", side_effect=_aia.FetchFailed("down")
+            ),
+        ):
+            with pytest.raises(_aia.ChaseInconclusive):
+                resolve_missing_intermediates(
+                    "https://leaf.test/", pki["root_pems"]
+                )
+
+    def test_an_unusable_issuer_response_is_still_a_verdict(self, pki):
+        """Bytes that arrive and are not a certificate were examined."""
+
+        with (
+            _resolves_to("93.184.216.34"),
+            patch.object(_aia, "_probe_chain", return_value=[pki["leaf"]]),
+            patch.object(_aia, "_fetch_certificate", return_value=None),
+        ):
+            assert (
+                resolve_missing_intermediates(
+                    "https://leaf.test/", pki["root_pems"]
+                )
+                == []
+            )
+
     def test_probe_failure_is_inconclusive_not_a_verdict(self, pki):
         """Never seeing the certificate is not the same as judging it.
 
@@ -869,9 +903,31 @@ class TestFetchCertificate:
         assert got is not None
         assert got.subject == pki["intermediate"].subject
 
-    def test_network_error_is_swallowed(self):
+    def test_a_transport_failure_is_reported_not_swallowed(self):
+        """No response at all is not the same as an unusable response.
+
+        Swallowing it into None let a momentary CA outage become a settled
+        "this chain cannot be completed" verdict for the whole session.
+        """
+
         with patch.object(_aia.urllib.request, "build_opener") as build:
             build.return_value.open.side_effect = OSError("boom")
+            with pytest.raises(_aia.FetchFailed):
+                _aia._fetch_certificate("http://ca.test/x.crt", 5.0)
+
+    def test_an_unusable_response_is_still_None(self):
+        class _Response:
+            def read(self, size):
+                return b"<html>not a certificate</html>"
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        with patch.object(_aia.urllib.request, "build_opener") as build:
+            build.return_value.open.return_value = _Response()
             assert _aia._fetch_certificate("http://ca.test/x.crt", 5.0) is None
 
 
@@ -2293,6 +2349,30 @@ class TestClientPublication:
         assert len(builds) == 2
         assert session._client is builds[-1]
 
+    def test_the_final_attempt_never_publishes_stale_state(self, pki):
+        """Giving up must not mean publishing state already known to be stale.
+
+        Returning the last unchecked candidate publishes trust state that a
+        concurrent chase has already superseded -- the exact failure this
+        helper exists to prevent.
+        """
+
+        session, _ = make_sync_session([MockResponse(200)])
+        seen_generations = []
+
+        def _build():
+            # Bump on every build except while the lock is held, which the
+            # final attempt does -- so the last build sees a stable value.
+            seen_generations.append(session._aia_generation)
+            if not session._aia_lock._is_owned():
+                session._aia_generation += 1
+            return object()
+
+        published = session._publish_under_generation(_build)
+        assert published is not None
+        # The last build ran with the generation it published under.
+        assert session._aia_generation == seen_generations[-1]
+
     def test_publication_gives_up_after_the_retry_bound(self, pki):
         """A pathological generation churn must not spin forever."""
 
@@ -2769,6 +2849,75 @@ class TestAnchorExpiry:
         with patch.object(_aia, "drop_expired_pems", lambda p: []):
             session._cert_store()
         assert ("busy.test", 443) in session._aia_attempted
+
+    def _short_lived_ca(self):
+        key = _key()
+        return (
+            x509.CertificateBuilder()
+            .subject_name(_name("Short CA"))
+            .issuer_name(_name("Short Root"))
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(_NOW - datetime.timedelta(days=1))
+            .not_valid_after(_NOW + datetime.timedelta(seconds=30))
+            .add_extension(x509.BasicConstraints(ca=True, path_length=None), True)
+            .sign(key, hashes.SHA256())
+        )
+
+    def test_expiry_is_enforced_without_a_client_rebuild(self, pki):
+        """A session that never rotates must still stop trusting an anchor.
+
+        Pruning only from the client build meant an already-built client held
+        an expired anchor for the life of the session, and the verifier does
+        not check an anchor's own validity.
+        """
+
+        session, _ = make_sync_session([MockResponse(200)])
+        short = self._short_lived_ca()
+        with patch.object(
+            _aia, "resolve_missing_intermediates", return_value=[_pem(short)]
+        ):
+            assert session._complete_chain_via_aia("https://short.test/")
+        assert session._aia_expires_at is not None
+
+        # Nothing rebuilds; only time passes.
+        with patch.object(
+            _aia.time, "time", lambda: session._aia_expires_at + 1
+        ), patch.object(_base.time, "time", lambda: session._aia_expires_at + 1):
+            assert session._expire_aia_anchors_if_due() is True
+        assert session._aia_extra_pems == []
+        assert session._aia_expires_at is None
+
+    def test_the_check_is_a_no_op_before_expiry(self, pki):
+        session, _ = make_sync_session([MockResponse(200)])
+        with patch.object(
+            _aia,
+            "resolve_missing_intermediates",
+            return_value=[_pem(pki["intermediate"])],
+        ):
+            session._complete_chain_via_aia("https://live.test/")
+        assert session._expire_aia_anchors_if_due() is False
+        assert len(session._aia_extra_pems) == 1
+
+    def test_the_check_is_free_when_nothing_was_chased(self):
+        session, _ = make_sync_session([MockResponse(200)])
+        assert session._aia_expires_at is None
+        assert session._expire_aia_anchors_if_due() is False
+
+    def test_pruning_invalidates_both_transports(self, pki):
+        """An existing native-TLS transport must not keep the old anchor."""
+
+        session, _ = make_sync_session([MockResponse(200)])
+        session._aia_extra_pems = [_pem(pki["intermediate"])]
+        session._aia_cert_store = None
+        session._native_transport()
+        assert session._native_tls is not None
+        generation = session._aia_generation
+
+        with patch.object(_aia, "drop_expired_pems", lambda p: []):
+            session._cert_store()
+        assert session._native_tls is None
+        assert session._aia_generation > generation
 
     def test_live_anchors_are_kept(self, pki):
         assert _aia.drop_expired_pems([_pem(pki["intermediate"])]) == [

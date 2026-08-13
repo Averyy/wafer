@@ -1408,6 +1408,13 @@ class SyncSession(BaseSession):
             if attempt_limit is not None:
                 kwargs["timeout"] = datetime.timedelta(seconds=attempt_limit)
 
+            # Withdraw any anchor that has passed its notAfter before using
+            # the client. A trust anchor's own validity is not checked by the
+            # verifier, and a session that never rotates would otherwise hold
+            # an expired one for as long as it lives. One timestamp compare
+            # when nothing is due, and nothing at all when nothing was chased.
+            self._expire_aia_anchors_if_due()
+
             # Make the request. When a resolve pin is set, canonicalize the
             # URL host (lowercase + trailing-dot strip) so wreq's DnsOptions -
             # which matches its map against the URL host verbatim - can't miss

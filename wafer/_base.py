@@ -869,6 +869,10 @@ class BaseSession:
         # Bumped whenever certificates are installed. A client build that
         # started before a bump is stale and must not be published.
         self._aia_generation = 0
+        # Soonest notAfter across the installed anchors, or None when there
+        # are none. Checked per request so expiry does not depend on a client
+        # rebuild happening to occur.
+        self._aia_expires_at: float | None = None
         # (canonical host, port) -> _AiaChase. Doubles as the "already
         # attempted" record and the gate concurrent callers wait on. Ordered so
         # the bound can evict the oldest origin instead of refusing new ones.
@@ -1874,6 +1878,30 @@ class BaseSession:
         defaults.update(kwargs)
         return cls(**defaults)
 
+    def _expire_aia_anchors_if_due(self) -> bool:
+        """Drop anchors past their notAfter, returning whether any went.
+
+        Called before a request rather than only from a client rebuild. A
+        session that never rotates builds its client once, and the verifier
+        does not check a trust anchor's own validity, so without this an
+        expired intermediate would stay effective for as long as the session
+        lives. Costs one timestamp comparison when nothing has expired.
+        """
+
+        expires_at = self._aia_expires_at
+        if expires_at is None or time.time() < expires_at:
+            return False
+        with self._aia_lock:
+            before = len(self._aia_extra_pems)
+        # _cert_store performs the prune and the invalidation under the lock.
+        self._cert_store()
+        with self._aia_lock:
+            dropped = len(self._aia_extra_pems) != before
+        if dropped:
+            logger.debug("AIA anchors expired; rebuilding without them")
+            self._rebuild_client()
+        return dropped
+
     def _publish_under_generation(self, build):
         """Build something from the trust store and publish it if still current.
 
@@ -1888,18 +1916,19 @@ class BaseSession:
         native-TLS transport -- which then carried exactly that bug.
         """
 
-        candidate = None
-        for _ in range(_MAX_CLIENT_PUBLISH_ATTEMPTS):
+        for _ in range(_MAX_CLIENT_PUBLISH_ATTEMPTS - 1):
             with self._aia_lock:
                 generation = self._aia_generation
             candidate = build()
             with self._aia_lock:
                 if self._aia_generation == generation:
                     return candidate
-        # Certificates kept landing mid-build. Publishing the last candidate
-        # is still correct -- it is only missing whatever arrived during the
-        # final attempt, and the next rebuild picks that up.
-        return candidate
+        # Certificates kept landing mid-build. Build the last one holding the
+        # lock so nothing can change underneath it: returning an unchecked
+        # candidate here would publish trust state already known to be stale,
+        # which is the whole failure this helper exists to prevent.
+        with self._aia_lock:
+            return build()
 
     def _cert_store(self):
         """Return the trust store this session's client should verify against.
@@ -1939,6 +1968,12 @@ class BaseSession:
                 )
                 self._aia_extra_pems[:] = live
                 self._aia_cert_store = None
+                # Bump the generation and drop the native transport as well.
+                # Without this an already-built wreq client and an existing
+                # Imperva transport both keep honouring the withdrawn anchor,
+                # and nothing left would invalidate them.
+                self._aia_generation += 1
+                self._native_tls = None
                 # Forget every settled verdict too. A succeeded origin whose
                 # anchor was just withdrawn is back to failing, and leaving it
                 # settled means the chase never runs again -- so the server
@@ -1948,6 +1983,9 @@ class BaseSession:
                     for key, chase in self._aia_attempted.items()
                     if not chase.done.is_set()
                 )
+            from wafer._aia import earliest_expiry as _earliest
+
+            self._aia_expires_at = _earliest(live) if live else None
             if not live:
                 return _SYSTEM_CERT_STORE
             if self._aia_cert_store is None:
@@ -2118,6 +2156,9 @@ class BaseSession:
             self._aia_extra_pems.extend(added)
             self._aia_cert_store = None
             self._aia_generation += 1
+            from wafer._aia import earliest_expiry as _earliest
+
+            self._aia_expires_at = _earliest(self._aia_extra_pems)
             # The native-TLS transport builds its SSL context once at
             # construction, so drop it and let it be rebuilt with the new
             # intermediates. Keeping the old one would leave the Imperva

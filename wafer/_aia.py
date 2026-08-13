@@ -52,6 +52,15 @@ from cryptography.x509.oid import (
 logger = logging.getLogger("wafer")
 
 
+class FetchFailed(Exception):
+    """The issuer fetch got no response at all.
+
+    Separate from returning None, which means bytes arrived and were not a
+    usable certificate. A CA endpoint that is briefly down, or a DNS blip,
+    must not be recorded as "this chain cannot be completed".
+    """
+
+
 class ChaseInconclusive(Exception):
     """The chase never got far enough to judge this origin's chain.
 
@@ -581,9 +590,9 @@ def _fetch_certificate(
         opener = urllib.request.build_opener(*handlers)
         with opener.open(request, timeout=timeout) as response:
             payload = response.read(_MAX_CERT_BYTES + 1)
-    except (urllib.error.URLError, OSError, ValueError):
+    except (urllib.error.URLError, OSError, ValueError) as exc:
         logger.debug("AIA fetch failed for %s", url, exc_info=True)
-        return None
+        raise FetchFailed(str(exc)) from exc
     # The bounded read above is what actually caps memory. This length test is
     # belt-and-braces for a file-like object that returns more than it was
     # asked for; on its own it is not observable, since a DER certificate
@@ -925,6 +934,7 @@ def resolve_missing_intermediates(
         if not urls:
             break
         issuer = None
+        transport_failed = False
         for candidate_url in urls:
             fetch_timeout = remaining(_FETCH_TIMEOUT)
             if fetch_timeout <= 0:
@@ -933,9 +943,13 @@ def resolve_missing_intermediates(
                 # request that arrived with a nearly-spent deadline latch the
                 # origin as unfixable for the whole session.
                 raise ChaseInconclusive("budget exhausted mid-chase")
-            candidate = _fetch_certificate(
-                candidate_url, fetch_timeout, proxy_url
-            )
+            try:
+                candidate = _fetch_certificate(
+                    candidate_url, fetch_timeout, proxy_url
+                )
+            except FetchFailed:
+                transport_failed = True
+                continue
             if candidate is None:
                 continue
             # The fetched certificate must have actually signed the one that
@@ -995,6 +1009,13 @@ def resolve_missing_intermediates(
             issuer = candidate
             break
         if issuer is None:
+            if transport_failed:
+                # Nothing was learned about this chain: the issuer endpoint
+                # never answered. Recording a verdict would let a momentary
+                # CA outage disable chasing for this origin all session.
+                raise ChaseInconclusive(
+                    "issuer endpoint unreachable; chain never examined"
+                )
             break
         # Kept, but not trusted yet. The next pass decides: either this
         # certificate is signed by a root in the store and the path is
@@ -1069,6 +1090,28 @@ def drop_expired_pems(pems: list[bytes]) -> list[bytes]:
         if _is_currently_valid(cert, now):
             live.append(pem)
     return live
+
+
+def earliest_expiry(pems: list[bytes]) -> float | None:
+    """Return the soonest notAfter across these certificates, as a timestamp.
+
+    Lets a session enforce anchor expiry on its own schedule instead of only
+    when something happens to rebuild the client: a trust anchor's validity
+    is not checked by the verifier, and a session that never rotates would
+    otherwise hold an expired anchor for as long as it lives.
+    """
+
+    soonest = None
+    for pem in pems:
+        try:
+            cert = x509.load_pem_x509_certificate(pem)
+            stamp = cert.not_valid_after_utc.timestamp()
+        except Exception:
+            # Unreadable: treat as already due so the prune drops it.
+            return 0.0
+        if soonest is None or stamp < soonest:
+            soonest = stamp
+    return soonest
 
 
 def merge_pem_stacks(base: bytes, extra: list[bytes]) -> bytes:

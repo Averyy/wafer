@@ -201,8 +201,10 @@ every root along with it and silently disable chasing.
   `ChaseInconclusive` and the origin is forgotten rather than recorded, so a
   momentary condition does not become a session-long outage. That covers
   budget exhaustion at every point it can occur -- before the probe, before a
-  fetch, and before the confirmation -- as well as an unreachable probe or an
-  unusable trust store. Otherwise, successful or not: two services on one name can present different chains.
+  fetch, and before the confirmation -- an unreachable probe, an unusable
+  trust store, and an issuer endpoint that never answered. That last one is
+  distinct from bytes arriving that are not a usable certificate, which *is*
+  a verdict: a CA endpoint briefly down says nothing about the chain. Otherwise, successful or not: two services on one name can present different chains.
   The claim is taken under a lock, because `AsyncSession` runs the chase in a
   worker thread and two concurrent failures on one origin would otherwise
   both proceed. Callers that arrive while a chase is in flight wait for it
@@ -222,8 +224,17 @@ every root along with it and silently disable chasing.
   an origin whose anchor was just pruned is failing again and would otherwise
   never be re-chased -- so a server renewing its intermediate could not
   repair the session. In-flight chases are left alone.
-- Anchors are re-checked for expiry on every `_cert_store()` call, not only
-  when the cache is cold. A trust anchor's own validity is not enforced by
+- Anchors are re-checked for expiry before every request, not only when a
+  client rebuild happens to occur. The soonest `notAfter` is tracked when
+  anchors are installed, so the check is one timestamp comparison and does
+  nothing at all for a session that never chased. Pruning from the client
+  build alone was not enough: a session that never rotates builds its client
+  once, and the verifier does not check a trust anchor's own validity, so an
+  expired intermediate stayed effective for the life of the session.
+- Withdrawing an anchor bumps the generation and drops the native-TLS
+  transport too. Invalidating only the cached store left an already-built
+  wreq client and an existing Imperva transport still honouring it, with
+  nothing remaining to invalidate them. A trust anchor's own validity is not enforced by
   the verifier, and after the first build the cache is invalidated only by a
   new chase, so a cache-gated check would never fire for the long sessions
   this exists to protect.
