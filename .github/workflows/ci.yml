@@ -28,3 +28,19 @@ jobs:
 
       - name: Test
         run: uv run pytest tests/ -x -q
+
+      # [build-system] leaves hatchling unpinned, so every build resolves the
+      # newest one, while the publisher validates with a twine frozen at a SHA.
+      # When hatchling bumps its default core-metadata version past what that
+      # twine accepts, the release aborts after the tag already exists (v0.5.0
+      # hit exactly this: metadata 2.5 vs the twine 6.1.0 in publish action
+      # v1.13.0). Running the publisher's own twine here turns that into a red
+      # CI run on an ordinary push instead.
+      #
+      # The pin must track the gh-action-pypi-publish SHA in publish.yml. An
+      # unpinned twine would float alongside hatchling and accept metadata the
+      # publisher still rejects, which is a check that can never fail.
+      - name: Validate distribution metadata
+        run: |
+          uv build
+          uvx --from twine==7.0.0 twine check --strict dist/*
