@@ -173,6 +173,8 @@ SITES: list[tuple[int, str, str]] = [
     (5, "riskified", "https://ssense.com"),
     (5, "kasada", "https://canadagoose.com"),
     (5, "cloudfront", "https://farfetch.com"),
+    (5, "pow", "https://forums.redflagdeals.com/viewtopic.php?t=2789391"),
+    (5, "pow", "https://www.redflagdeals.com/"),
     (5, "none", "https://skyscanner.com"),
 ]
 

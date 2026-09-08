@@ -1,4 +1,4 @@
-"""Tests for inline challenge solvers (ACW, Amazon, TMD, Radware)."""
+"""Tests for inline challenge solvers (ACW, PoW, Amazon, TMD, Radware)."""
 
 import threading
 import time
@@ -13,11 +13,15 @@ from tests.conftest import (
     make_async_session,
     make_sync_session,
 )
+from wafer._cookies import CookieCache
 from wafer._errors import ChallengeDetected
 from wafer._solvers import (
     _is_amazon_domain,
+    is_pow_challenge,
     parse_amazon_captcha,
+    parse_pow_challenge,
     solve_acw,
+    solve_pow,
     tmd_homepage_url,
 )
 
@@ -257,6 +261,219 @@ class TestTMDHomepageUrl:
         ) == "https://acs.aliexpress.com/"
 
 # ---------------------------------------------------------------------------
+# Proof-of-work gate solver
+# ---------------------------------------------------------------------------
+
+_POW_URL = "https://forums.redflagdeals.com/viewtopic.php?t=2789391"
+# Measured live on 2026-09-07. The page's own script lands on counter 90 for
+# this nonce/issued_at pair, and the replay with this cookie returned the
+# thread (HTTP 200, 180 KB).
+_POW_NONCE = "e68a8b5e136aad05bdb6de05fbe2db98"
+_POW_HMAC = "ba7e6328f78b8507c9141730"
+_POW_ISSUED = "1788821011"
+_POW_DIGEST = "bbbc373e028d50315d43d9de8513cd696a51707e48ad37e0f2cd2915194e99e3"
+
+
+def _pow_body(**overrides):
+    fields = {
+        "challenge_nonce": _POW_NONCE,
+        "challenge_hmac": _POW_HMAC,
+        "difficulty": "2",
+        "difficulty_char": "b",
+        "issued_at": _POW_ISSUED,
+        "cookie_duration": "3600",
+        "cookie_domain": ".redflagdeals.com",
+        "referrer": "(null)",
+        "headless_check": "1",
+    }
+    for k, v in overrides.items():
+        if v is None:
+            fields.pop(k, None)
+        else:
+            fields[k] = v
+    inner = ",\n".join(f"    {k}:'{v}'" for k, v in fields.items())
+    return (
+        "<!DOCTYPE html><html><head><script>\n"
+        "window.POW_CHALLENGE_DATA={\n" + inner + "\n};\n"
+        "let _isMobile=()=>false;\n"
+        "(async(d=window.POW_CHALLENGE_DATA)=>{let i=0;while(i++<1e7){"
+        "let u=i.toString(),c=await f(d.challenge_nonce+d.issued_at+u);"
+        "if(c.startsWith(d.difficulty_char.repeat(d.difficulty))){"
+        "document.cookie='pow_bypass='+d.challenge_nonce+'|'+d.issued_at+'|'+u"
+        "+'|'+c+'|'+d.challenge_hmac+'; domain='+d.cookie_domain"
+        "+'; path=/; max-age='+d.cookie_duration+'; SameSite=Lax; Secure';"
+        "location.reload();break}}})()\n"
+        "</script></head><body><noscript><h1>JavaScript Required</h1>"
+        "</noscript></body></html>"
+    )
+
+
+_POW_BODY = _pow_body()
+
+
+class TestSolvePow:
+    def test_known_vector_matches_the_page_script(self):
+        sol = solve_pow(_POW_BODY, _POW_URL)
+        assert sol is not None
+        assert sol.iterations == 90
+        assert sol.name == "pow_bypass"
+        assert sol.max_age == 3600
+        assert sol.cookie == (
+            f"pow_bypass={_POW_NONCE}|{_POW_ISSUED}|90|{_POW_DIGEST}|{_POW_HMAC}; "
+            "Domain=redflagdeals.com; Path=/; Max-Age=3600; SameSite=Lax; Secure"
+        )
+
+    def test_five_fields_no_trailing_signals(self):
+        """A clean browser sends exactly five fields; a sixth is never produced."""
+        sol = solve_pow(_POW_BODY, _POW_URL)
+        value = sol.cookie.split(";")[0].split("=", 1)[1]
+        assert value.count("|") == 4
+        assert not value.endswith("|")
+
+    def test_digest_actually_satisfies_prefix(self):
+        import hashlib
+
+        sol = solve_pow(_pow_body(difficulty="3", difficulty_char="0"), _POW_URL)
+        assert sol is not None
+        value = sol.cookie.split(";")[0].split("=", 1)[1]
+        nonce, issued, counter, digest, hmac = value.split("|")
+        assert digest.startswith("000")
+        assert (
+            hashlib.sha256((nonce + issued + counter).encode()).hexdigest()
+            == digest
+        )
+        assert int(counter) == sol.iterations >= 1
+
+    def test_domain_cookie_covers_sibling_host(self):
+        sol = solve_pow(_POW_BODY, "https://www.redflagdeals.com/")
+        assert "Domain=redflagdeals.com" in sol.cookie
+
+    def test_foreign_cookie_domain_falls_back_to_host_only(self):
+        """A page cannot plant a cookie for a domain the request host is not under."""
+        sol = solve_pow(_pow_body(cookie_domain=".example.com"), _POW_URL)
+        assert sol is not None
+        assert "Domain=" not in sol.cookie
+
+    def test_missing_cookie_domain_is_host_only(self):
+        sol = solve_pow(_pow_body(cookie_domain=None), _POW_URL)
+        assert sol is not None
+        assert "Domain=" not in sol.cookie
+
+    def test_missing_cookie_duration_defaults_to_an_hour(self):
+        sol = solve_pow(_pow_body(cookie_duration=None), _POW_URL)
+        assert sol.max_age == 3600
+        assert "Max-Age=3600" in sol.cookie
+
+    def test_zero_cookie_duration_defaults_to_an_hour(self):
+        """Max-Age=0 would delete the cookie before the replay that needs it."""
+        sol = solve_pow(_pow_body(cookie_duration="0"), _POW_URL)
+        assert sol.max_age == 3600
+
+    def test_huge_cookie_duration_is_clamped(self):
+        """A page cannot pin a cookie in the cache for years or overflow time()."""
+        sol = solve_pow(_pow_body(cookie_duration="9999999999"), _POW_URL)
+        assert sol.max_age == 86_400
+        assert "Max-Age=86400" in sol.cookie
+        assert parse_pow_challenge(_pow_body(cookie_duration="9" * 11)) is None
+
+    def test_subdomain_cookie_domain_is_honoured(self):
+        sol = solve_pow(
+            _pow_body(cookie_domain=".forums.redflagdeals.com"), _POW_URL
+        )
+        assert "Domain=forums.redflagdeals.com" in sol.cookie
+
+    @pytest.mark.parametrize(
+        "cookie_domain,url",
+        [
+            (".co.uk", "https://evil.co.uk/x"),
+            ("co.uk", "https://www.evil.co.uk/x"),
+            (".github.io", "https://attacker.github.io/x"),
+            (".com.au", "https://shop.example.com.au/"),
+        ],
+    )
+    def test_public_suffix_cookie_domain_refused(self, cookie_domain, url):
+        """wreq's jar accepts Domain=co.uk; wafer must not hand it one."""
+        sol = solve_pow(_pow_body(cookie_domain=cookie_domain), url)
+        assert sol is not None
+        assert "Domain=" not in sol.cookie
+
+    def test_nonce_and_hmac_length_bounded(self):
+        assert parse_pow_challenge(_pow_body(challenge_nonce="a" * 15)) is None
+        assert parse_pow_challenge(_pow_body(challenge_nonce="a" * 129)) is None
+        assert parse_pow_challenge(_pow_body(challenge_hmac="a" * 129)) is None
+        assert parse_pow_challenge(_pow_body(challenge_nonce="a" * 16)) is not None
+        assert parse_pow_challenge(_pow_body(challenge_nonce="a" * 128)) is not None
+
+    def test_hostile_unclosed_objects_parse_in_linear_time(self):
+        hostile = "POW_CHALLENGE_DATA={" * 2_400  # ~48 KB, never closed
+        start = time.perf_counter()
+        assert parse_pow_challenge(hostile) is None
+        assert solve_pow(hostile, _POW_URL, deadline=time.monotonic() - 1) is None
+        assert time.perf_counter() - start < 0.5
+
+    def test_oversized_body_is_not_scanned_past_the_cap(self):
+        """The object sits past 50 KB: detection and parsing both ignore it."""
+        body = "x" * 60_000 + _POW_BODY
+        assert not is_pow_challenge(body)
+        assert parse_pow_challenge(body) is None
+
+    def test_plain_http_omits_secure(self):
+        sol = solve_pow(_POW_BODY, "http://forums.redflagdeals.com/")
+        assert "Secure" not in sol.cookie
+
+    def test_no_marker_returns_none(self):
+        assert solve_pow("<html>real content</html>", _POW_URL) is None
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"challenge_nonce": None},
+            {"challenge_nonce": "not hex!"},
+            {"challenge_hmac": None},
+            {"challenge_hmac": "ZZ"},
+            {"issued_at": "17888e"},
+            {"difficulty": "0"},
+            {"difficulty": "6"},
+            {"difficulty": "9"},
+            {"difficulty": "two"},
+            {"difficulty_char": "z"},
+            {"difficulty_char": "bb"},
+            {"difficulty_char": ""},
+            {"cookie_duration": "1h"},
+            {"cookie_domain": "not a domain"},
+        ],
+    )
+    def test_malformed_fields_refused(self, overrides):
+        body = _pow_body(**overrides)
+        assert parse_pow_challenge(body) is None
+        assert solve_pow(body, _POW_URL) is None
+
+    def test_expired_deadline_returns_none(self):
+        assert solve_pow(_POW_BODY, _POW_URL, deadline=time.monotonic() - 1) is None
+
+    def test_deadline_aborts_a_long_solve(self):
+        """This nonce has no 5-nibble solution in its first 300,000 counters
+        (checked offline), so a 20 ms budget must run out mid-loop."""
+        body = _pow_body(
+            challenge_nonce="00000000000000000000000000000003",
+            difficulty="5",
+            difficulty_char="b",
+        )
+        start = time.perf_counter()
+        assert solve_pow(body, _POW_URL, deadline=time.monotonic() + 0.02) is None
+        assert time.perf_counter() - start < 1.0
+
+    def test_no_deadline_solves(self):
+        assert solve_pow(_POW_BODY, _POW_URL) is not None
+
+    def test_parse_returns_fields(self):
+        fields = parse_pow_challenge(_POW_BODY)
+        assert fields["challenge_nonce"] == _POW_NONCE
+        assert fields["difficulty_char"] == "b"
+        assert fields["headless_check"] == "1"
+
+
+# ---------------------------------------------------------------------------
 # Retry Loop Integration (Sync)
 # ---------------------------------------------------------------------------
 
@@ -315,6 +532,74 @@ class TestACWSolverIntegration:
         # Solver failed → rotation → second request succeeds
         assert resp.text == "<html>real content</html>"
         assert mock.request_count == 2
+
+
+class TestPowSolverIntegration:
+    @patch("wafer._sync.time.sleep")
+    def test_pow_solved_inline_then_success(self, mock_sleep):
+        """The measured exchange: 202 gate, solve, replay on the same jar, 200."""
+        responses = [
+            MockResponse(
+                202,
+                {
+                    "server": "Varnish",
+                    "set-cookie": (
+                        f"pow_trace={_POW_NONCE}|{_POW_ISSUED}; "
+                        "domain=.redflagdeals.com; path=/; max-age=86400"
+                    ),
+                },
+                _POW_BODY,
+            ),
+            MockResponse(200, {}, "<html><title>thread</title></html>"),
+        ]
+        session, mock = make_sync_session(responses, use_cookie_jar=True)
+        resp = session.request("GET", _POW_URL)
+        assert resp.status_code == 200
+        assert resp.text == "<html><title>thread</title></html>"
+        assert resp.inline_solves == 1
+        assert mock.request_count == 2
+        # The jar holds both the gate's own pow_trace (banked from the 202's
+        # Set-Cookie, so the replay carries it) and the solved pow_bypass.
+        names = [c.split("=", 1)[0] for c, _ in mock.cookie_jar.added]
+        assert names == ["pow_trace", "pow_bypass"]
+        cookie_str, cookie_url = mock.cookie_jar.added[1]
+        assert cookie_str.startswith(
+            f"pow_bypass={_POW_NONCE}|{_POW_ISSUED}|90|{_POW_DIGEST}|{_POW_HMAC};"
+        )
+        assert "Domain=redflagdeals.com" in cookie_str
+        assert cookie_url == _POW_URL
+
+    @patch("wafer._sync.time.sleep")
+    def test_pow_cookie_persisted_with_page_expiry(self, mock_sleep, tmp_path):
+        """A real CookieCache: the solve survives a restart until cookie_duration."""
+        cache = CookieCache(cache_dir=str(tmp_path))
+        responses = [
+            MockResponse(202, {"server": "Varnish"}, _POW_BODY),
+            MockResponse(200, {}, "<html>thread</html>"),
+        ]
+        session, _ = make_sync_session(
+            responses, use_cookie_jar=True, cookie_cache=cache
+        )
+        before = time.time()
+        session.request("GET", _POW_URL)
+        entries = cache.load("forums.redflagdeals.com")
+        assert [e["name"] for e in entries] == ["pow_bypass"]
+        assert entries[0]["raw"].startswith(f"pow_bypass={_POW_NONCE}|")
+        assert entries[0]["url"] == _POW_URL
+        assert before + 3500 < entries[0]["expires"] < before + 3700
+
+    @patch("wafer._sync.time.sleep")
+    def test_pow_malformed_falls_through(self, mock_sleep):
+        """Detected but unsolvable: no cookie is written and the loop moves on."""
+        responses = [
+            MockResponse(202, {}, _pow_body(difficulty_char="z")),
+            MockResponse(200, {}, "<html>real content</html>"),
+        ]
+        session, mock = make_sync_session(responses, use_cookie_jar=True)
+        resp = session.request("GET", _POW_URL)
+        assert resp.text == "<html>real content</html>"
+        assert resp.inline_solves == 0
+        assert mock.cookie_jar.added == []
 
 
 class TestInlineSolveBudget:
@@ -502,6 +787,45 @@ class TestACWSolverIntegrationAsync:
         assert mock.request_count == 2
         assert len(mock.cookie_jar.added) == 1
         assert "acw_sc__v2=" in mock.cookie_jar.added[0][0]
+
+
+class TestPowSolverIntegrationAsync:
+    @pytest.mark.asyncio
+    @patch("wafer._async.asyncio.sleep")
+    async def test_pow_solved_inline_then_success(self, mock_sleep):
+        responses = [
+            MockResponse(202, {"server": "Varnish"}, _POW_BODY),
+            MockResponse(200, {}, "<html><title>thread</title></html>"),
+        ]
+        session, mock = make_async_session(responses, use_cookie_jar=True)
+        resp = await session.request("GET", _POW_URL)
+        assert resp.status_code == 200
+        assert resp.text == "<html><title>thread</title></html>"
+        assert resp.inline_solves == 1
+        assert mock.request_count == 2
+        assert len(mock.cookie_jar.added) == 1
+        cookie_str, _ = mock.cookie_jar.added[0]
+        assert cookie_str.startswith(
+            f"pow_bypass={_POW_NONCE}|{_POW_ISSUED}|90|{_POW_DIGEST}|{_POW_HMAC};"
+        )
+        assert "Max-Age=3600" in cookie_str
+
+    @pytest.mark.asyncio
+    @patch("wafer._async.asyncio.sleep")
+    async def test_pow_cookie_persisted_with_page_expiry(self, mock_sleep, tmp_path):
+        cache = CookieCache(cache_dir=str(tmp_path))
+        responses = [
+            MockResponse(202, {"server": "Varnish"}, _POW_BODY),
+            MockResponse(200, {}, "<html>thread</html>"),
+        ]
+        session, _ = make_async_session(
+            responses, use_cookie_jar=True, cookie_cache=cache
+        )
+        before = time.time()
+        await session.request("GET", _POW_URL)
+        entries = cache.load("forums.redflagdeals.com")
+        assert [e["name"] for e in entries] == ["pow_bypass"]
+        assert before + 3500 < entries[0]["expires"] < before + 3700
 
 
 class TestTMDSolverIntegrationAsync:

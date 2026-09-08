@@ -1,17 +1,22 @@
 """Inline challenge solvers -- pure Python, no browser needed.
 
 ACW: Alibaba Cloud WAF -- shuffle + XOR (~1ms)
+PoW: home-grown SHA-256 proof-of-work gate -- hash loop + cookie (~1ms)
 Amazon: Rate-limit captcha -- form parsing + submission (~100ms)
 TMD: Alibaba TMD -- session warming via homepage fetch
 Reddit: Logged-out verification form parsing + solution derivation
 """
 
+import hashlib
 import logging
 import re
+import time
 from dataclasses import dataclass, field
 from html import unescape
 from html.parser import HTMLParser
 from urllib.parse import urlencode, urljoin, urlparse
+
+from wafer._cookies import cookie_domain_matches, registrable_domain
 
 logger = logging.getLogger("wafer")
 
@@ -52,6 +57,239 @@ def solve_acw(body: str) -> str | None:
         )
         result.append(f"{xored:02x}")
     return "".join(result)
+
+
+# ── Proof-of-work gate ────────────────────────────────────────────────────────
+# A home-grown Varnish-fronted gate (measured on redflagdeals.com, both the
+# www and forums hosts) that answers every page with HTTP 202 and a <head>
+# holding one inline script. The script hashes ``nonce + issued_at + counter``
+# with SHA-256 until the hex digest starts with ``difficulty_char`` repeated
+# ``difficulty`` times, then writes a ``pow_bypass`` cookie and reloads. No
+# vendor, no browser, no CAPTCHA: pure computation, then replay on the same
+# jar. See docs/ref-pow.md.
+
+POW_COOKIE_NAME = "pow_bypass"
+
+# The measured page is 2,671 bytes and is nothing but the script. Anything
+# larger is a real document, and the cap also bounds how much of a body the
+# parser ever scans, so a hostile page cannot buy CPU with size.
+POW_MAX_PAGE_BYTES = 50_000
+
+# The page script gives up after 1e7 counters; there is no point outlasting
+# it. Difficulty is capped so a hostile or misconfigured page cannot ask for
+# work the ceiling rarely or never satisfies. Measured ~3M SHA-256/s here: 5
+# nibbles expects ~1M hashes (a third of a second) and the ceiling fails fewer
+# than 1 in 10,000 such solves, while 6 expects ~16.8M, more than the ceiling
+# itself, so it would spend the whole ceiling (~3 s) and then usually fail.
+_POW_MAX_ITERATIONS = 10_000_000
+_POW_MAX_DIFFICULTY = 5
+# How often the hash loop looks at the clock. With the preimage bounded to a
+# few hundred bytes this is well under a millisecond between checks.
+_POW_DEADLINE_STRIDE = 4096
+
+# ``[^{}]*`` cannot backtrack across braces, so a body stuffed with unclosed
+# ``POW_CHALLENGE_DATA={`` costs one short scan per occurrence, not one scan
+# to end-of-body each (the naive ``(.*?)\}`` form is quadratic).
+_POW_DATA_RE = re.compile(r"POW_CHALLENGE_DATA\s*=\s*\{([^{}]*)\}")
+# Detection form: the object must open inside a <script> element, with nothing
+# but script text between the tag and the assignment. Prose that quotes the
+# object, and an HTML-rendered doc whose tags are escaped, both fail this;
+# the real page is exactly ``<script>\n window.POW_CHALLENGE_DATA={``.
+# The attribute scan is bounded (``{0,512}``) so a body stuffed with ``<script``
+# and no ``>`` costs at most 512 chars per occurrence instead of a scan to
+# end-of-body each; with that, and ``[^<]*`` / ``[^{}]*`` unable to cross
+# their delimiters, every start position does bounded work.
+_POW_SCRIPT_RE = re.compile(
+    r"<script[^>]{0,512}>[^<]*POW_CHALLENGE_DATA\s*=\s*\{[^{}]*\}", re.IGNORECASE
+)
+_POW_FIELD_RE = re.compile(r"(\w+)\s*:\s*'([^']*)'")
+# Real values: nonce 32 hex, hmac 24 hex. Bounded so a page cannot hand back
+# a megabyte cookie, bloat the cache file, or stretch the hash preimage until
+# the deadline stride is no longer fine-grained.
+_POW_HEX_RE = re.compile(r"[0-9a-f]{16,128}\Z")
+_POW_NIBBLE_RE = re.compile(r"[0-9a-f]\Z")
+_POW_ISSUED_RE = re.compile(r"[0-9]{1,20}\Z")
+_POW_DIFFICULTY_RE = re.compile(r"[0-9]{1,2}\Z")
+_POW_DURATION_RE = re.compile(r"[0-9]{1,10}\Z")
+_POW_DOMAIN_RE = re.compile(r"\.?[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+\Z")
+# The page's cookie_duration is 3,600. Fallback when the field is absent or
+# zero (a zero-lifetime cookie would expire before the reload that needs it,
+# so the page cannot mean it), and a ceiling so a page cannot pin a cookie in
+# the cache for years.
+_POW_DEFAULT_MAX_AGE = 3600
+_POW_MAX_MAX_AGE = 86_400
+
+
+def is_pow_challenge(body: str) -> bool:
+    """True for a proof-of-work gate page.
+
+    Structural, not textual: the page must be small (the real one is 2.7 KB
+    and is only the script), open the ``POW_CHALLENGE_DATA`` object inside a
+    ``<script>`` element, and name the ``pow_bypass`` cookie. A page that
+    merely quotes the object - a bug report, this project's own docs, a forum
+    thread about the gate - has no script element wrapping it, and a real
+    document that embeds all of it fails the size cap.
+
+    The cookie name is required because it is what the solver writes: a
+    variant of this gate that names its cookie differently would be detected
+    and then "solved" with the wrong cookie, which is worse than the plain
+    replay the loop falls back to. Nothing else about the script's text is
+    assumed (not even how it reaches ``document.cookie``), so an obfuscation
+    pass over the script does not silently turn the gate back into content.
+    """
+    if len(body) > POW_MAX_PAGE_BYTES:
+        return False
+    if "POW_CHALLENGE_DATA" not in body or POW_COOKIE_NAME not in body:
+        return False
+    return _POW_SCRIPT_RE.search(body) is not None
+
+
+@dataclass(frozen=True)
+class PowSolution:
+    """A solved proof-of-work gate, ready to add to a cookie jar."""
+
+    cookie: str
+    """The full Set-Cookie string the page script would have written."""
+
+    name: str
+    """Cookie name (``pow_bypass``)."""
+
+    max_age: int
+    """Cookie lifetime in seconds, from the page's ``cookie_duration``."""
+
+    iterations: int
+    """The counter that produced the winning digest."""
+
+
+def parse_pow_challenge(body: str) -> dict[str, str] | None:
+    """Extract and validate the ``POW_CHALLENGE_DATA`` object from a gate page.
+
+    Returns the field map, or ``None`` if the object is missing or any field
+    the solve depends on is malformed. Validation is strict on purpose: the
+    values are concatenated into a hash preimage and echoed into a cookie, so
+    anything that is not the shape the real script produces is refused rather
+    than guessed at. Only the first ``POW_MAX_PAGE_BYTES`` are scanned.
+    """
+    m = _POW_DATA_RE.search(body[:POW_MAX_PAGE_BYTES])
+    if not m:
+        return None
+    fields = dict(_POW_FIELD_RE.findall(m.group(1)))
+    nonce = fields.get("challenge_nonce", "")
+    hmac = fields.get("challenge_hmac", "")
+    issued_at = fields.get("issued_at", "")
+    difficulty = fields.get("difficulty", "")
+    difficulty_char = fields.get("difficulty_char", "")
+    if not _POW_HEX_RE.match(nonce) or not _POW_HEX_RE.match(hmac):
+        return None
+    if not _POW_ISSUED_RE.match(issued_at):
+        return None
+    if not _POW_DIFFICULTY_RE.match(difficulty) or not (
+        1 <= int(difficulty) <= _POW_MAX_DIFFICULTY
+    ):
+        return None
+    # The digest is lower-case hex, so any other prefix character can never
+    # match and the loop would spin to the ceiling for nothing.
+    if not _POW_NIBBLE_RE.match(difficulty_char):
+        return None
+    duration = fields.get("cookie_duration", "")
+    if duration and not _POW_DURATION_RE.match(duration):
+        return None
+    domain = fields.get("cookie_domain", "")
+    if domain and not _POW_DOMAIN_RE.match(domain):
+        return None
+    return fields
+
+
+def _pow_cookie_domain(cookie_domain: str, url: str) -> str | None:
+    """The ``Domain`` attribute to write, or ``None`` for a host-only cookie.
+
+    The page names its own parent domain (``.redflagdeals.com``), which is
+    what lets one solve cover both the www and forums hosts. It is honoured
+    only when the request host is that domain or under it AND the domain is
+    at or below the host's registrable domain. wreq's jar does NOT enforce a
+    public-suffix boundary (measured: it accepts ``Domain=co.uk`` from
+    ``evil.co.uk``), so without the second check a page on a shared suffix
+    such as ``github.io`` could plant a cookie every sibling site receives.
+    Anything refused degrades to a host-only cookie, which the gate accepts.
+    """
+    host = (urlparse(url).hostname or "").lower().rstrip(".")
+    domain = cookie_domain.lower().lstrip(".").rstrip(".")
+    if not host or not domain:
+        return None
+    if host != domain and not host.endswith("." + domain):
+        return None
+    if not cookie_domain_matches(domain, registrable_domain(host)):
+        return None
+    return domain
+
+
+def solve_pow(
+    body: str, url: str, deadline: float | None = None
+) -> PowSolution | None:
+    """Solve a proof-of-work gate page. Returns the cookie to replay with.
+
+    Mirrors the page script exactly: counter as decimal text from 1, preimage
+    ``nonce + issued_at + counter`` with no separator, lower-case hex SHA-256,
+    prefix comparison. The cookie carries the five fields the script writes
+    for a clean browser (``nonce|issued_at|counter|digest|hmac``) and no
+    trailing signals field - the script only appends one when a headless
+    signal fires, so a sixth field is a shape a passing browser never sends.
+
+    ``deadline`` is a ``time.monotonic()`` instant; the loop returns ``None``
+    once it passes. ``None`` is also returned if the page is malformed or the
+    script's own 1e7 ceiling is reached.
+    """
+    fields = parse_pow_challenge(body)
+    if fields is None:
+        logger.debug("PoW gate page present but POW_CHALLENGE_DATA malformed")
+        return None
+    nonce = fields["challenge_nonce"]
+    issued_at = fields["issued_at"]
+    prefix = fields["difficulty_char"] * int(fields["difficulty"])
+    seed = (nonce + issued_at).encode()
+
+    counter = 0
+    digest = None
+    while counter < _POW_MAX_ITERATIONS:
+        if (
+            deadline is not None
+            and counter % _POW_DEADLINE_STRIDE == 0
+            and time.monotonic() >= deadline
+        ):
+            logger.debug("PoW solve abandoned at counter %d: deadline", counter)
+            return None
+        counter += 1
+        h = hashlib.sha256(seed + str(counter).encode()).hexdigest()
+        if h.startswith(prefix):
+            digest = h
+            break
+    if digest is None:
+        logger.debug("PoW solve hit the %d-iteration ceiling", _POW_MAX_ITERATIONS)
+        return None
+
+    value = "|".join(
+        (nonce, issued_at, str(counter), digest, fields["challenge_hmac"])
+    )
+    duration = fields.get("cookie_duration", "")
+    max_age = int(duration) if duration else 0
+    if max_age <= 0:
+        max_age = _POW_DEFAULT_MAX_AGE
+    max_age = min(max_age, _POW_MAX_MAX_AGE)
+    parts = [f"{POW_COOKIE_NAME}={value}"]
+    domain = _pow_cookie_domain(fields.get("cookie_domain", ""), url)
+    if domain:
+        parts.append(f"Domain={domain}")
+    parts.append("Path=/")
+    parts.append(f"Max-Age={max_age}")
+    parts.append("SameSite=Lax")
+    if urlparse(url).scheme == "https":
+        parts.append("Secure")
+    return PowSolution(
+        cookie="; ".join(parts),
+        name=POW_COOKIE_NAME,
+        max_age=max_age,
+        iterations=counter,
+    )
 
 
 # ── Amazon Captcha Parser ─────────────────────────────────────────────────────

@@ -20,7 +20,7 @@ pip install wafer-py[browser]   # core + browser solving
 **Core** (`wafer-py`) provides the TLS client with wreq browser emulations,
 automatic challenge detection, retry with fingerprint rotation, cookie caching,
 rate limiting, and inline solving for challenges that don't need JavaScript
-(ACW, Amazon CAPTCHA, TMD, Reddit).
+(ACW, a SHA-256 proof-of-work gate, Amazon CAPTCHA, TMD, Reddit).
 
 **Browser** (`wafer-py[browser]`) adds a real Chrome browser solver for
 challenges that require JavaScript execution (Cloudflare Turnstile, DataDome,
@@ -873,7 +873,7 @@ These are all automatic. Do not write code to handle these yourself:
 
 ## Challenge Types
 
-Wafer detects 20 WAF/challenge types automatically. When a challenge cannot be
+Wafer detects 21 WAF/challenge types automatically. When a challenge cannot be
 solved, `ChallengeDetected.challenge_type` and `resp.challenge_type` contain
 one of these strings:
 
@@ -888,6 +888,8 @@ one of these strings:
 "radware"      - Radware Bot Manager / ShieldSquare (solved inline, no browser needed)
 "awswaf"       - AWS WAF
 "acw"          - Alibaba Cloud WAF (solved inline, no browser needed)
+"pow"          - home-grown SHA-256 proof-of-work gate, served as HTTP 202
+                 (redflagdeals.com; solved inline, no browser needed)
 "tmd"          - Alibaba TMD (inline warm-up; browser for Baxia/reCAPTCHA)
 "amazon"       - Amazon CAPTCHA (solved inline, no browser needed)
 "reddit"       - Reddit cold-session JSON/HTML gate (inline first; optional browser recovery)
@@ -916,8 +918,8 @@ a score token, not a visible challenge, and is minted browser-free via
 `session.mint_recaptcha_v3(...)` (see "reCAPTCHA v3 token minting").
 `"vercel"`/`"generic_js"` also get the generic browser JS-wait (no
 dedicated solver, but it passes their passive JS checks). The inline set
-(`acw`, `tmd`, `amazon`, `reddit`, `radware`) needs no browser for its normal
-path.
+(`acw`, `pow`, `tmd`, `amazon`, `reddit`, `radware`) needs no browser for its
+normal path.
 
 Radware serves its captcha interstitial as a plain HTTP 200 from its own host
 (`validate.perfdrive.com`) after a redirect off the origin, so a Radware block
@@ -935,6 +937,18 @@ the origin's 3xx into `perfdrive.com`, recognizes it, and replays the original
 URL from the clearance that redirect carries. The session returns the real page
 rather than the redirect, and Radware's host is never contacted. Redirects to
 any other host are returned to the caller unchanged.
+
+A proof-of-work gate (`"pow"`) is served as a plain HTTP **202** with a
+2.7 KB body that is only a script, so by status code it looks like success and
+by content it looks like an empty page. wafer solves the SHA-256 puzzle inline
+(hundreds of hashes at the measured difficulty, no sub-request), sets the
+`pow_bypass` cookie the script would have written, and replays the same URL.
+The cookie is scoped to the parent domain the page names (`.redflagdeals.com`)
+for the page's `cookie_duration` (an hour, measured), so one solve covers every
+host of the site, and with `cache_dir` it survives process restarts until it
+expires. A
+gate that keeps re-serving the puzzle after the solve raises `ChallengeDetected`
+with `challenge_type == "pow"` rather than returning the script page as content.
 
 A challenged POST is replayed as the same POST, with its body and headers
 intact. Radware's own host is only ever sent the bodyless GET that a redirect

@@ -1,6 +1,7 @@
 """Tests for challenge detection."""
 
 import pathlib
+import time
 
 import pytest
 
@@ -803,6 +804,128 @@ class TestACW:
 
 
 # ---------------------------------------------------------------------------
+# Proof-of-work gate (redflagdeals.com)
+# ---------------------------------------------------------------------------
+
+# The page as served on 2026-09-07: 202, one inline script, nothing else.
+_POW_GATE_BODY = """<!DOCTYPE html><html><head><script>
+window.POW_CHALLENGE_DATA={
+    challenge_nonce:'e68a8b5e136aad05bdb6de05fbe2db98',
+    challenge_hmac:'ba7e6328f78b8507c9141730',
+    difficulty:'2',
+    difficulty_char:'b',
+    issued_at:'1788821011',
+    cookie_duration:'3600',
+    cookie_domain:'.redflagdeals.com',
+    referrer:'(null)',
+    headless_check:'1'
+};
+(async(d=window.POW_CHALLENGE_DATA)=>{let i=0;while(i++<1e7){
+let u=i.toString(),c=await f(d.challenge_nonce+d.issued_at+u);
+if(c.startsWith(d.difficulty_char.repeat(d.difficulty))){
+document.cookie='pow_bypass='+d.challenge_nonce+'|'+d.issued_at+'|'+u
++'|'+c+'|'+d.challenge_hmac+'; domain='+d.cookie_domain
++'; path=/; max-age='+d.cookie_duration+'; SameSite=Lax; Secure';
+location.reload();break}}})()
+</script></head><body><noscript><h1>JavaScript Required</h1></noscript></body></html>"""
+
+_POW_GATE_HEADERS = {
+    "server": "Varnish",
+    "content-type": "text/html; charset=utf-8",
+    "cache-control": "no-store, private",
+    "set-cookie": (
+        "pow_trace=e68a8b5e136aad05bdb6de05fbe2db98|1788821011; "
+        "domain=.redflagdeals.com; path=/; max-age=86400; SameSite=Lax; Secure"
+    ),
+}
+
+
+class TestPow:
+    def test_202_gate_page(self):
+        """The measured shape: a clean 202 that every status check reads as success."""
+        assert (
+            detect_challenge(202, _POW_GATE_HEADERS, _POW_GATE_BODY)
+            == ChallengeType.POW
+        )
+
+    def test_status_agnostic(self):
+        for status in (200, 202, 403, 429, 503):
+            assert detect_challenge(status, {}, _POW_GATE_BODY) == ChallengeType.POW
+
+    def test_headers_alone_do_not_detect(self):
+        """pow_trace is only a trace cookie; without the script there is no puzzle."""
+        assert detect_challenge(202, _POW_GATE_HEADERS, "<html></html>") is None
+
+    def test_marker_requires_nonce_field(self):
+        body = "<script>if (window.POW_CHALLENGE_DATA) {}</script>"
+        assert detect_challenge(200, {}, body) is None
+
+    def test_real_page_after_solve_not_redetected(self):
+        """A thread that discusses the gate quotes its markers but is not it."""
+        body = (
+            "<html><head><title>RFD now has a POW_CHALLENGE_DATA gate?"
+            " - RedFlagDeals.com Forum</title></head><body>"
+            "<p>The script reads challenge_nonce and writes pow_bypass with"
+            " document.cookie, then reloads.</p>"
+            + "<p>post</p>" * 500
+            + "</body></html>"
+        )
+        assert detect_challenge(200, {"server": "Varnish"}, body) is None
+
+    def test_page_quoting_the_object_not_detected(self):
+        """Prose that pastes the data object (a bug report) is not the gate."""
+        body = (
+            "<html><body><pre>window.POW_CHALLENGE_DATA={challenge_nonce:'ab',"
+            "issued_at:'1'};</pre><p>and then it sets pow_bypass via"
+            " document.cookie</p></body></html>"
+        )
+        assert detect_challenge(200, {}, body) is None
+
+    def test_obfuscated_cookie_write_still_detected(self):
+        """Detection must not hinge on how the script reaches document.cookie."""
+        body = _POW_GATE_BODY.replace("document.cookie", 'document["coo"+"kie"]')
+        assert detect_challenge(202, {}, body) == ChallengeType.POW
+
+    def test_unclosed_script_tags_are_bounded(self):
+        hostile = "pow_bypass POW_CHALLENGE_DATA " + "<script" * 6_000
+        assert len(hostile) < 50_000
+        start = time.perf_counter()
+        assert detect_challenge(202, {}, hostile) is None
+        assert time.perf_counter() - start < 0.5
+
+    def test_escaped_script_tag_not_detected(self):
+        """An HTML-rendered doc escapes the tag, so the object is not in a script."""
+        body = _POW_GATE_BODY.replace("<script>", "&lt;script&gt;")
+        assert detect_challenge(202, {}, body) is None
+
+    def test_own_reference_doc_not_detected(self):
+        """docs/ref-pow.md quotes the object and the cookie name verbatim."""
+        doc = (pathlib.Path(__file__).parent.parent / "docs" / "ref-pow.md").read_text()
+        assert "POW_CHALLENGE_DATA" in doc and "pow_bypass" in doc
+        assert detect_challenge(200, {"content-type": "text/html"}, doc) is None
+
+    def test_large_document_embedding_the_script_not_detected(self):
+        body = _POW_GATE_BODY.replace(
+            "</body>", "<div>" + "x" * 60_000 + "</div></body>"
+        )
+        assert detect_challenge(202, {}, body) is None
+
+    def test_hostile_body_is_linear(self):
+        """Unclosed data objects must not make detection quadratic."""
+        hostile = "pow_bypass document.cookie " + (
+            "<script>POW_CHALLENGE_DATA={" * 1_500
+        )
+        assert len(hostile) < 50_000
+        start = time.perf_counter()
+        assert detect_challenge(202, {}, hostile) is None
+        assert time.perf_counter() - start < 0.5
+
+    def test_not_in_js_only_set(self):
+        """Pure computation: never routed to the browser or raised as JS-only."""
+        assert ChallengeType.POW not in JS_ONLY_CHALLENGES
+
+
+# ---------------------------------------------------------------------------
 # TMD (Alibaba)
 # ---------------------------------------------------------------------------
 
@@ -1191,6 +1314,10 @@ class TestDetectionPriority:
         """ACW detection should fire before generic JS fallback."""
         body = "<script>var arg1='abc'; acw_sc__v2('test');</script>"
         assert detect_challenge(403, {}, body) == ChallengeType.ACW
+
+    def test_pow_before_generic_js(self):
+        """A PoW gate on 403 is the puzzle, not an unclassified JS page."""
+        assert detect_challenge(403, {}, _POW_GATE_BODY) == ChallengeType.POW
 
     def test_specific_waf_before_generic(self):
         """Specific WAF detection should fire before generic JS."""

@@ -185,6 +185,20 @@ stopped challenging this egress altogether, and cold sessions now return the
 real page on the first request. Not reproducing the block does not mean the
 solver broke -it needs an egress without recent standing.
 
+
+### Proof-of-work gate (home-grown)
+
+The gate answers HTTP **202** with a 2.7 KB body that is only a script, on
+every page of both hosts; feeds and `robots.txt` are exempt. wafer solves the
+SHA-256 puzzle inline and replays. See `docs/ref-pow.md`.
+
+| URL | Challenge Type | Status | Notes |
+|---|---|---|---|
+| `forums.redflagdeals.com/viewtopic.php?t=2789391` | PoW gate | pass | 2026-09-07: cold `wafer.get()` -> 202 gate (fresh nonce, `pow_trace` set) -> inline solve (90 hashes) -> replay -> 200 180KB phpBB thread. No browser. `inline_solves == 1` |
+| `www.redflagdeals.com/` | PoW gate | pass | 2026-09-07: 200 528KB on the same jar with no re-solve; the `.redflagdeals.com` cookie from the forums solve covers the front page. Cold async session also 200 with one solve |
+| `forums.redflagdeals.com/feed/forum/9` | PoW gate (exempt route) | pass | 2026-09-07: 200 Atom 20KB, no challenge issued. Negative control: `pow_trace`-less, no script, correctly not detected |
+| `forums.redflagdeals.com/robots.txt` | PoW gate (exempt route) | pass | 2026-09-07: 200, no challenge issued |
+
 ### Unknown / Other
 
 | URL | Challenge Type | Status | Notes |

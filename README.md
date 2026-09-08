@@ -63,7 +63,7 @@ resp.elapsed        # float -seconds from request to response
 resp.was_retried    # bool -True if retries/rotations were used
 resp.retries        # int -normal retries used (5xx, connection errors)
 resp.rotations      # int -fingerprint rotations used (403/challenge)
-resp.inline_solves  # int -inline challenge solves used (ACW, Amazon, TMD, Reddit)
+resp.inline_solves  # int -inline challenge solves used (ACW, PoW, Amazon, TMD, Reddit)
 resp.challenge_type # str | None -WAF challenge type if detected
 resp.needs_render   # bool -body is HTML that ships script but under 1000 chars
                     #   of visible text, i.e. a client-rendered shell. A hint
@@ -343,7 +343,7 @@ and limitations.
 
 ## Challenge Detection
 
-Wafer detects 20 WAF challenge types from response status, headers, and body.
+Wafer detects 21 WAF challenge types from response status, headers, and body.
 **Detection is not the same as solving** - the "Solved by" column shows how each
 type is actually handled: `inline` (over HTTP, no browser), `browser` (needs a
 configured `browser_solver`), or `detect-only` (raises `ChallengeDetected`; no
@@ -361,6 +361,7 @@ solver - you must handle it yourself).
 | Radware Bot Manager | Radware sensor plus a captcha-template marker (`captcha.perfdrive.com`, `SSJSInternal`); served as a plain 200 | inline (clearance replay) |
 | AWS WAF | `aws-waf-token` cookie, `AwsWafIntegration` script | browser |
 | ACW (Alibaba) | `acw_sc__v2` challenge script | inline |
+| Proof-of-work gate | `POW_CHALLENGE_DATA` script, served as a plain HTTP 202 (redflagdeals.com) | inline (SHA-256 solve) |
 | TMD | TMD session validation pattern | inline (+ browser slider) |
 | Amazon | CAPTCHA page with `amzn` markers | inline |
 | Reddit | cold-session JSON block or 200 HTML verification | inline first; optional browser cookie recovery |
@@ -373,8 +374,8 @@ solver - you must handle it yourself).
 | Cloudflare WAF block | Error 1020 / IP-ban page: `cf.errors.css` present, `challenge-platform` absent | **terminal** -raises `RequestBlocked` at once, no retry or rotation |
 
 When a challenge is detected, wafer escalates automatically:
-1. Inline solving/warm-up (ACW, Amazon, Reddit, Radware, and the first TMD
-   warm-up)
+1. Inline solving/warm-up (ACW, PoW, Amazon, Reddit, Radware, and the first
+   TMD warm-up)
 2. For Imperva, a native OpenSSL transport that TLS-fingerprinting sites
    free-pass (no browser - see [Imperva bypass](#imperva--incapsula-no-browser-bypass))
 3. Browser solver if configured (JS challenges: Cloudflare, DataDome, reCAPTCHA,
@@ -388,11 +389,17 @@ Wafer raises `RequestBlocked` on the first response, spending no budget.
 
 ## Inline Solvers
 
-Four challenge types have an inline path that does not require a browser.
+Five challenge types have an inline path that does not require a browser.
 Reddit can optionally fall back to the configured browser if its strict inline
 bootstrap fails:
 
 - **ACW (Alibaba Cloud WAF)** -Extracts the obfuscated cookie value from the challenge page JavaScript, computes the XOR-shuffle, and sets the `acw_sc__v2` cookie.
+- **Proof-of-work gate** -A home-grown SHA-256 puzzle (redflagdeals.com) served
+  as a clean HTTP 202 whose body is one script. wafer reads the nonce,
+  difficulty and HMAC from the page, runs the same hash loop the script would,
+  sets the `pow_bypass` cookie for the page's `cookie_duration` on its
+  `cookie_domain`, and replays. One solve covers every host of the site for an
+  hour and is persisted to the cookie cache with that expiry.
 - **Amazon CAPTCHA** -Parses the captcha form and submits it programmatically.
 - **TMD (Alibaba TMD)** -First warms the session by fetching the homepage.
   If the issued punishment flow persists, the configured browser handles its
@@ -940,8 +947,8 @@ wafer/
   _sync.py          # SyncSession -wraps wreq.blocking.Client
   _async.py         # AsyncSession -wraps wreq.Client
   _response.py      # WaferResponse wrapper
-  _challenge.py     # Challenge detection (20 WAF types)
-  _solvers.py       # Inline solvers (ACW, Amazon, TMD, Reddit)
+  _challenge.py     # Challenge detection (21 WAF types)
+  _solvers.py       # Inline solvers (ACW, PoW, Amazon, TMD, Reddit)
   _cookies.py       # JSON disk cache with TTL and LRU
   _fingerprint.py   # Emulation profiles, sec-ch-ua generation
   _profiles.py      # Profile enum (OPERA_MINI, SAFARI, IOS_SAFARI, DART)

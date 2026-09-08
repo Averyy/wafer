@@ -81,6 +81,7 @@ from wafer._solvers import (
     reddit_solve_origin,
     reddit_submission_url,
     solve_acw,
+    solve_pow,
     tmd_homepage_url,
 )
 
@@ -487,6 +488,40 @@ class SyncSession(BaseSession):
                             ],
                         )
                 logger.info("ACW challenge solved inline")
+                return True
+
+        elif challenge == ChallengeType.POW:
+            # Pure computation like ACW, but the hash loop is bounded by the
+            # caller's deadline: difficulty is data the page chooses, so the
+            # work is not known to be trivial until the page has been read.
+            solution = solve_pow(body, url, deadline)
+            if solution:
+                self._record_cookie_scope(solution.cookie, url)
+                self._client.cookie_jar.add(solution.cookie, url)
+                # The page sets the cookie for cookie_duration seconds (an
+                # hour, measured) on the parent domain it names, so one solve
+                # covers every host of the site. Persist it with that expiry
+                # rather than as a session cookie, which the cache drops on
+                # load. The cache file is keyed by request host; hydration
+                # loads every domain file, so the sibling host finds it.
+                if self._cookie_cache:
+                    domain = extract_domain(url)
+                    if domain:
+                        self._cookie_cache.save(
+                            domain,
+                            [
+                                {
+                                    "name": solution.name,
+                                    "raw": solution.cookie,
+                                    "url": url,
+                                    "expires": time.time() + solution.max_age,
+                                    "last_used": time.time(),
+                                }
+                            ],
+                        )
+                logger.info(
+                    "PoW challenge solved inline (%d hashes)", solution.iterations
+                )
                 return True
 
         elif challenge == ChallengeType.AMAZON:

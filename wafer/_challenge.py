@@ -1,10 +1,10 @@
-"""Challenge detection for 20 WAF types.
+"""Challenge detection for 21 WAF types.
 
 Pure logic, no I/O. Inspects status code, headers, and body to identify
 which WAF/challenge system is blocking a request.
 
 Detection order is intentional:
-1. Inline-solvable challenges first (ACW, TMD, Amazon, Reddit)
+1. Inline-solvable challenges first (ACW, PoW, TMD, Amazon, Reddit)
 2. Browser-solvable challenges next (Cloudflare, Akamai, DataDome, etc.)
 3. Generic JS fallback last
 """
@@ -13,7 +13,7 @@ import enum
 import logging
 from urllib.parse import urlparse
 
-from wafer._solvers import is_reddit_verification
+from wafer._solvers import is_pow_challenge, is_reddit_verification
 
 logger = logging.getLogger("wafer")
 
@@ -148,6 +148,7 @@ class ChallengeType(enum.Enum):
     RADWARE = "radware"
     AWSWAF = "awswaf"
     ACW = "acw"
+    POW = "pow"
     TMD = "tmd"
     AMAZON = "amazon"
     REDDIT = "reddit"
@@ -362,6 +363,18 @@ def detect_challenge(
     if "acw_sc__v2" in body and "arg1" in body:
         logger.info("Challenge detected: acw")
         return ChallengeType.ACW
+
+    # Proof-of-work gate — a home-grown SHA-256 puzzle served as a clean
+    # HTTP 202 (redflagdeals.com, both hosts). The status is deliberately not
+    # checked: to every status-based test the page is a success, which is
+    # exactly how it slipped past the 403/429-gated generic-JS arm below and
+    # reached callers as an empty document. The check is structural (small
+    # body, the data object with its braces, the cookie write) so a page that
+    # merely quotes the script - a bug report, docs/ref-pow.md itself - is not
+    # taken for the gate.
+    if is_pow_challenge(body):
+        logger.info("Challenge detected: pow")
+        return ChallengeType.POW
 
     # TMD (Alibaba) — punish page, status 200
     if status_code == 200 and "/_____tmd_____/punish" in body:
