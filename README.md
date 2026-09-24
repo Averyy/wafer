@@ -69,7 +69,7 @@ resp.needs_render   # bool -body is HTML that ships script but under 1000 chars
                     #   of visible text, i.e. a client-rendered shell. A hint
                     #   for deciding to call session.render(url)
 resp.emulation      # str | None -the identity that served this response, for
-                    #   diagnosing a 403 (e.g. "Profile.Chrome149", "safari")
+                    #   diagnosing a 403 (e.g. "Profile.Chrome153", "safari")
 ```
 
 To read the session's *accumulated* cookie state (not just one response's
@@ -99,7 +99,7 @@ from wreq import Emulation
 
 session = SyncSession(
     # TLS fingerprint (defaults to newest Chrome)
-    emulation=None,  # or Emulation.Chrome149
+    emulation=None,  # or Emulation.Chrome153
     profile=None,    # or Profile.SAFARI / IOS_SAFARI / DART / OPERA_MINI
     safari_locale="us",  # "us" or "ca" for Safari profiles
     headers=None,    # optional complete replacement for DEFAULT_HEADERS
@@ -205,7 +205,7 @@ session = SyncSession()
 
 # Specific profile
 from wreq import Emulation
-session = SyncSession(emulation=Emulation.Chrome149)
+session = SyncSession(emulation=Emulation.Chrome153)
 ```
 
 The `sec-ch-ua` header is auto-generated to match the emulated Chrome version using the same GREASE algorithm as Chromium source.
@@ -254,10 +254,10 @@ from wreq import Emulation
 wafer.sec_ch_ua(147)                          # '"Google Chrome";v="147", ...'
 wafer.sec_ch_ua(147, brand="Microsoft Edge")  # Edge brand
 wafer.full_version(147)                       # "147.0.7727.24"
-wafer.chrome_full_version(Emulation.Chrome149)  # "149.0.7827.201"
+wafer.chrome_full_version(Emulation.Chrome153)  # "153.0.8010.53"
 wafer.emulation_family(Emulation.Edge148)     # "edge"
 wafer.emulation_is_mobile(Emulation.SafariIos26_2)  # True
-wafer.build_fingerprint_envelope(Emulation.Chrome149, user_agent="...")  # full dict
+wafer.build_fingerprint_envelope(Emulation.Chrome153, user_agent="...")  # full dict
 ```
 
 On a 403 or challenge, wafer rotates across browser families (Chrome ->
@@ -525,7 +525,7 @@ recovery and challenge-absent Cloudflare passthrough do not pin.
 ```python
 from wreq import Emulation
 session = SyncSession(
-    fingerprint_pool=[Emulation.Chrome149, Emulation.Firefox151, Emulation.Edge148],
+    fingerprint_pool=[Emulation.Chrome153, Emulation.Firefox151, Emulation.Edge148],
     max_rotations=6,  # bound how many pool steps one request may take
 )
 ```
@@ -565,7 +565,9 @@ Impersonate requests that originate from an iframe or fetch() call inside anothe
 
 ### XHR Mode (fetch/CORS)
 
-Emulates a modern `fetch()` call: `Sec-Fetch-Mode: cors`, `Sec-Fetch-Dest: empty`, `Accept: */*`, `Origin` from `embed_origin`, navigation headers stripped.
+Emulates a modern `fetch()` call: `Sec-Fetch-Mode: cors`, `Sec-Fetch-Dest: empty`, `Accept: */*`, `Origin` from `embed_origin`, no navigation headers (`Upgrade-Insecure-Requests`, `Cache-Control`, `Sec-Fetch-User`).
+
+In every embed mode wafer sends the complete header set, in the order the emulated browser (Chrome, Edge or Firefox) uses for that kind of request, captured from real browsers. The browser's navigation defaults are not mixed in.
 
 ```python
 session = SyncSession(
@@ -604,6 +606,8 @@ session = SyncSession(
 )
 resp = session.get("https://www.marinetraffic.com/widget")
 ```
+
+An iframe load is one made with the page (no `Sec-Fetch-User`); cross-site loads carry `Sec-Fetch-Storage-Access`.
 
 See [`docs/ref-sec-fetch.md`](docs/ref-sec-fetch.md) for exact header values set by each mode.
 

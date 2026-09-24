@@ -980,10 +980,10 @@ class AsyncSession(BaseSession):
         # AND its UA/client-hints (Cloudflare cf_clearance, DataDome), so wafer
         # pins the closest Chrome emulation (for the TLS shape) and replays the
         # browser's EXACT UA + sec-ch-ua version. Patchright's Chromium is often
-        # newer than wreq's newest Emulation (e.g. Chrome 150 vs 149); adjacent
-        # Chrome majors are wire-identical on JA4/H2, so this is coherent — and
-        # required, or the freshly minted cookie is rejected on the first replay
-        # and the session rotates away from the identity the cookie belongs to.
+        # newer than wreq's newest Emulation; the UA/hints must follow it anyway,
+        # or the freshly minted cookie is rejected on the first replay and the
+        # session rotates away from the identity the cookie belongs to. (The TLS
+        # can then lag the browser's; see FingerprintManager.pin_to_browser.)
         # Skip Imperva (its token rides an unpinned wreq/native path — see
         # below), Reddit (its anonymous cookies are not UA-bound, and a
         # session-wide pin would disable the fallback rotation escape hatch),

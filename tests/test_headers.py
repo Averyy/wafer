@@ -701,3 +701,167 @@ class TestIframeEmbedMode:
 
         headers = mock.last_kwargs.get("headers", {})
         assert "X-Requested-With" not in headers
+
+
+# ---------------------------------------------------------------------------
+# Embed mode owns its full header set (wreq's navigation headers are off)
+# ---------------------------------------------------------------------------
+
+
+class TestEmbedOwnedHeaders:
+    """In embed mode wafer turns off wreq's per-profile header set, which is a
+    top-level navigation (it carries Upgrade-Insecure-Requests and, since wreq
+    0.12.2, Sec-Fetch-User), and supplies every header plus the captured
+    browser order itself."""
+
+    @staticmethod
+    def _session(embed, **kwargs):
+        from wafer import SyncSession
+
+        return SyncSession(
+            embed=embed, embed_origin="https://widget-host.example", **kwargs
+        )
+
+    @pytest.mark.parametrize(
+        "embed,expected", [(None, True), ("xhr", False), ("iframe", False)]
+    )
+    def test_wreq_header_set_off_only_in_embed(self, monkeypatch, embed, expected):
+        import wafer._base as base
+
+        seen = []
+        real = base.wreq_emulation
+
+        def recording(profile, *, default_headers=True):
+            seen.append(default_headers)
+            return real(profile, default_headers=default_headers)
+
+        monkeypatch.setattr(base, "wreq_emulation", recording)
+        from wafer import SyncSession
+
+        if embed is None:
+            SyncSession()._build_client_kwargs()
+        else:
+            self._session(embed)._build_client_kwargs()
+        assert seen and seen[-1] is expected
+
+    def test_navigation_keeps_wreq_default_headers(self):
+        from wreq import Emulation
+
+        from wafer import SyncSession
+
+        kwargs = SyncSession()._build_client_kwargs()
+        assert isinstance(kwargs["emulation"], Emulation)
+        assert "orig_headers" not in kwargs
+
+    @pytest.mark.parametrize("embed", ["xhr", "xhr-jquery"])
+    def test_xhr_sends_no_navigation_headers(self, embed):
+        kwargs = self._session(embed)._build_client_kwargs()
+        names = {k.lower() for k in kwargs["headers"]}
+        assert "upgrade-insecure-requests" not in names
+        assert "cache-control" not in names
+        assert "sec-fetch-user" not in names
+        assert kwargs["headers"]["Priority"] == "u=1, i"
+
+    def test_xhr_supplies_what_wreq_used_to(self):
+        from wafer import SyncSession
+        from wafer._base import DEFAULT_EMULATION
+        from wafer._fingerprint import emulation_user_agent
+
+        headers = self._session("xhr")._build_client_kwargs()["headers"]
+        assert headers["User-Agent"] == emulation_user_agent(DEFAULT_EMULATION)
+        assert headers["Accept"] == "*/*"
+        assert headers["Accept-Encoding"] == "gzip, deflate, br, zstd"
+        # A session whose headers= left out Accept-Encoding still sends one.
+        bare = SyncSession(
+            headers={"Accept-Language": "fr-FR"},
+            embed="xhr",
+            embed_origin="https://widget-host.example",
+        )
+        filled = bare._build_client_kwargs()["headers"]
+        assert filled["Accept-Encoding"] == "gzip, deflate, br, zstd"
+        assert filled["Accept-Language"] == "fr-FR"
+
+    def test_chrome_fetch_order(self):
+        order = self._session("xhr")._build_client_kwargs()["orig_headers"]
+        # Google Chrome 153 fetch(), captured 2026-09-24.
+        assert order[:8] == [
+            "Content-Length", "sec-ch-ua-platform", "User-Agent", "sec-ch-ua",
+            "Content-Type", "sec-ch-ua-mobile", "Accept", "Origin",
+        ]
+        assert order[-3:] == ["Accept-Language", "Cookie", "Priority"]
+
+    def test_chrome_jquery_order_puts_x_requested_with_second(self):
+        order = self._session("xhr-jquery")._build_client_kwargs()["orig_headers"]
+        assert order[1:3] == ["sec-ch-ua-platform", "X-Requested-With"]
+
+    def test_iframe_is_an_unactivated_frame_load(self):
+        kwargs = self._session("iframe")._build_client_kwargs()
+        names = {k.lower() for k in kwargs["headers"]}
+        assert kwargs["headers"]["Upgrade-Insecure-Requests"] == "1"
+        assert kwargs["headers"]["Priority"] == "u=0, i"
+        assert "sec-fetch-user" not in names
+        assert "Sec-Fetch-Storage-Access" in kwargs["orig_headers"]
+
+    def test_iframe_storage_access_only_cross_site(self):
+        session = self._session("iframe")
+        cross = session._build_headers("https://other-site.example/w")
+        same = session._build_headers("https://www.widget-host.example/w")
+        assert cross["Sec-Fetch-Storage-Access"] == "active"
+        assert "Sec-Fetch-Storage-Access" not in same
+
+    def test_firefox_rung_uses_firefox_shape(self):
+        from wreq import Emulation
+
+        xhr = self._session("xhr", emulation=Emulation.Firefox151)
+        kwargs = xhr._build_client_kwargs()
+        assert kwargs["headers"]["TE"] == "trailers"
+        assert kwargs["headers"]["Priority"] == "u=4"
+        assert "Firefox/151.0" in kwargs["headers"]["User-Agent"]
+        assert kwargs["orig_headers"][0] == "User-Agent"
+        assert kwargs["orig_headers"][-1] == "te"
+        # Firefox sends no Priority header on an XMLHttpRequest.
+        jq = self._session("xhr-jquery", emulation=Emulation.Firefox151)
+        assert "Priority" not in jq._build_client_kwargs()["headers"]
+        frame = self._session("iframe", emulation=Emulation.Firefox151)
+        cross = frame._build_headers("https://other-site.example/w")
+        assert cross["Sec-Fetch-Storage-Access"] == "none"
+
+    def test_session_headers_win(self):
+        session = self._session(
+            "xhr", headers={"User-Agent": "custom-ua", "Priority": "u=3"}
+        )
+        headers = session._build_client_kwargs()["headers"]
+        assert headers["User-Agent"] == "custom-ua"
+        assert headers["Priority"] == "u=3"
+
+    @pytest.mark.parametrize("embed", [None, "xhr"])
+    def test_empty_session_header_never_reaches_wreq(self, embed):
+        # wreq would send "" as an empty header; a session "" means "leave it
+        # off", and it still suppresses the auto-Referer.
+        from wafer import SyncSession
+        from wafer._base import DEFAULT_HEADERS
+
+        headers = dict(DEFAULT_HEADERS, **{"Cache-Control": "", "Referer": ""})
+        session = (
+            self._session(embed, headers=headers)
+            if embed
+            else SyncSession(headers=headers)
+        )
+        sent = session._build_client_kwargs()["headers"]
+        assert "Cache-Control" not in sent
+        assert "Referer" not in sent
+        session._record_url("https://example.com/a")
+        assert "Referer" not in session._build_headers("https://example.com/b")
+
+    def test_safari_profile_keeps_its_own_headers(self):
+        from wafer import Profile
+
+        kwargs = self._session("xhr", profile=Profile.SAFARI)._build_client_kwargs()
+        assert "emulation" not in kwargs
+        assert "orig_headers" not in kwargs
+
+    def test_suspended_embed_restores_navigation_headers(self):
+        session = self._session("xhr")
+        with session._embed_suspended():
+            assert "orig_headers" not in session._build_client_kwargs()
+        assert "orig_headers" in session._build_client_kwargs()

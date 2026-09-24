@@ -203,3 +203,77 @@ class TestAsyncGetCookie:
         assert (
             session.get_cookie("tok", "https://api.example.com") == "xyz"
         )
+
+
+class TestHostOnlyCookiesRealJar:
+    """Host-only cookies against wreq's real Jar.
+
+    Since wreq 0.12.2, ``Jar.get_all()`` reports a host-only cookie with
+    ``domain=None`` instead of the host that set it, which made every
+    host-only cookie invisible to get_cookie(). These run on the real jar
+    (not conftest's MockJar) so the next change in wreq's jar shows up here.
+    """
+
+    def test_wreq_reports_host_only_cookie_without_domain(self):
+        # Canary for the wreq behavior the code below compensates for.
+        session = SyncSession(cache_dir=None)
+        session.add_cookie("h=1; Path=/", "https://www.example.com/")
+        (cookie,) = session._client.cookie_jar.get_all()
+        assert cookie.domain is None
+
+    def test_host_only_cookie_visible_below_its_path(self):
+        session = SyncSession(cache_dir=None)
+        session.add_cookie("h=1; Path=/", "https://www.example.com/")
+        assert session.get_cookie("h", "https://www.example.com/a/b") == "1"
+
+    def test_same_named_host_only_cookies_stay_on_their_hosts(self):
+        session = SyncSession(cache_dir=None)
+        session.add_cookie("sid=www; Path=/", "https://www.example.com/")
+        session.add_cookie("sid=api; Path=/", "https://api.example.com/")
+        assert session.get_cookie("sid", "https://www.example.com/") == "www"
+        assert session.get_cookie("sid", "https://api.example.com/") == "api"
+        assert session.get_cookie("sid", "https://example.com/") is None
+        assert session.get_cookie("sid", "https://other.example.com/") is None
+
+    def test_host_only_beats_parent_domain_on_its_host(self):
+        session = SyncSession(cache_dir=None)
+        session.add_cookie(
+            "sid=parent; Domain=.example.com; Path=/", "https://example.com/"
+        )
+        session.add_cookie("sid=host; Path=/", "https://api.example.com/")
+        assert session.get_cookie("sid", "https://api.example.com/") == "host"
+        assert session.get_cookie("sid", "https://www.example.com/") == "parent"
+
+    def test_scope_summary_names_the_host_of_a_host_only_cookie(self):
+        session = SyncSession(cache_dir=None)
+        session.add_cookie("h=1; Path=/", "https://www.example.com/")
+        session.add_cookie("o=2; Path=/", "https://api.example.com/")
+        session.add_cookie("d=3; Domain=example.com; Path=/", "https://example.com/")
+        domains = {
+            entry["name"]: entry["domain"]
+            for entry in session.cookie_scope_summary("https://www.example.com/")
+        }
+        assert domains == {
+            "h": "www.example.com",
+            "o": "api.example.com",
+            "d": "example.com",
+        }
+
+    def test_async_session_resolves_host_only_cookie(self):
+        session = AsyncSession(cache_dir=None)
+        session.add_cookie("h=1; Path=/", "https://www.example.com/")
+        assert session.get_cookie("h", "https://www.example.com/") == "1"
+        assert session.get_cookie("h", "https://api.example.com/") is None
+
+    def test_same_host_collision_returns_the_cookie_sent_first(self):
+        # A host-only cookie and a Domain=<same host> cookie with one name and
+        # path both live under that host; the jar sends the earlier-created one
+        # first, and get_cookie returns that one in either creation order.
+        for first, second, expected in (
+            ("sid=dom; Domain=example.com; Path=/", "sid=host; Path=/", "dom"),
+            ("sid=host; Path=/", "sid=dom; Domain=example.com; Path=/", "host"),
+        ):
+            session = SyncSession(cache_dir=None)
+            session.add_cookie(first, "https://example.com/")
+            session.add_cookie(second, "https://example.com/")
+            assert session.get_cookie("sid", "https://example.com/") == expected

@@ -548,7 +548,7 @@ class TestSyncRetryLoop:
 class TestFingerprintPool:
     """Opt-in pool replaces the default ladder as the rotation source."""
 
-    POOL = [Emulation.Chrome149, Emulation.Firefox151, Emulation.Edge148]
+    POOL = [Emulation.Chrome153, Emulation.Firefox151, Emulation.Edge148]
 
     def test_pool_cycles_through_identities(self, mock_sleep):
         # Each rotation steps to the next pool member (not the family ladder).
@@ -610,7 +610,7 @@ class TestFingerprintPool:
         # _rotation_delay penalty climbs above the flat 1.0s.
         for r in range(1, len(self.POOL) + 1):
             session._advance_rotation(r)
-        # Back on pool[0] (Chrome149) which now has 1 strike -> penalty 2.0.
+        # Back on pool[0] (Chrome153) which now has 1 strike -> penalty 2.0.
         assert emulation_family(session._fingerprint.current) == "chrome"
         assert session._rotation_delay() == 2.0
 
@@ -1005,7 +1005,7 @@ class TestAsyncRetryLoop:
                 MockResponse(200, body="OK"),
             ],
             fingerprint_pool=[
-                Emulation.Chrome149,
+                Emulation.Chrome153,
                 Emulation.Firefox151,
                 Emulation.Edge148,
             ],

@@ -1781,6 +1781,19 @@ class TestRedditBootstrapDiagnostics:
         assert state["cookie_names"] == []
         assert state["has_cookie_evidence"] is False
 
+    def test_state_counts_host_only_reddit_cookies(self):
+        # wreq's jar reports a host-only cookie with no domain; the evidence
+        # check must still see one set by www.reddit.com, and still ignore one
+        # set by another host.
+        session, mock = make_sync_session([], use_cookie_jar=True)
+        mock.cookie_jar.add("loid=anon; Path=/", REDDIT_SOLVE_ORIGIN)
+        mock.cookie_jar.add("csv=2; Path=/", REDDIT_SOLVE_ORIGIN)
+        mock.cookie_jar.add("token_v2=t; Path=/", "https://www.example.com/")
+
+        state = session.reddit_bootstrap_state()
+        assert state["cookie_names"] == ["csv", "loid"]
+        assert state["has_cookie_evidence"] is True
+
     @pytest.mark.asyncio
     @patch("wafer._async.asyncio.sleep")
     async def test_async_records_the_same_branch_labels(

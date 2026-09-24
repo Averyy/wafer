@@ -47,11 +47,25 @@ Sec-Fetch-User, Sec-Fetch-Dest, Accept-Encoding, Accept-Language, Cookie
 
 ## Embed Mode Header Details
 
-**XHR mode** (`embed="xhr"`) sets: `Sec-Fetch-Mode: cors`, `Sec-Fetch-Dest: empty`, `Origin`, `Accept: */*`. Computes `Sec-Fetch-Site` from `embed_origin` vs request URL (`same-origin`, `same-site`, or `cross-site`). Strips navigation headers (`Cache-Control`, `Upgrade-Insecure-Requests`). Referer sends the full URL from `embed_referers`. No `X-Requested-With` (modern `fetch()` doesn't send it).
+In every embed mode wafer supplies the whole header set and its order itself, with wreq's per-profile headers turned off (`Emulation(..., headers=False)` + `orig_headers`). Those defaults are a top-level navigation, and since wreq 0.12.2 they carry `Sec-Fetch-User: ?1` and `Upgrade-Insecure-Requests: 1`, which wreq cannot drop individually. Left on, XHR mode sent the first row of the invalid-combination table above. The shapes below apply to desktop Chrome, Edge and Firefox emulations. wafer's Safari, iOS Safari and Dart identities already send only wafer's headers. Any other `Emulation` keeps wreq's defaults.
 
-**jQuery XHR mode** (`embed="xhr-jquery"`) is identical to XHR mode plus the two markers a legacy jQuery `$.ajax` / `XMLHttpRequest` call adds: `X-Requested-With: XMLHttpRequest` and `Accept: application/json, text/javascript, */*; q=0.01` (the jQuery Accept, replacing `*/*`). Both are set at the client level (no HTTP/2 header duplication). Use this when an older `/ajax`, `getData`, tile, or autocomplete endpoint requires `X-Requested-With`; use plain `"xhr"` for modern `fetch()` endpoints.
+**XHR mode** (`embed="xhr"`) sets: `Sec-Fetch-Mode: cors`, `Sec-Fetch-Dest: empty`, `Origin`, `Accept: */*`. Computes `Sec-Fetch-Site` from `embed_origin` vs request URL (`same-origin`, `same-site`, or `cross-site`). No navigation headers (`Cache-Control`, `Upgrade-Insecure-Requests`, `Sec-Fetch-User`). `Priority: u=1, i` (Chrome) / `u=4` (Firefox). Referer sends the full URL from `embed_referers`. No `X-Requested-With` (modern `fetch()` doesn't send it).
 
-**Iframe mode** (`embed="iframe"`) sets: `Sec-Fetch-Mode: navigate`, `Sec-Fetch-Dest: iframe`. Computes `Sec-Fetch-Site` (same as XHR). No `Origin` (GET navigations don't send it; POST/PUT/PATCH/DELETE navigations do). Keeps navigation `Accept` and `Upgrade-Insecure-Requests`.
+**jQuery XHR mode** (`embed="xhr-jquery"`) is identical to XHR mode plus the two markers a legacy jQuery `$.ajax` / `XMLHttpRequest` call adds: `X-Requested-With: XMLHttpRequest` and `Accept: application/json, text/javascript, */*; q=0.01` (the jQuery Accept, replacing `*/*`). Both are set at the client level (no HTTP/2 header duplication). Use this when an older `/ajax`, `getData`, tile, or autocomplete endpoint requires `X-Requested-With`; use plain `"xhr"` for modern `fetch()` endpoints. Firefox sends no `Priority` header on an `XMLHttpRequest`.
+
+**Iframe mode** (`embed="iframe"`) sets: `Sec-Fetch-Mode: navigate`, `Sec-Fetch-Dest: iframe`. Computes `Sec-Fetch-Site` (same as XHR). No `Origin` (GET navigations don't send it; POST/PUT/PATCH/DELETE navigations do). Keeps navigation `Accept` and `Upgrade-Insecure-Requests`. It is an embed loaded with the page, so no `Sec-Fetch-User` (that needs user activation). A cross-site load adds `Sec-Fetch-Storage-Access`: `active` for Chrome (third-party cookies allowed by default), `none` for Firefox (Total Cookie Protection). `Priority: u=0, i` (Chrome) / `u=4` (Firefox).
+
+### Embed header order (captured)
+
+Captured 2026-09-24 from Google Chrome 153.0.8010.53 and Firefox 153, each running a real `fetch()`, jQuery-style `XMLHttpRequest` and script-inserted iframe, GET and POST, with a cookie set (`_fingerprint._EMBED_HEADER_ORDER`). Absent headers are skipped. wafer's high-entropy client hints follow at the end.
+
+| Mode | Chrome / Edge | Firefox |
+|---|---|---|
+| `xhr` | content-length, sec-ch-ua-platform, user-agent, sec-ch-ua, content-type, sec-ch-ua-mobile, accept, origin, sec-fetch-site, sec-fetch-mode, sec-fetch-dest, referer, accept-encoding, accept-language, cookie, priority | user-agent, accept, accept-language, accept-encoding, referer, content-type, content-length, origin, cookie, sec-fetch-dest, sec-fetch-mode, sec-fetch-site, priority, te |
+| `xhr-jquery` | content-length, sec-ch-ua-platform, x-requested-with, user-agent, accept, sec-ch-ua, content-type, sec-ch-ua-mobile, origin, sec-fetch-site, sec-fetch-mode, sec-fetch-dest, referer, accept-encoding, accept-language, cookie, priority | user-agent, accept, accept-language, accept-encoding, content-type, x-requested-with, content-length, origin, referer, cookie, sec-fetch-dest, sec-fetch-mode, sec-fetch-site, te |
+| `iframe` | content-length, cache-control, sec-ch-ua, sec-ch-ua-mobile, sec-ch-ua-platform, upgrade-insecure-requests, content-type, user-agent, origin, accept, sec-fetch-site, sec-fetch-mode, sec-fetch-dest, sec-fetch-storage-access, referer, accept-encoding, accept-language, cookie, priority | user-agent, accept, accept-language, accept-encoding, sec-fetch-storage-access, content-type, content-length, origin, referer, cookie, upgrade-insecure-requests, sec-fetch-dest, sec-fetch-mode, sec-fetch-site, priority, te |
+
+The Firefox captures used Playwright's Firefox 153 build, whose TLS and Accept-Language prefs are not stock, so only its order is used; values come from wafer's Firefox envelope.
 
 ### Same-site computation (PSL-lite)
 

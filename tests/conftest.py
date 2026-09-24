@@ -172,9 +172,10 @@ class AsyncMockResponse:
 
 
 class MockCookie:
-    # expires/max_age mirror wreq's Cookie: a datetime and a timedelta, both
-    # None for a session cookie. wreq also strips the leading dot from every
-    # Domain, so this mock stores the bare domain the same way.
+    # Mirrors wreq's Cookie as Jar.get_all() returns it since wreq 0.12.2:
+    # a Domain cookie reports its domain with the leading dot stripped, a
+    # host-only cookie reports domain=None, and Max-Age arrives already
+    # converted to an absolute ``expires`` (max_age stays None).
     def __init__(self, name, value, domain, path, secure,
                  expires=None, max_age=None):
         self.name = name
@@ -187,11 +188,19 @@ class MockCookie:
 
 
 class MockJar:
-    """Small wreq-like jar that records and resolves cookies."""
+    """Small wreq-like jar that records and resolves cookies.
+
+    Deliberate deviations, so tests can probe a jar with a request URL:
+    ``get`` prefix-matches the path and also returns parent-domain cookies,
+    where real wreq requires the exact stored path and the URL's exact host.
+    """
 
     def __init__(self):
         self.added = []
-        self._cookies: dict[tuple[str, str, str], MockCookie] = {}
+        # (host-or-domain, path, name, host_only) -> cookie, in creation order.
+        # A host-only cookie and a Domain=<same host> cookie are distinct
+        # entries, as in wreq.
+        self._cookies: dict[tuple[str, str, str, bool], MockCookie] = {}
 
     def add(self, cookie_str, url):
         self.added.append((cookie_str, url))
@@ -201,6 +210,7 @@ class MockJar:
             return
         parsed = urlparse(url)
         domain = parsed.hostname or ""
+        host_only = True
         path = "/"
         secure = False
         max_age = None
@@ -210,6 +220,7 @@ class MockJar:
             attr = attr.strip().lower()
             if attr == "domain" and attr_separator:
                 domain = attr_value.strip().lstrip(".").lower()
+                host_only = False
             elif attr == "path" and attr_separator:
                 path = attr_value.strip() or "/"
             elif attr == "secure":
@@ -226,8 +237,16 @@ class MockJar:
                         tzinfo=datetime.timezone.utc
                     )
                 expires = parsed_expires
-        self._cookies[(domain, path, name)] = MockCookie(
-            name, value, domain, path, secure, expires=expires, max_age=max_age
+        if max_age is not None:
+            # Max-Age wins over Expires and is stored as an absolute time.
+            expires = datetime.datetime.now(datetime.timezone.utc) + max_age
+        self._cookies[(domain, path, name, host_only)] = MockCookie(
+            name,
+            value,
+            None if host_only else domain,
+            path,
+            secure,
+            expires=expires,
         )
 
     def get(self, name, url):
@@ -235,19 +254,26 @@ class MockJar:
         host = (parsed.hostname or "").lower()
         request_path = parsed.path or "/"
         candidates = [
-            cookie
-            for (_, _, cookie_name), cookie in self._cookies.items()
-            if cookie_name == name
+            (key, cookie)
+            for key, cookie in self._cookies.items()
+            if key[2] == name
             and (
-                host == cookie.domain
-                or host.endswith("." + cookie.domain)
+                host == key[0]
+                if key[3]
+                else host == key[0] or host.endswith("." + key[0])
             )
             and request_path.startswith(cookie.path)
             and (not cookie.secure or parsed.scheme == "https")
         ]
         if not candidates:
             return None
-        return max(candidates, key=lambda cookie: len(cookie.path))
+        # Real wreq only looks under the URL's exact host and, between a
+        # host-only and a Domain=<host> cookie there, returns the one created
+        # first. Rank exact-host entries first; max() keeps the earliest of
+        # equals, and dict order is creation order.
+        return max(
+            candidates, key=lambda item: (len(item[1].path), item[0][0] == host)
+        )[1]
 
     def get_all(self):
         return list(self._cookies.values())

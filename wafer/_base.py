@@ -26,9 +26,14 @@ from wafer._fingerprint import (
     FingerprintManager,
     build_fingerprint_envelope,
     chrome_version_from_ua,
+    embed_header_family,
+    embed_header_order,
+    embed_priority,
+    embed_storage_access,
     emulation_family,
     emulation_user_agent,
     family_headers,
+    wreq_emulation,
 )
 from wafer._ios import IOSSafariIdentity
 from wafer._kasada import get_session as get_kasada_session  # noqa: F401
@@ -40,6 +45,7 @@ from wafer._solvers import (
     REDDIT_BROWSER_OUTCOME_ESTABLISHED,
     REDDIT_BROWSER_OUTCOME_INTERRUPTED,
     REDDIT_OUTCOME_ESTABLISHED,
+    REDDIT_SOLVE_ORIGIN,
     reddit_cookie_name_summary,
     reddit_has_cookie_evidence,
 )
@@ -369,7 +375,7 @@ else:
     logger.debug("No system CA store found; using wreq defaults")
 
 # Default to newest Chrome emulation profile
-DEFAULT_EMULATION = Emulation.Chrome149
+DEFAULT_EMULATION = Emulation.Chrome153
 
 DEFAULT_HEADERS = {
     "Accept": (
@@ -1354,7 +1360,57 @@ class BaseSession:
             else:
                 headers["Accept"] = "*/*"
 
+        kind = self._embed_header_kind()
+        if kind is not None:
+            # wreq's own header set is off in this mode (_build_client_kwargs),
+            # so everything it used to fill in comes from here. Session headers
+            # win, and one set to "" is left off (see _wire_client_headers).
+            present = {k.lower() for k in headers}
+            current = self._fingerprint.current
+            if "user-agent" not in present:
+                headers["User-Agent"] = emulation_user_agent(current)
+            fallback = family_headers(emulation_family(current)) or {}
+            for name in ("Accept", "Accept-Language", "Accept-Encoding"):
+                if name.lower() not in present and name in fallback:
+                    headers[name] = fallback[name]
+            if self._embed == "iframe" and "upgrade-insecure-requests" not in present:
+                headers["Upgrade-Insecure-Requests"] = "1"
+            priority = embed_priority(kind, self._embed)
+            if priority is not None and "priority" not in present:
+                headers["Priority"] = priority
+            if kind == "firefox" and "te" not in present:
+                headers["TE"] = "trailers"
+
         return headers
+
+    def _wire_client_headers(self) -> dict[str, str]:
+        """The client-level headers to hand wreq.
+
+        A session header set to "" stays in ``_client_headers`` as a marker
+        (``_build_headers`` reads it to skip that auto-header) but must not
+        reach wreq, which would send it with an empty value. Leaving it out
+        removes it from the wire, except for a header wreq's own navigation
+        set supplies outside embed mode, which then keeps wreq's value.
+        """
+        return {k: v for k, v in self._client_headers.items() if v != ""}
+
+    def _embed_header_kind(self) -> str | None:
+        """The verified embed request shape wafer supplies itself, or None.
+
+        Only for embed sessions served by a wreq Emulation that has a captured
+        shape (desktop Chrome, Edge, Firefox; see ``_EMBED_HEADER_ORDER``).
+        wafer's Safari, iOS Safari and Dart identities already send only
+        wafer's headers, and any other Emulation keeps wreq's own.
+        """
+        if not self._embed or self._fingerprint is None:
+            return None
+        if (
+            self._dart_identity is not None
+            or self._ios_safari_identity is not None
+            or self._safari_identity is not None
+        ):
+            return None
+        return embed_header_family(self._fingerprint.current)
 
     def _compute_sec_fetch_site(self, url: str) -> str:
         """Compute Sec-Fetch-Site based on embed_origin vs request URL.
@@ -1410,9 +1466,11 @@ class BaseSession:
         Cloudflare detect as non-browser behavior.
 
         Order: session defaults → sec-ch-ua → auto Host → referer/embed →
-        per-request overrides. Any auto-header can be suppressed by
-        setting it to empty string in session headers or per-request
-        overrides; empty-string values are stripped at the end.
+        per-request overrides. An auto-header (Referer, embed Origin, ...)
+        can be suppressed by setting it to empty string in session headers
+        or per-request overrides; empty-string values are stripped at the
+        end. A per-request "" cannot remove a header already at client level
+        (wreq only adds); a session-level "" keeps it off the client too.
         """
         self._validate_browser_request_identity(extra)
 
@@ -1456,6 +1514,11 @@ class BaseSession:
             merged["Sec-Fetch-Site"] = self._compute_sec_fetch_site(url)
             merged["Sec-Fetch-Mode"] = "navigate"
             merged["Sec-Fetch-Dest"] = "iframe"
+            # Both browsers report the frame's cookie access on a cross-site
+            # iframe load (and only there). Only for the captured shapes.
+            kind = self._embed_header_kind()
+            if kind is not None and merged["Sec-Fetch-Site"] == "cross-site":
+                merged["Sec-Fetch-Storage-Access"] = embed_storage_access(kind)
             # POST/PUT/PATCH/DELETE navigations send Origin (Fetch spec);
             # GET/HEAD navigations do not.
             if method.upper() not in ("GET", "HEAD"):
@@ -2192,7 +2255,7 @@ class BaseSession:
             # injects an ALPN extension that breaks the fingerprint).
             kwargs = {
                 "tls_options": self._dart_identity.tls_options(),
-                "headers": dict(self._client_headers),
+                "headers": self._wire_client_headers(),
                 "connect_timeout": self.connect_timeout,
                 "timeout": self.timeout,
                 "cookie_store": True,
@@ -2202,7 +2265,7 @@ class BaseSession:
             kwargs = {
                 "tls_options": self._ios_safari_identity.tls_options(),
                 "http2_options": self._ios_safari_identity.http2_options(),
-                "headers": dict(self._client_headers),
+                "headers": self._wire_client_headers(),
                 "connect_timeout": self.connect_timeout,
                 "timeout": self.timeout,
                 "cookie_store": True,
@@ -2215,7 +2278,7 @@ class BaseSession:
             kwargs = {
                 "tls_options": self._safari_identity.tls_options(),
                 "http2_options": self._safari_identity.http2_options(),
-                "headers": dict(self._client_headers),
+                "headers": self._wire_client_headers(),
                 "connect_timeout": self.connect_timeout,
                 "timeout": self.timeout,
                 "cookie_store": True,
@@ -2223,13 +2286,21 @@ class BaseSession:
         else:
             # Chrome: Emulation + sec-ch-ua headers
             # (reuse cached _client_headers instead of regenerating)
+            kind = self._embed_header_kind()
             kwargs = {
-                "emulation": self._fingerprint.current,
-                "headers": dict(self._client_headers),
+                # Built on the host platform; in embed mode without wreq's
+                # navigation header set (see _compute_client_headers).
+                "emulation": wreq_emulation(
+                    self._fingerprint.current,
+                    default_headers=kind is None,
+                ),
+                "headers": self._wire_client_headers(),
                 "connect_timeout": self.connect_timeout,
                 "timeout": self.timeout,
                 "cookie_store": True,
             }
+            if kind is not None:
+                kwargs["orig_headers"] = embed_header_order(kind, self._embed)
         store = self._cert_store()
         if store is not None:
             kwargs["tls_verify"] = store
@@ -2397,7 +2468,7 @@ class BaseSession:
         if self._fingerprint is not None:
             major = chrome_version(self._fingerprint.current)
         if major is None:
-            major = chrome_version(DEFAULT_EMULATION) or 149
+            major = chrome_version(DEFAULT_EMULATION) or 153
         return host_user_agent(major)
 
     def _native_prepare(
@@ -2643,8 +2714,9 @@ class BaseSession:
             return []
         request_path = parsed.path or "/"
         secure_ok = parsed.scheme == "https"
+        jar = self._client.cookie_jar
         try:
-            cookies = self._client.cookie_jar.get_all()
+            cookies = jar.get_all()
         except Exception:
             logger.debug("Failed to read cookie jar for %s", url, exc_info=True)
             return []
@@ -2663,16 +2735,15 @@ class BaseSession:
                 continue
             if getattr(cookie, "secure", False) and not secure_ok:
                 continue
-            # wreq reports every cookie's Domain with the leading dot already
-            # stripped, so a host-only cookie is indistinguishable from a
-            # Domain one here and the subdomain match is the only rule
-            # available. It errs permissive on purpose: the worst case is one
-            # replay riding on a parent-domain cookie the jar then declines to
-            # send, which costs a retry and nothing else.
+            # A Domain cookie is reported with its leading dot stripped, so the
+            # subdomain match is the rule for it. A host-only cookie has no
+            # domain at all (wreq >= 0.12.2) and counts only on the host that
+            # set it.
             domain = (cookie.domain or "").lower().rstrip(".")
             if not domain:
-                continue
-            if not (host == domain or host.endswith("." + domain)):
+                if not self._jar_host_only_owner(jar, cookie, host):
+                    continue
+            elif not (host == domain or host.endswith("." + domain)):
                 continue
             attributes = f"; Path={cookie.path or '/'}"
             if getattr(cookie, "secure", False):
@@ -2720,6 +2791,34 @@ class BaseSession:
             self._record_cookie_scope(raw, url)
         return normalized
 
+    @staticmethod
+    def _jar_host_only_owner(jar, cookie, host: str) -> bool:
+        """Whether a host-only cookie from a wreq jar belongs to ``host``.
+
+        Since wreq 0.12.2, ``Jar.get_all()`` reports a host-only cookie with
+        ``domain=None`` (earlier versions filled in the host that set it), so
+        the host is recovered from the jar itself. ``Jar.get`` looks up the
+        URL's exact host (no parent-domain matching) and exact path, and
+        comparing values keeps same-named cookies from sibling hosts apart.
+
+        One case stays hidden: a ``Domain=<host>`` cookie with the same name
+        and path lives under the same host, and ``Jar.get`` returns whichever
+        of the two was created first. When that is the Domain cookie, the
+        host-only one is not credited here; the Domain cookie still is, and
+        it is also the one the jar sends first, so ``get_cookie`` returns the
+        value a server reads.
+        """
+        netloc = f"[{host}]" if ":" in host else host
+        try:
+            match = jar.get(cookie.name, f"https://{netloc}{cookie.path or '/'}")
+        except Exception:
+            return False
+        return (
+            match is not None
+            and match.domain is None
+            and match.value == cookie.value
+        )
+
     def _scoped_cookie_value(
         self,
         cookies,
@@ -2729,8 +2828,13 @@ class BaseSession:
         secure_ok: bool,
         *,
         native: bool,
+        jar=None,
     ) -> str | None:
-        """Select the longest-path cookie that is valid for the target URL."""
+        """Select the longest-path cookie that is valid for the target URL.
+
+        ``jar`` is the wreq jar ``cookies`` came from; it resolves host-only
+        cookies, which that jar reports without a domain.
+        """
 
         candidates: list[tuple[int, bool, int, str]] = []
         for cookie in cookies:
@@ -2743,6 +2847,12 @@ class BaseSession:
 
             if native:
                 host_only = not bool(getattr(cookie, "domain_specified", False))
+            elif not domain:
+                # Host-only in a wreq jar: it applies only on the host that
+                # set it, which the jar knows and get_all() no longer says.
+                if jar is None or not self._jar_host_only_owner(jar, cookie, host):
+                    continue
+                domain, host_only = host, True
             else:
                 host_only = self._cookie_scopes.get((cookie.name, domain, path))
                 # Unknown scope is safe on the exact host, but must never be
@@ -2815,6 +2925,7 @@ class BaseSession:
                         request_path,
                         secure_ok,
                         native=False,
+                        jar=jar,
                     )
                     if value is not None:
                         return value
@@ -2860,13 +2971,29 @@ class BaseSession:
             cookies = jar.get_all()
         except Exception:
             return []
+        # A host-only cookie comes back from the jar without a domain; report
+        # the host that set it, found among this URL's host, the hosts whose
+        # host-only Set-Cookie was recorded, and the hosts requested.
+        hosts = [(urlparse(url).hostname or "").lower().rstrip(".")]
+        for h in [d for (_, d, _), only in self._cookie_scopes.items() if only]:
+            if h not in hosts:
+                hosts.append(h)
+        hosts += [h for h in self._last_url if h not in hosts]
         summary = []
         for cookie in cookies[:32]:
             try:
+                domain = cookie.domain or next(
+                    (
+                        h
+                        for h in hosts
+                        if h and self._jar_host_only_owner(jar, cookie, h)
+                    ),
+                    "",
+                )
                 summary.append(
                     {
                         "name": str(cookie.name),
-                        "domain": str(cookie.domain),
+                        "domain": str(domain),
                         "path": str(cookie.path),
                         "secure": bool(cookie.secure),
                     }
@@ -2942,14 +3069,26 @@ class BaseSession:
             cookies = jar.get_all()
         except Exception:
             return frozenset()
+        # Host-only cookies carry no domain, so check them against the Reddit
+        # hosts this session could have been given them by.
+        reddit_hosts = {urlparse(REDDIT_SOLVE_ORIGIN).hostname or ""} | {
+            h
+            for h in self._last_url
+            if h == "reddit.com" or h.endswith(".reddit.com")
+        }
         names = set()
         for cookie in cookies:
             try:
-                domain = str(cookie.domain).strip(".").lower()
+                domain = (cookie.domain or "").strip(".").lower()
                 name = str(cookie.name)
             except Exception:
                 continue
-            if domain == "reddit.com" or domain.endswith(".reddit.com"):
+            if domain:
+                if domain == "reddit.com" or domain.endswith(".reddit.com"):
+                    names.add(name)
+            elif any(
+                self._jar_host_only_owner(jar, cookie, h) for h in reddit_hosts
+            ):
                 names.add(name)
         return frozenset(names)
 

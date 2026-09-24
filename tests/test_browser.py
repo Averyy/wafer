@@ -497,7 +497,8 @@ class TestBrowserSolverInit:
         )
         session = BaseSession(browser_solver=solver)
 
-        assert repr(session.emulation) == "Profile.Chrome149"
+        # wreq has Chrome150, so the transport pins that exact profile.
+        assert repr(session.emulation) == "Profile.Chrome150"
         assert session._fingerprint.pinned is True
         assert session._client_headers["User-Agent"] == user_agent
         assert '"150"' in session._client_headers["sec-ch-ua"]
@@ -1483,7 +1484,7 @@ class TestSyncBrowserSolveIntegration:
         ua = (
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/150.0.0.0 Safari/537.36"
+            "Chrome/154.0.0.0 Safari/537.36"
         )
         browser_result = SolveResult(
             cookies=[
@@ -1496,7 +1497,7 @@ class TestSyncBrowserSolveIntegration:
                 }
             ],
             user_agent=ua,
-            browser_version="150.0.7871.125",
+            browser_version="154.0.8037.58",
         )
         mock_solver = MockBrowserSolver(result=browser_result)
 
@@ -1508,15 +1509,15 @@ class TestSyncBrowserSolveIntegration:
         )
 
         session.get("https://example.com/page")
-        # TLS pins the newest available wreq profile (no Chrome150 in wreq)...
-        assert repr(session._fingerprint.current) == "Profile.Chrome149"
+        # TLS pins the newest available wreq profile (no Chrome154 in wreq)...
+        assert repr(session._fingerprint.current) == "Profile.Chrome153"
         assert session._fingerprint.pinned is True
-        # ...but the wire identity follows the real browser (Chrome150).
+        # ...but the wire identity follows the real browser (Chrome154).
         assert session._fingerprint.ua_override == ua
         env = session.fingerprint_envelope()
         assert env["user_agent"] == ua
-        assert '"150"' in env["sec_ch_ua"]
-        assert "150.0.7871.125" in env["full_version_list"]
+        assert '"154"' in env["sec_ch_ua"]
+        assert "154.0.8037.58" in env["full_version_list"]
 
     @patch("time.sleep")
     def test_imperva_solve_leaves_fingerprint_unpinned(self, mock_sleep):
@@ -2665,7 +2666,7 @@ class TestAsyncBrowserSolveIntegration:
         ua = (
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/150.0.0.0 Safari/537.36"
+            "Chrome/154.0.0.0 Safari/537.36"
         )
         browser_result = SolveResult(
             cookies=[
@@ -2678,7 +2679,7 @@ class TestAsyncBrowserSolveIntegration:
                 }
             ],
             user_agent=ua,
-            browser_version="150.0.7871.125",
+            browser_version="154.0.8037.58",
         )
         mock_solver = MockBrowserSolver(result=browser_result)
 
@@ -2690,12 +2691,12 @@ class TestAsyncBrowserSolveIntegration:
         )
 
         await session.get("https://example.com/page")
-        assert repr(session._fingerprint.current) == "Profile.Chrome149"
+        assert repr(session._fingerprint.current) == "Profile.Chrome153"
         assert session._fingerprint.pinned is True
         assert session._fingerprint.ua_override == ua
         env = session.fingerprint_envelope()
-        assert '"150"' in env["sec_ch_ua"]
-        assert "150.0.7871.125" in env["full_version_list"]
+        assert '"154"' in env["sec_ch_ua"]
+        assert "154.0.8037.58" in env["full_version_list"]
 
     @patch("asyncio.sleep")
     async def test_imperva_solve_leaves_fingerprint_unpinned(self, mock_sleep):

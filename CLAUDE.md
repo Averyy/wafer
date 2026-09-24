@@ -31,7 +31,7 @@ See `docs/site-list.md` for WAF test sites and maintenance rules.
 
 ## wreq
 
-Wraps wreq **0.12.0+** (the `Emulation` API, formerly rnet). See `docs/ref-wreq.md` for TlsOptions gotchas and HTTP/2 header duplication rules.
+Wraps wreq **0.12.2+** (the `Emulation` API, formerly rnet). See `docs/ref-wreq.md` for TlsOptions gotchas and HTTP/2 header duplication rules.
 
 **When upgrading wreq**, check for new Chrome Emulation profiles (e.g. Chrome146). If found:
 1. Update `DEFAULT_EMULATION` in `wafer/_base.py` to the newest Chrome profile.
@@ -40,13 +40,14 @@ Wraps wreq **0.12.0+** (the `Emulation` API, formerly rnet). See `docs/ref-wreq.
 4. **Also check the changelog for kwarg renames at the Client level or in TlsOptions/Http2Options.** wreq silently accepts unknown kwargs - typos and stale names will not error, they will silently be ignored. v0.11 renamed `verify`→`tls_verify` (and other `tls_`-prefixed Client kwargs) and replaced `TlsOptions(key_shares_limit: int)` with `TlsOptions(key_shares: Sequence[KeyShare])`. After every wreq bump, wire-verify Safari + Dart against tls.peet.ws and run the badssl/expired test for `tls_verify`.
 5. After bumping, if `repr(Emulation.ChromeX)` changes shape (e.g. v0.11 changed it from `"Emulation.ChromeX"` to `"Profile.ChromeX"`), update any hardcoded `repr()` string comparisons in tests and docs.
 6. **Also refresh `FIREFOX_LADDER_EMULATION` and `EDGE_LADDER_EMULATION` in `wafer/_fingerprint.py`** to the newest available Firefox/Edge `Emulation` profiles. These pin the cross-family rotation ladder (`ROTATION_LADDER`); like `DEFAULT_EMULATION` they are concrete members, not auto-discovered, so a wreq bump that adds newer Firefox/Edge profiles leaves them silently stale (the ladder keeps rotating to an old browser version) unless you bump them by hand.
+7. **Diff every identity's full wire before and after, not just JA4/H2**: the header set and order per profile and per embed mode, and the cookie jar's `get_all()` shape. v0.12.2 changed no Python API, yet it added `Sec-Fetch-User`/`Upgrade-Insecure-Requests` to every profile's default headers (which leaked into embed="xhr") and made host-only cookies report `domain=None` (which broke `get_cookie`). Compare embed modes against a real browser capture (`docs/ref-sec-fetch.md`), and run `tests/test_add_cookie.py::TestHostOnlyCookiesRealJar`, which uses the real jar where `MockJar` would hide the change.
 
 ## Conventions
 
 - No `from __future__ import annotations`
 - Logging via `logging.getLogger("wafer")`, never print()
 - wreq's `Emulation` enum is the source of truth for browser fingerprints
-- Always default to the newest Chrome `Emulation` profile available (currently Chrome149)
+- Always default to the newest Chrome `Emulation` profile available (currently Chrome153)
 - Solver docs live in `docs/ref-*.md` -one per WAF type. `docs/ref-tls-chain.md` is the exception: AIA chasing is a TLS-layer fix, not a WAF solver. Read it before touching `wafer/_aia.py` -several checks there look redundant and are not, and the doc records which "hardening" ideas were tried and reverted for breaking real sites
 - **Chromium launch flags live in `hardened_launch_config()`** (`wafer/browser/_solver.py`, exported from `wafer.browser`). It is the single source of truth: `_ensure_browser` consumes it, and so do external callers driving their own Playwright. Never re-inline flags into `_ensure_browser` -a second copy drifts silently, and the failure mode is a site answering a flagged browser differently and that being recorded as a fact about the site. Changes must update `docs/ref-headless.md`, whose tables `tests/test_hardened_launch.py` backs
 - Mousse changes must update both `wafer/browser/mousse/README.md` and `README.md`

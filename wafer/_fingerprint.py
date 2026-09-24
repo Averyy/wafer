@@ -5,7 +5,7 @@ import platform
 import re
 import struct
 
-from wreq import Emulation
+from wreq import Emulation, Platform
 
 logger = logging.getLogger("wafer")
 
@@ -118,31 +118,37 @@ def host_user_agent(major_version: int) -> str:
 
 # Firefox freezes the macOS token at "Intel Mac OS X 10.15" (no "_7"),
 # unlike the Chromium "Intel Mac OS X 10_15_7". Wire-verified 2026-06-12.
+# Linux is the Ubuntu build's token, which wreq's Firefox 133+ profiles send
+# on a Linux platform (checked 2026-09-24).
 _FIREFOX_UA_PLATFORM_TOKENS = {
     "Darwin": "Macintosh; Intel Mac OS X 10.15",
     "Windows": "Windows NT 10.0; Win64; x64",
-    "Linux": "X11; Linux x86_64",
+    "Linux": "X11; Ubuntu; Linux x86_64",
 }
 
 
 def emulation_user_agent(emulation: Emulation) -> str | None:
     """Reconstruct the User-Agent wreq sends for an Emulation, for the host.
 
-    Mirrors wreq's per-family UA shape (wire-verified 2026-06-12):
+    Follows the real browsers' UA shape, which wreq's current profiles
+    (Chrome153, Edge148, Firefox151) send too:
 
     - Chrome: ``...Chrome/{major}.0.0.0 Safari/537.36`` (UA-reduced)
-    - Edge:   ``...Chrome/{major}.0.0.0 Safari/537.36 Edg/{edge_build}``
+    - Edge:   ``...Chrome/{major}.0.0.0 Safari/537.36 Edg/{major}.0.0.0``
     - Firefox:``Mozilla/5.0 ({token}; rv:{major}.0) Gecko/20100101
       Firefox/{major}.0``
 
     Returns ``None`` for families wafer doesn't reconstruct here (Safari,
     Opera, OkHttp - those use their own identity modules or aren't UA-stamped
-    from this path). The Chrome segment is UA-reduced (``MAJOR.0.0.0``). The
-    Edge ``Edg/`` segment carries the REAL Edge build (e.g. ``147.0.3912.51``):
-    Edge does NOT UA-reduce the ``Edg/`` token, and wreq's wire UA emits the
-    full build (wire-verified Edge146/147, 2026-06-12). This also keeps the
-    envelope UA coherent with the Edge ``sec-ch-ua-full-version-list``, which
-    carries the same Edge build.
+    from this path). Edge UA-reduces the ``Edg/`` token like Chrome's
+    (Microsoft's user-agent guidance shows ``Edg/120.0.0.0``); its real build
+    travels only in ``sec-ch-ua-full-version[-list]``. Older wreq Edge
+    profiles are inconsistent about this (Edge146/147 put the full build in
+    the UA, Edge134-141 omit the ``Edg/`` token entirely), so for those the
+    wire UA differs from this one.
+
+    Embed mode sends this UA itself (wreq's headers are off there), so it has
+    to be the real browser's.
     """
     family = emulation_family(emulation)
     ver = emulation_major_version(emulation)
@@ -151,7 +157,7 @@ def emulation_user_agent(emulation: Emulation) -> str | None:
     if family == "chrome":
         return host_user_agent(ver)
     if family == "edge":
-        return f"{host_user_agent(ver)} Edg/{_edge_full_version(ver)}"
+        return f"{host_user_agent(ver)} Edg/{ver}.0.0.0"
     if family == "firefox":
         token = _FIREFOX_UA_PLATFORM_TOKENS.get(
             platform.system(), _FIREFOX_UA_PLATFORM_TOKENS["Windows"]
@@ -215,7 +221,9 @@ def _detect_platform_version() -> str:
 
 
 # Chrome full version format: MAJOR.0.BUILD.PATCH
-# Real build numbers from versionhistory.googleapis.com (first stable release).
+# Real stable-channel build numbers from versionhistory.googleapis.com. Older
+# entries are each major's first stable release; newer ones are whichever
+# stable build was current when the entry was added.
 _CHROME_BUILDS: dict[int, tuple[int, int]] = {
     130: (6723, 58),
     131: (6778, 69),
@@ -237,11 +245,12 @@ _CHROME_BUILDS: dict[int, tuple[int, int]] = {
     147: (7727, 24),
     148: (7778, 217),
     149: (7827, 201),
-    # Chrome 150 stable. wreq has no Chrome150 Emulation yet, so
-    # DEFAULT_EMULATION stays at 149 and pin_to_browser() carries the real
-    # 150 UA/hints; this entry keeps _full_version(150) exact rather than
-    # falling back to the +61/major linear approximation (150.0.7943.58).
     150: (7871, 182),
+    151: (7922, 176),
+    152: (7977, 85),
+    # 153.0.8010.53 is the build the Chrome153 profile was wire-verified
+    # against (2026-09-24, Google Chrome on macOS): identical JA4 and sec-ch-ua.
+    153: (8010, 53),
 }
 
 # Fallback for versions outside the lookup table.
@@ -537,6 +546,43 @@ def emulation_is_mobile(emulation: Emulation) -> bool:
     return bool(_MOBILE_RE.match(repr(emulation)))
 
 
+# wreq builds a bare Profile with ``Platform.MacOS`` whatever the host is
+# (wreq-util's ``Platform`` default), so on Linux/Windows the wreq UA said
+# "Macintosh" while wafer's own sec-ch-ua-platform said "Linux"/"Windows".
+# Desktop families are therefore always built on the host's platform, the
+# same one _detect_platform() and host_user_agent() describe.
+_WREQ_HOST_PLATFORM = {
+    "Darwin": Platform.MacOS,
+    "Linux": Platform.Linux,
+    "Windows": Platform.Windows,
+}.get(platform.system(), Platform.Windows)
+
+# Families whose wreq profile takes a desktop platform. Safari (desktop and
+# mobile), Firefox Android and OkHttp carry their own fixed platform, so they
+# stay bare Profiles.
+_HOST_PLATFORM_FAMILIES = frozenset({"chrome", "edge", "firefox", "opera"})
+
+
+def wreq_emulation(emulation: Emulation, *, default_headers: bool = True):
+    """The value to hand ``wreq.Client(emulation=...)`` for a profile.
+
+    Desktop Chrome/Edge/Firefox/Opera are built on the host platform (see
+    ``_WREQ_HOST_PLATFORM``). ``default_headers=False`` drops wreq's own
+    per-profile header set so the caller supplies every header and its order
+    (embed mode, see ``embed_header_order``); the TLS and HTTP/2 fingerprint
+    are unaffected. Any other profile is returned unchanged, which also means
+    it keeps wreq's default headers.
+    """
+    family = emulation_family(emulation)
+    if family not in _HOST_PLATFORM_FAMILIES or emulation_is_mobile(emulation):
+        return emulation
+    return Emulation(
+        profile=emulation,
+        platform=_WREQ_HOST_PLATFORM,
+        headers=default_headers,
+    )
+
+
 # Per-family navigation Accept / Accept-Language / Accept-Encoding envelope.
 # Wire-verified 2026-06-12 against tls.peet.ws + tools.scrapfly.io (the
 # values wreq itself sends for each Emulation, cross-checked with MDN's
@@ -616,6 +662,120 @@ def family_headers(family: str | None) -> dict[str, str] | None:
         return None
     env = _FAMILY_HEADERS.get(family)
     return dict(env) if env is not None else None
+
+
+# ---------------------------------------------------------------------------
+# Embed-mode request shapes
+# ---------------------------------------------------------------------------
+#
+# In embed mode wafer supplies every header and its order itself. wreq's
+# per-profile header set describes a top-level navigation, and wreq can only
+# override a default header, never drop one. Since wreq 0.12.2 that set
+# includes Upgrade-Insecure-Requests and Sec-Fetch-User, which then rode
+# embed="xhr" requests next to "Sec-Fetch-Mode: cors", a combination no
+# browser sends, and marked every embedded iframe load as user-activated.
+#
+# Orders captured 2026-09-24 from Google Chrome 153.0.8010.53 and Firefox 153
+# (Gecko), each issuing a real fetch(), a jQuery-style XMLHttpRequest and a
+# script-inserted iframe load, GET and POST, with a cookie set. A name the
+# request does not carry is skipped. wafer's high-entropy client hints are
+# not listed and follow at the end, as they do on navigations.
+#
+# The iframe shapes are an embed loaded with the page, so there is no user
+# activation and no Sec-Fetch-User.
+_EMBED_HEADER_ORDER: dict[tuple[str, str], tuple[str, ...]] = {
+    ("chromium", "xhr"): (
+        "content-length", "sec-ch-ua-platform", "user-agent", "sec-ch-ua",
+        "content-type", "sec-ch-ua-mobile", "accept", "origin",
+        "sec-fetch-site", "sec-fetch-mode", "sec-fetch-dest", "referer",
+        "accept-encoding", "accept-language", "cookie", "priority",
+    ),
+    ("chromium", "xhr-jquery"): (
+        "content-length", "sec-ch-ua-platform", "x-requested-with",
+        "user-agent", "accept", "sec-ch-ua", "content-type",
+        "sec-ch-ua-mobile", "origin", "sec-fetch-site", "sec-fetch-mode",
+        "sec-fetch-dest", "referer", "accept-encoding", "accept-language",
+        "cookie", "priority",
+    ),
+    ("chromium", "iframe"): (
+        "content-length", "cache-control", "sec-ch-ua", "sec-ch-ua-mobile",
+        "sec-ch-ua-platform", "upgrade-insecure-requests", "content-type",
+        "user-agent", "origin", "accept", "sec-fetch-site", "sec-fetch-mode",
+        "sec-fetch-dest", "sec-fetch-storage-access", "referer",
+        "accept-encoding", "accept-language", "cookie", "priority",
+    ),
+    ("firefox", "xhr"): (
+        "user-agent", "accept", "accept-language", "accept-encoding",
+        "referer", "content-type", "content-length", "origin", "cookie",
+        "sec-fetch-dest", "sec-fetch-mode", "sec-fetch-site", "priority",
+        "te",
+    ),
+    ("firefox", "xhr-jquery"): (
+        "user-agent", "accept", "accept-language", "accept-encoding",
+        "content-type", "x-requested-with", "content-length", "origin",
+        "referer", "cookie", "sec-fetch-dest", "sec-fetch-mode",
+        "sec-fetch-site", "te",
+    ),
+    ("firefox", "iframe"): (
+        "user-agent", "accept", "accept-language", "accept-encoding",
+        "sec-fetch-storage-access", "content-type", "content-length",
+        "origin", "referer", "cookie", "upgrade-insecure-requests",
+        "sec-fetch-dest", "sec-fetch-mode", "sec-fetch-site", "priority",
+        "te",
+    ),
+}
+
+# Priority per request type. Chrome marks fetch()/XHR "u=1, i" and a frame
+# navigation "u=0, i". Firefox sends "u=4" for fetch() and frames and no
+# Priority header at all on an XMLHttpRequest.
+_EMBED_PRIORITY: dict[tuple[str, str], str | None] = {
+    ("chromium", "xhr"): "u=1, i",
+    ("chromium", "xhr-jquery"): "u=1, i",
+    ("chromium", "iframe"): "u=0, i",
+    ("firefox", "xhr"): "u=4",
+    ("firefox", "xhr-jquery"): None,
+    ("firefox", "iframe"): "u=4",
+}
+
+# Sec-Fetch-Storage-Access on a cross-site iframe load. Chrome's default
+# (third-party cookies allowed) reports "active"; Firefox's Total Cookie
+# Protection partitions them, so it reports "none".
+_EMBED_STORAGE_ACCESS = {"chromium": "active", "firefox": "none"}
+
+_EMBED_FAMILY = {"chrome": "chromium", "edge": "chromium", "firefox": "firefox"}
+
+
+def embed_header_family(emulation: Emulation) -> str | None:
+    """The verified embed request shape for a profile: "chromium", "firefox",
+    or None when wafer has no captured shape for it (mobile, Safari, Opera,
+    OkHttp), in which case the profile keeps wreq's own headers."""
+    if emulation_is_mobile(emulation):
+        return None
+    return _EMBED_FAMILY.get(emulation_family(emulation) or "")
+
+
+def _h1_header_case(name: str) -> str:
+    # wreq's orig_headers fixes the name's case as well as its position, which
+    # shows on HTTP/1.1. Both browsers send Title-Case there, except Chrome's
+    # client hints, which stay lowercase.
+    if name.startswith("sec-ch-ua") or name == "te":
+        return name
+    return "-".join(part.capitalize() for part in name.split("-"))
+
+
+def embed_header_order(kind: str, embed: str) -> list[str]:
+    """Wire order (and HTTP/1.1 casing) for an embed request of shape ``kind``."""
+    return [_h1_header_case(n) for n in _EMBED_HEADER_ORDER[(kind, embed)]]
+
+
+def embed_priority(kind: str, embed: str) -> str | None:
+    """Priority header value for an embed request, or None to send none."""
+    return _EMBED_PRIORITY[(kind, embed)]
+
+
+def embed_storage_access(kind: str) -> str:
+    """Sec-Fetch-Storage-Access value for a cross-site iframe load."""
+    return _EMBED_STORAGE_ACCESS[kind]
 
 
 # ---------------------------------------------------------------------------
@@ -798,11 +958,16 @@ class FingerprintManager:
         validates when replayed over wreq.
 
         Patchright's bundled Chromium is often NEWER than wreq's newest
-        Emulation (e.g. Chrome 150 vs Chrome 149). Adjacent Chrome majors are
-        wire-identical on JA4/H2, so pinning Chrome 149's TLS while presenting
-        Chrome 150's UA + hints is coherent to a WAF -- and necessary, because
+        Emulation. The UA + hints must still follow the real browser, because
         replaying the freshly minted cookie under the wrong UA is rejected on
-        the very first request (the whole reason a solve "doesn't stick").
+        the very first request (the whole reason a solve "doesn't stick"). The
+        TLS side is only as close as wreq allows: the newest profile matches a
+        newer browser's ClientHello only while Chrome has not changed it in
+        between, and Chrome does change it. Measured 2026-09-24: 149 -> 150
+        added ML-DSA signature algorithms and 151 -> 152 added extension
+        0xca34, each a new JA4 (HTTP/2 was identical across 149-153). A
+        JA4-aware WAF can see that skew, which is why the warning below asks
+        for a wreq bump.
         """
         exact = emulation_for_version(major_version)
         self._current = exact or CHROME_PROFILES[0][1]
@@ -813,17 +978,19 @@ class FingerprintManager:
         self._ch_full_version_override = full_version
         if exact is None:
             # The solving browser (Patchright's Chromium) is NEWER than any wreq
-            # Emulation. Handled: TLS pins the newest profile (JA4/H2 identical
-            # across adjacent Chrome majors) and the UA/hints follow the real
-            # browser, so cookie replay still works. Surfaced at WARNING so the
-            # skew is visible (it used to fail silently) -- bump DEFAULT_EMULATION
-            # + _CHROME_BUILDS once wreq ships this Chrome profile so the TLS
-            # shape tracks it too. See CLAUDE.md wreq-upgrade steps.
+            # Emulation. TLS pins the newest profile and the UA/hints follow the
+            # real browser, so a UA-bound cookie replays, but the ClientHello
+            # may not be the browser's (see the docstring). Surfaced at WARNING
+            # so the skew is visible (it used to fail silently) -- bump
+            # DEFAULT_EMULATION + _CHROME_BUILDS once wreq ships this Chrome
+            # profile so the TLS shape tracks it too. See CLAUDE.md
+            # wreq-upgrade steps.
             newest = emulation_major_version(self._current)
             logger.warning(
                 "Browser identity is Chrome %s but newest wreq Emulation is "
                 "Chrome %s; pinning %s TLS with the browser's real Chrome %s "
-                "UA/hints (cookie replay works; update wreq to close the gap)",
+                "UA/hints (the TLS fingerprint may not match the browser's; "
+                "update wreq to close the gap)",
                 major_version,
                 newest,
                 self._current,

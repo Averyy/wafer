@@ -117,7 +117,7 @@ Both support context managers (`with` / `async with`).
 
 ```python
 SyncSession(
-    # TLS identity (any wreq Emulation profile). Default: Emulation.Chrome149 (newest).
+    # TLS identity (any wreq Emulation profile). Default: Emulation.Chrome153 (newest).
     # Non-Chrome families get a matching HTTP header envelope automatically:
     #   Emulation.Edge148    -> Chromium headers, sec-ch-ua brand "Microsoft Edge"
     #   Emulation.Firefox151 -> Firefox Accept/Accept-Language, NO sec-ch-ua
@@ -125,7 +125,7 @@ SyncSession(
     # families (Chrome -> Firefox -> Safari -> Edge) before cycling versions -
     # see "Rotation escalation". A non-Chrome starting emulation just changes
     # the starting family; the same cross-family ladder still applies.
-    emulation: wreq.Emulation | None = None,  # default: Emulation.Chrome149 (newest)
+    emulation: wreq.Emulation | None = None,  # default: Emulation.Chrome153 (newest)
 
     # Non-Chrome profiles (overrides emulation)
     profile: Profile | None = None,           # OPERA_MINI, SAFARI, IOS_SAFARI, or DART
@@ -318,7 +318,9 @@ session.render(url: str, *, timeout=None, max_response_size=None) -> WaferRespon
 session.cookie_scope_summary(url: str) -> list[dict]
 # Value-free inspection of the wreq jar for diagnosing a protected flow: up to
 # 32 entries of {"name": str, "domain": str, "path": str, "secure": bool}.
-# Cookie values are never included. Returns [] for profiles with no wreq jar
+# "domain" is the cookie's Domain attribute without the leading dot, or for a
+# host-only cookie the host that set it ("" if that host is not one this
+# session requested or recorded a cookie from). Cookie values are never included. Returns [] for profiles with no wreq jar
 # (Opera Mini) and never raises.
 
 session.reddit_bootstrap_state() -> dict
@@ -433,7 +435,7 @@ resp.inline_solves  # int (inline challenge solves)
 resp.challenge_type # str | None (e.g. "cloudflare", "datadome")
 resp.emulation      # str | None - the identity that SERVED this response, for
                     # diagnosing a 403/regression. For Emulation sessions it's the
-                    # wreq profile repr, e.g. "Profile.Chrome149" / "Profile.Edge148"
+                    # wreq profile repr, e.g. "Profile.Chrome153" / "Profile.Edge148"
                     # / "Profile.Firefox151"; for non-Emulation profiles it's the
                     # profile name ("safari", "ios_safari", "dart",
                     # "opera_mini"). Reflects the
@@ -513,7 +515,7 @@ reaching into `wafer._fingerprint`. Always returns these keys:
 {
   "user_agent": str | None,        # the UA wreq sends for this profile
   "family": str | None,            # "chrome"|"edge"|"firefox"|"opera"|"safari"|"dart"|"opera_mini"|None
-  "emulation": str | None,         # "Profile.Chrome149" or "safari"/"ios_safari"/"dart"/"opera_mini"
+  "emulation": str | None,         # "Profile.Chrome153" or "safari"/"ios_safari"/"dart"/"opera_mini"
   "sec_ch_ua": str | None,         # low-entropy hint; None for Firefox/Safari/Opera (see below)
   "sec_ch_ua_mobile": str | None,  # "?0" or None
   "sec_ch_ua_platform": str | None,# e.g. '"macOS"' or None
@@ -678,13 +680,13 @@ WITHOUT retiring the whole session on N strikes.
   failures do not retire the session. Pool backoff is the health model;
   `max_rotations` still bounds rotations per request.
 - **Emulation-only.** Pool entries are wreq `Emulation` profiles
-  (`[Emulation.Chrome149, Emulation.Firefox151, Emulation.Edge148]`). A pool is
+  (`[Emulation.Chrome153, Emulation.Firefox151, Emulation.Edge148]`). A pool is
   ignored for `profile=` (Safari/iOS Safari/Dart/Opera Mini) sessions.
 
 ```python
 from wreq import Emulation
 session = SyncSession(
-    fingerprint_pool=[Emulation.Chrome149, Emulation.Firefox151, Emulation.Edge148],
+    fingerprint_pool=[Emulation.Chrome153, Emulation.Firefox151, Emulation.Edge148],
     max_rotations=6,  # bound how many pool steps a single request may take
 )
 ```
@@ -800,11 +802,14 @@ capabilities and trade-offs.
 
 ### Chrome (default, no profile= needed)
 
-- Default wreq TLS + HTTP/2 profile is `Emulation.Chrome149`
+- Default wreq TLS + HTTP/2 profile is `Emulation.Chrome153`
+- The User-Agent and `sec-ch-ua-platform` describe the host OS: a session on a
+  Linux server sends a Linux Chrome UA, on Windows a Windows one (the same holds
+  for the Edge and Firefox families)
 - Auto-generates `sec-ch-ua` Client Hints headers
 - On 403/challenge: rotates across families (Chrome -> Firefox -> Safari -> Edge -> Chrome versions), swapping the header envelope each switch (see "Rotation escalation")
 - All features enabled: challenge detection, retry, rotation, browser solving
-- Pass `emulation=wreq.Emulation.Chrome149` to select that specific profile
+- Pass `emulation=wreq.Emulation.Chrome153` to select that specific profile
 
 ### Safari (`profile=Profile.SAFARI`)
 
@@ -1318,11 +1323,22 @@ resp = await session.post("https://api.other.com/data", json=body)
 `cross-site`) from `embed_origin` vs request URL. Random Referer picked per
 request from `embed_referers`.
 
+For Chrome, Edge and Firefox emulations (the default and every rotation rung),
+an embed session sends the complete header set and header order of that
+browser's real `fetch()`, `XMLHttpRequest` or iframe load; `Sec-Fetch-User` is
+never sent. Session `headers=` values (e.g. `User-Agent`, `Priority`) take
+precedence, and an `Accept`, `Accept-Language` or `Accept-Encoding` left out of
+`headers=` is filled from the browser family. Any other `emulation=` (Opera,
+OkHttp, wreq's Safari members) keeps that profile's navigation headers
+alongside the embed `Sec-Fetch-*` values.
+
 ### XHR mode (`embed="xhr"`)
 - Emulates a modern `fetch()` call.
 - `Sec-Fetch-Mode: cors`, `Sec-Fetch-Dest: empty`, `Accept: */*`
 - Sets `Origin` from embed_origin
-- Strips navigation headers (`Upgrade-Insecure-Requests`, `Cache-Control`)
+- No navigation headers (`Upgrade-Insecure-Requests`, `Cache-Control`,
+  `Sec-Fetch-User`)
+- `Priority: u=1, i` (Chrome/Edge) or `u=4` (Firefox)
 
 ### jQuery XHR mode (`embed="xhr-jquery"`)
 - Emulates a legacy jQuery `$.ajax` / `XMLHttpRequest` call. Use this (instead
@@ -1335,10 +1351,16 @@ request from `embed_referers`.
   - `Accept: application/json, text/javascript, */*; q=0.01` (the jQuery Accept,
     instead of `"xhr"`'s `*/*`)
 - Both are set at the client level (no HTTP/2 header duplication).
+- Firefox sends no `Priority` header on an `XMLHttpRequest`, so none is sent
+  on the Firefox rung.
 - Use plain `"xhr"` for modern `fetch()` endpoints (no `X-Requested-With`).
 
 ### Iframe mode (`embed="iframe"`)
 - `Sec-Fetch-Mode: navigate`, `Sec-Fetch-Dest: iframe`
+- An embed loaded with the page: `Upgrade-Insecure-Requests: 1`, no
+  `Sec-Fetch-User`
+- Cross-site requests add `Sec-Fetch-Storage-Access: active` (Chrome/Edge) or
+  `none` (Firefox)
 - No `Origin` on GET navigations
 
 Per-request `headers=` overrides any embed header.
