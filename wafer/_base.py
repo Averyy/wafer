@@ -31,6 +31,7 @@ from wafer._fingerprint import (
     embed_priority,
     embed_storage_access,
     emulation_family,
+    emulation_is_mobile,
     emulation_user_agent,
     family_headers,
     wreq_emulation,
@@ -1329,8 +1330,15 @@ class BaseSession:
             # the UA from the Emulation unless a User-Agent header is set, so
             # inject it here. A user-supplied UA (in self.headers) still wins.
             ua_override = self._fingerprint.ua_override
-            if ua_override and not any(k.lower() == "user-agent" for k in headers):
-                headers["User-Agent"] = ua_override
+            if not any(k.lower() == "user-agent" for k in headers):
+                # Otherwise send wafer's own UA for desktop Chrome/Edge/Firefox:
+                # several wreq profiles carry broken UA literals (Edge134-141
+                # have no Edg/ token, Edge146/147 leak the full build,
+                # Firefox139 says rv:136 on Linux/Windows), and this keeps the
+                # wire equal to what fingerprint_envelope() reports.
+                ua = ua_override or self._desktop_emulation_ua()
+                if ua:
+                    headers["User-Agent"] = ua
             headers.update(self._fingerprint.sec_ch_ua_headers())
 
         if self._embed:
@@ -1382,6 +1390,13 @@ class BaseSession:
                 headers["TE"] = "trailers"
 
         return headers
+
+    def _desktop_emulation_ua(self) -> str | None:
+        """wafer's UA for a desktop Chrome/Edge/Firefox emulation, else None."""
+        current = self._fingerprint.current
+        if emulation_is_mobile(current):
+            return None
+        return emulation_user_agent(current)
 
     def _wire_client_headers(self) -> dict[str, str]:
         """The client-level headers to hand wreq.

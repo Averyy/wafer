@@ -142,13 +142,12 @@ def emulation_user_agent(emulation: Emulation) -> str | None:
     Opera, OkHttp - those use their own identity modules or aren't UA-stamped
     from this path). Edge UA-reduces the ``Edg/`` token like Chrome's
     (Microsoft's user-agent guidance shows ``Edg/120.0.0.0``); its real build
-    travels only in ``sec-ch-ua-full-version[-list]``. Older wreq Edge
-    profiles are inconsistent about this (Edge146/147 put the full build in
-    the UA, Edge134-141 omit the ``Edg/`` token entirely), so for those the
-    wire UA differs from this one.
+    travels only in ``sec-ch-ua-full-version[-list]``.
 
-    Embed mode sends this UA itself (wreq's headers are off there), so it has
-    to be the real browser's.
+    Sessions send this UA themselves rather than wreq's, whose literals are
+    wrong for some profiles (Edge134-141 omit ``Edg/`` and ``Safari/537.36``,
+    Edge146/147 carry the full build, Firefox139 says ``rv:136.0`` on
+    Linux/Windows), so it has to be the real browser's.
     """
     family = emulation_family(emulation)
     ver = emulation_major_version(emulation)
@@ -272,10 +271,8 @@ def _full_version(major: int) -> str:
 # series is DISTINCT from Chrome's (Edge 147 = 147.0.3912.x, Chrome 147 =
 # 147.0.7727.x) even though both share the same Chromium MAJOR. Real
 # first-stable Edge build numbers from the Microsoft Update Catalog /
-# Edge release notes (and wire-verified for the values wreq actually emits:
-# Edge146 -> 3856.109, Edge147 -> 3912.51, 2026-06-12 via tls.peet.ws).
-# Used ONLY for the "Microsoft Edge" brand in sec-ch-ua-full-version[-list]
-# and the reconstructed Edge UA; the "Chromium" brand keeps the shared Chrome
+# Edge release notes. Used ONLY for the "Microsoft Edge" brand in
+# sec-ch-ua-full-version[-list]; the "Chromium" brand keeps the shared Chrome
 # build (_CHROME_BUILDS), because Edge IS that Chromium under the hood.
 # IMPORTANT: refresh this alongside _CHROME_BUILDS when bumping wreq (see
 # CLAUDE.md "When upgrading wreq").
@@ -295,8 +292,8 @@ _EDGE_BUILDS: dict[int, tuple[int, int]] = {
     143: (3650, 66),
     144: (3719, 82),
     145: (3800, 58),
-    146: (3856, 109),  # wire-verified: the build wreq's Edge146 UA emits
-    147: (3912, 51),   # wire-verified: the build wreq's Edge147 UA emits
+    146: (3856, 109),
+    147: (3912, 51),
     148: (3967, 96),   # Edge 148 stable (MS Edge update API); wreq's Edge148
                        # UA is reduced to 148.0.0.0 so the build can't be
                        # wire-read - the full build lives only in wafer's

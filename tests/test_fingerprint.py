@@ -1042,3 +1042,41 @@ class TestFirefoxLinuxUserAgent:
         monkeypatch.setattr(platform, "system", lambda: "Linux")
         ua = emulation_user_agent(Emulation.Firefox151)
         assert ua.startswith("Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:151.0)")
+
+
+class TestSessionSendsWaferUserAgent:
+    """Sessions send wafer's desktop UA, not wreq's, whose literals are wrong
+    for some profiles (Edge134-141, Edge146/147, Firefox139 off macOS)."""
+
+    @staticmethod
+    def _ua(emulation):
+        from wafer import SyncSession
+
+        return SyncSession(emulation=emulation)._build_client_kwargs()["headers"].get(
+            "User-Agent"
+        )
+
+    def test_edge134_gets_a_real_edge_ua(self):
+        assert self._ua(Emulation.Edge134).endswith(
+            "Chrome/134.0.0.0 Safari/537.36 Edg/134.0.0.0"
+        )
+
+    def test_edge146_ua_is_reduced(self):
+        assert self._ua(Emulation.Edge146).endswith("Edg/146.0.0.0")
+
+    def test_firefox139_rv_matches_version(self, monkeypatch):
+        import platform
+
+        monkeypatch.setattr(platform, "system", lambda: "Linux")
+        ua = self._ua(Emulation.Firefox139)
+        assert "rv:139.0" in ua and "Firefox/139.0" in ua
+
+    def test_ua_matches_envelope(self):
+        from wafer import SyncSession
+
+        s = SyncSession(emulation=Emulation.Edge146)
+        sent = s._build_client_kwargs()["headers"]["User-Agent"]
+        assert s.fingerprint_envelope()["user_agent"] == sent
+
+    def test_mobile_profile_keeps_wreq_ua(self):
+        assert self._ua(Emulation.FirefoxAndroid135) is None

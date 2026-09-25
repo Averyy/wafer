@@ -513,7 +513,7 @@ reaching into `wafer._fingerprint`. Always returns these keys:
 
 ```python
 {
-  "user_agent": str | None,        # the UA wreq sends for this profile
+  "user_agent": str | None,        # the UA the session sends
   "family": str | None,            # "chrome"|"edge"|"firefox"|"opera"|"safari"|"dart"|"opera_mini"|None
   "emulation": str | None,         # "Profile.Chrome153" or "safari"/"ios_safari"/"dart"/"opera_mini"
   "sec_ch_ua": str | None,         # low-entropy hint; None for Firefox/Safari/Opera (see below)
