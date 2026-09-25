@@ -1236,7 +1236,7 @@ class BaseSession:
           "safari" | "dart" | "opera_mini" | None``
         - ``emulation``: ``repr()`` of the Emulation, or the Profile name
           for Safari/iOS Safari/Dart/Opera Mini (e.g.
-          ``"Profile.Chrome149"``, ``"ios_safari"``)
+          ``"Profile.Chrome153"``, ``"ios_safari"``)
         - ``sec_ch_ua`` / ``sec_ch_ua_mobile`` / ``sec_ch_ua_platform``:
           the low-entropy Client Hints. ``None`` for Firefox/Safari (no
           client hints) and for Opera (wreq's Emulation emits accurate
@@ -2903,12 +2903,13 @@ class BaseSession:
     def get_cookie(self, name: str, url: str) -> str | None:
         """Read a cookie value from the session's cookie jar(s).
 
-        Looks up ``name`` scoped to ``url``'s host: exact-host cookies
-        first, then parent-domain cookies (``Domain=.example.com``
-        matching ``www.example.com``). Reads whichever jars the session
-        actually uses -- the wreq jar, the native-TLS (Imperva bypass)
-        jar, and the Opera Mini jar. Cookies with the ``Secure`` flag
-        are only returned for ``https://`` URLs (RFC 6265 5.4). Returns
+        Looks up ``name`` scoped to ``url``'s host and path: the longest
+        matching path wins, then an exact-host cookie over a parent-domain
+        one (``Domain=.example.com`` matching ``www.example.com``). Reads
+        whichever jars the session actually uses -- the wreq jar, the
+        native-TLS (Imperva bypass) jar, and the Opera Mini jar. Cookies
+        with the ``Secure`` flag are only returned for ``https://`` URLs
+        (RFC 6265 5.4). Returns
         the cookie value, or None if not found. Never raises.
 
         Parent-domain matching uses ``_cookie_applies_to_host``, which is

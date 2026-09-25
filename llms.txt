@@ -134,7 +134,12 @@ SyncSession(
     # Custom headers (replaces DEFAULT_HEADERS entirely if provided).
     # Prefer per-request headers= kwarg for one-off overrides. Header names are
     # matched case-insensitively, so a per-request "accept" replaces the
-    # session's "Accept" rather than being sent alongside it.
+    # session's "Accept" rather than being sent alongside it. A value of ""
+    # leaves that header off the wire and suppresses the matching auto-header
+    # (e.g. "Referer": ""); outside embed mode, a header the browser profile
+    # supplies by default (e.g. Accept-Language, User-Agent) keeps the
+    # profile's value instead. A per-request "" suppresses an auto-header but
+    # cannot remove a header already set at the session or profile level.
     headers: dict[str, str] | None = None,
 
     # Timeouts (int, float seconds, or datetime.timedelta)
@@ -566,8 +571,9 @@ wafer.build_fingerprint_envelope(emulation, user_agent: str | None = None, *,
                                  ch_major_version: int | None = None,
                                  ch_full_version: str | None = None) -> dict
 # Same dict shape as session.fingerprint_envelope(), for an arbitrary Emulation
-# (without a session). user_agent is the UA you intend to send (wreq sets it from
-# the Emulation); pass it so the envelope is complete.
+# (without a session). user_agent is the UA you intend to send; pass it so the
+# envelope is complete (session.fingerprint_envelope() fills it in itself, since
+# a session sends its own desktop Chrome/Edge/Firefox UA).
 # ch_major_version / ch_full_version override the client-hint version and full
 # build independently of `emulation` (Chrome family only; ignored for others).
 # Leave None to use the Emulation's own version.
@@ -1095,9 +1101,9 @@ resp = session.get("https://protected-site.com")  # auto-solves challenges
 result: SolveResult | None = solver.solve(url, challenge_type)
 # result.cookies: list[dict] - browser cookies
 # result.user_agent: str - browser's User-Agent (version-reduced, e.g.
-#   "...Chrome/150.0.0.0...")
+#   "...Chrome/153.0.0.0...")
 # result.browser_version: str | None - browser's full build (e.g.
-#   "150.0.7871.125"); the version-reduced user_agent hides it
+#   "153.0.8010.53"); the version-reduced user_agent hides it
 # result.extras: dict | None - WAF-specific data
 # result.response: CapturedResponse | None - passthrough content (see below)
 # result.challenge_absent: bool - no transferable clearance identity was
@@ -1329,8 +1335,10 @@ browser's real `fetch()`, `XMLHttpRequest` or iframe load; `Sec-Fetch-User` is
 never sent. Session `headers=` values (e.g. `User-Agent`, `Priority`) take
 precedence, and an `Accept`, `Accept-Language` or `Accept-Encoding` left out of
 `headers=` is filled from the browser family. Any other `emulation=` (Opera,
-OkHttp, wreq's Safari members) keeps that profile's navigation headers
-alongside the embed `Sec-Fetch-*` values.
+OkHttp, wreq's Safari members) keeps that profile's navigation headers,
+including `Sec-Fetch-User: ?1` and `Upgrade-Insecure-Requests: 1`, next to the
+embed `Sec-Fetch-*` values, a combination no browser sends; use a Chrome, Edge
+or Firefox emulation for embed mode.
 
 ### XHR mode (`embed="xhr"`)
 - Emulates a modern `fetch()` call.
@@ -1352,7 +1360,7 @@ alongside the embed `Sec-Fetch-*` values.
     instead of `"xhr"`'s `*/*`)
 - Both are set at the client level (no HTTP/2 header duplication).
 - Firefox sends no `Priority` header on an `XMLHttpRequest`, so none is sent
-  on the Firefox rung.
+  on the Firefox rung. Firefox rungs add `TE: trailers` in every embed mode.
 - Use plain `"xhr"` for modern `fetch()` endpoints (no `X-Requested-With`).
 
 ### Iframe mode (`embed="iframe"`)

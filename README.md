@@ -580,7 +580,7 @@ resp = session.get("https://www.marinetraffic.com/getData/get_data_json_4/z:11/X
 
 ### jQuery XHR Mode (`embed="xhr-jquery"`)
 
-Same as `"xhr"` (identical CORS `Sec-Fetch-*`, `Origin`, Referer, stripped navigation headers), plus the two markers a legacy jQuery `$.ajax` / `XMLHttpRequest` call sends:
+Same as `"xhr"` (identical CORS `Sec-Fetch-*`, `Origin`, Referer, no navigation headers), plus the two markers a legacy jQuery `$.ajax` / `XMLHttpRequest` call sends:
 
 - `X-Requested-With: XMLHttpRequest`
 - `Accept: application/json, text/javascript, */*; q=0.01` (the jQuery Accept, instead of `"xhr"`'s `*/*`)

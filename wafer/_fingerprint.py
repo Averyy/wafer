@@ -1119,11 +1119,11 @@ def build_fingerprint_envelope(
 
     Keys (always present):
 
-    - ``user_agent``: ``str | None`` -- the UA wreq sends for this profile
-      (the caller supplies it; wreq sets it from the Emulation, wafer never
-      overrides it for Chrome/Edge/Firefox)
+    - ``user_agent``: ``str | None`` -- the UA the caller supplies. A session
+      sends its own UA for desktop Chrome/Edge/Firefox
+      (``emulation_user_agent``); ``session.fingerprint_envelope()`` fills it in
     - ``family``: ``"chrome" | "edge" | "firefox" | "opera" | "safari" | None``
-    - ``emulation``: ``repr(emulation)`` (e.g. ``"Profile.Chrome149"``)
+    - ``emulation``: ``repr(emulation)`` (e.g. ``"Profile.Chrome153"``)
     - ``sec_ch_ua`` / ``sec_ch_ua_mobile`` / ``sec_ch_ua_platform``:
       the low-entropy Client Hints. ``None`` for Firefox/Safari (no client
       hints) and for Opera (wreq's Emulation emits accurate Opera hints

@@ -5,8 +5,8 @@
 **Detection**: Done. HTTP-level: `/_____tmd_____/punish` in response body (`_challenge.py`). Browser-level: `#nc_1_n1z` handle or `#nc_1_wrapper` in DOM (`_drag.py::detect_drag_vendor`).
 
 **Browser solve**: Implemented and live-verified. Re-verified 2026-07-27 on
-**system Chrome 150.0.7871.182** (macOS, headed), i.e. a Chrome newer than
-wafer's `DEFAULT_EMULATION`: an Alibaba search burst triggered TMD on the first
+**system Chrome 150.0.7871.182** (macOS, headed), i.e. newer than
+wafer's `DEFAULT_EMULATION` at the time (Chrome149): an Alibaba search burst triggered TMD on the first
 request, the slider solved on its first attempt, and the request returned 200 /
 1.43MB of real results in 19.5s, followed by 11 consecutive ~2s 200s replaying
 the earned `x5sec`. A repeat run after the navigation-budget fix solved again
