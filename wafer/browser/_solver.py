@@ -408,6 +408,24 @@ def _network_url_identity(parsed) -> tuple[str, str, int | None, str, str]:
     return (*_origin_path_identity(parsed), parsed.query)
 
 
+def _main_document_status(records: list[tuple[str, int]], landed) -> int | None:
+    """Status of the latest main-frame document served for ``landed``.
+
+    ``records`` holds (url, status) for every main-frame document response
+    in order. Query and fragment are ignored, as a challenge's own reload
+    often adds and then strips a token query. None when the page never had
+    a document response of its own (a client-side route change).
+    """
+    target = _origin_path_identity(landed)
+    for record_url, status in reversed(records):
+        try:
+            if _origin_path_identity(urlparse(record_url)) == target:
+                return status
+        except ValueError:
+            continue
+    return None
+
+
 def _response_headers(response) -> tuple[dict[str, str], list[str]]:
     """Read a Playwright response's headers without collapsing Set-Cookie."""
 
@@ -3205,6 +3223,26 @@ class BrowserSolver:
                     else set()
                 )
 
+                # Every main-frame document's status, so a post-solve
+                # passthrough reports what the server answered for the page it
+                # returns instead of assuming 200.
+                main_documents: list[tuple[str, int]] = []
+
+                def _record_main_document(response) -> None:
+                    try:
+                        request = response.request
+                        if (
+                            request.resource_type == "document"
+                            and request.frame == page.main_frame
+                        ):
+                            main_documents.append(
+                                (str(response.url), int(response.status))
+                            )
+                    except Exception:
+                        return
+
+                page.on("response", _record_main_document)
+
                 # Navigate the origin page when one was supplied
                 # (solve_origin / a non-Imperva embedder): the request URL is
                 # a JSON/XHR API that can't be top-navigated, so we run the
@@ -3434,6 +3472,27 @@ class BrowserSolver:
                         # redirects to siteclosed/invitation.html).
                         page_url = page.url.lower()
                         is_block = "invitation" in page_url or "siteclosed" in page_url
+                        landed = urlparse(page.url)
+                        if _origin_path_identity(landed)[:3] != _origin_path_identity(
+                            urlparse(url)
+                        )[:3]:
+                            # The browser followed a redirect to another
+                            # origin. Returning that page would hide the
+                            # redirect from follow_redirects=False and from the
+                            # caller's per-hop checks, so keep the cookies and
+                            # let the replay surface it.
+                            logger.info(
+                                "%s solve landed on another origin (%s); "
+                                "replaying instead of passing the page through",
+                                challenge_type or "unknown",
+                                landed.hostname,
+                            )
+                            break
+                        landed_status = _main_document_status(main_documents, landed)
+                        if landed_status is not None and not 200 <= landed_status < 300:
+                            # Not content (a 404, an error page): let the
+                            # replay return the server's real status.
+                            break
                         if len(html) > 1024 and not is_challenge and not is_block:
                             body = html.encode("utf-8")
                             # Re-read cookies after redirect —
@@ -3441,7 +3500,7 @@ class BrowserSolver:
                             cookies = context.cookies()
                             captured = CapturedResponse(
                                 url=page.url,
-                                status=200,
+                                status=landed_status or 200,
                                 headers={"content-type": ("text/html; charset=utf-8")},
                                 body=body,
                             )
