@@ -362,6 +362,7 @@ solver - you must handle it yourself).
 | AWS WAF | `aws-waf-token` cookie, `AwsWafIntegration` script | browser |
 | ACW (Alibaba) | `acw_sc__v2` challenge script | inline |
 | Proof-of-work gate | `POW_CHALLENGE_DATA` script, served as a plain HTTP 202 (redflagdeals.com) | inline (SHA-256 solve) |
+| Cookie gate | small page whose inline script writes a fixed `document.cookie` and reloads, e.g. a "Continue" button (fccid.io, fcc.report) | inline (writes the cookie) |
 | TMD | TMD session validation pattern | inline (+ browser slider) |
 | Amazon | CAPTCHA page with `amzn` markers | inline |
 | Reddit | cold-session JSON block or 200 HTML verification | inline first; optional browser cookie recovery |
@@ -374,8 +375,8 @@ solver - you must handle it yourself).
 | Cloudflare WAF block | Error 1020 / IP-ban page: `cf.errors.css` present, `challenge-platform` absent | **terminal** -raises `RequestBlocked` at once, no retry or rotation |
 
 When a challenge is detected, wafer escalates automatically:
-1. Inline solving/warm-up (ACW, PoW, Amazon, Reddit, Radware, and the first
-   TMD warm-up)
+1. Inline solving/warm-up (ACW, PoW, cookie gate, Amazon, Reddit, Radware,
+   and the first TMD warm-up)
 2. For Imperva, a native OpenSSL transport that TLS-fingerprinting sites
    free-pass (no browser - see [Imperva bypass](#imperva--incapsula-no-browser-bypass))
 3. Browser solver if configured (JS challenges: Cloudflare, DataDome, reCAPTCHA,
@@ -389,7 +390,7 @@ Wafer raises `RequestBlocked` on the first response, spending no budget.
 
 ## Inline Solvers
 
-Five challenge types have an inline path that does not require a browser.
+Seven challenge types have an inline path that does not require a browser.
 Reddit can optionally fall back to the configured browser if its strict inline
 bootstrap fails:
 
@@ -400,6 +401,12 @@ bootstrap fails:
   sets the `pow_bypass` cookie for the page's `cookie_duration` on its
   `cookie_domain`, and replays. One solve covers every host of the site for an
   hour and is persisted to the cookie cache with that expiry.
+- **Cookie gate** -A site's own "Continue" page (fccid.io, fcc.report) whose
+  script writes a fixed cookie and reloads. wafer writes the same cookie and
+  replays, and persists it for the page's `Max-Age` (capped at a day).
+- **Radware Bot Manager** -The redirect that fronts the captcha page already
+  sets the `__uzm*` clearance on the origin, so wafer replays the original URL
+  on the same jar.
 - **Amazon CAPTCHA** -Parses the captcha form and submits it programmatically.
 - **TMD (Alibaba TMD)** -First warms the session by fetching the homepage.
   If the issued punishment flow persists, the configured browser handles its

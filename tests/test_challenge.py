@@ -840,6 +840,90 @@ _POW_GATE_HEADERS = {
 }
 
 
+_COOKIE_GATE_BODY = (
+    pathlib.Path(__file__).parent / "fixtures" / "fccid_continue_gate.html"
+).read_text()
+
+
+class TestCookieGate:
+    """fccid.io's Continue page, captured 2026-09-26 behind Cloudflare."""
+
+    def test_measured_gate_page(self):
+        assert detect_challenge(200, {"server": "cloudflare"}, _COOKIE_GATE_BODY) == (
+            ChallengeType.COOKIE_GATE
+        )
+
+    def test_status_agnostic(self):
+        for status in (200, 202, 403, 503):
+            assert (
+                detect_challenge(status, {}, _COOKIE_GATE_BODY)
+                == ChallengeType.COOKIE_GATE
+            )
+
+    def test_auto_reload_without_button(self):
+        body = (
+            '<html><script>document.cookie="js=1; Path=/";location.reload()'
+            "</script></html>"
+        )
+        assert detect_challenge(200, {}, body) == ChallengeType.COOKIE_GATE
+
+    def test_reference_doc_is_not_the_gate(self):
+        doc = (
+            pathlib.Path(__file__).parent.parent / "docs" / "ref-cookie-gate.md"
+        ).read_text()
+        assert detect_challenge(200, {}, doc) is None
+
+    def test_escaped_script_tag_not_detected(self):
+        body = _COOKIE_GATE_BODY.replace("<script>", "&lt;script&gt;")
+        assert detect_challenge(200, {}, body) is None
+
+    def test_large_page_with_the_same_script_is_content(self):
+        """A consent banner on a real page sets a cookie and reloads too."""
+        body = _COOKIE_GATE_BODY.replace(
+            "</main>", "<p>filing text</p>" * 2_000 + "</main>"
+        )
+        assert detect_challenge(200, {}, body) is None
+
+    def test_computed_cookie_not_detected(self):
+        body = (
+            '<html><script>var t=Date.now();document.cookie="gate=" + t;'
+            "location.reload();</script></html>"
+        )
+        assert detect_challenge(200, {}, body) is None
+
+    def test_one_computed_write_disqualifies_the_script(self):
+        body = (
+            '<html><script>document.cookie="a=1";document.cookie=token;'
+            "location.reload();</script></html>"
+        )
+        assert detect_challenge(200, {}, body) is None
+
+    def test_cookie_without_reload_not_detected(self):
+        body = '<html><script>document.cookie="seen=1; Path=/";</script></html>'
+        assert detect_challenge(200, {}, body) is None
+
+    def test_reload_before_the_write_not_detected(self):
+        body = (
+            '<html><script>location.reload();document.cookie="a=1";'
+            "</script></html>"
+        )
+        assert detect_challenge(200, {}, body) is None
+
+    def test_external_script_ignored(self):
+        body = (
+            '<html><script src="/g.js">document.cookie="a=1";location.reload()'
+            "</script></html>"
+        )
+        assert detect_challenge(200, {}, body) is None
+
+    def test_unclosed_script_tags_are_bounded(self):
+        hostile = "document.cookie " + "<script" * 2_500
+        assert len(hostile) < 20_000
+        start = time.perf_counter()
+        assert detect_challenge(200, {}, hostile) is None
+        assert time.perf_counter() - start < 0.5
+
+
 class TestPow:
     def test_202_gate_page(self):
         """The measured shape: a clean 202 that every status check reads as success."""

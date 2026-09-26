@@ -72,6 +72,11 @@ _METHOD_MAP: dict[str, Method] = {
 }
 
 
+def _browser_attempt_key(challenge, url: str) -> tuple[str, str]:
+    """What a request's one-browser-solve-per-challenge limit is keyed on."""
+    return (challenge.value, (urlparse(url).hostname or "").lower())
+
+
 def _browser_solve_timeout(remaining: float) -> float:
     """Reserve part of a request deadline for cookie replay after solving.
 
@@ -1397,6 +1402,27 @@ class BaseSession:
         if emulation_is_mobile(current):
             return None
         return emulation_user_agent(current)
+
+    def _add_gate_cookies(self, cookies, url: str) -> list[dict]:
+        """Add a cookie gate's cookies to the jar; return cache entries for
+        the ones with a lifetime (a session cookie is not persisted, as in
+        the browser)."""
+        now = time.time()
+        entries = []
+        for gate_cookie in cookies:
+            self._record_cookie_scope(gate_cookie.cookie, url)
+            self._client.cookie_jar.add(gate_cookie.cookie, url)
+            if gate_cookie.max_age:
+                entries.append(
+                    {
+                        "name": gate_cookie.name,
+                        "raw": gate_cookie.cookie,
+                        "url": url,
+                        "expires": now + gate_cookie.max_age,
+                        "last_used": now,
+                    }
+                )
+        return entries
 
     def _wire_client_headers(self) -> dict[str, str]:
         """The client-level headers to hand wreq.

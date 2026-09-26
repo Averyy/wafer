@@ -13,7 +13,7 @@ import enum
 import logging
 from urllib.parse import urlparse
 
-from wafer._solvers import is_pow_challenge, is_reddit_verification
+from wafer._solvers import is_cookie_gate, is_pow_challenge, is_reddit_verification
 
 logger = logging.getLogger("wafer")
 
@@ -149,6 +149,7 @@ class ChallengeType(enum.Enum):
     AWSWAF = "awswaf"
     ACW = "acw"
     POW = "pow"
+    COOKIE_GATE = "cookie_gate"
     TMD = "tmd"
     AMAZON = "amazon"
     REDDIT = "reddit"
@@ -375,6 +376,15 @@ def detect_challenge(
     if is_pow_challenge(body):
         logger.info("Challenge detected: pow")
         return ChallengeType.POW
+
+    # Cookie gate - a site-owned "Continue" page (fccid.io, as HTTP 200) whose
+    # inline script writes a fixed cookie and reloads. Status-agnostic for
+    # the same reason as the PoW gate; structural (small page, literal cookie
+    # writes, then location.reload() in one inline script) so a page quoting
+    # the script is not taken for it.
+    if is_cookie_gate(body):
+        logger.info("Challenge detected: cookie_gate")
+        return ChallengeType.COOKIE_GATE
 
     # TMD (Alibaba) — punish page, status 200
     if status_code == 200 and "/_____tmd_____/punish" in body:

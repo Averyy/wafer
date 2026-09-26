@@ -199,6 +199,16 @@ SHA-256 puzzle inline and replays. See `docs/ref-pow.md`.
 | `forums.redflagdeals.com/feed/forum/9` | PoW gate (exempt route) | pass | 2026-09-07: 200 Atom 20KB, no challenge issued. Negative control: `pow_trace`-less, no script, correctly not detected |
 | `forums.redflagdeals.com/robots.txt` | PoW gate (exempt route) | pass | 2026-09-07: 200, no challenge issued |
 
+### Cookie gate (site-owned "Continue" page)
+
+A small page whose script writes a fixed cookie and reloads. wafer writes the
+cookie and replays. See `docs/ref-cookie-gate.md`.
+
+| URL | Challenge Type | Status | Notes |
+|---|---|---|---|
+| `fccid.io/2AC7Z-ESPWROOM32` | Cloudflare managed + cookie gate (`fcc_continue`) | browser-solve + inline | 2026-09-26: 403 CF managed challenge (site-branded "Security check" template) -> headless browser solve -> 200 2.4KB Continue gate (not passed through) -> replay -> inline gate solve -> 200 72KB filing in 4.1s. A second session on the same `cache_dir` with no browser got the filing directly, 0 solves |
+| `fcc.report/FCC-ID/2AC7Z-ESPWROOM32` | Cloudflare managed + cookie gate (`fcc_report_continue`) + 301 to fccid.io | browser-solve + inline | 2026-09-26: `follow_redirects=False` -> 301 to fccid.io surfaced (the browser's cross-host landing is no longer passed through). Default redirects -> one browser solve per host plus both gates inline -> 200 fccid.io filing in 7.3s |
+
 ### Unknown / Other
 
 | URL | Challenge Type | Status | Notes |

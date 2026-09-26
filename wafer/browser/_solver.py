@@ -46,6 +46,7 @@ from urllib.parse import unquote, urlparse
 from wafer._cookies import browser_cookie_matches_host, registrable_domain
 from wafer._errors import ResponseTooLarge
 from wafer._fingerprint import chrome_full_version
+from wafer._solvers import is_cookie_gate
 
 logger = logging.getLogger("wafer")
 
@@ -358,6 +359,9 @@ def _is_passthrough_challenge_html(html: str) -> bool:
         # Shreddit response, so it must not be limited to the generic 10 KiB
         # marker prefix.
         or _REDDIT_BROWSER_CHALLENGE_RE.search(html) is not None
+        # A site's own "Continue" gate behind the WAF (fccid.io): the session
+        # solves it inline on the replay, so it is never content.
+        or is_cookie_gate(html)
     )
 
 
@@ -3492,6 +3496,10 @@ class BrowserSolver:
                         if landed_status is not None and not 200 <= landed_status < 300:
                             # Not content (a 404, an error page): let the
                             # replay return the server's real status.
+                            break
+                        if is_cookie_gate(html):
+                            # It will not clear by itself; the replay writes
+                            # its cookie inline.
                             break
                         if len(html) > 1024 and not is_challenge and not is_block:
                             body = html.encode("utf-8")

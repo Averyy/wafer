@@ -901,6 +901,8 @@ one of these strings:
 "acw"          - Alibaba Cloud WAF (solved inline, no browser needed)
 "pow"          - home-grown SHA-256 proof-of-work gate, served as HTTP 202
                  (redflagdeals.com; solved inline, no browser needed)
+"cookie_gate"  - site-owned "Continue" page whose script writes a fixed cookie
+                 and reloads (fccid.io; solved inline, no browser needed)
 "tmd"          - Alibaba TMD (inline warm-up; browser for Baxia/reCAPTCHA)
 "amazon"       - Amazon CAPTCHA (solved inline, no browser needed)
 "reddit"       - Reddit cold-session JSON/HTML gate (inline first; optional browser recovery)
@@ -929,8 +931,8 @@ a score token, not a visible challenge, and is minted browser-free via
 `session.mint_recaptcha_v3(...)` (see "reCAPTCHA v3 token minting").
 `"vercel"`/`"generic_js"` also get the generic browser JS-wait (no
 dedicated solver, but it passes their passive JS checks). The inline set
-(`acw`, `pow`, `tmd`, `amazon`, `reddit`, `radware`) needs no browser for its
-normal path.
+(`acw`, `pow`, `cookie_gate`, `tmd`, `amazon`, `reddit`, `radware`) needs no
+browser for its normal path.
 
 Radware serves its captcha interstitial as a plain HTTP 200 from its own host
 (`validate.perfdrive.com`) after a redirect off the origin, so a Radware block
@@ -960,6 +962,21 @@ host of the site, and with `cache_dir` it survives process restarts until it
 expires. A
 gate that keeps re-serving the puzzle after the solve raises `ChallengeDetected`
 with `challenge_type == "pow"` rather than returning the script page as content.
+
+A cookie gate (`"cookie_gate"`) is a small page, often a 200 behind a WAF
+challenge, whose inline script writes a fixed `document.cookie` value and
+reloads, usually from a "Continue" button. wafer writes the same cookie and
+replays the URL. A cookie with `Max-Age` is persisted with `cache_dir` for that
+lifetime, capped at a day. A script that computes any part of its cookie is not
+treated as this gate. A gate that keeps coming back after the solve raises
+`ChallengeDetected` with `challenge_type == "cookie_gate"`.
+
+A browser solve returns the page the browser ended on only when it is on the
+requested origin and was not answered with a non-2xx status. If the browser followed a redirect
+to another origin, the session replays the original URL with the solve's
+cookies instead, so the redirect reaches the caller as a normal 3xx
+(`follow_redirects=False`) or is followed by wafer. Each host in a redirect
+chain gets its own browser solve, once per challenge type per request.
 
 A challenged POST is replayed as the same POST, with its body and headers
 intact. Radware's own host is only ever sent the bodyless GET that a redirect

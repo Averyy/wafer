@@ -200,7 +200,7 @@ def parse_pow_challenge(body: str) -> dict[str, str] | None:
     return fields
 
 
-def _pow_cookie_domain(cookie_domain: str, url: str) -> str | None:
+def _page_cookie_domain(cookie_domain: str, url: str) -> str | None:
     """The ``Domain`` attribute to write, or ``None`` for a host-only cookie.
 
     The page names its own parent domain (``.redflagdeals.com``), which is
@@ -276,7 +276,7 @@ def solve_pow(
         max_age = _POW_DEFAULT_MAX_AGE
     max_age = min(max_age, _POW_MAX_MAX_AGE)
     parts = [f"{POW_COOKIE_NAME}={value}"]
-    domain = _pow_cookie_domain(fields.get("cookie_domain", ""), url)
+    domain = _page_cookie_domain(fields.get("cookie_domain", ""), url)
     if domain:
         parts.append(f"Domain={domain}")
     parts.append("Path=/")
@@ -290,6 +290,144 @@ def solve_pow(
         max_age=max_age,
         iterations=counter,
     )
+
+
+# ── Cookie gate ───────────────────────────────────────────────────────────────
+# A site-owned interstitial whose script writes a fixed cookie and reloads,
+# usually from a "Continue" button (measured on fccid.io, behind Cloudflare:
+# ``document.cookie="fcc_continue=1; Path=/; Max-Age=1800; ..."`` then
+# ``location.reload()``). Nothing is computed, so the solve is to write the
+# same cookie and replay. See docs/ref-cookie-gate.md.
+
+# The measured page is 2.4 KB. The cap keeps a real document that happens to
+# set a cookie and reload (a consent banner) from being taken for the gate,
+# and bounds the scan.
+COOKIE_GATE_MAX_PAGE_BYTES = 20_000
+
+# A lifetime the page gives is honoured up to a day, so a page cannot pin a
+# cookie in the cache for years. Without one the cookie is a session cookie,
+# as it is in the browser.
+_COOKIE_GATE_MAX_MAX_AGE = 86_400
+
+_SCRIPT_OPEN_RE = re.compile(r"<script\b([^>]{0,512})>", re.IGNORECASE)
+# Any write to document.cookie, and the subset that writes a string literal
+# with nothing appended (``"a=" + x`` fails the lookahead).
+_COOKIE_WRITE_RE = re.compile(r"document\.cookie\s*=(?!=)")
+_COOKIE_LITERAL_RE = re.compile(
+    r"document\.cookie\s*=\s*([\"'])([^\"'\\\r\n]{1,512})\1\s*(?=[;,)}\r\n]|$)"
+)
+_RELOAD_RE = re.compile(r"location\.reload\s*\(")
+# RFC 6265 cookie-name (token) and cookie-value octets, bounded.
+_COOKIE_NAME_RE = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]{1,64}\Z")
+_COOKIE_VALUE_RE = re.compile(r"[\x21\x23-\x2B\x2D-\x3A\x3C-\x5B\x5D-\x7E]{1,256}\Z")
+_COOKIE_PATH_RE = re.compile(r"/[\x21-\x3A\x3C-\x7E]{0,255}\Z")
+
+
+def _gate_cookie_writes(body: str) -> list[str] | None:
+    """The cookie strings a gate page's inline script writes before reloading.
+
+    Returns ``None`` unless one inline ``<script>`` writes only string
+    literals to ``document.cookie`` and then calls ``location.reload()``.
+    A script that computes any part of a cookie is not this gate: writing a
+    guessed value would be worse than the plain replay the loop falls back
+    to.
+    """
+    if len(body) > COOKIE_GATE_MAX_PAGE_BYTES or "document.cookie" not in body:
+        return None
+    for match in _SCRIPT_OPEN_RE.finditer(body):
+        if "src=" in match.group(1).lower():
+            continue
+        end = body.find("</script", match.end())
+        script = body[match.end() : end if end != -1 else len(body)]
+        reload = _RELOAD_RE.search(script)
+        if reload is None:
+            continue
+        before = script[: reload.start()]
+        literals = list(_COOKIE_LITERAL_RE.finditer(before))
+        if not literals or len(literals) != len(_COOKIE_WRITE_RE.findall(before)):
+            continue
+        return [m.group(2) for m in literals]
+    return None
+
+
+def is_cookie_gate(body: str) -> bool:
+    """True for a small page whose inline script writes a fixed cookie and
+    reloads. Prose that quotes such a script has no ``<script>`` element
+    around it, and a real document fails the size cap."""
+    writes = _gate_cookie_writes(body)
+    return writes is not None and all(_parse_gate_cookie(w) for w in writes)
+
+
+@dataclass(frozen=True)
+class GateCookie:
+    """One cookie a gate page writes, ready to add to a jar."""
+
+    cookie: str
+    """Set-Cookie string with the page's attributes, validated."""
+
+    name: str
+
+    max_age: int | None
+    """Lifetime in seconds, or ``None`` for a session cookie."""
+
+
+def _parse_gate_cookie(raw: str, url: str = "") -> GateCookie | None:
+    """Validate one ``document.cookie`` string and rebuild it for the jar.
+
+    The name and value must be plain RFC 6265 tokens. Path, Max-Age (capped
+    at a day) and SameSite are kept; a Domain is honoured only at or below
+    the request host's registrable domain; Secure follows the request
+    scheme. Expires is dropped, leaving a session cookie unless Max-Age is
+    given.
+    """
+    parts = [part.strip() for part in raw.split(";")]
+    name, sep, value = parts[0].partition("=")
+    name, value = name.strip(), value.strip()
+    if not sep or not _COOKIE_NAME_RE.match(name) or not _COOKIE_VALUE_RE.match(value):
+        return None
+    path, max_age, same_site, domain_attr = "/", None, "Lax", ""
+    for attr in parts[1:]:
+        key, _, val = attr.partition("=")
+        key, val = key.strip().lower(), val.strip()
+        if key == "path":
+            if not _COOKIE_PATH_RE.match(val):
+                return None
+            path = val
+        elif key == "max-age":
+            if not val.isdigit() or len(val) > 10:
+                return None
+            max_age = min(int(val), _COOKIE_GATE_MAX_MAX_AGE)
+        elif key == "samesite":
+            if val.lower() not in ("lax", "strict", "none"):
+                return None
+            same_site = val.capitalize()
+        elif key == "domain":
+            domain_attr = val
+    if max_age == 0:
+        # Deleting the cookie cannot be what lets the reload through.
+        return None
+    out = [f"{name}={value}"]
+    domain = _page_cookie_domain(domain_attr, url) if domain_attr and url else None
+    if domain:
+        out.append(f"Domain={domain}")
+    out.append(f"Path={path}")
+    if max_age is not None:
+        out.append(f"Max-Age={max_age}")
+    out.append(f"SameSite={same_site}")
+    if urlparse(url).scheme == "https":
+        out.append("Secure")
+    return GateCookie(cookie="; ".join(out), name=name, max_age=max_age)
+
+
+def solve_cookie_gate(body: str, url: str) -> list[GateCookie] | None:
+    """The cookies a cookie-gate page's script writes, for replaying ``url``."""
+    writes = _gate_cookie_writes(body)
+    if writes is None:
+        return None
+    cookies = [_parse_gate_cookie(raw, url) for raw in writes]
+    if not cookies or any(c is None for c in cookies):
+        return None
+    return cookies
 
 
 # ── Amazon Captcha Parser ─────────────────────────────────────────────────────

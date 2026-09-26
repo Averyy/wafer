@@ -3,6 +3,7 @@
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 from unittest.mock import patch
 from urllib.parse import urlparse
 
@@ -21,6 +22,7 @@ from wafer._solvers import (
     parse_amazon_captcha,
     parse_pow_challenge,
     solve_acw,
+    solve_cookie_gate,
     solve_pow,
     tmd_homepage_url,
 )
@@ -600,6 +602,131 @@ class TestPowSolverIntegration:
         assert resp.text == "<html>real content</html>"
         assert resp.inline_solves == 0
         assert mock.cookie_jar.added == []
+
+
+_GATE_URL = "https://fccid.io/2AC7Z-ESPWROOM32"
+_GATE_BODY = (
+    Path(__file__).parent / "fixtures" / "fccid_continue_gate.html"
+).read_text()
+_GATE_COOKIE = "fcc_continue=1; Path=/; Max-Age=1800; SameSite=Lax; Secure"
+
+
+def _gate(cookie):
+    return f'<html><script>document.cookie="{cookie}";location.reload()</script></html>'
+
+
+class TestSolveCookieGate:
+    def test_measured_page(self):
+        (cookie,) = solve_cookie_gate(_GATE_BODY, _GATE_URL)
+        assert cookie.cookie == _GATE_COOKIE
+        assert cookie.name == "fcc_continue"
+        assert cookie.max_age == 1800
+
+    def test_max_age_is_capped_at_a_day(self):
+        (cookie,) = solve_cookie_gate(_gate("a=1; Max-Age=99999999"), _GATE_URL)
+        assert cookie.max_age == 86_400
+
+    def test_no_max_age_is_a_session_cookie(self):
+        body = _gate("a=1; Expires=Fri, 01 Jan 2100 00:00:00 GMT")
+        (cookie,) = solve_cookie_gate(body, _GATE_URL)
+        assert cookie.max_age is None
+        assert "Expires" not in cookie.cookie
+
+    def test_zero_max_age_is_refused(self):
+        assert solve_cookie_gate(_gate("a=1; Max-Age=0"), _GATE_URL) is None
+
+    def test_domain_on_a_public_suffix_is_dropped(self):
+        (cookie,) = solve_cookie_gate(_gate("a=1; Domain=co.uk"), "https://evil.co.uk/")
+        assert "Domain" not in cookie.cookie
+
+    def test_parent_domain_is_kept(self):
+        (cookie,) = solve_cookie_gate(_gate("a=1; Domain=.fccid.io"), "https://www.fccid.io/")
+        assert "Domain=fccid.io" in cookie.cookie
+
+    def test_plain_http_has_no_secure(self):
+        (cookie,) = solve_cookie_gate(_gate("a=1; Secure"), "http://fccid.io/")
+        assert "Secure" not in cookie.cookie
+
+    def test_invalid_name_or_value_refused(self):
+        assert solve_cookie_gate(_gate("a b=1"), _GATE_URL) is None
+        assert solve_cookie_gate(_gate("a=1,2"), _GATE_URL) is None
+
+    def test_multiple_literal_writes(self):
+        body = (
+            '<html><script>document.cookie="a=1; Path=/";'
+            'document.cookie="b=2; Path=/";location.reload()</script></html>'
+        )
+        assert [c.name for c in solve_cookie_gate(body, _GATE_URL)] == ["a", "b"]
+
+
+class TestCookieGateSolverIntegration:
+    @patch("wafer._sync.time.sleep")
+    def test_gate_solved_inline_then_filing(self, mock_sleep):
+        responses = [
+            MockResponse(200, {"server": "cloudflare"}, _GATE_BODY),
+            MockResponse(200, {}, "<html><title>FCC ID 2AC7Z</title></html>"),
+        ]
+        session, mock = make_sync_session(responses, use_cookie_jar=True)
+        resp = session.request("GET", _GATE_URL)
+        assert resp.text == "<html><title>FCC ID 2AC7Z</title></html>"
+        assert resp.inline_solves == 1
+        assert mock.request_count == 2
+        assert mock.cookie_jar.added == [(_GATE_COOKIE, _GATE_URL)]
+
+    @patch("wafer._sync.time.sleep")
+    def test_cookie_persisted_for_its_max_age(self, mock_sleep, tmp_path):
+        cache = CookieCache(cache_dir=str(tmp_path))
+        responses = [
+            MockResponse(200, {}, _GATE_BODY),
+            MockResponse(200, {}, "<html>filing</html>"),
+        ]
+        session, _ = make_sync_session(
+            responses, use_cookie_jar=True, cookie_cache=cache
+        )
+        before = time.time()
+        session.request("GET", _GATE_URL)
+        (entry,) = cache.load("fccid.io")
+        assert entry["raw"] == _GATE_COOKIE
+        assert before + 1790 < entry["expires"] < before + 1810
+
+    @patch("wafer._sync.time.sleep")
+    def test_gate_that_never_clears_raises(self, mock_sleep):
+        session, _ = make_sync_session(
+            [MockResponse(200, {}, _GATE_BODY)], use_cookie_jar=True
+        )
+        with pytest.raises(ChallengeDetected) as excinfo:
+            session.request("GET", _GATE_URL)
+        assert excinfo.value.challenge_type == "cookie_gate"
+
+
+class TestCookieGateSolverIntegrationAsync:
+    @pytest.mark.asyncio
+    @patch("wafer._async.asyncio.sleep")
+    async def test_gate_solved_inline_then_filing(self, mock_sleep):
+        responses = [
+            MockResponse(200, {}, _GATE_BODY),
+            MockResponse(200, {}, "<html>filing</html>"),
+        ]
+        session, mock = make_async_session(responses, use_cookie_jar=True)
+        resp = await session.request("GET", _GATE_URL)
+        assert resp.text == "<html>filing</html>"
+        assert resp.inline_solves == 1
+        assert mock.cookie_jar.added == [(_GATE_COOKIE, _GATE_URL)]
+
+    @pytest.mark.asyncio
+    @patch("wafer._async.asyncio.sleep")
+    async def test_cookie_persisted_for_its_max_age(self, mock_sleep, tmp_path):
+        cache = CookieCache(cache_dir=str(tmp_path))
+        responses = [
+            MockResponse(200, {}, _GATE_BODY),
+            MockResponse(200, {}, "<html>filing</html>"),
+        ]
+        session, _ = make_async_session(
+            responses, use_cookie_jar=True, cookie_cache=cache
+        )
+        await session.request("GET", _GATE_URL)
+        (entry,) = cache.load("fccid.io")
+        assert entry["raw"] == _GATE_COOKIE
 
 
 class TestInlineSolveBudget:

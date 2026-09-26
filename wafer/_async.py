@@ -12,6 +12,7 @@ from wreq import Method
 from wafer._base import (
     BaseSession,
     _aread_body_capped,
+    _browser_attempt_key,
     _browser_attempt_timeout,
     _browser_solve_timeout,
     _callable_accepts_keyword,
@@ -83,6 +84,7 @@ from wafer._solvers import (
     reddit_solve_origin,
     reddit_submission_url,
     solve_acw,
+    solve_cookie_gate,
     solve_pow,
     tmd_homepage_url,
 )
@@ -632,6 +634,25 @@ class AsyncSession(BaseSession):
                         )
                 logger.info(
                     "PoW challenge solved inline (%d hashes)", solution.iterations
+                )
+                return True
+
+        elif challenge == ChallengeType.COOKIE_GATE:
+            # A site-owned gate whose script writes a fixed cookie and
+            # reloads (fccid.io's Continue button): write the same cookie and
+            # let the caller replay. Persisted for the page's own Max-Age.
+            gate_cookies = solve_cookie_gate(body, url)
+            if gate_cookies:
+                entries = self._add_gate_cookies(gate_cookies, url)
+                if self._cookie_cache and entries:
+                    domain = extract_domain(url)
+                    if domain:
+                        await asyncio.to_thread(
+                            self._cookie_cache.save, domain, entries
+                        )
+                logger.info(
+                    "Cookie gate solved inline (%s)",
+                    ", ".join(c.name for c in gate_cookies),
                 )
                 return True
 
@@ -1475,7 +1496,9 @@ class AsyncSession(BaseSession):
         }
         original_extra_headers = extra_headers
 
-        browser_attempted_type: str | None = None
+        # One browser solve per (challenge type, host): a redirect onto
+        # another host behind the same WAF needs that host's own clearance.
+        browser_attempted: set[tuple[str, str]] = set()
         reddit_bootstrap_attempted = False
         tmd_inline_attempted = False
         # Clearance the last Radware replay rode on, so an identical reissue is
@@ -1833,7 +1856,7 @@ class AsyncSession(BaseSession):
             was_retried = (
                 state.normal_retries > 0
                 or state.rotation_retries > 0
-                or browser_attempted_type is not None
+                or bool(browser_attempted)
             )
             content_type = headers.get("content-type", "")
             reddit_response = reddit_solve_origin(current_url) is not None
@@ -2212,10 +2235,11 @@ class AsyncSession(BaseSession):
                 if (
                     challenge is not None
                     and challenge in JS_ONLY_CHALLENGES
-                    and browser_attempted_type != challenge.value
+                    and _browser_attempt_key(challenge, current_url)
+                    not in browser_attempted
                     and self._browser_solver is not None
                 ):
-                    browser_attempted_type = challenge.value
+                    browser_attempted.add(_browser_attempt_key(challenge, current_url))
                     browser_result = await self._try_browser_solve(
                         challenge,
                         current_url,
@@ -2284,10 +2308,13 @@ class AsyncSession(BaseSession):
                     if (
                         challenge is not None
                         and challenge != ChallengeType.REDDIT
-                        and browser_attempted_type != challenge.value
+                        and _browser_attempt_key(challenge, current_url)
+                    not in browser_attempted
                         and self._browser_solver is not None
                     ):
-                        browser_attempted_type = challenge.value
+                        browser_attempted.add(
+                            _browser_attempt_key(challenge, current_url)
+                        )
                         browser_result = await self._try_browser_solve(
                             challenge,
                             current_url,
