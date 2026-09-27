@@ -1,6 +1,6 @@
 # wreq Reference
 
-Wafer wraps wreq **0.12.2+** (the `Emulation` API, formerly rnet).
+Wafer wraps wreq **0.12.3+** (the `Emulation` API, formerly rnet).
 
 ## TlsOptions Silent Failure
 
@@ -75,3 +75,4 @@ Also: **never send Host per-request** -wreq auto-sets it from the URL. Sending i
   - **Every profile's default header set became the real browser's navigation**: Chrome/Edge/Firefox gained `sec-fetch-user: ?1` (and Chrome `upgrade-insecure-requests: 1`) in the browsers' real order. That is right for navigation and made embed="xhr" send `Sec-Fetch-Mode: cors` + `Sec-Fetch-User`, hence wafer's embed mode now owns its headers.
   - **The cookie jar's `get_all()` changed shape** (see Cookie Jar above).
   - Wheel platforms are unchanged (28 files); the musllinux build moved to GitHub runners. Default Cargo features are unchanged in effect (`webpki-roots` + `tokio-rt`, same as the 6.0.0-rc.29 that 0.12.1 built against), so the fallback root store and proxy behavior did not move.
+- **v0.12.3 (2026-09-27)**: no Python API or fingerprint change (same wreq, wreq-util and btls revisions). hickory-resolver 0.26, and when the system DNS config cannot be read the resolver falls back to Cloudflare DNS instead of Google. Async request cancellation is now preserved. Re-verified on the wire (all modes, Safari, Dart, `tls_verify`, AIA, `resolve=` pin).
