@@ -57,6 +57,24 @@ from wafer._fingerprint import (
 )
 from wafer._native_tls import NATIVE_MAX_RETRIES
 from wafer._profiles import Profile
+from wafer._reddit_app import (
+    REDDIT_APP_OUTCOME_GATE,
+    REDDIT_APP_OUTCOME_RATELIMIT,
+    REDDIT_APP_OUTCOME_REDIRECT,
+    REDDIT_APP_OUTCOME_TOKEN,
+    REDDIT_APP_OUTCOME_TRANSPORT,
+    REDDIT_APP_OUTCOME_UNAUTHORIZED,
+    REDDIT_APP_READ_MARGIN,
+    REDDIT_APP_TOKEN_MAX_BYTES,
+    REDDIT_APP_TOKEN_URL,
+    REDDIT_APP_TRANSPORT_BACKOFF_SECONDS,
+    caller_location,
+    is_gate_response,
+    mint_backoff,
+    reddit_app_redirect,
+    token_request,
+    web_url,
+)
 from wafer._response import HistoryEntry, WaferResponse, resolve_charset
 from wafer._retry import RetryState, calculate_backoff, parse_retry_after
 from wafer._solvers import (
@@ -77,6 +95,7 @@ from wafer._solvers import (
     REDDIT_OUTCOME_VERIFICATION_TOO_LARGE,
     REDDIT_VERIFICATION_MAX_BYTES,
     format_reddit_cookie_names,
+    is_reddit_captcha_gate,
     parse_amazon_captcha,
     parse_reddit_verification,
     reddit_cookie_names,
@@ -234,7 +253,10 @@ class AsyncSession(BaseSession):
                 url, deadline, total_timeout
             )
             self._record_reddit_bootstrap_attempt()
-            verification_resp = await client.get(origin, **request_kwargs)
+            leg_headers, leg_kwargs = self._reddit_leg_headers(origin)
+            verification_resp = await client.get(
+                origin, headers=leg_headers, **leg_kwargs, **request_kwargs
+            )
             if self._reddit_client_changed(client, client_generation):
                 return None
             verification_cookies = verification_resp.headers.get_all("set-cookie")
@@ -329,8 +351,13 @@ class AsyncSession(BaseSession):
                 return False
 
             submission_url = reddit_submission_url(verification)
+            # Sent the way the page's script submits the form.
+            self._record_accept_ch(origin, verification_resp.headers)
+            leg_headers, leg_kwargs = self._reddit_leg_headers(submission_url, origin)
             solved_resp = await client.get(
                 submission_url,
+                headers=leg_headers,
+                **leg_kwargs,
                 **self._reddit_subrequest_kwargs(url, deadline, total_timeout),
             )
             if self._reddit_client_changed(client, client_generation):
@@ -737,7 +764,7 @@ class AsyncSession(BaseSession):
                     errors="replace",
                 )
                 homepage_challenge = detect_challenge(
-                    homepage_status, homepage_headers, homepage_body
+                    homepage_status, homepage_headers, homepage_body, url=homepage
                 )
                 if 200 <= homepage_status < 300 and homepage_challenge is None:
                     await self._cache_response_cookies(homepage, homepage_resp)
@@ -1365,6 +1392,7 @@ class AsyncSession(BaseSession):
             result.status_code,
             result.headers,
             result.text,
+            url=result.url,
         )
         if challenge is not None:
             result.challenge_type = challenge.value
@@ -1375,6 +1403,241 @@ class AsyncSession(BaseSession):
                 response=result,
             )
         return result
+
+    def _reddit_app_http(self):
+        if self._reddit_app_client is None:
+            self._reddit_app_client = wreq.Client(
+                **self._reddit_app_client_kwargs()
+            )
+        return self._reddit_app_client
+
+    async def _reddit_app_pace(self, domain: str, deadline: float) -> None:
+        if self._rate_limiter:
+            await self._rate_limiter.wait_async(
+                domain, max_wait=deadline - time.monotonic()
+            )
+
+    async def _reddit_app_mint(
+        self,
+        domain: str,
+        deadline: float,
+        attempt_secs: float | None,
+        timeout_secs: float,
+        url: str,
+    ):
+        """Mint an anonymous token, as the app does on first launch.
+
+        Returns ``(token, status)``: the token or None, and the HTTP status of
+        the answer, None when none arrived (a transport error). Concurrent
+        reads on a cold session share one mint.
+        """
+        if self._reddit_app_mint_lock is None:
+            self._reddit_app_mint_lock = asyncio.Lock()
+        async with self._reddit_app_mint_lock:
+            token = self._reddit_app_fresh_token()
+            if token is not None:
+                return token, None
+            return await self._reddit_app_mint_locked(
+                domain, deadline, attempt_secs, timeout_secs, url
+            )
+
+    async def _reddit_app_mint_locked(
+        self,
+        domain: str,
+        deadline: float,
+        attempt_secs: float | None,
+        timeout_secs: float,
+        url: str,
+    ):
+        headers, body = token_request(self._reddit_app_install())
+        await self._reddit_app_pace(domain, deadline)
+        limit = self._reddit_app_attempt_limit(
+            deadline, attempt_secs, timeout_secs, url
+        )
+        try:
+            resp = await self._reddit_app_http().post(
+                REDDIT_APP_TOKEN_URL,
+                headers=headers,
+                body=body,
+                timeout=datetime.timedelta(seconds=limit),
+            )
+            status = resp.status.as_int()
+            resp_headers = _decode_headers(resp.headers)
+            raw = await _aread_body_capped(resp, REDDIT_APP_TOKEN_MAX_BYTES)
+        except _CapExceeded:
+            return None, status
+        except Exception as e:
+            logger.debug("Reddit app token request failed: %s", type(e).__name__)
+            return None, None
+        finally:
+            if self._rate_limiter:
+                self._rate_limiter.record(domain)
+        return self._reddit_app_accept_token(status, resp_headers, raw), status
+
+    async def _try_reddit_app(
+        self,
+        url: str,
+        api_url: str,
+        *,
+        deadline: float,
+        attempt_secs: float | None,
+        timeout_secs: float,
+        max_response_size: int | None,
+        start_time: float,
+    ) -> WaferResponse | None:
+        """Read a Reddit JSON URL through the Android app API.
+
+        Returns None to hand the read to the web path (docs/ref-reddit.md has
+        the table): no token, Reddit's edge turning the client away, a
+        transport error, a refused fresh token, a rate-limit window that will
+        not reset within the deadline, or a redirect somewhere the app route
+        does not read.
+        """
+        domain = extract_domain(url) or url
+        current = api_url
+        history: list[HistoryEntry] = []
+        retries = 0
+        reminted = False
+        try:
+            client = self._reddit_app_http()
+        except Exception as e:
+            logger.debug("Reddit app client unavailable: %s", type(e).__name__)
+            self._reddit_app_fall_back(
+                REDDIT_APP_OUTCOME_TRANSPORT,
+                backoff=REDDIT_APP_TRANSPORT_BACKOFF_SECONDS,
+            )
+            return None
+        while True:
+            token = self._reddit_app_fresh_token()
+            if token is None:
+                token, mint_status = await self._reddit_app_mint(
+                    domain, deadline, attempt_secs, timeout_secs, url
+                )
+                if token is None:
+                    self._reddit_app_fall_back(
+                        REDDIT_APP_OUTCOME_TOKEN,
+                        status=mint_status,
+                        backoff=mint_backoff(mint_status),
+                    )
+                    return None
+            wait = self._reddit_app_ratelimit_wait()
+            if wait > 0:
+                if wait >= deadline - time.monotonic() - REDDIT_APP_READ_MARGIN:
+                    # The window will not reset in time: the web path reads.
+                    self._reddit_app_fall_back(REDDIT_APP_OUTCOME_RATELIMIT, backoff=0)
+                    return None
+                await asyncio.sleep(wait)
+            await self._reddit_app_pace(domain, deadline)
+            limit = self._reddit_app_attempt_limit(
+                deadline, attempt_secs, timeout_secs, url
+            )
+            try:
+                resp = await client.get(
+                    current,
+                    headers=self._reddit_app_read_headers(token),
+                    timeout=datetime.timedelta(seconds=limit),
+                )
+            except Exception as e:
+                if self._rate_limiter:
+                    self._rate_limiter.record(domain)
+                if time.monotonic() >= deadline:
+                    raise WaferTimeout(url, timeout_secs) from e
+                logger.debug("Reddit app read failed: %s", type(e).__name__)
+                self._reddit_app_fall_back(
+                    REDDIT_APP_OUTCOME_TRANSPORT,
+                    backoff=REDDIT_APP_TRANSPORT_BACKOFF_SECONDS,
+                )
+                return None
+            if self._rate_limiter:
+                self._rate_limiter.record(domain)
+            status = resp.status.as_int()
+            headers = _decode_headers(resp.headers)
+            self._reddit_app_note_ratelimit(headers)
+
+            redirected = 300 <= status < 400 and status != 304
+            location = headers.get("location") if redirected else None
+            if location and self.follow_redirects:
+                target = reddit_app_redirect(current, location)
+                if target is None:
+                    self._reddit_app_fall_back(
+                        REDDIT_APP_OUTCOME_REDIRECT, status=status, backoff=0
+                    )
+                    return None
+                if len(history) >= self.max_redirects:
+                    raise TooManyRedirects(url, self.max_redirects)
+                history.append(HistoryEntry(status, web_url(url, current)))
+                current = target
+                continue
+            if location:
+                headers["location"] = caller_location(url, current, location)
+
+            final_url = web_url(url, current)
+            if max_response_size is not None:
+                declared = _content_length_over_cap(resp, max_response_size)
+                if declared is not None:
+                    raise ResponseTooLarge(final_url, declared, max_response_size)
+            try:
+                content = (
+                    await resp.bytes()
+                    if max_response_size is None
+                    else await _aread_body_capped(resp, max_response_size)
+                )
+            except _CapExceeded as ce:
+                raise ResponseTooLarge(
+                    final_url, ce.size, max_response_size
+                ) from None
+            except Exception as e:
+                logger.debug("Reddit app body read failed: %s", type(e).__name__)
+                self._reddit_app_fall_back(
+                    REDDIT_APP_OUTCOME_TRANSPORT,
+                    status=status,
+                    backoff=REDDIT_APP_TRANSPORT_BACKOFF_SECONDS,
+                )
+                return None
+
+            if status == 401:
+                if not reminted and not token.recent():
+                    # Revoked or expired early: one fresh token, then retry.
+                    reminted = True
+                    self._reddit_app_drop_token()
+                    continue
+                # A fresh token refused is the API's answer for an endpoint
+                # that needs an account; the web path has the logged-out one.
+                self._reddit_app_fall_back(
+                    REDDIT_APP_OUTCOME_UNAUTHORIZED, status=401, backoff=0
+                )
+                return None
+            if is_gate_response(status, headers, content):
+                self._reddit_app_fall_back(REDDIT_APP_OUTCOME_GATE, status=status)
+                return None
+            if (status == 429 or 500 <= status < 600) and retries < self.max_retries:
+                delay = self._reddit_app_retry_delay(status, headers, retries)
+                if time.monotonic() + delay < deadline - REDDIT_APP_READ_MARGIN:
+                    retries += 1
+                    logger.debug(
+                        "Reddit app read %d, retry %d/%d in %.1fs",
+                        status,
+                        retries,
+                        self.max_retries,
+                        delay,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+            if status == 429:
+                # The window will not reset in time: the web path reads.
+                self._reddit_app_fall_back(
+                    REDDIT_APP_OUTCOME_RATELIMIT, status=429, backoff=0
+                )
+                return None
+            return self._reddit_app_response(
+                status=status,
+                content=content,
+                headers=headers,
+                url=final_url,
+                history=history,
+                start_time=start_time,
+                retries=retries,
+            )
 
     async def request(self, method: str, url: str, **kwargs) -> WaferResponse:
         """Send an HTTP request with retry, backoff, and challenge handling."""
@@ -1476,6 +1739,22 @@ class AsyncSession(BaseSession):
                 raw=None,
                 raw_set_cookie=set_cookies,
             )
+
+        # Reddit JSON reads go through the Android app API when they can:
+        # logged-out web JSON is gated, and the app reads it without one.
+        reddit_app_url = self._reddit_app_target(method, url, extra_headers, kwargs)
+        if reddit_app_url is not None:
+            app_resp = await self._try_reddit_app(
+                url,
+                reddit_app_url,
+                deadline=deadline,
+                attempt_secs=attempt_secs,
+                timeout_secs=timeout_secs,
+                max_response_size=max_response_size,
+                start_time=start_time,
+            )
+            if app_resp is not None:
+                return app_resp
 
         state = RetryState(self.max_retries, self.max_rotations)
         m = _to_method(method) if isinstance(method, str) else method
@@ -1880,14 +2159,9 @@ class AsyncSession(BaseSession):
             )
             body_read_cap = max_response_size
             if reddit_gate_probe:
-                body_read_cap = max(
-                    max_response_size,
-                    (
-                        REDDIT_GATE_MAX_BYTES
-                        if status == 403
-                        else REDDIT_VERIFICATION_MAX_BYTES
-                    ),
-                )
+                # The 403 gate and the reCAPTCHA page (~170 KB) are both
+                # internal challenge overhead, like the verification page.
+                body_read_cap = max(max_response_size, REDDIT_GATE_MAX_BYTES)
 
             # Response-size cap: short-circuit on a declared Content-Length
             # over the cap before reading the body at all.
@@ -1972,7 +2246,7 @@ class AsyncSession(BaseSession):
             #   the API URL itself can't work (renders raw JSON).
             # - Opera Mini / Dart -- non-browser profiles.
             challenge = (
-                detect_challenge(status, headers, body)
+                detect_challenge(status, headers, body, url=current_url)
                 if body is not None
                 and self._profile not in (Profile.OPERA_MINI, Profile.DART)
                 and _is_challengeable_content_type(content_type)
@@ -1980,10 +2254,24 @@ class AsyncSession(BaseSession):
             )
             if challenge == ChallengeType.REDDIT and not reddit_response:
                 challenge = None
+            # A cold Reddit page can get the reCAPTCHA gate (a fresh real
+            # browser does too) while the root still serves the JS
+            # verification, whose cookies clear the page. Bootstrap first;
+            # only a captcha that survives it is solved as one.
+            reddit_captcha = (
+                challenge == ChallengeType.RECAPTCHA
+                and reddit_response
+                and is_reddit_captcha_gate(body)
+            )
+            if reddit_captcha and not reddit_bootstrap_attempted:
+                challenge = ChallengeType.REDDIT
             if (
                 max_response_size is not None
                 and len(raw_content) > max_response_size
-                and not (challenge == ChallengeType.REDDIT and reddit_response)
+                and not (
+                    (challenge == ChallengeType.REDDIT or reddit_captcha)
+                    and reddit_response
+                )
             ):
                 raise ResponseTooLarge(
                     current_url,
@@ -2194,6 +2482,9 @@ class AsyncSession(BaseSession):
                     )
                     await asyncio.sleep(self._clamp_delay(delay, deadline))
                     continue
+                if reddit_captcha:
+                    # The bootstrap could not clear it: now it is a reCAPTCHA.
+                    challenge = ChallengeType.RECAPTCHA
 
                 # Imperva: try the native-TLS (OpenSSL) bypass before
                 # burning rotations or a browser. Imperva free-passes
@@ -2281,6 +2572,7 @@ class AsyncSession(BaseSession):
 
                 # No browser solver — rotation can't help JS-only challenges
                 if self._browser_solver is None and challenge in JS_ONLY_CHALLENGES:
+                    self._enforce_final_cap(raw_content, current_url, max_response_size)
                     if self.max_rotations == 0:
                         return self._make_response(
                             status_code=status,
@@ -2351,6 +2643,9 @@ class AsyncSession(BaseSession):
                             self._record_success(domain)
                             continue
                     if challenge:
+                        self._enforce_final_cap(
+                            raw_content, current_url, max_response_size
+                        )
                         if self.max_rotations == 0:
                             return self._make_response(
                                 status_code=status,

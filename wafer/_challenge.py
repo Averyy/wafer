@@ -11,9 +11,16 @@ Detection order is intentional:
 
 import enum
 import logging
+import re
 from urllib.parse import urlparse
 
-from wafer._solvers import is_cookie_gate, is_pow_challenge, is_reddit_verification
+from wafer._solvers import (
+    is_cookie_gate,
+    is_pow_challenge,
+    is_reddit_captcha_gate,
+    is_reddit_verification,
+    reddit_solve_origin,
+)
 
 logger = logging.getLogger("wafer")
 
@@ -335,8 +342,18 @@ def _looks_like_shape_sensor(val: str) -> bool:
     return val[0].isdigit() or any(c in _SHAPE_SEPARATORS for c in val)
 
 
+# Reddit's gate copy, tolerant of a curly apostrophe or reflowed whitespace.
+_REDDIT_BLOCK_COPY_RE = re.compile(r"blocked\s+by\s+network\s+security", re.IGNORECASE)
+# Without a URL, a small page is only taken for Reddit's verification when it
+# carries one of the titles Reddit has served for it.
+_REDDIT_VERIFICATION_TITLE_RE = re.compile(
+    r"<title>\s*reddit(?:\s*-\s*please\s+wait\s+for\s+verification)?\s*</title>",
+    re.IGNORECASE,
+)
+
+
 def detect_challenge(
-    status_code: int, headers: dict[str, str], body: str
+    status_code: int, headers: dict[str, str], body: str, url: str | None = None
 ) -> ChallengeType | None:
     """Detect bot challenge type from HTTP response.
 
@@ -393,26 +410,37 @@ def detect_challenge(
 
     # Reddit anonymous-session gates. JSON endpoints return a large Shreddit
     # block template, while direct HTML navigation can return a small, valid
-    # 200 verification form. The latter goes through the strict verification
-    # parser so an ordinary successful Reddit page cannot become a bootstrap
-    # loop.
-    if (
-        status_code == 403
-        and "theme-beta" in body[:256].lower()
-        and "you've been blocked by network security" in body.lower()
-    ):
-        logger.info("Challenge detected: reddit")
-        return ChallengeType.REDDIT
-    if (
-        status_code == 200
-        # Bounded prefix, like the 403 probe above: this runs on every
-        # successful 200 that reaches here, and lowercasing a multi-megabyte
-        # body to look for a <title> in <head> is pure waste.
-        and "reddit - please wait for verification" in body[:4096].lower()
-        and is_reddit_verification(body)
-    ):
-        logger.info("Challenge detected: reddit")
-        return ChallengeType.REDDIT
+    # 200 verification form. The latter goes through the structural
+    # verification parser so an ordinary successful Reddit page cannot become
+    # a bootstrap loop. With the request URL known, a non-Reddit host is never
+    # a Reddit gate and a Reddit host needs no wording match at all.
+    reddit_host = None if url is None else reddit_solve_origin(url) is not None
+    if reddit_host is not False:
+        # Both markers: Shreddit's private or quarantined subreddit 403 pages
+        # also start with theme-beta.
+        if (
+            status_code == 403
+            and "theme-beta" in body[:4096].lower()
+            and _REDDIT_BLOCK_COPY_RE.search(body) is not None
+        ):
+            logger.info("Challenge detected: reddit")
+            return ChallengeType.REDDIT
+        if (
+            status_code == 200
+            and (
+                reddit_host
+                # Bounded prefix: this runs on every 200 that reaches here.
+                or _REDDIT_VERIFICATION_TITLE_RE.search(body[:4096]) is not None
+            )
+            and is_reddit_verification(body)
+        ):
+            logger.info("Challenge detected: reddit")
+            return ChallengeType.REDDIT
+        # The reCAPTCHA gate Reddit escalates to. Only a browser can clear it,
+        # and as RECAPTCHA it is solved or reported, never returned as content.
+        if status_code == 200 and reddit_host and is_reddit_captcha_gate(body):
+            logger.info("Challenge detected: recaptcha (reddit gate)")
+            return ChallengeType.RECAPTCHA
 
     # Amazon rate-limit captcha — status 200, small body, "Continue shopping"
     if status_code == 200 and len(body) < 50_000:

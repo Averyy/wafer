@@ -101,6 +101,83 @@ class TestRefererChain:
         headers = mock.last_kwargs.get("headers", {})
         assert headers.get("Referer") == "https://google.com"
 
+    @patch("time.sleep")
+    def test_referer_chain_is_a_same_origin_link_click(self, mock_sleep):
+        """A navigation with a Referer came from that page: Chrome never
+        sends Sec-Fetch-Site: none beside a Referer."""
+        session, mock = make_sync_session([
+            MockResponse(200, body="page A"),
+            MockResponse(200, body="page B"),
+        ])
+        session.get("https://example.com/a")
+        assert "Sec-Fetch-Site" not in mock.last_kwargs["headers"]
+        session.get("https://example.com/b")
+        headers = mock.last_kwargs["headers"]
+        assert headers["Referer"] == "https://example.com/a"
+        assert headers["Sec-Fetch-Site"] == "same-origin"
+
+    @pytest.mark.parametrize(
+        ("referer", "site"),
+        [
+            ("https://www.example.com/x", "same-site"),
+            ("https://google.com/", "cross-site"),
+            ("http://api.example.com/", "cross-site"),
+            ("https://api.example.com:8443/", "same-site"),
+            ("https://api.example.com/y", "same-origin"),
+        ],
+    )
+    def test_caller_referer_sets_the_site_relation(self, referer, site):
+        session, _ = make_sync_session([])
+        headers = session._build_headers(
+            "https://api.example.com/", {"Referer": referer}
+        )
+        assert headers["Sec-Fetch-Site"] == site
+
+    def test_caller_sec_fetch_site_is_kept(self):
+        session, _ = make_sync_session([])
+        headers = session._build_headers(
+            "https://example.com/",
+            {"Referer": "https://google.com/", "sec-fetch-site": "none"},
+        )
+        assert headers["sec-fetch-site"] == "none"
+        assert "Sec-Fetch-Site" not in headers
+
+    def test_session_sec_fetch_site_is_kept(self):
+        from wafer import SyncSession
+
+        with SyncSession(headers={"Sec-Fetch-Site": "cross-site"}) as s:
+            s._last_url["example.com"] = "https://example.com/a"
+            headers = s._build_headers("https://example.com/b")
+        assert headers["Referer"] == "https://example.com/a"
+        assert "Sec-Fetch-Site" not in headers  # the client-level value stands
+
+    def test_safari_identity_replaces_its_client_level_none(self):
+        from wafer import Profile
+
+        session, _ = make_sync_session([], profile=Profile.IOS_SAFARI)
+        assert session._client_headers["Sec-Fetch-Site"] == "none"
+        headers = session._build_headers(
+            "https://example.com/b", {"Referer": "https://example.com/a"}
+        )
+        assert headers["Sec-Fetch-Site"] == "same-origin"
+
+    @pytest.mark.parametrize("profile", ["dart", "okhttp"])
+    def test_clients_without_fetch_metadata_get_none_added(self, profile):
+        from wreq import Emulation
+
+        from wafer import Profile, SyncSession
+
+        kwargs = (
+            {"profile": Profile.DART}
+            if profile == "dart"
+            else {"emulation": Emulation.OkHttp4_12}
+        )
+        with SyncSession(**kwargs) as s:
+            headers = s._build_headers(
+                "https://example.com/b", {"Referer": "https://example.com/a"}
+            )
+        assert not any(k.lower() == "sec-fetch-site" for k in headers)
+
     @pytest.mark.asyncio
     async def test_async_referer_chain(self):
         """Async session should also track referer chain."""

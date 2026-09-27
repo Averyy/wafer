@@ -1083,6 +1083,95 @@ class TestReddit:
 
         assert detect_challenge(200, {}, body) == ChallengeType.REDDIT
 
+    _LIVE = (
+        pathlib.Path(__file__).parent
+        / "fixtures"
+        / "reddit_verification_2026-09-27.html"
+    ).read_text()
+
+    def test_live_verification_on_a_reddit_url(self):
+        """Captured 2026-09-27: title "Reddit", token field jsc_token."""
+        assert (
+            detect_challenge(200, {}, self._LIVE, url="https://www.reddit.com/r/x/")
+            == ChallengeType.REDDIT
+        )
+
+    def test_live_verification_without_a_url_uses_the_title_allowlist(self):
+        assert detect_challenge(200, {}, self._LIVE) == ChallengeType.REDDIT
+        renamed = self._LIVE.replace("<title>Reddit</title>", "<title>Hi</title>")
+        assert detect_challenge(200, {}, renamed) is None
+        # With a Reddit URL the wording does not matter.
+        assert (
+            detect_challenge(200, {}, renamed, url="https://www.reddit.com/")
+            == ChallengeType.REDDIT
+        )
+
+    def test_look_alike_on_another_host_is_not_reddit(self):
+        assert detect_challenge(200, {}, self._LIVE, url="https://example.com/") is None
+        assert detect_challenge(403, {}, self._BODY, url="https://example.com/") is None
+
+    def test_json_gate_markers_are_tolerant(self):
+        prefixed = "<!doctype html>" + " " * 400 + self._BODY
+        curly = self._BODY.replace("You've been", "You\u2019ve been")
+        for body in (prefixed, curly):
+            assert (
+                detect_challenge(403, {}, body, url="https://www.reddit.com/r/x.json")
+                == ChallengeType.REDDIT
+            )
+
+    def test_private_subreddit_403_is_not_the_gate_even_on_reddit(self):
+        body = "<body class=theme-beta><main>This community is private</main>"
+        url = "https://www.reddit.com/r/x/"
+        assert detect_challenge(403, {}, body, url=url) is None
+
+    _CAPTCHA_GATE = (
+        pathlib.Path(__file__).parent
+        / "fixtures"
+        / "reddit_captcha_gate_2026-09-27.html"
+    ).read_text()
+
+    def test_captcha_gate_on_a_reddit_url_is_recaptcha(self):
+        """Reddit's "Prove your humanity" 200 is never returned as content."""
+        url = "https://www.reddit.com/r/Python/"
+        assert (
+            detect_challenge(200, {}, self._CAPTCHA_GATE, url=url)
+            == ChallengeType.RECAPTCHA
+        )
+
+    def test_captcha_gate_is_structural_not_worded(self):
+        reworded = (
+            self._CAPTCHA_GATE.replace("Prove your humanity", "One more step")
+            .replace("/r/Python/?captcha=1", "/?foo=1&captcha=1")
+        )
+        url = "https://www.reddit.com/"
+        assert detect_challenge(200, {}, reworded, url=url) == ChallengeType.RECAPTCHA
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            # Reddit's login page loads reCAPTCHA but never posts to ?captcha=1.
+            '<script src="https://www.google.com/recaptcha/api.js"></script>'
+            '<form method="POST" action="/login">'
+            '<div class="g-recaptcha"></div></form>',
+            # A form posting to ?captcha=1 with no widget.
+            '<form method="POST" action="/?captcha=1"></form>',
+            '<form action="/?captcha=10"><div class="g-recaptcha"></div></form>',
+        ],
+    )
+    def test_other_reddit_pages_are_not_the_captcha_gate(self, body):
+        url = "https://www.reddit.com/login/"
+        assert detect_challenge(200, {}, body, url=url) is None
+
+    def test_captcha_gate_needs_a_reddit_url(self):
+        assert detect_challenge(200, {}, self._CAPTCHA_GATE) is None
+        url = "https://example.com/"
+        assert detect_challenge(200, {}, self._CAPTCHA_GATE, url=url) is None
+
+    def test_browser_never_passes_the_captcha_gate_through(self):
+        from wafer.browser._solver import _is_passthrough_challenge_html
+
+        assert _is_passthrough_challenge_html(self._CAPTCHA_GATE)
+
     def test_reddit_200_title_without_valid_form_is_not_a_gate(self):
         body = (
             "<html><title>Reddit - Please wait for verification</title>"

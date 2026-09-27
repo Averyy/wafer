@@ -172,8 +172,8 @@ SyncSession(
     # is never fully buffered). Measures the DECOMPRESSED body, and the
     # decompressor output is bounded too, so a gzip/deflate bomb cannot expand
     # past the cap. Applies to EVERY transport: the normal wreq path, the
-    # Opera Mini path, the Imperva native-TLS bypass, and the browser
-    # passthrough body. Overridable per-request.
+    # Opera Mini path, the Imperva native-TLS bypass, the Reddit app route,
+    # and the browser passthrough body. Overridable per-request.
     max_response_size: int | None = None,
 
     # Fingerprint pool (opt-in, additive). A fixed list of Emulation identities
@@ -206,7 +206,14 @@ SyncSession(
     # Socket connects to these IPs; TLS SNI + cert still key on the hostname.
     # Construction-only (no per-request form); an empty IP list raises;
     # combining with proxy= raises (a proxy resolves the host, voiding the pin).
+    # Reddit JSON reads use the app API (reddit_app= below) only when both
+    # oauth.reddit.com and www.reddit.com are pinned; otherwise the web path.
     resolve: dict[str, list[str]] | None = None,
+
+    # Reddit JSON reads through Reddit's Android app API (see "Reddit" under
+    # Challenge Types). On by default; False sends them through the web path
+    # like any other URL.
+    reddit_app: bool = True,
 
     # Embed mode (both modes select a random Referer from embed_referers)
     embed: str | None = None,           # "xhr", "xhr-jquery", or "iframe"
@@ -360,8 +367,23 @@ session.reddit_bootstrap_state() -> dict
 #                              hydration-aware answer to "is this session set
 #                              up for Reddit"; cookie_scope_summary() reflects
 #                              only cookies observed so far.
-# Names, counts, and labels only - never cookie values, the verification token,
-# or the solved submission query. Counters are per session and never reset.
+#   "app_reads": int         - JSON reads the Android app route served
+#   "app_token_mints": int   - anonymous app tokens minted (0 when a token saved
+#                              in cache_dir was reused)
+#   "app_fallbacks": int     - reads the app route handed to the web path
+#   "app_last_outcome": str|None - "served", "token" (no token could be
+#                              minted), "gate" (Reddit's edge turned the app
+#                              client away: a non-JSON answer),
+#                              "unauthorized" (a fresh token got 401: an
+#                              endpoint that needs an account), "ratelimit"
+#                              (the API's window would not reset within the
+#                              deadline), "transport", "redirect" (to a URL
+#                              the app route does not read). All but "served"
+#                              mean that read went through the web path.
+#   "app_last_status": int|None - HTTP status behind app_last_outcome
+# Names, counts, and labels only - never cookie values, the app token, the
+# verification token, or the solved submission query. Counters are per session
+# and never reset.
 # Each failure branch also logs one WARNING carrying the same context, so a
 # consumer that configures logging sees the reason without polling this.
 
@@ -443,7 +465,8 @@ resp.emulation      # str | None - the identity that SERVED this response, for
                     # wreq profile repr, e.g. "Profile.Chrome153" / "Profile.Edge148"
                     # / "Profile.Firefox151"; for non-Emulation profiles it's the
                     # profile name ("safari", "ios_safari", "dart",
-                    # "opera_mini"). Reflects the
+                    # "opera_mini"), and "reddit_app" for a Reddit JSON read
+                    # the Android app route served. Reflects the
                     # CURRENT identity, so after a rotation it shows the one that
                     # actually served (not the session's original). This is the TLS
                     # profile only; after a browser solve it may report a lower
@@ -754,8 +777,8 @@ without `Sec-Fetch-*` headers. The request method, body, and caller-supplied
 ## Concurrency and Thread Safety
 
 **AsyncSession** is safe to use from multiple concurrent coroutines. Internally
-uses an asyncio.Lock for TLS rotation. You can share a single AsyncSession
-across many `asyncio.Task`s.
+uses an asyncio.Lock for TLS rotation (and one for the Reddit app route's token
+mint). You can share a single AsyncSession across many `asyncio.Task`s.
 
 **SyncSession** is NOT thread-safe. Create one session per thread. For
 concurrent workloads, either use AsyncSession with asyncio, or create separate
@@ -773,7 +796,9 @@ Thread-safe (per-domain locks, atomic writes via temp file + rename). Multiple
 threads can share the same `cache_dir` path safely. Multiple processes sharing
 the same path may lose updates under concurrent writes to the same domain.
 Cookie files are written `0o600` and a wafer-created `cache_dir` is `0o700`
-(owner-only), since they hold WAF-clearance and auth tokens.
+(owner-only), since they hold WAF-clearance and auth tokens. The Reddit app
+route's install and anonymous token live in the same directory
+(`reddit-app.state`, also `0o600`).
 
 ---
 
@@ -880,7 +905,7 @@ capabilities and trade-offs.
 These are all automatic. Do not write code to handle these yourself:
 
 - **Redirects** - 3xx followed automatically (POST -> GET on 301/302/303). 304 passes through. Auth stripped on cross-origin redirects. Body headers stripped on method change. Followed hops are recorded in `resp.history`.
-- **Referer headers** - set automatically from the last URL visited per hostname
+- **Referer headers** - set automatically from the last URL visited per hostname. A navigation that carries a Referer (automatic or passed by you) gets the `Sec-Fetch-Site` that Referer implies (`same-origin` for the automatic chain), as a browser link click does; only a navigation with no Referer says `none`. A `Sec-Fetch-Site` you set yourself is kept.
 - **Cookies** - managed in-memory and optionally persisted to disk; no manual cookie jar needed
 - **WAF challenges** - detected, browser-solved if configured, retried with cross-family fingerprint rotation (Chrome -> Firefox -> Safari -> Edge). A terminal WAF *block* is reported at once instead (see `RequestBlocked`).
 - **Rate limiting** - per-hostname delays enforced automatically when `rate_limit` is set
@@ -915,11 +940,14 @@ one of these strings:
 "tmd"          - Alibaba TMD (inline warm-up; browser for Baxia/reCAPTCHA)
 "amazon"       - Amazon CAPTCHA (solved inline, no browser needed)
 "reddit"       - Reddit cold-session JSON/HTML gate (inline first; optional browser recovery)
+                 (Reddit JSON reads normally never see it: they go through
+                 Reddit's Android app API instead - see "Reddit" below)
 "vercel"       - Vercel bot protection
 "arkose"       - Arkose Labs / FunCaptcha (no dedicated solver; not solvable)
 "geetest"      - GeeTest v4
 "hcaptcha"     - hCaptcha
-"recaptcha"    - reCAPTCHA v2
+"recaptcha"    - reCAPTCHA v2 (also Reddit's "Prove your humanity" page when
+                 the inline Reddit verification does not clear it)
 "generic_js"   - unclassified JS challenge
 "cloudflare_block" - Cloudflare WAF *block* page (Error 1020 and the IP bans):
                  terminal, nothing to solve. Raised as RequestBlocked without
@@ -990,10 +1018,48 @@ chain gets its own browser solve, once per challenge type per request.
 A challenged POST is replayed as the same POST, with its body and headers
 intact. Radware's own host is only ever sent the bodyless GET that a redirect
 implies, so request bodies and `Authorization` headers are not disclosed to it.
-Reddit's solver recognizes both the large JSON block and direct 200 verification
-HTML, performs the logged-out New Reddit verification at
-`https://www.reddit.com/` in the same TLS session, then retries the original
-request. If the strict inline flow fails and `browser_solver` is configured,
+**Reddit.** A Reddit JSON read (`GET` of a `.json` path on `reddit.com`,
+`www.reddit.com` or `new.reddit.com`, or any path on `api.reddit.com` or
+`oauth.reddit.com`) goes through Reddit's official Android app API by default,
+the way a logged-out install of the app reads: an anonymous app token, the
+app's headers, and the TLS of the network stack the app ships. No web gate, no
+bootstrap, no browser. The response is the same listing JSON the web path
+returns; `resp.url` and `resp.history` show the host you requested, and
+`resp.emulation == "reddit_app"`. With `cache_dir`, the app install and its
+token (valid about a day) are saved as `reddit-app.state` (owner-only), so a
+new process reuses them; one install per cache directory. On `AsyncSession`,
+concurrent cold reads share one token mint. The API's rate limit (100 reads per
+10-minute window when measured, reported in the `x-ratelimit-*` response
+headers) is honored: once a window is spent, the next read waits for the reset
+when that fits in `timeout=` (a 429 likewise), and otherwise goes through the
+web path instead of timing out. Set `rate_limit=` if you read in bulk. Reddit's
+own JSON errors (a private subreddit's 403, a 404) are returned as they are.
+
+A request that speaks for an account stays on the web path: an
+`Authorization` or `Cookie` header (per request or in the session's
+`headers=`), or a logged-in `reddit_session` cookie in the session (e.g. added
+with `add_cookie` or hydrated from `cache_dir`). So do a body, a non-GET
+method, anything under `old.reddit.com`, and every HTML page. Your per-request
+`headers=` are not sent on the app route (it sends only the app's headers).
+A 401 for a freshly minted token (an endpoint that needs an account) sends that
+read to the web path. If the app route itself fails - no token, or Reddit's
+edge turning the app client away (any non-JSON answer, e.g. an HTML 403 or
+reCAPTCHA page) - that read and every Reddit read for the next 15 minutes use
+the web path below; after a transport error (or a 429/5xx from the token
+endpoint), for 1 minute.
+`reddit_bootstrap_state()["app_last_outcome"]` says why.
+`reddit_app=False` turns the route off.
+
+On the web path, Reddit's solver recognizes both the large JSON block and
+direct 200 verification HTML (by its structure: one hidden GET form, one
+seed-doubling calculation and a submit call, not its wording), performs the
+logged-out New Reddit verification at `https://www.reddit.com/` in the same TLS
+session, submitting the form exactly as the page's script does, then retries
+the original request. A cold page that gets Reddit's reCAPTCHA page ("Prove
+your humanity") goes through the same inline verification first, whose cookies
+clear it; only a captcha that survives that is reported as `"recaptcha"`:
+solved in the browser when `browser_solver` is set, otherwise returned
+(`max_rotations=0` / `bulk()`) or raised, never as page content. If the strict inline flow fails and `browser_solver` is configured,
 wafer navigates that fixed HTML root in Chrome, optionally reloads it once,
 requires `loid` plus `token_v2` or `csv`, imports the cookies, and retries the
 original method/body through wreq. It never browser-navigates the JSON URL or
@@ -1528,3 +1594,12 @@ logging.getLogger("wafer").setLevel(logging.DEBUG)
     hard 30s ceiling on the whole call (it used to be a per-attempt default that
     let the total run several times over) - raise it if your flow needs retries
     plus a browser solve.
+
+18. **Reading public Reddit JSON needs no browser, login, or Old Reddit.** Do
+    not add your own Reddit OAuth client, a browser step, or an `old.reddit.com`
+    fallback for logged-out reads: `session.get("https://www.reddit.com/r/x/.json")`
+    already goes through Reddit's Android app API. Passing your own
+    `Authorization` or `Cookie` header (per request or on the session), or a
+    logged-in `reddit_session` cookie in the session, takes the request off
+    the app route (it is then sent as you asked), and so does
+    `reddit_app=False`.

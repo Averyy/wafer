@@ -46,7 +46,11 @@ from urllib.parse import unquote, urlparse
 from wafer._cookies import browser_cookie_matches_host, registrable_domain
 from wafer._errors import ResponseTooLarge
 from wafer._fingerprint import chrome_full_version
-from wafer._solvers import is_cookie_gate
+from wafer._solvers import (
+    is_cookie_gate,
+    is_reddit_captcha_gate,
+    is_reddit_verification,
+)
 
 logger = logging.getLogger("wafer")
 
@@ -359,6 +363,9 @@ def _is_passthrough_challenge_html(html: str) -> bool:
         # Shreddit response, so it must not be limited to the generic 10 KiB
         # marker prefix.
         or _REDDIT_BROWSER_CHALLENGE_RE.search(html) is not None
+        # Structural, so a Reddit wording change cannot leak the page.
+        or is_reddit_verification(html)
+        or is_reddit_captcha_gate(html)
         # A site's own "Continue" gate behind the WAF (fccid.io): the session
         # solves it inline on the replay, so it is never content.
         or is_cookie_gate(html)
@@ -649,7 +656,7 @@ def _capture_tmd_browser_passthrough(
 
     headers, set_cookie = _rendered_headers(matched_response)
     if (
-        detect_challenge(status, headers, html) is not None
+        detect_challenge(status, headers, html, url=page_url) is not None
         or _is_passthrough_challenge_html(html)
     ):
         return None
@@ -3806,6 +3813,7 @@ class BrowserSolver:
                                         nav_status,
                                         {"content-type": "text/html"},
                                         html,
+                                        url=url,
                                     )
                                     is None
                                 ):
@@ -3979,13 +3987,13 @@ class BrowserSolver:
         # because other WAFs gate their body markers on a blocking status and
         # would hide from a challenge served in place as 200.
         headers = {"content-type": "text/html"}
-        challenge = detect_challenge(status, headers, html)
+        challenge = detect_challenge(status, headers, html, url=url)
         if (
             challenge is None
             and status != 403
             and _is_passthrough_challenge_html(html)
         ):
-            challenge = detect_challenge(403, headers, html)
+            challenge = detect_challenge(403, headers, html, url=url)
         if challenge is None:
             return False
         logger.info(

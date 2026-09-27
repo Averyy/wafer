@@ -536,7 +536,7 @@ def tmd_homepage_url(url: str) -> str:
 
 REDDIT_SOLVE_ORIGIN = "https://www.reddit.com/"
 REDDIT_CACHE_DOMAIN = "reddit.com"
-REDDIT_VERIFICATION_MAX_BYTES = 32 * 1024
+REDDIT_VERIFICATION_MAX_BYTES = 64 * 1024
 # The live Shreddit network-security response was ~190 KiB on 2026-07-26,
 # with its distinguishing block copy near the end. This cap is challenge
 # overhead only; the caller's max_response_size still applies to the final
@@ -570,33 +570,82 @@ REDDIT_BROWSER_OUTCOME_INTERRUPTED = "interrupted"
 _REDDIT_MAX_REPORTED_COOKIE_NAMES = 32
 _REDDIT_SAFE_COOKIE_NAME = re.compile(r"[A-Za-z0-9_.-]{1,64}")
 
-_REDDIT_TITLE = "Reddit - Please wait for verification"
-_REDDIT_FIELDS = frozenset({
-    "solution",
-    "js_challenge",
-    "token",
-    "jsc_orig_r",
-})
-_REDDIT_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{16,256}\Z")
+# The verification page is recognized by what a browser acts on, not by its
+# wording: one hidden GET form on the fixed same-origin action, one field the
+# script fills, one recognized calculation and a submit call. Reddit renamed
+# the title and the token field on 2026-09-27 without changing any of that.
+# Anything that changes the computation or the target still fails closed.
+_REDDIT_FIELD_NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
+_REDDIT_FIELD_VALUE_RE = re.compile(r"[A-Za-z0-9_.:/%-]{0,256}\Z")
+_REDDIT_MIN_FIELDS = 2
+_REDDIT_MAX_FIELDS = 8
+# Controls requestSubmit() leaves out when it has no submitter.
+_REDDIT_UNSUBMITTED_TYPES = frozenset({"submit", "button", "image", "reset"})
+_REDDIT_IDENT = r"[A-Za-z_$][A-Za-z0-9_$]{0,63}"
+# A calculation body: 1-64 characters that begin and end with a non-space, so
+# no whitespace quantifier beside it can trade characters with it. With the
+# possessive ``\s*+`` throughout, matching stays linear in the script length
+# (a hostile page of whitespace cannot make it backtrack).
+_REDDIT_EXPR = r"[^\s;{}(),](?:[^;{}(),]{0,62}?[^\s;{}(),])?"
+_REDDIT_STMT = r"[^\s;{}](?:[^;{}]{0,62}?[^\s;{}])?"
+# One immediately invoked function over a quoted seed, in the syntax a
+# minifier or a rewrite produces: (async e=>e+e)("s"), ((e)=>{return e+e})('s'),
+# (async function(e){return e+e})(`s`). Its body is checked separately so that
+# only seed doubling is accepted.
 _REDDIT_CALC_RE = re.compile(
-    r"""
-    await\s*\(\s*async\s+
-    (?P<var>[A-Za-z_$][A-Za-z0-9_$]*)\s*=>\s*
-    (?P=var)\s*\+\s*(?P=var)\s*
-    \)\s*\(\s*
-    (?P<quote>["'])(?P<seed>[A-Za-z0-9]{1,128})(?P=quote)
-    \s*\)
+    rf"""
+    \(\s*+(?:async\b\s*+)?
+    (?:
+        function\s*+\(\s*+(?P<p1>{_REDDIT_IDENT})\s*+\)\s*+
+            \{{\s*+return\s++(?P<b1>{_REDDIT_STMT})\s*+(?:;\s*+)?\}}
+      | (?:\(\s*+(?P<p2>{_REDDIT_IDENT})\s*+\)|(?P<p3>{_REDDIT_IDENT}))\s*+=>\s*+
+            (?:\{{\s*+return\s++(?P<b2>{_REDDIT_STMT})\s*+(?:;\s*+)?\}}
+              |(?P<b3>{_REDDIT_EXPR}))
+    )
+    \s*+\)\s*+\(\s*+(?P<quote>["'`])(?P<seed>[A-Za-z0-9]{{1,128}})(?P=quote)\s*+\)
     """,
     re.VERBOSE,
 )
-_REDDIT_SCRIPT_MARKERS = (
-    re.compile(r"document\.forms\s*\[\s*0\s*\]"),
-    re.compile(
-        r"\.elements\.namedItem\s*\(\s*([\"'])solution\1\s*\)"
-        r"\.value\s*="
-    ),
-    re.compile(r"\.requestSubmit\s*\(\s*\)"),
+# The field the script fills: form.elements.namedItem("x"), .elements["x"],
+# .elements.x, or querySelector('[name=x]'), then ``.value =``.
+_REDDIT_FILL_RE = re.compile(
+    r"""
+    (?:
+        \.elements\s*+\.\s*+namedItem\s*+\(\s*+
+            (?P<q1>["'`])(?P<n1>[A-Za-z0-9_-]{1,64})(?P=q1)\s*+\)
+      | \.elements\s*+\[\s*+(?P<q2>["'`])(?P<n2>[A-Za-z0-9_-]{1,64})(?P=q2)\s*+\]
+      | \.elements\s*+\.\s*+(?P<n3>[A-Za-z_][A-Za-z0-9_]{0,63})
+      | querySelector\s*+\(\s*+(?P<q4>["'`])
+            \[\s*+name\s*+=\s*+["']?(?P<n4>[A-Za-z0-9_-]{1,64})["']?\s*+\]
+        (?P=q4)\s*+\)
+    )
+    \s*+\.\s*+value\s*+=(?!=)
+    """,
+    re.VERBOSE,
 )
+_REDDIT_SUBMIT_RE = re.compile(r"\.\s*+(?:requestSubmit|submit)\s*+\(\s*+\)")
+
+
+def _reddit_calculation(script: str) -> list[str]:
+    """Seeds of the seed-doubling calculations in one script."""
+    seeds = []
+    for m in _REDDIT_CALC_RE.finditer(script):
+        param = m.group("p1") or m.group("p2") or m.group("p3")
+        body = (m.group("b1") or m.group("b2") or m.group("b3") or "").strip()
+        doubled = rf"{re.escape(param)}\s*\+\s*{re.escape(param)}"
+        if re.fullmatch(doubled, body):
+            seeds.append(m.group("seed"))
+        else:
+            # Some other computation: never guess at it.
+            seeds.append("")
+    return seeds
+
+
+def _reddit_fill_targets(script: str) -> set[str]:
+    return {
+        next(n for n in m.group("n1", "n2", "n3", "n4") if n)
+        for m in _REDDIT_FILL_RE.finditer(script)
+    }
 
 
 @dataclass(frozen=True)
@@ -605,6 +654,9 @@ class RedditVerification:
 
     action_url: str
     fields: tuple[tuple[str, str], ...] = field(repr=False)
+
+
+_REDDIT_CONTROL_TAGS = frozenset({"input", "select", "textarea", "button"})
 
 
 class _RedditDocumentParser(HTMLParser):
@@ -618,6 +670,11 @@ class _RedditDocumentParser(HTMLParser):
         self._form: dict | None = None
         self._script_parts: list[str] | None = None
         self._in_title = False
+        # With scripting on, <noscript> content is not part of the document.
+        self._noscript = 0
+        # A control tied to a form by its form= attribute, wherever it sits:
+        # the browser's form data would then differ from what was parsed.
+        self.detached_control = False
 
     def handle_starttag(self, tag, attrs):
         attrs_dict = {
@@ -625,6 +682,11 @@ class _RedditDocumentParser(HTMLParser):
             for key, value in attrs
         }
         tag = tag.lower()
+        if tag == "noscript":
+            self._noscript += 1
+            return
+        if self._noscript:
+            return
         if tag == "title":
             self._in_title = True
         elif tag == "script":
@@ -638,7 +700,15 @@ class _RedditDocumentParser(HTMLParser):
                 "method": (attrs_dict.get("method") or "GET").upper(),
                 "fields": [],
             }
+        elif tag in _REDDIT_CONTROL_TAGS and "form" in attrs_dict:
+            self.detached_control = True
+        elif tag in ("select", "textarea") and self._form is not None:
+            # Submitted by the browser, but not something this solver models.
+            self._form["invalid"] = True
         elif tag == "input" and self._form is not None:
+            if "disabled" in attrs_dict:
+                # Left out of the browser's submission; never guess at it.
+                self._form["invalid"] = True
             self._form["fields"].append(
                 {
                     "name": attrs_dict.get("name"),
@@ -649,6 +719,11 @@ class _RedditDocumentParser(HTMLParser):
 
     def handle_endtag(self, tag):
         tag = tag.lower()
+        if tag == "noscript":
+            self._noscript = max(0, self._noscript - 1)
+            return
+        if self._noscript:
+            return
         if tag == "title":
             self._in_title = False
         elif tag == "script" and self._script_parts is not None:
@@ -757,6 +832,8 @@ def _parse_reddit_verification(
     *,
     allow_same_origin_path: bool,
 ) -> RedditVerification | None:
+    if len(body) > REDDIT_VERIFICATION_MAX_BYTES or "<form" not in body.lower():
+        return None
     parser = _RedditDocumentParser()
     try:
         parser.feed(body)
@@ -764,10 +841,8 @@ def _parse_reddit_verification(
     except Exception:
         return None
 
-    title = " ".join("".join(parser.title_parts).split())
-    if title != _REDDIT_TITLE or len(parser.forms) != 1:
+    if len(parser.forms) != 1 or parser.detached_control:
         return None
-
     form = parser.forms[0]
     if form.get("invalid") or form.get("method") != "GET":
         return None
@@ -778,46 +853,43 @@ def _parse_reddit_verification(
     if action_url is None:
         return None
 
-    fields = form.get("fields", [])
+    fields = [
+        f for f in form.get("fields", []) if f["type"] not in _REDDIT_UNSUBMITTED_TYPES
+    ]
+    if not _REDDIT_MIN_FIELDS <= len(fields) <= _REDDIT_MAX_FIELDS:
+        return None
+    names = [f["name"] for f in fields]
     if (
-        len(fields) != len(_REDDIT_FIELDS)
-        or any(field["type"] != "hidden" for field in fields)
-    ):
-        return None
-    names = [field["name"] for field in fields]
-    if None in names or set(names) != _REDDIT_FIELDS:
-        return None
-    if len(names) != len(set(names)):
-        return None
-    by_name = {field["name"]: field["value"] for field in fields}
-    if (
-        by_name["solution"] != ""
-        or by_name["js_challenge"] != "1"
-        or by_name["jsc_orig_r"] != ""
-        or not _REDDIT_TOKEN_RE.fullmatch(by_name["token"])
+        any(f["type"] != "hidden" for f in fields)
+        or any(n is None or not _REDDIT_FIELD_NAME_RE.match(n) for n in names)
+        or len(names) != len(set(names))
+        or any(not _REDDIT_FIELD_VALUE_RE.match(f["value"]) for f in fields)
     ):
         return None
 
-    calculations = []
-    matching_scripts = []
+    # Exactly one script computes the solution, fills one empty form field
+    # with it, and submits the form.
+    candidates = []
     for script in parser.scripts:
-        matches = list(_REDDIT_CALC_RE.finditer(script))
-        calculations.extend(matches)
-        if matches:
-            matching_scripts.append(script)
-    if len(calculations) != 1 or len(matching_scripts) != 1:
+        seeds = _reddit_calculation(script)
+        if seeds:
+            candidates.append((script, seeds))
+    if len(candidates) != 1 or len(candidates[0][1]) != 1:
         return None
-    script = matching_scripts[0]
-    if any(marker.search(script) is None for marker in _REDDIT_SCRIPT_MARKERS):
+    script, (seed,) = candidates[0]
+    if not seed or _REDDIT_SUBMIT_RE.search(script) is None:
+        return None
+    targets = _reddit_fill_targets(script)
+    if len(targets) != 1:
+        return None
+    (target,) = targets
+    values = {f["name"]: f["value"] for f in fields}
+    if target not in values or values[target] != "":
         return None
 
-    seed = unescape(calculations[0].group("seed"))
-    if not re.fullmatch(r"[A-Za-z0-9]{1,128}", seed):
-        return None
     solution = seed + seed
     solved_fields = tuple(
-        (field["name"], solution if field["name"] == "solution" else field["value"])
-        for field in fields
+        (f["name"], solution if f["name"] == target else f["value"]) for f in fields
     )
     return RedditVerification(action_url=action_url, fields=solved_fields)
 
@@ -838,6 +910,27 @@ def is_reddit_verification(body: str) -> bool:
             allow_same_origin_path=True,
         )
         is not None
+    )
+
+
+# Reddit's reCAPTCHA gate ("Prove your humanity", first seen 2026-09-27): a
+# 200 whose form posts the widget's token back to the page with ?captcha=1.
+# Reddit's login page loads reCAPTCHA too, but never posts to ?captcha=1.
+_CAPTCHA_FORM_RE = re.compile(
+    r"""<form\b[^>]{0,512}?\baction\s*+=\s*+["']?[^"'\s>]{0,1024}?[?&]captcha=1\b""",
+    re.IGNORECASE,
+)
+
+
+_CAPTCHA_WIDGET_RE = re.compile(r"g-recaptcha|recaptcha/api\.js", re.IGNORECASE)
+
+
+def is_reddit_captcha_gate(body: str) -> bool:
+    """Recognize Reddit's reCAPTCHA gate by structure, not wording. Runs on
+    every Reddit page, so it scans without copying the body."""
+    return (
+        _CAPTCHA_FORM_RE.search(body) is not None
+        and _CAPTCHA_WIDGET_RE.search(body) is not None
     )
 
 

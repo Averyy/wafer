@@ -28,9 +28,11 @@ Concrete example: `wreq.blocking.Client(verify=False).get("https://expired.badss
 
 ## HTTP/2 Header Duplication
 
-**NEVER send the same header at both client level AND per-request level.** wreq creates duplicate entries in HTTP/2 HEADERS frames, which strict WAFs (Cloudflare, DataDome) detect as non-browser behavior -> instant 403.
+**Send a header at one level only.** Older wreq/rnet builds put a header set at both client level and per request into the HTTP/2 HEADERS frame twice, which strict WAFs (Cloudflare, DataDome) detect as non-browser behavior -> instant 403. Measured on 0.12.3 (2026-09-27, pingly echo): a per-request header replaces a same-named client header or emulation default in place, whatever its case, with no duplicate. Keep the rule anyway: it costs nothing and holds across versions.
 
-The `_build_headers()` method returns a **delta** -only headers that are NEW or DIFFERENT from client-level. Static headers (Accept, sec-ch-ua, etc.) are set ONCE at client construction. Per-request only adds dynamic headers (Referer, embed headers, user overrides).
+The `_build_headers()` method returns a **delta** -only headers that are NEW or DIFFERENT from client-level. Static headers (Accept, sec-ch-ua, etc.) are set ONCE at client construction. Per-request only adds dynamic headers (Referer, Sec-Fetch-Site that follows it, embed headers, user overrides).
+
+**Per-request `default_headers=False`** drops the emulation's default headers and the client's `headers=` for that one request, while the client's `orig_headers` still orders what is sent and the cookie jar still adds `Cookie` (wire-verified 0.12.3). It is the only way to leave out one header the emulation adds (e.g. `Sec-Fetch-User` on a script-submitted form, `wafer/_sync.py` Reddit bootstrap), so the request must carry the whole set itself.
 
 Also: **never send Host per-request** -wreq auto-sets it from the URL. Sending it per-request duplicates the `:authority` pseudo-header.
 

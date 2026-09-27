@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlparse
@@ -17,10 +18,11 @@ from tests.conftest import (
     make_sync_session,
 )
 from wafer._cookies import CookieCache
-from wafer._errors import WaferTimeout
+from wafer._errors import ResponseTooLarge, WaferTimeout
 from wafer._solvers import (
     REDDIT_CACHE_DOMAIN,
     REDDIT_SOLVE_ORIGIN,
+    REDDIT_VERIFICATION_MAX_BYTES,
     is_reddit_verification,
     parse_reddit_verification,
     reddit_cookie_names,
@@ -32,6 +34,7 @@ _JSON_URL = "https://api.reddit.com/r/homelab/hot"
 _OLD_JSON_URL = "https://old.reddit.com/r/homelab/hot.json?limit=1"
 _HTML_URL = "https://www.reddit.com/r/homelab/"
 _TOKEN = "t" * 64
+_FIXTURES = Path(__file__).parent / "fixtures"
 _SEED = "AbC123xYz987LmNo"
 
 _REDDIT_GATE_BODY = (
@@ -258,24 +261,49 @@ class TestRedditVerificationParser:
             _verification_html(action="/other"),
             _verification_html(action="/?next=evil"),
             _verification_html(method="POST"),
-            _verification_html(token="short"),
             _verification_html(seed="not-valid!"),
             _verification_html(seed="a" * 129),
             "<html><title>Reddit</title><body>normal homepage</body></html>",
-            _verification_html().replace(
-                "Reddit - Please wait for verification", "Reddit"
-            ),
             _verification_html().replace("<form", "<section").replace(
                 "</form>", "</section>"
             ),
             _verification_html().replace(
-                '<input type="hidden" name="jsc_orig_r" value="">', ""
-            ),
-            _verification_html().replace(
-                "e.requestSubmit();", "e.submit();"
-            ),
-            _verification_html().replace(
                 "await(async e=>e+e)", "await(async e=>e)"
+            ),
+            # Any other computation is never guessed at.
+            _verification_html().replace("e=>e+e", "e=>e+e+e"),
+            _verification_html().replace("e=>e+e", 'e=>e+"x"'),
+            _verification_html().replace(
+                "e=>e+e", 'e=>e.split("").reverse().join("")'
+            ),
+            # The filled field must be one of the form's empty fields.
+            _verification_html().replace(
+                'namedItem("solution")', 'namedItem("js_challenge")'
+            ),
+            _verification_html().replace(
+                'namedItem("solution")', 'namedItem("missing")'
+            ),
+            _verification_html().replace(
+                "e.requestSubmit();",
+                'e.elements.namedItem("token").value = n; e.requestSubmit();',
+            ),
+            _verification_html().replace("e.requestSubmit();", ""),
+            # Every submitted field hidden, with plain names and values, 2-8.
+            _verification_html().replace(
+                'type="hidden" name="js_challenge"', 'type="text" name="js_challenge"'
+            ),
+            _verification_html().replace('name="jsc_orig_r"', 'name="bad name"'),
+            _verification_html(token="t" * 300),
+            _verification_html().replace(
+                '<input type="hidden" name="js_challenge" value="1">', ""
+            ).replace('<input type="hidden" name="token" value="' + _TOKEN + '">', "")
+            .replace('<input type="hidden" name="jsc_orig_r" value="">', ""),
+            _verification_html().replace(
+                "</form>",
+                "".join(
+                    f'<input type="hidden" name="x{i}" value="1">' for i in range(6)
+                )
+                + "</form>",
             ),
             _verification_html().replace(
                 "n = await(async e=>e+e)('"
@@ -285,10 +313,117 @@ class TestRedditVerificationParser:
                 + _SEED
                 + "') + await(async x=>x+x)('OtherSeed');",
             ),
+            # Form data the browser would build differently from the parse.
+            _verification_html().replace(
+                "</form>", '<select name="s"><option value="1"></select></form>'
+            ),
+            _verification_html().replace(
+                "</form>", '<textarea name="t"></textarea></form>'
+            ),
+            _verification_html().replace(
+                'name="js_challenge" value="1"',
+                'name="js_challenge" value="1" disabled',
+            ),
+            _verification_html().replace(
+                "</body>", '<input type="hidden" form="f" name="x" value="1"></body>'
+            ),
         ],
     )
     def test_unrecognized_or_unsafe_document_is_rejected(self, html):
         assert parse_reddit_verification(html) is None
+
+    def test_live_capture_2026_09_27(self):
+        """Reddit's current page: title "Reddit" and a jsc_token field."""
+        page = (_FIXTURES / "reddit_verification_2026-09-27.html").read_text()
+        verification = parse_reddit_verification(page)
+        assert verification is not None
+        assert list(verification.fields) == [
+            ("solution", "e4c625ca8ffc7858" * 2),
+            ("js_challenge", "1"),
+            ("jsc_token", "0123456789abcdef" * 4),
+            ("jsc_orig_r", ""),
+        ]
+
+    @pytest.mark.parametrize(
+        "html",
+        [
+            # Wording and naming Reddit may change without changing the challenge.
+            _verification_html().replace(
+                "Reddit - Please wait for verification", "Reddit"
+            ),
+            _verification_html().replace("<title>", "<title>Something else "),
+            _verification_html().replace('name="token"', 'name="jsc_token"'),
+            _verification_html(token="short"),
+            _verification_html().replace(
+                '<input type="hidden" name="jsc_orig_r" value="">', ""
+            ),
+            _verification_html().replace(
+                '<input type="hidden" name="jsc_orig_r" value="">',
+                '<input type="hidden" name="jsc_orig_r" value="">'
+                '<input type="hidden" name="extra" value="/r/python%2F">',
+            ),
+            _verification_html().replace("e.requestSubmit();", "e.submit();"),
+            # Syntax a rewrite or minifier produces for the same doubling.
+            _verification_html().replace("async e=>e+e", "async (e)=>e+e"),
+            _verification_html().replace("async e=>e+e", "(e)=>{return e+e}"),
+            _verification_html().replace(
+                "async e=>e+e", "async function(e){return e+e;}"
+            ),
+            _verification_html().replace(f"('{_SEED}')", f"(`{_SEED}`)"),
+            _verification_html().replace(
+                'e.elements.namedItem("solution")', 'e.elements["solution"]'
+            ),
+            _verification_html().replace(
+                'e.elements.namedItem("solution")', "e.elements.solution"
+            ),
+            _verification_html().replace(
+                'e.elements.namedItem("solution")',
+                "e.querySelector('[name=solution]')",
+            ),
+            # Controls a submitter-less requestSubmit() leaves out, and a
+            # <noscript> fallback form, do not count.
+            _verification_html().replace(
+                "</form>", '<input type="submit" value="Continue"></form>'
+            ),
+            _verification_html().replace(
+                "<body>", "<body><noscript><form action=/x></form></noscript>"
+            ),
+        ],
+    )
+    def test_cosmetic_changes_still_parse(self, html):
+        verification = parse_reddit_verification(html)
+        assert verification is not None
+        fields = dict(verification.fields)
+        assert fields["solution"] == _SEED + _SEED
+
+    def test_oversized_document_is_not_parsed(self):
+        assert parse_reddit_verification(_oversize_verification_html()) is None
+
+    @pytest.mark.parametrize(
+        "script",
+        [
+            "(e=>" + " " * 60_000,
+            "(function(e){return " + " " * 60_000,
+            "((e)=>{return " + " " * 60_000,
+            "(e=>e+e" + " " * 60_000,
+            "(async" + " " * 60_000,
+            "(" + "a" * 60_000,
+            "(e=> e + e " * 5_000,
+            ".elements" + " " * 60_000,
+            "querySelector('[name=" + " " * 60_000,
+        ],
+    )
+    def test_hostile_script_parses_in_linear_time(self, script):
+        """Whitespace runs must not make the calculation regex backtrack."""
+        page = (
+            '<form action="/" method="GET">'
+            '<input type="hidden" name="solution" value="">'
+            '<input type="hidden" name="x" value="1"></form>'
+            f"<script>{script}</script>"
+        )
+        start = time.perf_counter()
+        assert parse_reddit_verification(page) is None
+        assert time.perf_counter() - start < 0.5
 
     def test_duplicate_field_is_rejected(self):
         duplicate = _verification_html().replace(
@@ -434,9 +569,7 @@ class TestRedditBootstrapSync:
     def test_malformed_verification_is_not_submitted_or_repeated(
         self, mock_sleep
     ):
-        malformed = _verification_html().replace(
-            "e.requestSubmit();", "e.submit();"
-        )
+        malformed = _verification_html().replace("e=>e+e", "e=>e+e+e")
         responses = [
             _gate_response(),
             MockResponse(200, {}, malformed),
@@ -670,7 +803,7 @@ class TestRedditBootstrapSync:
     def test_verification_over_internal_cap_fails_closed(
         self, mock_sleep
     ):
-        oversized = _verification_html() + "x" * (33 * 1024)
+        oversized = _verification_html() + "x" * (REDDIT_VERIFICATION_MAX_BYTES + 1024)
         responses = [
             _gate_response(),
             MockResponse(200, {}, oversized),
@@ -843,6 +976,192 @@ class TestRedditBootstrapSync:
         assert resp.text == body
         assert mock.request_count == 1
         assert mock.request_log[0][1] == "https://old.reddit.com/"
+
+
+class TestRedditLiveShape:
+    """The page Reddit serves since 2026-09-27 (title "Reddit", jsc_token),
+    solved inline without a browser."""
+
+    _PAGE = (_FIXTURES / "reddit_verification_2026-09-27.html").read_text()
+
+    def _assert_submitted(self, url):
+        parsed = urlparse(url)
+        assert f"{parsed.scheme}://{parsed.netloc}{parsed.path}" == REDDIT_SOLVE_ORIGIN
+        assert parse_qs(parsed.query, keep_blank_values=True) == {
+            "solution": ["e4c625ca8ffc7858" * 2],
+            "js_challenge": ["1"],
+            "jsc_token": ["0123456789abcdef" * 4],
+            "jsc_orig_r": [""],
+        }
+
+    @staticmethod
+    def _assert_leg_shapes(log):
+        """Captured from Chrome 153: the page is fetched like a typed URL, and
+        its script's requestSubmit() is a same-origin navigation from the page
+        with no user activation (so no Sec-Fetch-User)."""
+        page_kw, submit_kw = log[1][2], log[2][2]
+        page_headers = {k.lower(): v for k, v in page_kw["headers"].items()}
+        assert "referer" not in page_headers
+        assert "default_headers" not in page_kw
+        submit = {k.lower(): v for k, v in submit_kw["headers"].items()}
+        assert submit_kw["default_headers"] is False
+        assert submit["referer"] == REDDIT_SOLVE_ORIGIN
+        assert submit["sec-fetch-site"] == "same-origin"
+        assert submit["sec-fetch-mode"] == "navigate"
+        assert submit["sec-fetch-dest"] == "document"
+        assert "sec-fetch-user" not in submit
+        assert "cache-control" not in submit
+        for name in ("user-agent", "accept", "sec-ch-ua", "accept-language"):
+            assert name in submit
+
+    @patch("wafer._sync.time.sleep")
+    def test_sync_bootstrap(self, mock_sleep, caplog):
+        caplog.set_level(logging.DEBUG, logger="wafer")
+        responses = [
+            _gate_response(),
+            MockResponse(200, {}, self._PAGE),
+            _solved_response(),
+            MockResponse(200, {"content-type": "application/json"}, "{}"),
+        ]
+        session, mock = make_sync_session(responses, max_rotations=0)
+        resp = session.get(_JSON_URL)
+        assert resp.status_code == 200
+        assert resp.inline_solves == 1
+        self._assert_submitted(mock.request_log[2][1])
+        self._assert_leg_shapes(mock.request_log)
+        assert "0123456789abcdef" not in caplog.text
+        assert "e4c625ca8ffc7858" not in caplog.text
+
+    @pytest.mark.asyncio
+    @patch("wafer._async.asyncio.sleep")
+    async def test_async_bootstrap(self, mock_sleep, caplog):
+        caplog.set_level(logging.DEBUG, logger="wafer")
+        responses = [
+            _async_gate_response(),
+            AsyncMockResponse(200, {}, self._PAGE),
+            _async_solved_response(),
+            AsyncMockResponse(200, {"content-type": "application/json"}, "{}"),
+        ]
+        session, mock = make_async_session(responses, max_rotations=0)
+        resp = await session.get(_JSON_URL)
+        assert resp.status_code == 200
+        assert resp.inline_solves == 1
+        self._assert_submitted(mock.request_log[2][1])
+        self._assert_leg_shapes(mock.request_log)
+        assert "0123456789abcdef" not in caplog.text
+
+    def test_browser_never_passes_the_page_through(self):
+        from wafer.browser._solver import _is_passthrough_challenge_html
+
+        assert _is_passthrough_challenge_html(self._PAGE)
+
+
+class TestRedditCaptchaGate:
+    """A cold Reddit page can get the reCAPTCHA gate, while the root still
+    serves the JS verification: the bootstrap's cookies clear the page, and
+    only a captcha that survives it is reported, never returned as content."""
+
+    _GATE = (_FIXTURES / "reddit_captcha_gate_2026-09-27.html").read_text()
+    _PAGE = (_FIXTURES / "reddit_verification_2026-09-27.html").read_text()
+    _REAL = "<html><title>r/homelab</title><main>real content</main></html>"
+
+    def _gate(self, cls=MockResponse):
+        return cls(200, {"content-type": "text/html"}, self._GATE)
+
+    @patch("wafer._sync.time.sleep")
+    def test_bootstrap_clears_a_cold_captcha(self, mock_sleep):
+        session, mock = make_sync_session(
+            [
+                self._gate(),
+                MockResponse(200, {"content-type": "text/html"}, self._PAGE),
+                _solved_response(),
+                MockResponse(200, {"content-type": "text/html"}, self._REAL),
+            ],
+            max_rotations=0,
+        )
+        resp = session.get(_HTML_URL)
+        assert resp.status_code == 200
+        assert resp.challenge_type is None
+        assert "real content" in resp.text
+        assert resp.inline_solves == 1
+        urls = [entry[1] for entry in mock.request_log]
+        assert urls[0] == _HTML_URL and urls[-1] == _HTML_URL
+        assert urls[1] == REDDIT_SOLVE_ORIGIN
+        assert session.reddit_bootstrap_state()["last_outcome"] == "established"
+
+    @patch("wafer._sync.time.sleep")
+    def test_captcha_that_survives_the_bootstrap_is_reported(self, mock_sleep):
+        session, mock = make_sync_session(
+            [
+                self._gate(),
+                MockResponse(200, {"content-type": "text/html"}, self._PAGE),
+                _solved_response(),
+                self._gate(),
+            ],
+            max_rotations=0,
+        )
+        resp = session.get(_HTML_URL)
+        assert resp.challenge_type == "recaptcha"
+        assert mock.request_count == 4  # one bootstrap, one replay, no loop
+
+    @patch("wafer._sync.time.sleep")
+    def test_failed_bootstrap_reports_recaptcha(self, mock_sleep):
+        session, mock = make_sync_session(
+            [self._gate(), self._gate()], max_rotations=0
+        )
+        resp = session.get(_HTML_URL)
+        assert resp.challenge_type == "recaptcha"
+        assert mock.request_count == 2
+        assert (
+            session.reddit_bootstrap_state()["last_outcome"]
+            == "verification_structure"
+        )
+
+    @patch("wafer._sync.time.sleep")
+    def test_raised_without_rotating_when_rotation_is_allowed(self, mock_sleep):
+        from wafer._errors import ChallengeDetected
+
+        session, mock = make_sync_session([self._gate(), self._gate()])
+        with pytest.raises(ChallengeDetected) as info:
+            session.get(_HTML_URL)
+        assert info.value.challenge_type == "recaptcha"
+        assert mock.request_count == 2
+
+    def test_small_response_cap_still_reaches_the_bootstrap(self):
+        session, mock = make_sync_session(
+            [
+                MockResponse(
+                    200,
+                    {"content-type": "text/html"},
+                    self._GATE + "<!--" + "x" * 150_000 + "-->",
+                ),
+                self._gate(),
+            ],
+            max_rotations=0,
+        )
+        with pytest.raises(ResponseTooLarge):
+            session.get(_HTML_URL, max_response_size=10_000)
+        # The oversize gate was still read as overhead and the bootstrap ran;
+        # only handing it back to the caller is refused.
+        assert mock.request_count == 2
+        assert session.reddit_bootstrap_state()["attempts"] == 1
+
+    @pytest.mark.asyncio
+    @patch("wafer._async.asyncio.sleep")
+    async def test_async_bootstrap_clears_a_cold_captcha(self, mock_sleep):
+        session, mock = make_async_session(
+            [
+                self._gate(AsyncMockResponse),
+                AsyncMockResponse(200, {"content-type": "text/html"}, self._PAGE),
+                _async_solved_response(),
+                AsyncMockResponse(200, {"content-type": "text/html"}, self._REAL),
+            ],
+            max_rotations=0,
+        )
+        resp = await session.get(_HTML_URL)
+        assert resp.challenge_type is None
+        assert "real content" in resp.text
+        assert resp.inline_solves == 1
 
 
 class TestRedditBootstrapAsync:
@@ -1428,8 +1747,9 @@ class _AsyncNonUtf8Response(AsyncMockResponse):
 
 
 def _oversize_verification_html():
-    # Past REDDIT_VERIFICATION_MAX_BYTES (32 KiB) so the capped read aborts.
-    return _verification_html() + "<!--" + "x" * (33 * 1024) + "-->"
+    # Past REDDIT_VERIFICATION_MAX_BYTES so the capped read aborts.
+    padding = "x" * (REDDIT_VERIFICATION_MAX_BYTES + 1024)
+    return _verification_html() + "<!--" + padding + "-->"
 
 
 def _assert_value_free(state, caplog):
@@ -1459,6 +1779,11 @@ class TestRedditBootstrapDiagnostics:
             "last_browser_budget": None,
             "cookie_names": [],
             "has_cookie_evidence": False,
+            "app_reads": 0,
+            "app_token_mints": 0,
+            "app_fallbacks": 0,
+            "app_last_outcome": None,
+            "app_last_status": None,
         }
 
     @patch("wafer._sync.time.sleep")
@@ -1530,8 +1855,11 @@ class TestRedditBootstrapDiagnostics:
         state = session.reddit_bootstrap_state()
         assert state["last_outcome"] == "verification_too_large"
         assert state["last_status"] == 200
-        assert "passed the 32768-byte verification cap" in caplog.text
-        assert "bytes=32784" in caplog.text
+        assert (
+            f"passed the {REDDIT_VERIFICATION_MAX_BYTES}-byte verification cap"
+            in caplog.text
+        )
+        assert f"bytes={REDDIT_VERIFICATION_MAX_BYTES + 16}" in caplog.text
         _assert_value_free(state, caplog)
 
     @patch("wafer._sync.time.sleep")

@@ -9,6 +9,7 @@ Reference for `Sec-Fetch-*` headers, embed mode header behavior, and WAF detecti
 | Address bar / bookmark | `document` | `navigate` | `none` | `?1` | absent | absent |
 | Same-origin link click | `document` | `navigate` | `same-origin` | `?1` | absent | absent |
 | Cross-site link click | `document` | `navigate` | `cross-site` | `?1` | absent | absent |
+| Script-submitted form / `location=` (no user activation) | `document` | `navigate` | relation to the page | absent | absent (GET) | absent |
 | iframe (cross-origin) | `iframe` | `navigate` | `cross-site` | absent | absent | absent |
 | iframe (same-origin) | `iframe` | `navigate` | `same-origin` | absent | absent | absent |
 | Script tag (CDN) | `script` | `no-cors` | `cross-site` | absent | absent | absent |
@@ -27,6 +28,7 @@ Reference for `Sec-Fetch-*` headers, embed mode header behavior, and WAF detecti
 | `Dest: empty` + `Mode: navigate` | Navigate implies document/iframe/frame/embed/object dest |
 | `Dest: script` + `Mode: navigate` | Scripts don't navigate |
 | `Dest: iframe` + `Mode: cors` | iframes use navigate mode |
+| `Site: none` + a `Referer` | `none` means no page started the navigation (typed URL, bookmark), and such a navigation has no referrer |
 
 ## Accept Header by Request Type
 
@@ -55,6 +57,23 @@ POST. The bracketed high-entropy hints appear only after the origin asked for
 them with `Accept-CH`, and only those it asked for; a `Critical-CH` response
 makes Chrome resend once with them. A plain navigation sends no
 `Cache-Control`.
+
+## wafer's navigations
+
+- The first request to a host is an address-bar navigation (`none`, `?1`, no
+  Referer).
+- Later requests to the same host carry the automatic Referer (the last URL
+  fetched there) and, with it, `Sec-Fetch-Site: same-origin`: a same-origin
+  link click. Any Referer the caller passes likewise sets the relation
+  (`same-origin`, `same-site` or `cross-site`, PSL-lite aware). Before
+  2026-09-27 wafer sent the automatic Referer beside `none`, the impossible
+  combination above. A `Sec-Fetch-Site` the caller sets, per request or on the
+  session, is kept. Profiles that send no Fetch Metadata (Dart, OkHttp, Safari
+  before 16.4) get none added.
+- Reddit's verification form is submitted as the page's script does it:
+  `same-origin`, `Referer: https://www.reddit.com/`, no `Sec-Fetch-User`
+  (captured from Chrome 153 on a local copy of the page; see
+  `docs/ref-reddit.md`).
 
 ## Embed Mode Header Details
 
