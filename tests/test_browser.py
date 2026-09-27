@@ -502,9 +502,14 @@ class TestBrowserSolverInit:
         assert session._fingerprint.pinned is True
         assert session._client_headers["User-Agent"] == user_agent
         assert '"150"' in session._client_headers["sec-ch-ua"]
-        assert (
-            "150.0.7871.125" in session._client_headers["sec-ch-ua-full-version-list"]
+        # The full build rides the high-entropy hints, sent once the origin
+        # asks for them with Accept-CH.
+        assert "sec-ch-ua-full-version-list" not in session._client_headers
+        session._accept_ch["https://example.com:443"] = frozenset(
+            {"sec-ch-ua-full-version-list"}
         )
+        built = session._build_headers("https://example.com/")
+        assert "150.0.7871.125" in built["sec-ch-ua-full-version-list"]
 
     def test_preflight_identity_rejects_mismatched_explicit_user_agent(self):
         user_agent = (

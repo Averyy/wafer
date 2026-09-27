@@ -511,8 +511,9 @@ coherent identity; it does NOT change rotation behavior.
 
 ### session.fingerprint_envelope() -> dict
 
-Snapshot of the identity the session currently serves with - the same UA +
-client hints actually on the wire. Useful to feed the same identity to other
+Snapshot of the identity the session currently serves with - its UA and the
+client-hint values it sends (the high-entropy ones only reach origins that
+asked for them). Useful to feed the same identity to other
 tooling (e.g. signing a JS challenge) or to log what served a 403. Replaces
 reaching into `wafer._fingerprint`. Always returns these keys:
 
@@ -812,7 +813,15 @@ capabilities and trade-offs.
 - The User-Agent and `sec-ch-ua-platform` describe the host OS: a session on a
   Linux server sends a Linux Chrome UA, on Windows a Windows one (the same holds
   for the Edge and Firefox families)
-- Auto-generates `sec-ch-ua` Client Hints headers
+- Sends the Client Hints Chrome sends: `sec-ch-ua`, `sec-ch-ua-mobile` and
+  `sec-ch-ua-platform` on every request, and the high-entropy hints
+  (`sec-ch-ua-arch`, `-bitness`, `-full-version`, `-full-version-list`,
+  `-model`, `-platform-version`) only to an origin that asked for them with
+  `Accept-CH` on an HTTPS response, in the session. A response whose
+  `Critical-CH` names a requested hint the request lacked is resent once with
+  it. Embed-mode requests carry no high-entropy hints.
+- A navigation has no `Cache-Control`; a POST (form-submission) navigation
+  sends `Cache-Control: max-age=0`, as Chrome does
 - On 403/challenge: rotates across families (Chrome -> Firefox -> Safari -> Edge -> Chrome versions), swapping the header envelope each switch (see "Rotation escalation")
 - All features enabled: challenge detection, retry, rotation, browser solving
 - Pass `emulation=wreq.Emulation.Chrome153` to select that specific profile
@@ -1351,16 +1360,15 @@ an embed session sends the complete header set and header order of that
 browser's real `fetch()`, `XMLHttpRequest` or iframe load; `Sec-Fetch-User` is
 never sent. Session `headers=` values (e.g. `User-Agent`, `Priority`) take
 precedence, and an `Accept`, `Accept-Language` or `Accept-Encoding` left out of
-`headers=` is filled from the browser family. Any other `emulation=` (Opera,
-OkHttp, wreq's Safari members) keeps that profile's navigation headers,
-including `Sec-Fetch-User: ?1` and `Upgrade-Insecure-Requests: 1`, next to the
-embed `Sec-Fetch-*` values, a combination no browser sends; use a Chrome, Edge
-or Firefox emulation for embed mode.
+`headers=` is filled from the browser family. Any other `emulation=` or
+`fingerprint_pool` entry (Opera, OkHttp, wreq's Safari members, mobile
+profiles) raises `ValueError` at construction when `embed=` is set; use
+`profile=Profile.SAFARI` for Safari.
 
 ### XHR mode (`embed="xhr"`)
 - Emulates a modern `fetch()` call.
 - `Sec-Fetch-Mode: cors`, `Sec-Fetch-Dest: empty`, `Accept: */*`
-- Sets `Origin` from embed_origin
+- Sets `Origin` from embed_origin, except on a same-origin GET/HEAD
 - No navigation headers (`Upgrade-Insecure-Requests`, `Cache-Control`,
   `Sec-Fetch-User`)
 - `Priority: u=1, i` (Chrome/Edge) or `u=4` (Firefox)

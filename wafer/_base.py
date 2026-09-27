@@ -22,10 +22,12 @@ from wafer import _psl
 from wafer._cookies import CookieCache, _default_cookie_path
 from wafer._dart import DartIdentity
 from wafer._fingerprint import (
+    HIGH_ENTROPY_HINTS,
     ROTATION_LADDER,
     FingerprintManager,
     build_fingerprint_envelope,
     chrome_version_from_ua,
+    chromium_navigation_order,
     embed_header_family,
     embed_header_order,
     embed_priority,
@@ -391,7 +393,6 @@ DEFAULT_HEADERS = {
     ),
     "Accept-Language": "en-US,en;q=0.9",
     "Accept-Encoding": "gzip, deflate, br, zstd",
-    "Cache-Control": "max-age=0",
     "Upgrade-Insecure-Requests": "1",
 }
 
@@ -844,6 +845,8 @@ class BaseSession:
         # parent-domain cookies without leaking host-only cookies to siblings.
         # Keyed by the RFC cookie identity (name, normalized domain, path).
         self._cookie_scopes: dict[tuple[str, str, str], bool] = {}
+        # High-entropy Client Hints each origin asked for with Accept-CH.
+        self._accept_ch: dict[str, frozenset[str]] = {}
 
         # Reddit anonymous-bootstrap diagnostics (see reddit_bootstrap_state).
         self._reddit_bootstrap_stats = _new_reddit_bootstrap_stats()
@@ -869,6 +872,23 @@ class BaseSession:
                 "Embed mode is not supported with Profile.DART "
                 "(Dart apps don't send Sec-Fetch-* headers)"
             )
+        if embed and self._fingerprint is not None:
+            # wafer sends an embed request's whole header set itself, which it
+            # can only do for the shapes captured from real browsers. Any
+            # other emulation would send its navigation headers
+            # (Sec-Fetch-User, Upgrade-Insecure-Requests) beside
+            # Sec-Fetch-Mode: cors, which no browser does.
+            unshaped = [
+                repr(e)
+                for e in [self._fingerprint.current, *(self._fingerprint_pool or [])]
+                if embed_header_family(e) is None
+            ]
+            if unshaped:
+                raise ValueError(
+                    "Embed mode needs desktop Chrome, Edge or Firefox emulations"
+                    f" (got {', '.join(unshaped)}); use profile=Profile.SAFARI"
+                    " for Safari"
+                )
         self._embed = embed
         self._embed_origin = embed_origin
         self._embed_referers = embed_referers or []
@@ -1344,7 +1364,9 @@ class BaseSession:
                 ua = ua_override or self._desktop_emulation_ua()
                 if ua:
                     headers["User-Agent"] = ua
-            headers.update(self._fingerprint.sec_ch_ua_headers())
+            # Low-entropy only; the high-entropy hints go per request to the
+            # origins that asked for them (_build_headers).
+            headers.update(self._fingerprint.sec_ch_ua_headers(high_entropy=False))
 
         if self._embed:
             # Strip Sec-Fetch-* from client level. _build_headers sets
@@ -1434,6 +1456,79 @@ class BaseSession:
         set supplies outside embed mode, which then keeps wreq's value.
         """
         return {k: v for k, v in self._client_headers.items() if v != ""}
+
+    @staticmethod
+    def _set_default(headers: dict[str, str], name: str, value: str) -> None:
+        """Set ``name`` unless present under any casing (a "" suppresses)."""
+        if not any(k.lower() == name.lower() for k in headers):
+            headers[name] = value
+
+    def _is_chromium_navigation(self) -> bool:
+        """A desktop Chrome/Edge emulation making top-level navigations."""
+        if self._embed or self._fingerprint is None:
+            return False
+        if (
+            self._dart_identity is not None
+            or self._ios_safari_identity is not None
+            or self._safari_identity is not None
+        ):
+            return False
+        current = self._fingerprint.current
+        return not emulation_is_mobile(current) and emulation_family(current) in (
+            "chrome",
+            "edge",
+        )
+
+    @staticmethod
+    def _hint_origin(url: str) -> str | None:
+        """Origin key for Accept-CH, or None outside a secure context, where
+        Chrome ignores Accept-CH."""
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower().rstrip(".")
+        if parsed.scheme != "https" and host not in ("localhost", "127.0.0.1", "::1"):
+            return None
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        return f"{parsed.scheme}://{host}:{port}"
+
+    @staticmethod
+    def _header_tokens(headers, name: str) -> frozenset[str] | None:
+        """Lower-cased comma-separated tokens of a response header, or None."""
+        try:
+            values = list(headers.get_all(name))
+        except Exception:
+            return None
+        if not values:
+            return None
+        text = ",".join(
+            v.decode("latin-1") if isinstance(v, bytes) else str(v) for v in values
+        )
+        return frozenset(t.strip().lower() for t in text.split(",") if t.strip())
+
+    def _record_accept_ch(self, url: str, headers) -> None:
+        """Remember which high-entropy hints a navigation response asks for.
+
+        A response with Accept-CH replaces the origin's set; one without it
+        leaves the set alone.
+        """
+        if not self._is_chromium_navigation():
+            return
+        origin = self._hint_origin(url)
+        tokens = self._header_tokens(headers, "accept-ch")
+        if origin is None or tokens is None:
+            return
+        self._accept_ch[origin] = tokens & HIGH_ENTROPY_HINTS
+
+    def _critical_ch_missing(self, url: str, headers, sent: dict[str, str]) -> bool:
+        """Whether Critical-CH names a requested hint this request lacked,
+        which makes Chrome retry the request once with it."""
+        if not self._is_chromium_navigation():
+            return False
+        origin = self._hint_origin(url)
+        critical = self._header_tokens(headers, "critical-ch")
+        if origin is None or critical is None:
+            return False
+        wanted = critical & self._accept_ch.get(origin, frozenset())
+        return bool(wanted - {k.lower() for k in sent})
 
     def _embed_header_kind(self) -> str | None:
         """The verified embed request shape wafer supplies itself, or None.
@@ -1537,8 +1632,14 @@ class BaseSession:
             # _compute_client_headers. The Sec-Fetch-* / Origin / Referer
             # behavior is identical for fetch() and jQuery XHR -- both are CORS
             # requests issued from the embed_origin page.
-            merged["Origin"] = self._embed_origin or ""
             merged["Sec-Fetch-Site"] = self._compute_sec_fetch_site(url)
+            # Fetch spec: a same-origin GET/HEAD carries no Origin (captured:
+            # Chrome 153 same-origin fetch() GET has none, POST has one).
+            if merged["Sec-Fetch-Site"] != "same-origin" or method.upper() not in (
+                "GET",
+                "HEAD",
+            ):
+                merged["Origin"] = self._embed_origin or ""
             merged["Sec-Fetch-Mode"] = "cors"
             merged["Sec-Fetch-Dest"] = "empty"
             if self._embed_referers:
@@ -1564,6 +1665,9 @@ class BaseSession:
             # GET/HEAD navigations do not.
             if method.upper() not in ("GET", "HEAD"):
                 merged["Origin"] = self._embed_origin or ""
+                # Chrome also revalidates a form-POST navigation.
+                if kind == "chromium":
+                    self._set_default(merged, "Cache-Control", "max-age=0")
             if self._embed_referers:
                 merged["Referer"] = random.choice(self._embed_referers)
             logger.debug(
@@ -1576,6 +1680,17 @@ class BaseSession:
             if "Referer" not in merged and domain in self._last_url:
                 merged["Referer"] = self._last_url[domain]
                 logger.debug("Auto-Referer: %s", self._last_url[domain])
+            if self._is_chromium_navigation():
+                # High-entropy hints only to an origin that asked for them
+                # with Accept-CH, as Chrome does.
+                requested = self._accept_ch.get(self._hint_origin(url) or "")
+                if requested:
+                    for name, value in self._fingerprint.sec_ch_ua_headers().items():
+                        if name in requested:
+                            merged[name] = value
+                # A form-POST navigation revalidates; a plain one does not.
+                if method.upper() not in ("GET", "HEAD"):
+                    self._set_default(merged, "Cache-Control", "max-age=0")
 
         # Kasada: CT+CD headers require x-kpsdk-h HMAC to be valid.
         # Without H, sending CT+CD causes server rejection (worse
@@ -2342,6 +2457,10 @@ class BaseSession:
             }
             if kind is not None:
                 kwargs["orig_headers"] = embed_header_order(kind, self._embed)
+            elif self._is_chromium_navigation():
+                # Chrome's navigation order, which places requested
+                # high-entropy hints inside the sec-ch-ua block.
+                kwargs["orig_headers"] = chromium_navigation_order()
         store = self._cert_store()
         if store is not None:
             kwargs["tls_verify"] = store

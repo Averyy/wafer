@@ -572,7 +572,7 @@ Impersonate requests that originate from an iframe or fetch() call inside anothe
 
 ### XHR Mode (fetch/CORS)
 
-Emulates a modern `fetch()` call: `Sec-Fetch-Mode: cors`, `Sec-Fetch-Dest: empty`, `Accept: */*`, `Origin` from `embed_origin`, no navigation headers (`Upgrade-Insecure-Requests`, `Cache-Control`, `Sec-Fetch-User`).
+Emulates a modern `fetch()` call: `Sec-Fetch-Mode: cors`, `Sec-Fetch-Dest: empty`, `Accept: */*`, `Origin` from `embed_origin` (not on a same-origin GET), no navigation headers (`Upgrade-Insecure-Requests`, `Cache-Control`, `Sec-Fetch-User`).
 
 In every embed mode wafer sends the complete header set, in the order the emulated browser (Chrome, Edge or Firefox) uses for that kind of request, captured from real browsers. The browser's navigation defaults are not mixed in.
 

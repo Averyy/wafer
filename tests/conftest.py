@@ -436,6 +436,7 @@ def make_sync_session(responses, **session_kwargs):
     session._pool_strikes = {}
     session._cookie_cache = session_kwargs.get("cookie_cache", None)
     session._cookie_scopes = {}
+    session._accept_ch = {}
     session._reddit_bootstrap_stats = _new_reddit_bootstrap_stats()
     session._rate_limiter = session_kwargs.get("rate_limiter", None)
     session._domain_failures = {}
@@ -544,6 +545,7 @@ def make_async_session(responses, **session_kwargs):
     session._pool_strikes = {}
     session._cookie_cache = session_kwargs.get("cookie_cache", None)
     session._cookie_scopes = {}
+    session._accept_ch = {}
     session._reddit_bootstrap_stats = _new_reddit_bootstrap_stats()
     session._rate_limiter = session_kwargs.get("rate_limiter", None)
     session._domain_failures = {}

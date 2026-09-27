@@ -40,20 +40,31 @@ Reference for `Sec-Fetch-*` headers, embed mode header behavior, and WAF detecti
 ## Chrome Header Order (top-level navigation)
 
 ```
-Host, Connection, Cache-Control, sec-ch-ua, sec-ch-ua-mobile, sec-ch-ua-platform,
-Upgrade-Insecure-Requests, User-Agent, Accept, Sec-Fetch-Site, Sec-Fetch-Mode,
-Sec-Fetch-User, Sec-Fetch-Dest, Accept-Encoding, Accept-Language, Cookie
+Content-Length, Cache-Control, sec-ch-ua, sec-ch-ua-mobile,
+[sec-ch-ua-full-version, sec-ch-ua-arch], sec-ch-ua-platform,
+[sec-ch-ua-platform-version, sec-ch-ua-model, sec-ch-ua-bitness,
+sec-ch-ua-full-version-list], Upgrade-Insecure-Requests, Content-Type,
+User-Agent, Origin, Accept, Sec-Fetch-Site, Sec-Fetch-Mode, Sec-Fetch-User,
+Sec-Fetch-Dest, Referer, Accept-Encoding, Accept-Language, Cookie, Priority
 ```
+
+Captured 2026-09-27 from Google Chrome 153 (`_fingerprint._CHROMIUM_NAVIGATION_ORDER`,
+which wafer applies to Chrome and Edge navigations). `Content-Length`,
+`Cache-Control: max-age=0`, `Content-Type` and `Origin` appear only on a form
+POST. The bracketed high-entropy hints appear only after the origin asked for
+them with `Accept-CH`, and only those it asked for; a `Critical-CH` response
+makes Chrome resend once with them. A plain navigation sends no
+`Cache-Control`.
 
 ## Embed Mode Header Details
 
-In every embed mode wafer supplies the whole header set and its order itself, with wreq's per-profile headers turned off (`Emulation(..., headers=False)` + `orig_headers`). Those defaults are a top-level navigation, and since wreq 0.12.2 they carry `Sec-Fetch-User: ?1` and `Upgrade-Insecure-Requests: 1`, which wreq cannot drop individually. Left on, XHR mode sent the first row of the invalid-combination table above. The shapes below apply to desktop Chrome, Edge and Firefox emulations. wafer's Safari, iOS Safari and Dart identities already send only wafer's headers. Any other `Emulation` keeps wreq's defaults.
+In every embed mode wafer supplies the whole header set and its order itself, with wreq's per-profile headers turned off (`Emulation(..., headers=False)` + `orig_headers`). Those defaults are a top-level navigation, and since wreq 0.12.2 they carry `Sec-Fetch-User: ?1` and `Upgrade-Insecure-Requests: 1`, which wreq cannot drop individually. Left on, XHR mode sent the first row of the invalid-combination table above. The shapes below apply to desktop Chrome, Edge and Firefox emulations. wafer's Safari and iOS Safari identities already send only wafer's headers (Dart refuses embed mode). Any other `Emulation`, including a `fingerprint_pool` entry, is refused with `ValueError`, since wreq cannot drop its navigation headers.
 
-**XHR mode** (`embed="xhr"`) sets: `Sec-Fetch-Mode: cors`, `Sec-Fetch-Dest: empty`, `Origin`, `Accept: */*`. Computes `Sec-Fetch-Site` from `embed_origin` vs request URL (`same-origin`, `same-site`, or `cross-site`). No navigation headers (`Cache-Control`, `Upgrade-Insecure-Requests`, `Sec-Fetch-User`). `Priority: u=1, i` (Chrome) / `u=4` (Firefox). Referer sends the full URL from `embed_referers`. No `X-Requested-With` (modern `fetch()` doesn't send it).
+**XHR mode** (`embed="xhr"`) sets: `Sec-Fetch-Mode: cors`, `Sec-Fetch-Dest: empty`, `Accept: */*`, and `Origin` except on a same-origin GET/HEAD (Fetch spec; Chrome's same-origin `fetch()` GET has none). Computes `Sec-Fetch-Site` from `embed_origin` vs request URL (`same-origin`, `same-site`, or `cross-site`). No navigation headers (`Cache-Control`, `Upgrade-Insecure-Requests`, `Sec-Fetch-User`). `Priority: u=1, i` (Chrome) / `u=4` (Firefox). Referer sends the full URL from `embed_referers`. No `X-Requested-With` (modern `fetch()` doesn't send it).
 
 **jQuery XHR mode** (`embed="xhr-jquery"`) is identical to XHR mode plus the two markers a legacy jQuery `$.ajax` / `XMLHttpRequest` call adds: `X-Requested-With: XMLHttpRequest` and `Accept: application/json, text/javascript, */*; q=0.01` (the jQuery Accept, replacing `*/*`). Both are set at the client level (no HTTP/2 header duplication). Use this when an older `/ajax`, `getData`, tile, or autocomplete endpoint requires `X-Requested-With`; use plain `"xhr"` for modern `fetch()` endpoints. Firefox sends no `Priority` header on an `XMLHttpRequest`.
 
-**Iframe mode** (`embed="iframe"`) sets: `Sec-Fetch-Mode: navigate`, `Sec-Fetch-Dest: iframe`. Computes `Sec-Fetch-Site` (same as XHR). No `Origin` (GET navigations don't send it; POST/PUT/PATCH/DELETE navigations do). Keeps navigation `Accept`, `Cache-Control` and `Upgrade-Insecure-Requests`. It is an embed loaded with the page, so no `Sec-Fetch-User` (that needs user activation). A cross-site load adds `Sec-Fetch-Storage-Access`: `active` for Chrome (third-party cookies allowed by default), `none` for Firefox (Total Cookie Protection). `Priority: u=0, i` (Chrome) / `u=4` (Firefox).
+**Iframe mode** (`embed="iframe"`) sets: `Sec-Fetch-Mode: navigate`, `Sec-Fetch-Dest: iframe`. Computes `Sec-Fetch-Site` (same as XHR). No `Origin` (GET navigations don't send it; POST/PUT/PATCH/DELETE navigations do). Keeps navigation `Accept` and `Upgrade-Insecure-Requests`; Chrome adds `Cache-Control: max-age=0` only on a form POST. It is an embed loaded with the page, so no `Sec-Fetch-User` (that needs user activation). A cross-site load adds `Sec-Fetch-Storage-Access`: `active` for Chrome (third-party cookies allowed by default), `none` for Firefox (Total Cookie Protection). `Priority: u=0, i` (Chrome) / `u=4` (Firefox).
 
 ### Embed header order (captured)
 

@@ -609,21 +609,20 @@ _SAFARI_ACCEPT = (
 
 # Navigation header envelope per family (the headers a real browser of
 # that family sends on a top-level navigation, minus sec-ch-ua, which is
-# generated dynamically per version). Chrome/Edge include the navigation
-# Cache-Control / Upgrade-Insecure-Requests; Firefox does too.
+# generated dynamically per version). No Cache-Control: Chrome sends
+# max-age=0 only on a reload or a form POST, which the session adds per
+# request (see _build_headers).
 _FAMILY_HEADERS: dict[str, dict[str, str]] = {
     "chrome": {
         "Accept": _CHROME_ACCEPT,
         "Accept-Language": "en-US,en;q=0.9",
         "Accept-Encoding": "gzip, deflate, br, zstd",
-        "Cache-Control": "max-age=0",
         "Upgrade-Insecure-Requests": "1",
     },
     "edge": {
         "Accept": _CHROME_ACCEPT,
         "Accept-Language": "en-US,en;q=0.9",
         "Accept-Encoding": "gzip, deflate, br, zstd",
-        "Cache-Control": "max-age=0",
         "Upgrade-Insecure-Requests": "1",
     },
     "firefox": {
@@ -758,6 +757,39 @@ def _h1_header_case(name: str) -> str:
     if name.startswith("sec-ch-ua") or name == "te":
         return name
     return "-".join(part.capitalize() for part in name.split("-"))
+
+
+# The Client Hints a site must ask for with Accept-CH before Chrome sends them.
+# The low-entropy three (sec-ch-ua, -mobile, -platform) are always sent.
+HIGH_ENTROPY_HINTS = frozenset(
+    {
+        "sec-ch-ua-arch",
+        "sec-ch-ua-bitness",
+        "sec-ch-ua-full-version",
+        "sec-ch-ua-full-version-list",
+        "sec-ch-ua-model",
+        "sec-ch-ua-platform-version",
+    }
+)
+
+# Chrome's top-level navigation order, GET and form POST, with the requested
+# high-entropy hints in place. Captured 2026-09-27 from Google Chrome
+# 153.0.8010.53 on a site that sent Accept-CH; without hints it reduces to the
+# plain navigation order (sec-ch-ua, -mobile, -platform, ...).
+_CHROMIUM_NAVIGATION_ORDER = (
+    "content-length", "cache-control", "sec-ch-ua", "sec-ch-ua-mobile",
+    "sec-ch-ua-full-version", "sec-ch-ua-arch", "sec-ch-ua-platform",
+    "sec-ch-ua-platform-version", "sec-ch-ua-model", "sec-ch-ua-bitness",
+    "sec-ch-ua-full-version-list", "upgrade-insecure-requests", "content-type",
+    "user-agent", "origin", "accept", "sec-fetch-site", "sec-fetch-mode",
+    "sec-fetch-user", "sec-fetch-dest", "referer", "accept-encoding",
+    "accept-language", "cookie", "priority",
+)
+
+
+def chromium_navigation_order() -> list[str]:
+    """Wire order (and HTTP/1.1 casing) of a Chrome/Edge navigation."""
+    return [_h1_header_case(n) for n in _CHROMIUM_NAVIGATION_ORDER]
 
 
 def embed_header_order(kind: str, embed: str) -> list[str]:
@@ -1030,7 +1062,7 @@ class FingerprintManager:
         self._ch_full_version_override = None
         logger.debug("Fingerprint reset to %s", self._current)
 
-    def sec_ch_ua_headers(self) -> dict[str, str]:
+    def sec_ch_ua_headers(self, high_entropy: bool = True) -> dict[str, str]:
         """Generate sec-ch-ua headers for the current emulation profile.
 
         Family-aware: Chrome and Edge send the full low- + high-entropy
@@ -1040,10 +1072,11 @@ class FingerprintManager:
         injected accurately by wreq's own Emulation (wafer would clobber
         them with wrong Chrome-GREASE values -- see ``_FAMILY_BRAND``).
 
-        Includes both low-entropy (always sent) and high-entropy Client
-        Hints (sent after Accept-CH / Critical-CH).  Strict WAFs like
-        Cloudflare on manta.com require high-entropy hints for
-        cf_clearance cookie replay.
+        Returns the low-entropy hints Chrome always sends and, unless
+        ``high_entropy=False``, the high-entropy ones it sends only to an
+        origin that asked for them with Accept-CH (the session filters them
+        per origin). Strict WAFs (Cloudflare) ask for them and check them on
+        cf_clearance replay.
         """
         family = emulation_family(self._current)
         brand = _FAMILY_BRAND.get(family) if family else None
@@ -1071,7 +1104,7 @@ class FingerprintManager:
         # (pin_to_browser always pins a Chrome emulation); Edge keeps its
         # distinct-build behaviour.
         chromium_full = self._ch_full_version_override
-        return {
+        hints = {
             # Low-entropy (always sent by Chromium browsers)
             "sec-ch-ua": generate_sec_ch_ua(ver, brand=brand),
             "sec-ch-ua-mobile": "?0",
@@ -1091,6 +1124,9 @@ class FingerprintManager:
             "sec-ch-ua-model": '""',
             "sec-ch-ua-platform-version": _HOST_PLATFORM_VERSION,
         }
+        if not high_entropy:
+            return {k: v for k, v in hints.items() if k not in HIGH_ENTROPY_HINTS}
+        return hints
 
 
 # ---------------------------------------------------------------------------

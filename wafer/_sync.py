@@ -1330,6 +1330,7 @@ class SyncSession(BaseSession):
         # One browser solve per (challenge type, host): a redirect onto
         # another host behind the same WAF needs that host's own clearance.
         browser_attempted: set[tuple[str, str]] = set()
+        critical_ch_retried = False
         reddit_bootstrap_attempted = False
         tmd_inline_attempted = False
         # Clearance the last Radware replay rode on, so an identical reissue is
@@ -1616,6 +1617,17 @@ class SyncSession(BaseSession):
             # Record request timestamp for rate limiting
             if self._rate_limiter:
                 self._rate_limiter.record(domain)
+
+            # Client Hints: remember what this origin asks for, and resend
+            # once when Critical-CH names a hint the request lacked, as
+            # Chrome does before it uses the response.
+            self._record_accept_ch(current_url, resp.headers)
+            if not critical_ch_retried and self._critical_ch_missing(
+                current_url, resp.headers, kwargs["headers"]
+            ):
+                critical_ch_retried = True
+                logger.debug("Critical-CH from %s; resending with its hints", domain)
+                continue
 
             # 3xx → follow redirect
             if self.follow_redirects and 300 <= status < 400 and status != 304:

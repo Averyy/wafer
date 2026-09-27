@@ -365,7 +365,13 @@ class TestSessionFingerprint:
         # ...but the wire identity is the solving browser's Chrome154.
         assert headers["User-Agent"] == ua154
         assert '"154"' in headers["sec-ch-ua"]
-        assert "154.0.8037.58" in headers["sec-ch-ua-full-version-list"]
+        # High-entropy hints go per request, to origins that asked for them.
+        assert "sec-ch-ua-full-version-list" not in headers
+        s._accept_ch["https://example.com:443"] = frozenset(
+            {"sec-ch-ua-full-version-list"}
+        )
+        built = s._build_headers("https://example.com/")
+        assert "154.0.8037.58" in built["sec-ch-ua-full-version-list"]
         assert s.fingerprint_envelope()["user_agent"] == ua154
 
     def test_user_supplied_ua_wins_over_solve_override(self):
