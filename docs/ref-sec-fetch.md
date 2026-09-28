@@ -62,18 +62,15 @@ makes Chrome resend once with them. A plain navigation sends no
 
 - The first request to a host is an address-bar navigation (`none`, `?1`, no
   Referer).
-- Later requests to the same host carry the automatic Referer (the last URL
-  fetched there) and, with it, `Sec-Fetch-Site: same-origin`: a same-origin
-  link click. Any Referer the caller passes likewise sets the relation
-  (`same-origin`, `same-site` or `cross-site`, PSL-lite aware). Before
-  2026-09-27 wafer sent the automatic Referer beside `none`, the impossible
-  combination above. A `Sec-Fetch-Site` the caller sets, per request or on the
-  session, is kept. Profiles that send no Fetch Metadata (Dart, OkHttp, Safari
-  before 16.4) get none added.
-- Reddit's verification form is submitted as the page's script does it:
-  `same-origin`, `Referer: https://www.reddit.com/`, no `Sec-Fetch-User`
-  (captured from Chrome 153 on a local copy of the page; see
-  `docs/ref-reddit.md`).
+- Later requests carry the automatic Referer (the last URL fetched on that
+  host) with `Sec-Fetch-Site: same-origin` (a link click). A caller's Referer
+  sets the relation the same way (PSL-lite aware); a caller's
+  `Sec-Fetch-Site` is kept. Profiles without Fetch Metadata (Dart, OkHttp,
+  Safari before 16.4) get none. Before 2026-09-27 wafer sent the Referer beside
+  `none`, an impossible combination.
+- Reddit's verification form goes out as its script submits it: `same-origin`,
+  `Referer: https://www.reddit.com/`, no `Sec-Fetch-User` (Chrome 153 capture;
+  see `docs/ref-reddit.md`).
 
 ## Embed Mode Header Details
 

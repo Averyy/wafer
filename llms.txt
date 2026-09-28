@@ -206,13 +206,12 @@ SyncSession(
     # Socket connects to these IPs; TLS SNI + cert still key on the hostname.
     # Construction-only (no per-request form); an empty IP list raises;
     # combining with proxy= raises (a proxy resolves the host, voiding the pin).
-    # Reddit JSON reads use the app API (reddit_app= below) only when both
-    # oauth.reddit.com and www.reddit.com are pinned; otherwise the web path.
+    # Reddit's app route (reddit_app=) needs both oauth.reddit.com and
+    # www.reddit.com pinned; otherwise Reddit JSON uses the web path.
     resolve: dict[str, list[str]] | None = None,
 
-    # Reddit JSON reads through Reddit's Android app API (see "Reddit" under
-    # Challenge Types). On by default; False sends them through the web path
-    # like any other URL.
+    # Reddit JSON reads via Reddit's app API (see "Reddit" under Challenge
+    # Types). False sends them through the web path. Off under Opera Mini.
     reddit_app: bool = True,
 
     # Embed mode (both modes select a random Referer from embed_referers)
@@ -368,18 +367,12 @@ session.reddit_bootstrap_state() -> dict
 #                              up for Reddit"; cookie_scope_summary() reflects
 #                              only cookies observed so far.
 #   "app_reads": int         - JSON reads the Android app route served
-#   "app_token_mints": int   - anonymous app tokens minted (0 when a token saved
-#                              in cache_dir was reused)
+#   "app_token_mints": int   - app tokens minted (0 when cache_dir had one)
 #   "app_fallbacks": int     - reads the app route handed to the web path
-#   "app_last_outcome": str|None - "served", "token" (no token could be
-#                              minted), "gate" (Reddit's edge turned the app
-#                              client away: a non-JSON answer),
-#                              "unauthorized" (a fresh token got 401: an
-#                              endpoint that needs an account), "ratelimit"
-#                              (the API's window would not reset within the
-#                              deadline), "transport", "redirect" (to a URL
-#                              the app route does not read). All but "served"
-#                              mean that read went through the web path.
+#   "app_last_outcome": str|None - "served", or why the read went to the web
+#                              path: "token", "gate" (Reddit refused the app
+#                              client), "unauthorized" (endpoint needs an
+#                              account), "ratelimit", "transport", "redirect"
 #   "app_last_status": int|None - HTTP status behind app_last_outcome
 # Names, counts, and labels only - never cookie values, the app token, the
 # verification token, or the solved submission query. Counters are per session
@@ -894,7 +887,7 @@ capabilities and trade-offs.
 
 - Impersonates Opera Mini in Extreme data-saving mode
 - GET only (raises ValueError on POST, PUT, etc.)
-- No challenge detection, no retry, no browser solving
+- No challenge detection, no retry, no browser solving, no Reddit app route
 - Rate limiting still works
 - Useful for fetching server-side rendered pages that Opera Mini triggers
 
@@ -905,7 +898,7 @@ capabilities and trade-offs.
 These are all automatic. Do not write code to handle these yourself:
 
 - **Redirects** - 3xx followed automatically (POST -> GET on 301/302/303). 304 passes through. Auth stripped on cross-origin redirects. Body headers stripped on method change. Followed hops are recorded in `resp.history`.
-- **Referer headers** - set automatically from the last URL visited per hostname. A navigation that carries a Referer (automatic or passed by you) gets the `Sec-Fetch-Site` that Referer implies (`same-origin` for the automatic chain), as a browser link click does; only a navigation with no Referer says `none`. A `Sec-Fetch-Site` you set yourself is kept.
+- **Referer headers** - set automatically from the last URL visited per hostname, with the matching `Sec-Fetch-Site` (`same-origin`, like a link click). A Referer you pass sets it too; a `Sec-Fetch-Site` you set is kept.
 - **Cookies** - managed in-memory and optionally persisted to disk; no manual cookie jar needed
 - **WAF challenges** - detected, browser-solved if configured, retried with cross-family fingerprint rotation (Chrome -> Firefox -> Safari -> Edge). A terminal WAF *block* is reported at once instead (see `RequestBlocked`).
 - **Rate limiting** - per-hostname delays enforced automatically when `rate_limit` is set
@@ -1018,64 +1011,41 @@ chain gets its own browser solve, once per challenge type per request.
 A challenged POST is replayed as the same POST, with its body and headers
 intact. Radware's own host is only ever sent the bodyless GET that a redirect
 implies, so request bodies and `Authorization` headers are not disclosed to it.
-**Reddit.** A Reddit JSON read (`GET` of a `.json` path on `reddit.com`,
-`www.reddit.com` or `new.reddit.com`, or any path on `api.reddit.com` or
-`oauth.reddit.com`) goes through Reddit's official Android app API by default,
-the way a logged-out install of the app reads: an anonymous app token, the
-app's headers, and the TLS of the network stack the app ships. No web gate, no
-bootstrap, no browser. The response is the same listing JSON the web path
-returns; `resp.url` and `resp.history` show the host you requested, and
-`resp.emulation == "reddit_app"`. With `cache_dir`, the app install and its
-token (valid about a day) are saved as `reddit-app.state` (owner-only), so a
-new process reuses them; one install per cache directory. On `AsyncSession`,
-concurrent cold reads share one token mint. The API's rate limit (100 reads per
-10-minute window when measured, reported in the `x-ratelimit-*` response
-headers) is honored: once a window is spent, the next read waits for the reset
-when that fits in `timeout=` (a 429 likewise), and otherwise goes through the
-web path instead of timing out. No pacing is required; that budget averages
-one read every 6 s, so at `rate_limit=6` or higher it is never reached (reads
-of `www.reddit.com` and `api.reddit.com` share the budget but are spaced
-separately). Reddit's
-own JSON errors (a private subreddit's 403, a 404) are returned as they are.
+**Reddit.** Reddit JSON reads (`GET` of a `.json` path on `reddit.com`,
+`www.reddit.com` or `new.reddit.com`, or any path on `api.reddit.com` /
+`oauth.reddit.com`) go through Reddit's Android app API by default, as a
+logged-out app install: no web gate, no bootstrap, no browser. The JSON is the
+same as the web's; `resp.url` / `resp.history` show the host you asked for, and
+`resp.emulation == "reddit_app"`. With `cache_dir`, the install and its token
+persist in `reddit-app.state`; sessions sharing a `cache_dir` share them.
+Reddit's own JSON errors (a private subreddit's 403, a 404) are returned as is.
 
-A request that speaks for an account stays on the web path: an
-`Authorization` or `Cookie` header (per request or in the session's
-`headers=`), or a logged-in `reddit_session` cookie in the session (e.g. added
-with `add_cookie` or hydrated from `cache_dir`). So do a body, a non-GET
-method, anything under `old.reddit.com`, and every HTML page. Your per-request
-`headers=` are not sent on the app route (it sends only the app's headers).
-A 401 for a freshly minted token (an endpoint that needs an account) sends that
-read to the web path. If the app route itself fails - no token, or Reddit's
-edge turning the app client away (any non-JSON answer, e.g. an HTML 403 or
-reCAPTCHA page) - that read and every Reddit read for the next 15 minutes use
-the web path below; after a transport error (or a 429/5xx from the token
-endpoint), for 1 minute.
-`reddit_bootstrap_state()["app_last_outcome"]` says why.
-`reddit_app=False` turns the route off.
+- Budget: 100 reads per 10 minutes. No pacing is required; at `rate_limit=6`
+  or higher it is never reached (`rate_limit` spaces `www.` and `api.`
+  separately, but they share the budget). When it is spent, a read waits for
+  the reset if that fits `timeout=`, else goes through the web path. It never
+  raises for this.
+- Always on the web path: HTML pages, `old.reddit.com`, a body or non-GET
+  method, and account requests (`Authorization` / `Cookie` per request or in
+  the session's `headers=`, or a logged-in `reddit_session` cookie). Your
+  per-request `headers=` are not sent on the app route.
+- Falls back to the web path for one read when an endpoint needs an account or
+  a redirect leaves the API; for 15 minutes when Reddit turns the app client
+  away; for 1 minute after a transport error.
+  `reddit_bootstrap_state()["app_last_outcome"]` says why. `reddit_app=False`
+  turns the route off.
 
-On the web path, Reddit's solver recognizes both the large JSON block and
-direct 200 verification HTML (by its structure: one hidden GET form, one
-seed-doubling calculation and a submit call, not its wording), performs the
-logged-out New Reddit verification at `https://www.reddit.com/` in the same TLS
-session, submitting the form exactly as the page's script does, then retries
-the original request. A cold page that gets Reddit's reCAPTCHA page ("Prove
-your humanity") goes through the same inline verification first, whose cookies
-clear it; only a captcha that survives that is reported as `"recaptcha"`:
-solved in the browser when `browser_solver` is set, otherwise returned
-(`max_rotations=0` / `bulk()`) or raised, never as page content. If the strict inline flow fails and `browser_solver` is configured,
-wafer navigates that fixed HTML root in Chrome, optionally reloads it once,
-requires `loid` plus `token_v2` or `csv`, imports the cookies, and retries the
-original method/body through wreq. It never browser-navigates the JSON URL or
-returns browser HTML as the API response. Reddit's fixed root overrides
-`solve_origin` for this recovery. `cache_dir`
-persists the durable cookie-setting response legs so later processes can start
-warm. A bootstrap that fails logs one WARNING naming the branch (verification
-status, oversize or non-UTF-8 body, unrecognized form, submission status,
-missing cookie evidence, transport) with the HTTP status and the Set-Cookie
-names observed; `session.reddit_bootstrap_state()` returns the same information
-for a caller that needs it programmatically. Explicit `old.reddit.com` requests are fetched normally, but wafer never
-selects Old Reddit automatically or uses it as a fallback. A login wall from
-an explicit Old Reddit request is returned normally.
+On the web path, wafer solves Reddit's JS verification inline at
+`https://www.reddit.com/` and retries the original request. That also clears the "Prove your
+humanity" reCAPTCHA page cold subreddit pages get; a captcha that survives is
+`"recaptcha"` (browser-solved with `browser_solver`, else returned under
+`max_rotations=0` / `bulk()` or raised), never page content. If the inline
+solve fails and `browser_solver` is set, the browser loads that root (never the
+JSON URL) and wafer retries through wreq with its cookies; this ignores
+`solve_origin`. `cache_dir` persists the cookies. A failed bootstrap logs one
+WARNING naming the branch; `reddit_bootstrap_state()` reports the same.
+`old.reddit.com` URLs are fetched as requested (a login wall is returned
+normally), but Old Reddit is never used automatically.
 
 ---
 
@@ -1598,11 +1568,8 @@ logging.getLogger("wafer").setLevel(logging.DEBUG)
     let the total run several times over) - raise it if your flow needs retries
     plus a browser solve.
 
-18. **Reading public Reddit JSON needs no browser, login, or Old Reddit.** Do
-    not add your own Reddit OAuth client, a browser step, or an `old.reddit.com`
-    fallback for logged-out reads: `session.get("https://www.reddit.com/r/x/.json")`
-    already goes through Reddit's Android app API. Passing your own
-    `Authorization` or `Cookie` header (per request or on the session), or a
-    logged-in `reddit_session` cookie in the session, takes the request off
-    the app route (it is then sent as you asked), and so does
-    `reddit_app=False`.
+18. **Public Reddit JSON needs no browser, login, or Old Reddit.** Don't add
+    your own OAuth client, a browser step, or an `old.reddit.com` fallback:
+    `session.get("https://www.reddit.com/r/x/.json")` already uses Reddit's app
+    API. An `Authorization` or `Cookie` header, or a `reddit_session` cookie,
+    sends the request as you asked instead.

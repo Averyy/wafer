@@ -212,7 +212,9 @@ from wreq import Emulation
 session = SyncSession(emulation=Emulation.Chrome153)
 ```
 
-The `sec-ch-ua` header is auto-generated to match the emulated Chrome version using the same GREASE algorithm as Chromium source.
+The `sec-ch-ua` header is auto-generated to match the emulated Chrome version using the same GREASE algorithm as Chromium source. As in Chrome, the low-entropy hints go on every request and the high-entropy ones only to an origin that asked with `Accept-CH` (a `Critical-CH` response is resent once); only a POST-style navigation (a form submission) carries `Cache-Control: max-age=0`.
+
+Referer is set automatically from the last URL fetched on the same host, with the `Sec-Fetch-Site` it implies (`same-origin`, like a link click).
 
 ### Non-Chrome family profiles (Firefox / Edge)
 
@@ -369,8 +371,7 @@ solver - you must handle it yourself).
 | Cookie gate | small page whose inline script writes a fixed `document.cookie` and reloads, e.g. a "Continue" button (fccid.io, fcc.report) | inline (writes the cookie) |
 | TMD | TMD session validation pattern | inline (+ browser slider) |
 | Amazon | CAPTCHA page with `amzn` markers | inline |
-| Reddit | cold-session JSON block or 200 HTML verification; JSON reads normally skip both via the app API | inline first; optional browser cookie recovery |
-| Reddit reCAPTCHA gate | 200 "Prove your humanity" page: form posting to `?captcha=1` with the `g-recaptcha` widget | inline Reddit verification first (its cookies clear it); if it survives, `recaptcha` (browser); never returned as content |
+| Reddit | cold-session JSON block, 200 HTML verification, or "Prove your humanity" reCAPTCHA page (JSON reads skip them via the app API) | inline first; optional browser cookie recovery; a reCAPTCHA that survives is `recaptcha` |
 | Arkose / FunCaptcha | `arkoselabs.com` or `funcaptcha` markers | **detect-only** (no solver; the generic browser fallback can't pass FunCaptcha) |
 | GeeTest v4 | `initGeetest4`, `gcaptcha4.geetest.com`, `gt4.js` | browser |
 | hCaptcha | `hcaptcha.com` script, `h-captcha` div | browser |
@@ -423,33 +424,14 @@ bootstrap fails:
   When the total request deadline can fund them, wafer tries up to three fresh
   browser contexts with distinct recorded drags and a fair share of the
   remaining time, reserving up to 15 seconds for HTTP replay.
-- **Reddit** -JSON reads (`.json` paths on `reddit.com` / `www` / `new`, any
-  path on `api.reddit.com` / `oauth.reddit.com`) go through Reddit's official
-  Android app API, as a logged-out install of the app reads: an anonymous
-  token, the app's headers, and the TLS of Chromium's network stack on Android.
-  No web gate, no bootstrap, no browser; `resp.emulation == "reddit_app"`. The
-  install and its day-long token persist in `cache_dir` (`reddit-app.state`,
-  `0o600`); the API's rate-limit headers are honored (a window that will not
-  reset in time sends the read to the web path). If Reddit turns the route
-  away, Reddit reads use the web path for 15 minutes (1 after a transport
-  error). `reddit_app=False` turns it off; a request that speaks for an account
-  (`Authorization`/`Cookie` per request or on the session, or a logged-in
-  `reddit_session` cookie), a body, a non-GET method, and every HTML page use
-  the web path.
-  On the web path, on a cold-session JSON block or direct 200 HTML verification
-  page (recognized by structure, not wording), wafer performs New Reddit's
-  logged-out verification at `https://www.reddit.com/` in the same TLS session,
-  submitting the form as the page's script does, then replays the original
-  request. A cold page that gets Reddit's reCAPTCHA page takes the same
-  verification first, which clears it; one that survives is reported as
-  `recaptcha`, never returned as content. If that strict inline flow fails and `browser_solver` is configured,
-  wafer navigates the browser to that fixed HTML root (never the JSON URL),
-  requires authoritative Reddit cookies, imports them, and replays the original
-  request through wreq before trying fingerprint rotation. A session-level
-  `solve_origin` does not override Reddit's fixed solve page. With `cache_dir`,
-  every durable cookie-setting leg is persisted for fresh processes. Explicit
-  `old.reddit.com` URLs are fetched as requested, but Old Reddit is never
-  selected automatically or used as a fallback.
+- **Reddit** -JSON reads go through Reddit's Android app API as a logged-out
+  app install, so they meet no web gate (`resp.emulation == "reddit_app"`;
+  `reddit_app=False` turns it off). Everything else (HTML, account requests,
+  reads the app route declines) uses the web path: wafer solves New Reddit's JS
+  verification at `https://www.reddit.com/` inline and replays, which also
+  clears the reCAPTCHA page a cold subreddit gets. If that
+  fails, a configured browser recovers the cookies at the same root. Old
+  Reddit is fetched only when you ask for it. See `docs/ref-reddit.md`.
 
 These run automatically during the retry loop.
 
@@ -595,7 +577,7 @@ Impersonate requests that originate from an iframe or fetch() call inside anothe
 
 Emulates a modern `fetch()` call: `Sec-Fetch-Mode: cors`, `Sec-Fetch-Dest: empty`, `Accept: */*`, `Origin` from `embed_origin` (not on a same-origin GET), no navigation headers (`Upgrade-Insecure-Requests`, `Cache-Control`, `Sec-Fetch-User`).
 
-In every embed mode wafer sends the complete header set, in the order the emulated browser (Chrome, Edge or Firefox) uses for that kind of request, captured from real browsers. The browser's navigation defaults are not mixed in.
+In every embed mode wafer sends the complete header set, in the order the emulated browser (Chrome, Edge or Firefox) uses for that kind of request, captured from real browsers. The browser's navigation defaults are not mixed in. Any other `emulation=` raises `ValueError` at construction (use `profile=Profile.SAFARI` for Safari).
 
 ```python
 session = SyncSession(

@@ -249,11 +249,10 @@ bootstrap (`attempts`, `successes`, `last_outcome`, `last_status`,
 
 ## Live verification
 
-This section is for contributors verifying the solvers against live Reddit,
-not a usage rule (see "Request pacing" above). When testing, space requests
-out (the repository uses 15-30 s between Reddit requests while developing) so
-a burst of test traffic does not change what Reddit serves. Use wafer directly
-and an empty temporary cache.
+For contributors checking the solvers against live Reddit; not a usage rule
+(see "Request pacing"). Space test requests 15-30 s apart so a burst of test
+traffic does not change what Reddit serves. Use wafer directly and an empty
+temporary cache.
 
 App route:
 
@@ -275,19 +274,13 @@ Web route (`reddit_app=False`, `max_rotations=0`):
    controlled test and confirm Chrome navigates only the fixed New Reddit root,
    followed by a successful wreq replay of the original URL.
 
-If Reddit does not serve the cold gate during a run, the warm result does not
-by itself validate the solver. A cold HTML page that meets the reCAPTCHA gate
-should still come back as content after one inline solve; only if the gate
-survives the bootstrap is the result `challenge_type == "recaptcha"`, never
-page content.
+If Reddit serves no cold gate during a run, a warm pass proves nothing. A cold
+HTML page that meets the reCAPTCHA page should still return content after one
+inline solve.
 
-History: 2026-07-28, forced-inline-failure browser recovery verified (fixed New
-Reddit root only, 200 replay, no rotation, unpinned). 2026-09-27, the
-verification page changed shape (title and token field) and the structural
-parser landed; cold subreddit HTML then met the reCAPTCHA gate for wafer and
-for fresh headed Chrome alike, and the app route was added (cold read 200 in
-0.9 s, one mint; recreated async session 200 in 0.14 s, no mint; permalink,
-404 JSON and `api.reddit.com` reads served; 100 reads per 10-minute window).
-With the script-shaped submission, the web route solved the JSON gate inline
-(200, no browser), and cold `/r/Python/` and `/r/programming/` HTML went from
-the reCAPTCHA gate to 200 content through one root bootstrap, sync and async.
+History: 2026-07-28, browser recovery verified (root only, 200 replay, no
+rotation). 2026-09-27, the verification page's title and token field changed
+(parser made structural), cold subreddit HTML started getting the reCAPTCHA
+page (fresh Chrome too), and the app route landed; app-route and web-route
+checks 1-2 passed, sync and async, `browser_attempts=0`.
+2026-09-28, re-verified from the PyPI v0.7.0 install.
