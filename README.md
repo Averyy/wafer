@@ -989,6 +989,7 @@ wafer/
   _ios.py           # iOS Safari 26.5.2 identity -mobile TLS, H2, headers
   _dart.py          # Dart 3.11 (Flutter) identity -TLS options, headers
   _native_tls.py    # Native OpenSSL transport (Imperva TLS-fingerprint bypass)
+  _reddit_app.py    # Reddit Android app identity, token and state (JSON reads)
   _kasada.py        # Kasada CD (proof-of-work) generation
   _retry.py         # Retry strategy and backoff
   _ratelimit.py     # Per-hostname rate limiting
