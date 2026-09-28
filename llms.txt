@@ -1032,7 +1032,8 @@ concurrent cold reads share one token mint. The API's rate limit (100 reads per
 10-minute window when measured, reported in the `x-ratelimit-*` response
 headers) is honored: once a window is spent, the next read waits for the reset
 when that fits in `timeout=` (a 429 likewise), and otherwise goes through the
-web path instead of timing out. Set `rate_limit=` if you read in bulk. Reddit's
+web path instead of timing out. No pacing is required; that budget averages
+one read every 6 s, so `rate_limit=6` keeps a steady reader inside it. Reddit's
 own JSON errors (a private subreddit's 403, a 404) are returned as they are.
 
 A request that speaks for an account stays on the web path: an

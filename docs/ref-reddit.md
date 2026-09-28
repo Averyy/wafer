@@ -225,6 +225,16 @@ Malformed verification, non-2xx legs, missing response cookie evidence, or a
 client replacement cause a safe failure or a restart on the replacement client
 under the same deadline. Wafer never falls back to Old Reddit.
 
+## Request pacing
+
+Wafer needs no pacing between Reddit requests and adds no delay of its own.
+The one limit is the app API's budget: 100 reads per 10-minute window (a
+sustained average of one read every 6 s; bursts are fine). A spent window
+makes the next read wait for the reset when that fits its `timeout=`, and
+otherwise sends it through the web route. To read steadily inside one window,
+set `rate_limit=6`; anything slower is never limited. Sessions that share a
+`cache_dir` share one app install, and so one budget.
+
 ## Diagnostics
 
 `session.reddit_bootstrap_state()` reports both routes, value-free: the inline
@@ -236,8 +246,11 @@ bootstrap (`attempts`, `successes`, `last_outcome`, `last_status`,
 
 ## Live verification
 
-Follow the repository request-pacing rules in `CLAUDE.md` (at least 15-20 s
-between Reddit requests). Use wafer directly and an empty temporary cache.
+This section is for contributors verifying the solvers against live Reddit,
+not a usage rule (see "Request pacing" above). When testing, space requests
+out (the repository uses 15-30 s between Reddit requests while developing) so
+a burst of test traffic does not change what Reddit serves. Use wafer directly
+and an empty temporary cache.
 
 App route:
 
