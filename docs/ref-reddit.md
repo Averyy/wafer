@@ -231,9 +231,12 @@ Wafer needs no pacing between Reddit requests and adds no delay of its own.
 The one limit is the app API's budget: 100 reads per 10-minute window (a
 sustained average of one read every 6 s; bursts are fine). A spent window
 makes the next read wait for the reset when that fits its `timeout=`, and
-otherwise sends it through the web route. To read steadily inside one window,
-set `rate_limit=6`; anything slower is never limited. Sessions that share a
-`cache_dir` share one app install, and so one budget.
+otherwise sends it through the web route. At one read every 6 s or more
+(`rate_limit=6` or higher), a window never holds more than 100 reads, so the
+limit is never reached. The budget is Reddit's, not a host's: `rate_limit`
+spaces each hostname separately, so `www.reddit.com` and `api.reddit.com` reads
+together can go faster, and so can sessions that share a `cache_dir` (one app
+install, one budget).
 
 ## Diagnostics
 
