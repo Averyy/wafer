@@ -35,13 +35,21 @@ class MockStatus:
         return 200 <= self._code < 300
 
 
-class MockHeaderMap:
-    """Mock wreq HeaderMap with bytes keys and bytes values.
+def _ro(data: bytes) -> memoryview:
+    """A read-only memoryview, the shape wreq 0.13 returns for binary data."""
+    return memoryview(data).toreadonly()
 
-    Mirrors wreq's real HeaderMap behavior:
-    - keys() returns unique bytes keys
+
+class MockHeaderMap:
+    """Mock wreq HeaderMap with read-only memoryview keys and values.
+
+    Mirrors wreq's real HeaderMap behavior (0.13+):
+    - keys() returns unique memoryview keys
     - get()/[] returns first value only
     - get_all() returns list of all values for a key
+    Every name and value is a read-only ``memoryview``, never ``bytes``, so a
+    test fails if wafer code assumes ``bytes`` (no ``.decode()``, fails
+    ``isinstance(x, bytes)``) the way the real 0.13 objects would.
     """
 
     def __init__(
@@ -59,12 +67,12 @@ class MockHeaderMap:
             )
 
     def keys(self):
-        return list(self._raw.keys())
+        return [_ro(k) for k in self._raw]
 
     def __getitem__(self, key):
         if isinstance(key, str):
             key = key.lower().encode("ascii")
-        return self._raw[key][0]
+        return _ro(self._raw[bytes(key)][0])
 
     def get(self, key):
         try:
@@ -75,11 +83,11 @@ class MockHeaderMap:
     def get_all(self, key):
         if isinstance(key, str):
             key = key.lower().encode("ascii")
-        return list(self._raw.get(key, []))
+        return [_ro(v) for v in self._raw.get(bytes(key), [])]
 
 
 class _MockStreamer:
-    """Mock wreq Streamer: yields body bytes in fixed-size chunks.
+    """Mock wreq Streamer: yields read-only memoryview chunks of fixed size.
 
     Supports both sync (for ... in) and async (async for ... in) iteration
     plus context-manager use, mirroring wreq's real Streamer. Used to
@@ -88,7 +96,7 @@ class _MockStreamer:
 
     def __init__(self, data: bytes, chunk_size: int = 16):
         self._chunks = [
-            data[i : i + chunk_size]
+            _ro(data[i : i + chunk_size])
             for i in range(0, max(len(data), 1), chunk_size)
         ] if data else []
 
@@ -134,7 +142,7 @@ class MockResponse:
         return self._body
 
     def bytes(self):
-        return self._body.encode("utf-8")
+        return _ro(self._body.encode("utf-8"))
 
     def stream(self):
         return _MockStreamer(self._body.encode("utf-8"))
@@ -162,7 +170,7 @@ class AsyncMockResponse:
         return self._body
 
     async def bytes(self):
-        return self._body.encode("utf-8")
+        return _ro(self._body.encode("utf-8"))
 
     def stream(self):
         return _MockStreamer(self._body.encode("utf-8"))
@@ -281,7 +289,7 @@ class MockJar:
 
 def _install_response_cookies(cookie_jar, response, url):
     for raw in response.headers.get_all("set-cookie"):
-        cookie_jar.add(raw.decode("utf-8"), url)
+        cookie_jar.add(bytes(raw).decode("utf-8"), url)
 
 
 class MockClient:

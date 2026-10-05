@@ -1553,7 +1553,7 @@ class TestSyncBrowserSolveIntegration:
         ua = (
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/154.0.0.0 Safari/537.36"
+            "Chrome/155.0.0.0 Safari/537.36"
         )
         browser_result = SolveResult(
             cookies=[
@@ -1566,7 +1566,7 @@ class TestSyncBrowserSolveIntegration:
                 }
             ],
             user_agent=ua,
-            browser_version="154.0.8037.58",
+            browser_version="155.0.8059.26",
         )
         mock_solver = MockBrowserSolver(result=browser_result)
 
@@ -1578,15 +1578,15 @@ class TestSyncBrowserSolveIntegration:
         )
 
         session.get("https://example.com/page")
-        # TLS pins the newest available wreq profile (no Chrome154 in wreq)...
-        assert repr(session._fingerprint.current) == "Profile.Chrome153"
+        # TLS pins the newest available wreq profile (no Chrome155 in wreq)...
+        assert repr(session._fingerprint.current) == "Profile.Chrome154"
         assert session._fingerprint.pinned is True
-        # ...but the wire identity follows the real browser (Chrome154).
+        # ...but the wire identity follows the real browser (Chrome155).
         assert session._fingerprint.ua_override == ua
         env = session.fingerprint_envelope()
         assert env["user_agent"] == ua
-        assert '"154"' in env["sec_ch_ua"]
-        assert "154.0.8037.58" in env["full_version_list"]
+        assert '"155"' in env["sec_ch_ua"]
+        assert "155.0.8059.26" in env["full_version_list"]
 
     @patch("time.sleep")
     def test_imperva_solve_leaves_fingerprint_unpinned(self, mock_sleep):
@@ -2735,7 +2735,7 @@ class TestAsyncBrowserSolveIntegration:
         ua = (
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/154.0.0.0 Safari/537.36"
+            "Chrome/155.0.0.0 Safari/537.36"
         )
         browser_result = SolveResult(
             cookies=[
@@ -2748,7 +2748,7 @@ class TestAsyncBrowserSolveIntegration:
                 }
             ],
             user_agent=ua,
-            browser_version="154.0.8037.58",
+            browser_version="155.0.8059.26",
         )
         mock_solver = MockBrowserSolver(result=browser_result)
 
@@ -2760,12 +2760,12 @@ class TestAsyncBrowserSolveIntegration:
         )
 
         await session.get("https://example.com/page")
-        assert repr(session._fingerprint.current) == "Profile.Chrome153"
+        assert repr(session._fingerprint.current) == "Profile.Chrome154"
         assert session._fingerprint.pinned is True
         assert session._fingerprint.ua_override == ua
         env = session.fingerprint_envelope()
-        assert '"154"' in env["sec_ch_ua"]
-        assert "154.0.8037.58" in env["full_version_list"]
+        assert '"155"' in env["sec_ch_ua"]
+        assert "155.0.8059.26" in env["full_version_list"]
 
     @patch("asyncio.sleep")
     async def test_imperva_solve_leaves_fingerprint_unpinned(self, mock_sleep):
@@ -7620,6 +7620,193 @@ class TestDispatchChallenge:
         )
         mock_baxia.assert_not_called()
 
+    _ITEM_URL = "https://www.aliexpress.com/item/4000085910726.html"
+    # The in-page MTop dialog seen on a rendered item page (2026-10-05): the
+    # main frame stays on the item URL and only this child frame is issued.
+    _DIALOG_FRAME_URL = (
+        "https://recom-acs.aliexpress.com//h5/"
+        "mtop.relationrecommend.aliexpressrecommend.recommend/1.0/"
+        "_____tmd_____/punish?x5secdata=issued&x5step=2&"
+        "action=captcharecaptcha&pureCaptcha="
+    )
+
+    def _item_page(self, *frame_urls):
+        page = MagicMock()
+        page.url = self._ITEM_URL
+        page.frames = [
+            SimpleNamespace(url=url) for url in (self._ITEM_URL, *frame_urls)
+        ]
+        return page
+
+    @patch("wafer.browser._drag.solve_baxia")
+    @patch("wafer.browser._recaptcha.wait_for_recaptcha", return_value=True)
+    def test_render_in_page_recaptcha_dialog_uses_recaptcha(
+        self, mock_recaptcha, mock_baxia
+    ):
+        solver = self._make_solver_with_mock_browser()
+        page = self._item_page(
+            self._DIALOG_FRAME_URL,
+            "https://recom-acs.aliexpress.com/h5/"
+            "mtop.relationrecommend.aliexpressrecommend.recommend/1.0/"
+            "_____tmd_____/punish?recaptcha=1&iframe=1&x5step=3",
+            "https://www.google.com/recaptcha/enterprise/anchor?k=site",
+        )
+
+        assert solver._dispatch_challenge(
+            page, "tmd", 10_000, challenge_url=self._ITEM_URL
+        )
+        mock_recaptcha.assert_called_once_with(
+            solver,
+            page,
+            10_000,
+            protocol_completion_is_intermediate=True,
+        )
+        mock_baxia.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "frame_url",
+        [
+            # A bare Google widget is not a TMD punishment.
+            "https://www.google.com/recaptcha/enterprise/anchor?k=site",
+            # A lookalike punishment on any other host (an ad or user-content
+            # iframe) is not vendor-issued.
+            "https://evil.example/_____tmd_____/punish?action=captcharecaptcha",
+            "https://ads.example//h5/mtop.ae.x/1.0/_____tmd_____/punish?"
+            "action=captcharecaptcha",
+            # Nor is a vendor-looking one over plain HTTP.
+            "http://recom-acs.aliexpress.com//h5/mtop.ae.x/1.0/"
+            "_____tmd_____/punish?action=captcharecaptcha",
+            # TMD's nested wrapper never carries the issued action.
+            "https://recom-acs.aliexpress.com/h5/mtop.x.y/1.0/"
+            "_____tmd_____/punish?recaptcha=1&iframe=1&x5step=3",
+        ],
+    )
+    @patch("wafer.browser._drag.solve_baxia", return_value=True)
+    @patch("wafer.browser._recaptcha.wait_for_recaptcha")
+    def test_render_without_issued_recaptcha_frame_keeps_slider(
+        self, mock_recaptcha, mock_baxia, frame_url
+    ):
+        solver = self._make_solver_with_mock_browser()
+        page = self._item_page(frame_url)
+
+        assert solver._dispatch_challenge(
+            page, "tmd", 10_000, challenge_url=self._ITEM_URL
+        )
+        mock_baxia.assert_called_once_with(
+            solver, page, 10_000, challenge_url=self._ITEM_URL
+        )
+        mock_recaptcha.assert_not_called()
+
+    @patch("wafer.browser._drag.solve_baxia", return_value=True)
+    @patch("wafer.browser._recaptcha.wait_for_recaptcha")
+    def test_issued_slider_punishment_is_not_overridden_by_frames(
+        self, mock_recaptcha, mock_baxia
+    ):
+        # The immutable issued URL names the challenge; a frame cannot
+        # relabel an issued slider punishment as reCAPTCHA.
+        solver = self._make_solver_with_mock_browser()
+        page = self._item_page(self._DIALOG_FRAME_URL)
+        issued_url = (
+            "https://acs.aliexpress.com/_____tmd_____/punish?x5secdata=issued"
+        )
+
+        assert solver._dispatch_challenge(
+            page, "tmd", 10_000, challenge_url=issued_url
+        )
+        mock_baxia.assert_called_once_with(
+            solver, page, 10_000, challenge_url=issued_url
+        )
+        mock_recaptcha.assert_not_called()
+
+
+class TestTmdRecaptchaWidgetTeardown:
+    """TMD consumes an auto-passed checkbox token and navigates away.
+
+    The widget's frames are gone before ``aria-checked`` can be read, so a
+    TMD solve must hand off to the outer x5sec gate rather than wait out its
+    budget for a token in frames that no longer exist (2026-10-05).
+    """
+
+    @staticmethod
+    def _run(*, intermediate, detached, timeout_ms=1500):
+        from wafer.browser import _recaptcha as rc
+
+        owner = MagicMock()
+        anchor = MagicMock()
+        anchor.url = "https://www.google.com/recaptcha/enterprise/anchor?k=site"
+        anchor.name = "a-instance"
+        anchor.parent_frame = owner
+        anchor.locator.return_value.bounding_box.return_value = {
+            "x": 10.0,
+            "y": 10.0,
+            "width": 24.0,
+            "height": 24.0,
+        }
+        anchor.locator.return_value.get_attribute.return_value = "false"
+        anchor.is_detached.return_value = detached
+        owner.evaluate.return_value = []
+        page = MagicMock()
+        page.frames = [anchor]
+        solver = MagicMock()
+        solver._needs_screenxy_patch = False
+        solver._replay_path.return_value = True
+        solver._replay_browse_chunk.side_effect = lambda *args: time.sleep(0.02)
+
+        started = time.monotonic()
+        with patch("wafer.browser._solver.patch_frame_screenxy"):
+            result = rc.wait_for_recaptcha(
+                solver,
+                page,
+                timeout_ms,
+                protocol_completion_is_intermediate=intermediate,
+            )
+        return result, time.monotonic() - started, anchor
+
+    def test_tmd_hands_off_when_the_clicked_widget_is_torn_down(self):
+        result, elapsed, anchor = self._run(
+            intermediate=True, detached=True, timeout_ms=10_000
+        )
+
+        assert result is True
+        assert elapsed < 5.0
+        anchor.is_detached.assert_called()
+
+    def test_tmd_keeps_waiting_while_the_widget_is_alive(self):
+        result, elapsed, _ = self._run(intermediate=True, detached=False)
+
+        assert result is False
+        assert elapsed >= 1.4
+
+    def test_generic_recaptcha_never_treats_teardown_as_success(self):
+        result, _, anchor = self._run(intermediate=False, detached=True)
+
+        assert result is False
+        anchor.is_detached.assert_not_called()
+
+    def test_exhausted_checkbox_budget_never_enters_the_image_phase(self, caplog):
+        # Running out of budget while a preloaded bframe sits hidden used to
+        # fall through into the grid phase and log an escalation that never
+        # happened (seen live after a render timeout, 2026-10-05).
+        bframe = MagicMock()
+
+        def hidden_until_budget_spent(timeout):
+            # Overrun the probe so the budget runs out inside the iteration,
+            # after the loop condition was checked: the exact live shape.
+            time.sleep(timeout / 1000 + 0.05)
+            return False
+
+        bframe.locator.return_value.is_visible.side_effect = hidden_until_budget_spent
+        with (
+            patch("wafer.browser._recaptcha._find_bframe", return_value=bframe),
+            patch("wafer.browser._recaptcha_grid.solve_image_grid") as grid_solve,
+            caplog.at_level(logging.INFO, logger="wafer"),
+        ):
+            result, _, _ = self._run(intermediate=True, detached=False)
+
+        assert result is False
+        assert "escalated to image challenge" not in caplog.text
+        grid_solve.assert_not_called()
+
 
 class TestRecaptchaFrameRouting:
     def test_widget_binding_uses_instance_not_shared_sitekey_or_owner(self):
@@ -8437,6 +8624,165 @@ class TestTmdClearanceEvidence:
 
         assert _tmd_retry_target(issued) == _TMD_MTOP_RETRY_URL
 
+    @pytest.mark.parametrize("leading_slash", ["/", "//"])
+    @pytest.mark.parametrize(
+        ("host", "api"),
+        [
+            # Every (host, api) here was called by live AliExpress pages
+            # (2026-10-05); the gateway serves more than mtop.aliexpress.*.
+            ("acs.aliexpress.com", "mtop.aliexpress.pdp.pc.query"),
+            ("acs.aliexpress.com", "mtop.aliexpress.itemdetail.msite"),
+            ("acs.aliexpress.com", "mtop.ae.cookie.render"),
+            (
+                "acs.aliexpress.com",
+                "mtop.relationrecommend.aliexpressrecommend.recommend",
+            ),
+            # Issued live as the item page's in-page reCAPTCHA dialog.
+            (
+                "recom-acs.aliexpress.com",
+                "mtop.relationrecommend.aliexpressrecommend.recommend",
+            ),
+        ],
+    )
+    def test_aliexpress_mtop_recaptcha_punishment_retries_the_endpoint_it_names(
+        self, leading_slash, host, api
+    ):
+        # The live MTop reCAPTCHA shape (2026-10-05) carries no callback;
+        # returning None here meant the solved widget's x5sec was never read.
+        from wafer.browser._solver import _tmd_retry_target
+
+        issued = (
+            f"https://{host}:443"
+            f"{leading_slash}h5/{api}/1.0/_____tmd_____/punish?"
+            "x5secdata=issued&x5step=2&action=captcharecaptcha"
+        )
+
+        assert _tmd_retry_target(issued) == f"https://{host}/h5/{api}/1.0/"
+
+    @pytest.mark.parametrize(
+        "issued",
+        [
+            # Callback-less MTop punishments are only accepted from an
+            # AliExpress MTop gateway host, for an API that does not name
+            # Alibaba (in any case), at a numeric version, with nothing before
+            # /h5/, and only when no callback was offered at all.
+            (
+                "https://acs.alibaba.com/h5/mtop.alibaba.product/1.0/"
+                "_____tmd_____/punish?x5secdata=issued&x5step=2"
+            ),
+            (
+                "https://acs.aliexpress.com/h5/mtop.alibaba.product/1.0/"
+                "_____tmd_____/punish?x5secdata=issued&x5step=2"
+            ),
+            (
+                "https://acs.aliexpress.com/h5/mtop.Alibaba.product/1.0/"
+                "_____tmd_____/punish?x5secdata=issued&x5step=2"
+            ),
+            # Not an MTop gateway: storefront and seller subdomains.
+            (
+                "https://www.aliexpress.com/h5/mtop.aliexpress.pdp.pc.query/1.0/"
+                "_____tmd_____/punish?x5secdata=issued&x5step=2"
+            ),
+            (
+                "https://seller.aliexpress.com/h5/mtop.ae.cookie.render/1.0/"
+                "_____tmd_____/punish?x5secdata=issued&x5step=2"
+            ),
+            # A callback was offered but the strict parser rejected it: that
+            # must not fall through to the callback-less endpoint target.
+            (
+                "https://acs.aliexpress.com/h5/mtop.ae.cookie.render/1.0/"
+                "_____tmd_____/punish?x5secdata=issued&"
+                "url=https%3A%2F%2Fwww.aliexpress.com%2Flogin"
+            ),
+            (
+                "https://acs.aliexpress.com/h5/mtop.ae.cookie.render/1.0/"
+                "_____tmd_____/punish?x5secdata=issued&"
+                "url=https%3A%2F%2Fevil.example%2Fitem"
+            ),
+            # urlparse keeps the backslash in hostname; Chromium treats it as
+            # a path separator and would navigate to x.evil.com.
+            (
+                "https://x.evil.com\\.acs.aliexpress.com/h5/mtop.ae.cookie.render/"
+                "1.0/_____tmd_____/punish?x5secdata=issued"
+            ),
+            (
+                "https://acs.aliexpress.com/h5/mtop.ae/1.0/"
+                "_____tmd_____/punish?x5secdata=issued&x5step=2"
+            ),
+            (
+                "https://acs.aliexpress.com/h5/notmtop.ae.cookie.render/1.0/"
+                "_____tmd_____/punish?x5secdata=issued&x5step=2"
+            ),
+            (
+                "https://acs.aliexpress.com/h5/mtop.aliexpress.pdp.pc.query/latest/"
+                "_____tmd_____/punish?x5secdata=issued&x5step=2"
+            ),
+            (
+                "https://acs.aliexpress.com/x/h5/mtop.aliexpress.pdp.pc.query/1.0/"
+                "_____tmd_____/punish?x5secdata=issued&x5step=2"
+            ),
+        ],
+    )
+    def test_callback_less_punishment_outside_aliexpress_mtop_fails_closed(
+        self, issued
+    ):
+        from wafer.browser._solver import _tmd_retry_target
+
+        assert _tmd_retry_target(issued) is None
+
+    @pytest.mark.parametrize(
+        ("api", "family", "accepted"),
+        [
+            # AliExpress: any MTop name except one naming Alibaba (any case).
+            ("mtop.aliexpress.pdp.pc.query", "aliexpress.com", True),
+            ("mtop.ae.cookie.render", "aliexpress.com", True),
+            (
+                "mtop.relationrecommend.aliexpressrecommend.recommend",
+                "aliexpress.com",
+                True,
+            ),
+            ("mtop.alibaba.product", "aliexpress.com", False),
+            ("mtop.ALIBABA.product", "aliexpress.com", False),
+            # Alibaba: only mtop.alibaba.* has ever been seen; nothing wider.
+            ("mtop.alibaba.product", "alibaba.com", True),
+            ("mtop.Alibaba.product", "alibaba.com", True),
+            ("mtop.ae.cookie.render", "alibaba.com", False),
+            ("mtop.aliexpress.pdp.pc.query", "alibaba.com", False),
+        ],
+    )
+    def test_mtop_punish_path_family_rules(self, api, family, accepted):
+        from wafer.browser._drag import _expected_baxia_punish_path
+
+        path = f"//h5/{api}/1.0/_____tmd_____/punish"
+        assert _expected_baxia_punish_path(path, family) is accepted
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://x.evil.com\\.aliexpress.com/_____tmd_____/punish?x5secdata=a",
+            "https://x.evil.com%5C.aliexpress.com/_____tmd_____/punish?x5secdata=a",
+            "https://ex ample.aliexpress.com/_____tmd_____/punish?x5secdata=a",
+        ],
+    )
+    def test_safe_target_rejects_hostnames_a_browser_parses_differently(self, url):
+        from wafer.browser._drag import _safe_baxia_target
+
+        assert _safe_baxia_target(url) is None
+
+    def test_retry_target_rejects_an_application_url_with_a_split_host(self):
+        # A non-punishment URL is returned verbatim as its own retry target,
+        # so a host that only Python reads as AliExpress must fail closed.
+        from wafer.browser._solver import _tmd_retry_target
+
+        assert (
+            _tmd_retry_target("https://x.evil.com\\.aliexpress.com/item/1.html")
+            is None
+        )
+        assert (
+            _tmd_retry_target("https://www.aliexpress.com/item/1.html")
+            == "https://www.aliexpress.com/item/1.html"
+        )
+
     @pytest.mark.parametrize(
         "issued",
         [
@@ -9130,6 +9476,153 @@ class TestRecaptchaGridDeadline:
             assert first_ready is None
         if expected_observations == 2:
             assert observe.call_args_list[1].kwargs["maximum"] == 30.0
+
+    @staticmethod
+    def _solve_grid_with_outcomes(protocol_intermediate, outcomes):
+        """Run one submitted grid whose uvresp read lost the teardown race."""
+        import io
+
+        import numpy as np
+        from PIL import Image
+
+        from wafer.browser import _recaptcha_grid as grid
+
+        image = Image.new("RGB", (12, 12))
+        raw = io.BytesIO()
+        image.save(raw, "PNG")
+        response = MagicMock(status=200)
+        response.body.return_value = raw.getvalue()
+        page = MagicMock()
+        page.request.get.return_value = response
+        bframe = MagicMock()
+        bframe.locator.return_value.first.get_attribute.return_value = (
+            "https://www.google.com/recaptcha/api2/payload"
+        )
+        solver = MagicMock()
+        solver._ensure_recordings.return_value = True
+        probabilities = np.zeros((9, 14), dtype=np.float32)
+        probabilities[:, 3] = 1.0
+        diagnostics = {"verify_statuses": [], "verify_summaries": []}
+
+        def submit(*_args, **_kwargs):
+            diagnostics["verify_statuses"].append(200)
+            diagnostics["verify_summaries"].append({"classification": "unreadable"})
+            return 10.0, 20.0, True
+
+        with (
+            patch.object(
+                grid,
+                "_ensure_models_before",
+                return_value=(MagicMock(), None),
+            ),
+            patch.object(
+                grid,
+                "_detect_grid_type",
+                return_value=("static_3x3", "cars"),
+            ),
+            patch.object(grid, "_split_grid", return_value=[image] * 9),
+            patch.object(
+                grid,
+                "_classify_tiles_batch",
+                return_value=probabilities,
+            ),
+            patch.object(grid, "_select_tiles", return_value=[0]),
+            patch.object(
+                grid,
+                "_click_tile",
+                return_value=(10.0, 20.0, True),
+            ),
+            patch.object(grid, "_click_verify", side_effect=submit),
+            patch.object(
+                grid,
+                "_wait_for_post_verify_outcome",
+                side_effect=outcomes,
+            ) as observe,
+            patch.object(grid, "_click_reload") as reload,
+            patch.object(
+                grid,
+                "_grid_state_marker",
+                return_value=("payload", "cars", "VERIFY"),
+            ),
+            patch.object(grid, "_wait_for_grid_stable", return_value=True),
+            patch.object(grid, "_sleep_with_deadline", return_value=True),
+            patch.object(grid, "_collect_tiles"),
+            patch.object(grid, "_collect_det_grid"),
+        ):
+            solved = grid.solve_image_grid(
+                solver,
+                page,
+                bframe,
+                MagicMock(current_x=10.0, current_y=20.0),
+                time.monotonic() + 60,
+                diagnostics=diagnostics,
+                max_attempts=1,
+                protocol_completion_is_intermediate=protocol_intermediate,
+            )
+        return solved, observe, reload
+
+    @pytest.mark.parametrize(
+        "outcomes",
+        [["torn_down"], ["pending", "torn_down"]],
+        ids=["first-window", "extended-window"],
+    )
+    def test_tmd_grid_teardown_after_verify_hands_off(self, outcomes):
+        # TMD destroys the widget once it has the token; a teardown in either
+        # observation window must reach the outer x5sec gate, not a reload.
+        solved, observe, reload = self._solve_grid_with_outcomes(True, outcomes)
+
+        assert solved is True
+        assert observe.call_count == len(outcomes)
+        assert all(
+            call.kwargs["teardown_is_outcome"] is True
+            for call in observe.call_args_list
+        )
+        reload.assert_not_called()
+
+    def test_generic_grid_never_opts_into_teardown_outcome(self):
+        solved, observe, _reload = self._solve_grid_with_outcomes(
+            False, ["pending", "pending"]
+        )
+
+        assert solved is False
+        assert observe.call_args_list
+        assert all(
+            call.kwargs["teardown_is_outcome"] is False
+            for call in observe.call_args_list
+        )
+
+    @pytest.mark.parametrize(
+        ("teardown_is_outcome", "expected"),
+        [(True, "torn_down"), (False, "pending")],
+    )
+    def test_post_verify_reports_teardown_only_when_opted_in(
+        self, teardown_is_outcome, expected
+    ):
+        from wafer.browser import _recaptcha_grid as grid
+
+        bframe = MagicMock()
+        bframe.locator.return_value.first.is_visible.return_value = False
+        anchor = MagicMock()
+        anchor.is_detached.return_value = True
+        marker = ("payload", "Select all buses", "VERIFY")
+
+        with (
+            patch("wafer.browser._recaptcha._check_token", return_value=False),
+            patch.object(grid, "_grid_state_marker", return_value=marker),
+            patch.object(grid, "_sleep_with_deadline", return_value=False),
+        ):
+            outcome = grid._wait_for_post_verify_outcome(
+                MagicMock(),
+                bframe,
+                time.monotonic() + 1,
+                marker,
+                token_widget={"anchor": anchor},
+                teardown_is_outcome=teardown_is_outcome,
+            )
+
+        assert outcome == expected
+        if not teardown_is_outcome:
+            anchor.is_detached.assert_not_called()
 
     def test_dynamic_grid_without_stable_base_selection_never_claims_complete(self):
         from wafer.browser import _recaptcha_grid as grid
@@ -10957,6 +11450,40 @@ class TestRenderedHeaders:
         headers, set_cookie = _rendered_headers(None)
         assert headers == {"content-type": "text/html; charset=utf-8"}
         assert set_cookie == []
+
+    def test_failed_raw_header_read_is_never_retried(self):
+        # Patchright caches a pending future before asking the driver for raw
+        # headers; when that request fails the future never resolves, so a
+        # second raw read on the same response blocks forever. That wedged a
+        # timed-out render's worker and every close() behind it (2026-10-05).
+        from wafer.browser._solver import _response_headers
+
+        response = MagicMock()
+        response.all_headers.side_effect = RuntimeError("Target closed")
+        response.headers = {"Content-Type": "text/html", "Content-Length": "9"}
+        response.headers_array.side_effect = AssertionError("blocks forever")
+
+        headers, set_cookie = _response_headers(response)
+
+        assert headers == {"content-type": "text/html"}
+        assert set_cookie == []
+        response.headers_array.assert_not_called()
+
+    def test_successful_raw_header_read_keeps_every_set_cookie(self):
+        from wafer.browser._solver import _response_headers
+
+        response = MagicMock()
+        response.all_headers.return_value = {"content-type": "text/html"}
+        response.headers_array.return_value = [
+            {"name": "Set-Cookie", "value": "a=1; Path=/"},
+            {"name": "set-cookie", "value": "b=2; Path=/"},
+            {"name": "content-type", "value": "text/html"},
+        ]
+
+        headers, set_cookie = _response_headers(response)
+
+        assert headers == {"content-type": "text/html"}
+        assert set_cookie == ["a=1; Path=/", "b=2; Path=/"]
 
 
 class TestRenderOnWorker:

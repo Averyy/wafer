@@ -30,6 +30,7 @@ from wafer._base import (
     _to_method,
     is_certificate_verify_failure,
 )
+from wafer._bytes import as_bytes
 from wafer._challenge import (
     JS_ONLY_CHALLENGES,
     TERMINAL_CHALLENGES,
@@ -1578,7 +1579,7 @@ class AsyncSession(BaseSession):
                     raise ResponseTooLarge(final_url, declared, max_response_size)
             try:
                 content = (
-                    await resp.bytes()
+                    as_bytes(await resp.bytes())
                     if max_response_size is None
                     else await _aread_body_capped(resp, max_response_size)
                 )
@@ -2183,7 +2184,7 @@ class AsyncSession(BaseSession):
                     # passes the cap, never buffering the whole oversize body.
                     raw_content = await _aread_body_capped(resp, body_read_cap)
                 else:
-                    raw_content = await resp.bytes()
+                    raw_content = as_bytes(await resp.bytes())
                 if is_binary:
                     body = None
                 else:

@@ -888,6 +888,77 @@ class TestEmbedOwnedHeaders:
         assert cross["Sec-Fetch-Storage-Access"] == "active"
         assert "Sec-Fetch-Storage-Access" not in same
 
+    @pytest.mark.parametrize("embed", ["xhr", "xhr-jquery"])
+    @pytest.mark.parametrize(
+        ("emulation", "expected"),
+        [("Chrome154", "active"), ("Edge148", "active"), ("Firefox152", "none")],
+    )
+    def test_xhr_storage_access_only_cross_site(self, embed, emulation, expected):
+        # wafer's XHR modes send the jar's cookies, i.e. a fetch() with
+        # credentials "include". Chrome reports "active" and Firefox "none" on
+        # every such cross-site request, cookie or not, and neither sends it
+        # same-site or same-origin (captured 2026-10-05, Chrome 154 and
+        # Firefox 153). Cookies without the header are a pairing no browser
+        # sends.
+        import wreq
+
+        session = self._session(embed, emulation=getattr(wreq.Emulation, emulation))
+        for method in ("GET", "POST"):
+            cross = session._build_headers(
+                "https://api.other-site.example/x", method=method
+            )
+            same_site = session._build_headers(
+                "https://api.widget-host.example/x", method=method
+            )
+            same_origin = session._build_headers(
+                "https://widget-host.example/x", method=method
+            )
+            assert cross["Sec-Fetch-Storage-Access"] == expected
+            assert "Sec-Fetch-Storage-Access" not in same_site
+            assert "Sec-Fetch-Storage-Access" not in same_origin
+
+    def test_xhr_storage_access_yields_to_the_caller(self):
+        session = self._session("xhr")
+        url = "https://api.other-site.example/x"
+        overridden = session._build_headers(
+            url, extra={"Sec-Fetch-Storage-Access": "inactive"}
+        )
+        suppressed = session._build_headers(url, extra={"Sec-Fetch-Storage-Access": ""})
+        assert overridden["Sec-Fetch-Storage-Access"] == "inactive"
+        assert "Sec-Fetch-Storage-Access" not in suppressed
+
+    @pytest.mark.parametrize("embed", ["xhr", "xhr-jquery"])
+    def test_safari_xhr_never_sends_storage_access(self, embed):
+        # WebKit has no Sec-Fetch-Storage-Access; wafer's Safari identity
+        # keeps its own header set in embed mode.
+        from wafer import Profile
+
+        session = self._session(embed, profile=Profile.SAFARI)
+        cross = session._build_headers("https://api.other-site.example/x")
+        assert "Sec-Fetch-Storage-Access" not in cross
+
+    @pytest.mark.parametrize(
+        ("embed", "emulation", "before", "after"),
+        [
+            # Chrome: right after Sec-Fetch-Dest, before Referer.
+            ("xhr", None, "Sec-Fetch-Dest", "Referer"),
+            ("xhr-jquery", None, "Sec-Fetch-Dest", "Referer"),
+            # Firefox: right after Origin (fetch: before Cookie; XHR: Referer).
+            ("xhr", "Firefox152", "Origin", "Cookie"),
+            ("xhr-jquery", "Firefox152", "Origin", "Referer"),
+        ],
+    )
+    def test_xhr_storage_access_wire_slot(self, embed, emulation, before, after):
+        import wreq
+
+        kwargs = {}
+        if emulation:
+            kwargs["emulation"] = getattr(wreq.Emulation, emulation)
+        order = self._session(embed, **kwargs)._build_client_kwargs()["orig_headers"]
+        slot = order.index("Sec-Fetch-Storage-Access")
+        assert order[slot - 1] == before
+        assert order[slot + 1] == after
+
     def test_firefox_rung_uses_firefox_shape(self):
         from wreq import Emulation
 

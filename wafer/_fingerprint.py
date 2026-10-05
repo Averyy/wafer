@@ -131,7 +131,7 @@ def emulation_user_agent(emulation: Emulation) -> str | None:
     """Reconstruct the User-Agent wreq sends for an Emulation, for the host.
 
     Follows the real browsers' UA shape, which wreq's current profiles
-    (Chrome153, Edge148, Firefox151) send too:
+    (Chrome154, Edge148, Firefox152) send too:
 
     - Chrome: ``...Chrome/{major}.0.0.0 Safari/537.36`` (UA-reduced)
     - Edge:   ``...Chrome/{major}.0.0.0 Safari/537.36 Edg/{major}.0.0.0``
@@ -250,6 +250,9 @@ _CHROME_BUILDS: dict[int, tuple[int, int]] = {
     # 153.0.8010.53 is the build the Chrome153 profile was wire-verified
     # against (2026-09-24, Google Chrome on macOS): identical JA4 and sec-ch-ua.
     153: (8010, 53),
+    # 154.0.8037.93 is the build the Chrome154 profile was wire-verified
+    # against (2026-10-05, Google Chrome on macOS).
+    154: (8037, 93),
 }
 
 # Fallback for versions outside the lookup table.
@@ -583,7 +586,7 @@ def wreq_emulation(emulation: Emulation, *, default_headers: bool = True):
 # Per-family navigation Accept / Accept-Language / Accept-Encoding envelope.
 # Wire-verified 2026-06-12 against tls.peet.ws + tools.scrapfly.io (the
 # values wreq itself sends for each Emulation, cross-checked with MDN's
-# "List of default Accept values"). Firefox 132+ (our Firefox151 target)
+# "List of default Accept values"). Firefox 132+ (our Firefox152 target)
 # uses the SHORT Accept - the longer image/avif... form is Firefox 128-131
 # and is stale. Edge is Chromium, so it shares Chrome's navigation Accept
 # (only the sec-ch-ua brand differs).
@@ -675,7 +678,11 @@ def family_headers(family: str | None) -> dict[str, str] | None:
 # (Gecko), each issuing a real fetch(), a jQuery-style XMLHttpRequest and a
 # script-inserted iframe load, GET and POST, with a cookie set. A name the
 # request does not carry is skipped. wafer's high-entropy client hints are
-# not listed and follow at the end, as they do on navigations.
+# not listed and follow at the end, as they do on navigations. The
+# Sec-Fetch-Storage-Access slot in the fetch()/XHR shapes comes from
+# credentialed cross-site requests captured 2026-10-05 (Chrome 154, Firefox
+# 153); those 2026-09-24 captures used fetch()'s default credentials, which
+# never carry the header.
 #
 # The iframe shapes are an embed loaded with the page, so there is no user
 # activation and no Sec-Fetch-User.
@@ -683,15 +690,16 @@ _EMBED_HEADER_ORDER: dict[tuple[str, str], tuple[str, ...]] = {
     ("chromium", "xhr"): (
         "content-length", "sec-ch-ua-platform", "user-agent", "sec-ch-ua",
         "content-type", "sec-ch-ua-mobile", "accept", "origin",
-        "sec-fetch-site", "sec-fetch-mode", "sec-fetch-dest", "referer",
-        "accept-encoding", "accept-language", "cookie", "priority",
+        "sec-fetch-site", "sec-fetch-mode", "sec-fetch-dest",
+        "sec-fetch-storage-access", "referer", "accept-encoding",
+        "accept-language", "cookie", "priority",
     ),
     ("chromium", "xhr-jquery"): (
         "content-length", "sec-ch-ua-platform", "x-requested-with",
         "user-agent", "accept", "sec-ch-ua", "content-type",
         "sec-ch-ua-mobile", "origin", "sec-fetch-site", "sec-fetch-mode",
-        "sec-fetch-dest", "referer", "accept-encoding", "accept-language",
-        "cookie", "priority",
+        "sec-fetch-dest", "sec-fetch-storage-access", "referer",
+        "accept-encoding", "accept-language", "cookie", "priority",
     ),
     ("chromium", "iframe"): (
         "content-length", "cache-control", "sec-ch-ua", "sec-ch-ua-mobile",
@@ -702,15 +710,15 @@ _EMBED_HEADER_ORDER: dict[tuple[str, str], tuple[str, ...]] = {
     ),
     ("firefox", "xhr"): (
         "user-agent", "accept", "accept-language", "accept-encoding",
-        "referer", "content-type", "content-length", "origin", "cookie",
-        "sec-fetch-dest", "sec-fetch-mode", "sec-fetch-site", "priority",
-        "te",
+        "referer", "content-type", "content-length", "origin",
+        "sec-fetch-storage-access", "cookie", "sec-fetch-dest",
+        "sec-fetch-mode", "sec-fetch-site", "priority", "te",
     ),
     ("firefox", "xhr-jquery"): (
         "user-agent", "accept", "accept-language", "accept-encoding",
         "content-type", "x-requested-with", "content-length", "origin",
-        "referer", "cookie", "sec-fetch-dest", "sec-fetch-mode",
-        "sec-fetch-site", "te",
+        "sec-fetch-storage-access", "referer", "cookie", "sec-fetch-dest",
+        "sec-fetch-mode", "sec-fetch-site", "te",
     ),
     ("firefox", "iframe"): (
         "user-agent", "accept", "accept-language", "accept-encoding",
@@ -733,9 +741,17 @@ _EMBED_PRIORITY: dict[tuple[str, str], str | None] = {
     ("firefox", "iframe"): "u=4",
 }
 
-# Sec-Fetch-Storage-Access on a cross-site iframe load. Chrome's default
-# (third-party cookies allowed) reports "active"; Firefox's Total Cookie
-# Protection partitions them, so it reports "none".
+# Sec-Fetch-Storage-Access on a cross-site request that may carry cookies:
+# an iframe load, and a fetch()/XHR with credentials "include" (wafer's XHR
+# modes always send the jar's cookies, so they are that kind). Chrome's
+# default (third-party cookies allowed) reports "active"; Firefox's Total
+# Cookie Protection partitions them, so it reports "none". Neither browser
+# sends it same-site, same-origin, or on a fetch() with its default
+# "same-origin" credentials, which carries no cookies cross-site. Captured
+# 2026-10-05 from Chrome 154.0.8037.98 and Firefox 151/153 (stock cookie
+# behavior), every method, with and without a cookie present; it matches
+# Chromium's SetSecFetchStorageAccessHeader and Gecko's
+# AddStorageAccessHeadersToRequest.
 _EMBED_STORAGE_ACCESS = {"chromium": "active", "firefox": "none"}
 
 _EMBED_FAMILY = {"chrome": "chromium", "edge": "chromium", "firefox": "firefox"}
@@ -803,7 +819,7 @@ def embed_priority(kind: str, embed: str) -> str | None:
 
 
 def embed_storage_access(kind: str) -> str:
-    """Sec-Fetch-Storage-Access value for a cross-site iframe load."""
+    """Sec-Fetch-Storage-Access value for a cross-site embed request."""
     return _EMBED_STORAGE_ACCESS[kind]
 
 
@@ -877,7 +893,7 @@ def emulation_for_version(version: int) -> Emulation | None:
 # Pinned to concrete members (not auto-discovered) so the ladder is
 # deterministic and so a wreq bump that adds a newer member is a conscious
 # update (mirrors DEFAULT_EMULATION). Refresh alongside DEFAULT_EMULATION.
-FIREFOX_LADDER_EMULATION = Emulation.Firefox151
+FIREFOX_LADDER_EMULATION = Emulation.Firefox152
 EDGE_LADDER_EMULATION = Emulation.Edge148
 
 # The deterministic family escalation order. "chrome" is the implicit start
@@ -994,9 +1010,9 @@ class FingerprintManager:
         newer browser's ClientHello only while Chrome has not changed it in
         between, and Chrome does change it. Measured 2026-09-24: 149 -> 150
         added ML-DSA signature algorithms and 151 -> 152 added extension
-        0xca34, each a new JA4 (HTTP/2 was identical across 149-153). A
-        JA4-aware WAF can see that skew, which is why the warning below asks
-        for a wreq bump.
+        0xca34, each a new JA4 (HTTP/2 was identical across 149-153); 153 ->
+        154 changed neither (measured 2026-10-05). A JA4-aware WAF can see
+        that skew, which is why the warning below asks for a wreq bump.
         """
         exact = emulation_for_version(major_version)
         self._current = exact or CHROME_PROFILES[0][1]
@@ -1159,7 +1175,7 @@ def build_fingerprint_envelope(
       sends its own UA for desktop Chrome/Edge/Firefox
       (``emulation_user_agent``); ``session.fingerprint_envelope()`` fills it in
     - ``family``: ``"chrome" | "edge" | "firefox" | "opera" | "safari" | None``
-    - ``emulation``: ``repr(emulation)`` (e.g. ``"Profile.Chrome153"``)
+    - ``emulation``: ``repr(emulation)`` (e.g. ``"Profile.Chrome154"``)
     - ``sec_ch_ua`` / ``sec_ch_ua_mobile`` / ``sec_ch_ua_platform``:
       the low-entropy Client Hints. ``None`` for Firefox/Safari (no client
       hints) and for Opera (wreq's Emulation emits accurate Opera hints

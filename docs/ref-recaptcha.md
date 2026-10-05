@@ -18,7 +18,16 @@ wafer handles the two reCAPTCHA variants with two unrelated mechanisms:
 
 **Browser solve**: Done. Live-solved on `google.com/recaptcha/api2/demo` (Feb 2026). Checkbox click + image grid classification/detection.
 
-**Dispatch**: `challenge_type="recaptcha"` routes to `solve_recaptcha()` in `_solver.py`.
+**Dispatch**: `challenge_type="recaptcha"` routes to `wait_for_recaptcha()` in `_recaptcha.py`, which escalates to `solve_image_grid()` in `_recaptcha_grid.py` when Google shows a grid.
+
+## Under TMD (AliExpress MTop)
+
+`challenge_type="tmd"` also lands here when the issued punishment URL, or a vendor punishment frame on a rendered page, carries `action=captcharecaptcha`. That call passes `protocol_completion_is_intermediate=True`: the widget is no longer the authority, because `BrowserSolver`'s outer gate requires a new target-scoped `x5sec` before reporting success. Under that flag the solver hands off (returns True) as soon as TMD has what it needs:
+
+- **Checkbox:** our click happened and the bound anchor frame detached. TMD consumes the auto-passed token and tears the widget down about a second later, before `aria-checked` can be read, so waiting for a token there spent the whole budget.
+- **Grid, after a submitted Verify:** an accepted `uvresp` (`protocol_solved`), or a widget teardown (the `torn_down` outcome, watched in both the 10s and 30s post-Verify windows). Live, a `continued` uvresp was followed by a teardown and the gate found a new `x5sec`.
+
+The hand-off log names Google's last verdict since the click (`google_verdict=`, or `not_observed`); it is diagnostic only, since the body read can lose the race with the teardown. A generic `recaptcha` caller never takes these paths and keeps waiting for a token it can prove. Running out of budget in the checkbox phase is a timeout (False), never a fall-through into the image phase. The TMD side (retry targets, render dialog, measurements) is in `docs/ref-baxia.md`.
 
 ## Architecture
 

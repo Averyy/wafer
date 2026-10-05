@@ -93,11 +93,75 @@ wafer/browser/
    without transferable clearance is returned as browser passthrough for that
    GET
 
+#### MTop reCAPTCHA punishments (`action=captcharecaptcha`)
+
+AliExpress MTop (`acs.aliexpress.com/h5/<api>/<version>/`) answers a session
+it distrusts with `FAIL_SYS_USER_VALIDATE` and an issued URL of the form
+`/h5/<api>/<version>/_____tmd_____/punish?x5secdata=..&x5step=2&action=captcharecaptcha`
+(observed 2026-10-05, including on the token-bootstrap request itself, so no
+`_m_h5_tk` is minted until it is solved). Two properties of this shape matter:
+
+- **It carries no callback.** The retry target is the endpoint its path names
+  (`_baxia_punish_mtop_endpoint`) on the AliExpress host that issued it, for a
+  well-formed MTop API at a numeric version. Before this, `_tmd_retry_target`
+  returned None, the fresh x5sec was never looked for, and every successful
+  solve was reported as a failure.
+- **The checkbox usually auto-passes and TMD tears the widget down at once.**
+  It consumes the token, loads `/_____tmd_____/page/third_validate_close_page`
+  and navigates to `www.aliexpress.com/` about a second after the click, before
+  `aria-checked` can be read. Under TMD (`protocol_completion_is_intermediate`)
+  a torn-down anchor after our click hands off to the outer x5sec gate, which
+  stays authoritative; generic reCAPTCHA callers never take that path. Waiting
+  on for a token instead spent the whole budget (150 s) and pre-empted the
+  gate. Live: solve plus clearance in ~7 s, MTop then answers `SUCCESS`.
+  Measured order after the click: `reload` returns `nocaptcha`, `userverify`
+  returns a token, the anchor detaches, and only then does
+  `/_____tmd_____/validate` set `x5sec` (domain `.aliexpress.com`, path `/`),
+  about 130 ms later. The gate's bounded poll covers that gap, so detachment
+  is safe to hand off on. Google's verdict is logged at hand-off
+  (`google_verdict=`) but is not required: the body read can lose the race
+  with the teardown, and one in-page dialog solve below cleared with no
+  accepted verdict recorded.
+- **A rendered page carries it in place.** `session.render()` of an AliExpress
+  item page shows the punishment as a dialog iframe
+  (`recom-acs.aliexpress.com//h5/mtop.relationrecommend.aliexpressrecommend.recommend/1.0/_____tmd_____/punish?..&action=captcharecaptcha`)
+  while the main frame stays on the item URL. With no issued URL to trust,
+  dispatch reads the action from that child frame
+  (`_tmd_recaptcha_frame_present`); a Google frame alone never counts, and an
+  issued slider URL is never overridden. Before this the slider solver waited
+  out the whole render budget for a widget that never exists. Live: the item
+  page renders hydrated (~370 KB, `runParams`, no TMD) in ~20 s.
+- **The image grid hands off the same way.** Under TMD, a widget torn down
+  after a submitted Verify is a `torn_down` outcome in both post-Verify
+  windows and goes to the outer gate instead of reloading a grid that no
+  longer exists. Observed live (2026-10-05, fetchaller's product read of
+  item 4000085910726): Google escalated to 4x4 grids, the third Verify's
+  `uvresp` was `continued` (so the protocol hand-off could not fire), TMD
+  tore the widget down, `torn_down` handed off, and the gate found a new
+  `x5sec`; the product came back in 59.5 s.
+
+The MTop API name in a punishment path is not a family marker. An inventory
+of the MTop calls live AliExpress pages make (2026-10-05) found
+`mtop.ae.cookie.render` and `mtop.relationrecommend.aliexpressrecommend.recommend`
+on `acs.aliexpress.com`, and the latter on `recom-acs.aliexpress.com`, which
+issued the dialog punishment. The parser used to require `mtop.aliexpress.*`
+on AliExpress, so a callback-less punishment for the first two returned None
+(the original bug again), and the `recom-acs` one was retried verbatim as a
+non-punishment URL. Now any well-formed `mtop.<a>.<b>...` name parses and only
+an API naming the other family (`mtop.alibaba.*` on AliExpress, and the
+reverse) is rejected. The retry target keeps the issuing host. Live: the
+captured `recom-acs` dialog punishment, solved through
+`browser_solve_challenge`, retried
+`https://recom-acs.aliexpress.com/h5/mtop.relationrecommend.aliexpressrecommend.recommend/1.0/`
+and found a new `x5sec` in 5.7 s. Callback-less Alibaba punishments still fail
+closed: none has been observed.
+
 Wafer is normally invoked with the original application URL whose response
 contains the punishment redirect. That immutable URL is the exact retry
 target. If it is invoked with an ACS punishment URL instead, the callback must
 pass the strict same-family parser; arbitrary non-punishment ACS URLs remain
-invalid.
+invalid. The one exception is the callback-less AliExpress MTop punishment
+above, whose retry target is the endpoint its own path names on its own host.
 
 ### Selectors
 

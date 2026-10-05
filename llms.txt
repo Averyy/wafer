@@ -117,15 +117,15 @@ Both support context managers (`with` / `async with`).
 
 ```python
 SyncSession(
-    # TLS identity (any wreq Emulation profile). Default: Emulation.Chrome153 (newest).
+    # TLS identity (any wreq Emulation profile). Default: Emulation.Chrome154 (newest).
     # Non-Chrome families get a matching HTTP header envelope automatically:
     #   Emulation.Edge148    -> Chromium headers, sec-ch-ua brand "Microsoft Edge"
-    #   Emulation.Firefox151 -> Firefox Accept/Accept-Language, NO sec-ch-ua
+    #   Emulation.Firefox152 -> Firefox Accept/Accept-Language, NO sec-ch-ua
     # See "Fingerprint Identity". On 403/challenge, rotation escalates ACROSS
     # families (Chrome -> Firefox -> Safari -> Edge) before cycling versions -
     # see "Rotation escalation". A non-Chrome starting emulation just changes
     # the starting family; the same cross-family ladder still applies.
-    emulation: wreq.Emulation | None = None,  # default: Emulation.Chrome153 (newest)
+    emulation: wreq.Emulation | None = None,  # default: Emulation.Chrome154 (newest)
 
     # Non-Chrome profiles (overrides emulation)
     profile: Profile | None = None,           # OPERA_MINI, SAFARI, IOS_SAFARI, or DART
@@ -286,6 +286,13 @@ session.browser_solve_challenge(url: str, challenge_type: str, *,
 # True from either means browser state was earned and imported, NOT that your
 # application request succeeded: reissue that request yourself and validate
 # the result. timeout defaults to the session timeout; <= 0 returns False.
+# A response whose Content-Type is JSON, XML, plain text or CSV is never
+# checked for challenges, so a punishment returned inside an API's JSON body
+# reaches you as an ordinary response. AliExpress MTop is the common case: a
+# call answered with resp.json()["ret"][0] == "FAIL_SYS_USER_VALIDATE" carries
+# the issued punishment URL in resp.json()["data"]["url"]. Pass that URL with
+# challenge_type="tmd", then reissue the MTop call; its token bootstrap
+# (FAIL_SYS_TOKEN_EMPTY plus a fresh _m_h5_tk cookie) follows as usual.
 
 # Browser-rendered fetch (sync on SyncSession; coroutine on AsyncSession):
 session.render(url: str, *, timeout=None, max_response_size=None) -> WaferResponse
@@ -455,8 +462,8 @@ resp.inline_solves  # int (inline challenge solves)
 resp.challenge_type # str | None (e.g. "cloudflare", "datadome")
 resp.emulation      # str | None - the identity that SERVED this response, for
                     # diagnosing a 403/regression. For Emulation sessions it's the
-                    # wreq profile repr, e.g. "Profile.Chrome153" / "Profile.Edge148"
-                    # / "Profile.Firefox151"; for non-Emulation profiles it's the
+                    # wreq profile repr, e.g. "Profile.Chrome154" / "Profile.Edge148"
+                    # / "Profile.Firefox152"; for non-Emulation profiles it's the
                     # profile name ("safari", "ios_safari", "dart",
                     # "opera_mini"), and "reddit_app" for a Reddit JSON read
                     # the Android app route served. Reflects the
@@ -483,7 +490,7 @@ derived from the chosen `emulation`:
 - **Edge** (`emulation=Emulation.Edge148`): Chromium, so Chrome-like headers and
   the SAME navigation `Accept`, but the sec-ch-ua brand is `"Microsoft Edge"`.
   UA is wreq's Edge UA.
-- **Firefox** (`emulation=Emulation.Firefox151`): sends **NO** sec-ch-ua client
+- **Firefox** (`emulation=Emulation.Firefox152`): sends **NO** sec-ch-ua client
   hints at all, a Firefox `Accept`
   (`text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8`) and
   `Accept-Language: en-US,en;q=0.5`. UA is wreq's Firefox UA.
@@ -537,7 +544,7 @@ reaching into `wafer._fingerprint`. Always returns these keys:
 {
   "user_agent": str | None,        # the UA the session sends
   "family": str | None,            # "chrome"|"edge"|"firefox"|"opera"|"safari"|"dart"|"opera_mini"|None
-  "emulation": str | None,         # "Profile.Chrome153" or "safari"/"ios_safari"/"dart"/"opera_mini"
+  "emulation": str | None,         # "Profile.Chrome154" or "safari"/"ios_safari"/"dart"/"opera_mini"
   "sec_ch_ua": str | None,         # low-entropy hint; None for Firefox/Safari/Opera (see below)
   "sec_ch_ua_mobile": str | None,  # "?0" or None
   "sec_ch_ua_platform": str | None,# e.g. '"macOS"' or None
@@ -671,7 +678,7 @@ hints so the headers remain coherent with the TLS fingerprint.
 The deterministic ladder (starting from the default Chrome family):
 
 1. **Fresh TLS session** (rotation 1) - rebuilds the wreq client (new TLS session, empty cookie jar) with the SAME family. Also clears that domain's disk cookie cache (if `cache_dir` is set).
-2. **Firefox** (rotation 2) - `Emulation.Firefox151`: Gecko TLS/H2, Firefox Accept, `Accept-Language: en-US,en;q=0.5`, NO sec-ch-ua.
+2. **Firefox** (rotation 2) - `Emulation.Firefox152`: Gecko TLS/H2, Firefox Accept, `Accept-Language: en-US,en;q=0.5`, NO sec-ch-ua.
 3. **Safari** (rotation 3) - wafer's Safari 26 custom TlsOptions/Http2Options profile, no client hints.
 4. **Edge** (rotation 4) - `Emulation.Edge148`: Chromium TLS but the `"Microsoft Edge"` sec-ch-ua brand + Edge build.
 5. **Chrome version cycling** (rotation 5+) - returns to the Chrome family and cycles Chrome versions on subsequent rotations.
@@ -703,13 +710,13 @@ WITHOUT retiring the whole session on N strikes.
   failures do not retire the session. Pool backoff is the health model;
   `max_rotations` still bounds rotations per request.
 - **Emulation-only.** Pool entries are wreq `Emulation` profiles
-  (`[Emulation.Chrome153, Emulation.Firefox151, Emulation.Edge148]`). A pool is
+  (`[Emulation.Chrome154, Emulation.Firefox152, Emulation.Edge148]`). A pool is
   ignored for `profile=` (Safari/iOS Safari/Dart/Opera Mini) sessions.
 
 ```python
 from wreq import Emulation
 session = SyncSession(
-    fingerprint_pool=[Emulation.Chrome153, Emulation.Firefox151, Emulation.Edge148],
+    fingerprint_pool=[Emulation.Chrome154, Emulation.Firefox152, Emulation.Edge148],
     max_rotations=6,  # bound how many pool steps a single request may take
 )
 ```
@@ -827,7 +834,7 @@ capabilities and trade-offs.
 
 ### Chrome (default, no profile= needed)
 
-- Default wreq TLS + HTTP/2 profile is `Emulation.Chrome153`
+- Default wreq TLS + HTTP/2 profile is `Emulation.Chrome154`
 - The User-Agent and `sec-ch-ua-platform` describe the host OS: a session on a
   Linux server sends a Linux Chrome UA, on Windows a Windows one (the same holds
   for the Edge and Firefox families)
@@ -842,7 +849,7 @@ capabilities and trade-offs.
   sends `Cache-Control: max-age=0`, as Chrome does
 - On 403/challenge: rotates across families (Chrome -> Firefox -> Safari -> Edge -> Chrome versions), swapping the header envelope each switch (see "Rotation escalation")
 - All features enabled: challenge detection, retry, rotation, browser solving
-- Pass `emulation=wreq.Emulation.Chrome153` to select that specific profile
+- Pass `emulation=wreq.Emulation.Chrome154` to select that specific profile
 
 ### Safari (`profile=Profile.SAFARI`)
 
@@ -1153,10 +1160,11 @@ assert solver.runtime_ready is False
 # directly, preserves its existing wreq identity/jar, and does not claim later
 # transport requests are unlocked. An unchanged URL or vanished iframe with
 # TMD markup still in the main DOM is failure. Short budgets use one viable
-# context instead of several underfunded attempts. When the response body
-# carries an issued punishment URL selecting Google reCAPTCHA (AliExpress MTop
-# answers an API call that way), one long context is used instead: its image
-# rounds belong to a single-use document that a fresh context would discard.
+# context instead of several underfunded attempts. When a challenge-checked
+# response body carries an issued punishment URL selecting Google reCAPTCHA,
+# one long context is used instead: its image rounds belong to a single-use
+# document that a fresh context would discard. An AliExpress MTop JSON answer
+# is not challenge-checked; solve it with browser_solve_challenge.
 
 # Automatic usage (pass to session):
 session = SyncSession(browser_solver=solver)
@@ -1166,9 +1174,9 @@ resp = session.get("https://protected-site.com")  # auto-solves challenges
 result: SolveResult | None = solver.solve(url, challenge_type)
 # result.cookies: list[dict] - browser cookies
 # result.user_agent: str - browser's User-Agent (version-reduced, e.g.
-#   "...Chrome/153.0.0.0...")
+#   "...Chrome/154.0.0.0...")
 # result.browser_version: str | None - browser's full build (e.g.
-#   "153.0.8010.53"); the version-reduced user_agent hides it
+#   "154.0.8037.93"); the version-reduced user_agent hides it
 # result.extras: dict | None - WAF-specific data
 # result.response: CapturedResponse | None - passthrough content (see below)
 # result.challenge_absent: bool - no transferable clearance identity was
@@ -1411,6 +1419,11 @@ profiles) raises `ValueError` at construction when `embed=` is set; use
 - No navigation headers (`Upgrade-Insecure-Requests`, `Cache-Control`,
   `Sec-Fetch-User`)
 - `Priority: u=1, i` (Chrome/Edge) or `u=4` (Firefox)
+- Cross-site requests add `Sec-Fetch-Storage-Access: active` (Chrome/Edge) or
+  `none` (Firefox), with or without cookies: the session's cookies go with
+  every request, as on a `fetch()` with `credentials: "include"`, and browsers
+  send this header on every such cross-site request. Never same-site or
+  same-origin.
 
 ### jQuery XHR mode (`embed="xhr-jquery"`)
 - Emulates a legacy jQuery `$.ajax` / `XMLHttpRequest` call. Use this (instead

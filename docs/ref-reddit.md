@@ -32,7 +32,7 @@ install does. Wafer presents itself as one such install:
   minimum Android), `client-vendor-id` and `x-reddit-device-id` (one uuid4 per
   install), `x-reddit-retry`, `x-reddit-compression`, `x-reddit-qos`
   (a per-install download rate) and `x-reddit-media-codecs`.
-- **TLS:** Chromium's network stack on Android (`Emulation(profile=Chrome153,
+- **TLS:** Chromium's network stack on Android (`Emulation(profile=DEFAULT_EMULATION,
   platform=Android, headers=False)`), on its own wreq client with no cookie
   jar. Measured 2026-09-27: an OkHttp 4.12 ClientHello gets Reddit's HTML
   network-security 403 on the token endpoint, while the Chromium one is served.

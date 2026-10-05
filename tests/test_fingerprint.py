@@ -90,6 +90,15 @@ class TestSecChUaGeneration:
             '"Chromium";v="153"'
         )
 
+    def test_chrome_154(self):
+        # Captured from Google Chrome 154.0.8037.93 on 2026-10-05.
+        result = generate_sec_ch_ua(154)
+        assert result == (
+            '"Chromium";v="154", '
+            '"Google Chrome";v="154", '
+            '"Not A(Brand";v="99"'
+        )
+
     def test_grease_chars_cycle_every_11(self):
         """Chrome versions 11 apart should produce the same GREASE chars."""
         v100 = generate_sec_ch_ua(100)
@@ -120,7 +129,8 @@ class TestChromeVersion:
         assert chrome_full_version(Emulation.Chrome149) == "149.0.7827.201"
 
     def test_full_version_of_the_wire_verified_default(self):
-        # The build Chrome153 was wire-verified against (JA4 + sec-ch-ua).
+        # The builds Chrome154 and Chrome153 were wire-verified against.
+        assert chrome_full_version(Emulation.Chrome154) == "154.0.8037.93"
         assert chrome_full_version(Emulation.Chrome153) == "153.0.8010.53"
 
     def test_full_version_rejects_non_chrome(self):
@@ -129,44 +139,44 @@ class TestChromeVersion:
 
 class TestChromeProfiles:
     def test_profiles_discovered(self):
-        assert len(CHROME_PROFILES) == 45
+        assert len(CHROME_PROFILES) == 46
 
     def test_newest_first(self):
         versions = [v for v, _ in CHROME_PROFILES]
-        assert versions[0] == 153
+        assert versions[0] == 154
         assert versions == sorted(versions, reverse=True)
 
 
 class TestFingerprintManager:
     def test_defaults_to_newest_chrome(self):
         fm = FingerprintManager()
-        assert fm.current == Emulation.Chrome153
+        assert fm.current == Emulation.Chrome154
 
     def test_custom_initial(self):
         fm = FingerprintManager(initial=Emulation.Chrome130)
         assert fm.current == Emulation.Chrome130
 
     def test_rotation_changes_profile(self):
-        fm = FingerprintManager(initial=Emulation.Chrome153)
+        fm = FingerprintManager(initial=Emulation.Chrome154)
         original = fm.current
         fm.rotate()
         assert fm.current != original
 
     def test_rotation_cycles_through_profiles(self):
-        fm = FingerprintManager(initial=Emulation.Chrome153)
+        fm = FingerprintManager(initial=Emulation.Chrome154)
         seen = {repr(fm.current)}
-        for _ in range(44):  # 45 total profiles - 1 initial
+        for _ in range(45):  # 46 total profiles - 1 initial
             fm.rotate()
             seen.add(repr(fm.current))
-        # Should have visited all 45 Chrome profiles
-        assert len(seen) == 45
+        # Should have visited all 46 Chrome profiles
+        assert len(seen) == 46
 
     def test_pinning_prevents_rotation(self):
-        fm = FingerprintManager(initial=Emulation.Chrome153)
+        fm = FingerprintManager(initial=Emulation.Chrome154)
         fm.pin()
         assert fm.pinned
         fm.rotate()
-        assert fm.current == Emulation.Chrome153
+        assert fm.current == Emulation.Chrome154
 
     def test_pin_is_idempotent(self):
         fm = FingerprintManager()
@@ -179,7 +189,7 @@ class TestFingerprintManager:
         fm.pin()
         fm.reset()
         assert not fm.pinned
-        assert fm.current == Emulation.Chrome153  # resets to newest
+        assert fm.current == Emulation.Chrome154  # resets to newest
 
     def test_reset_with_custom_emulation(self):
         fm = FingerprintManager()
@@ -188,16 +198,16 @@ class TestFingerprintManager:
         assert not fm.pinned
 
     def test_sec_ch_ua_headers_for_chrome(self):
-        fm = FingerprintManager(initial=Emulation.Chrome153)
+        fm = FingerprintManager(initial=Emulation.Chrome154)
         headers = fm.sec_ch_ua_headers()
         assert "sec-ch-ua" in headers
         assert "sec-ch-ua-mobile" in headers
         assert "sec-ch-ua-platform" in headers
-        assert '"153"' in headers["sec-ch-ua"]
+        assert '"154"' in headers["sec-ch-ua"]
         assert headers["sec-ch-ua-mobile"] == "?0"
 
     def test_sec_ch_ua_updates_after_rotation(self):
-        fm = FingerprintManager(initial=Emulation.Chrome153)
+        fm = FingerprintManager(initial=Emulation.Chrome154)
         headers_before = fm.sec_ch_ua_headers()
         fm.rotate()
         headers_after = fm.sec_ch_ua_headers()
@@ -210,86 +220,86 @@ class TestPinToBrowser:
     UA + client-hint version, even when it is newer than any wreq Emulation
     (Patchright's Chromium is often ahead of wreq). See pin_to_browser."""
 
-    _UA_154 = (
+    _UA_155 = (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36"
+        "(KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36"
     )
 
     def test_newer_browser_pins_newest_emulation(self):
-        # Browser Chrome154 has no wreq profile -> pin the newest (153) for TLS.
-        fm = FingerprintManager(initial=Emulation.Chrome153)
-        fm.pin_to_browser(self._UA_154, 154, "154.0.8037.58")
+        # Browser Chrome155 has no wreq profile -> pin the newest (154) for TLS.
+        fm = FingerprintManager(initial=Emulation.Chrome154)
+        fm.pin_to_browser(self._UA_155, 155, "155.0.8059.26")
         assert fm.pinned
-        assert fm.current == Emulation.Chrome153  # newest available TLS shape
+        assert fm.current == Emulation.Chrome154  # newest available TLS shape
 
     def test_exact_version_pins_that_emulation(self):
         # A browser version wreq DOES have pins that exact emulation.
-        fm = FingerprintManager(initial=Emulation.Chrome153)
-        ua147 = self._UA_154.replace("154.0.0.0", "147.0.0.0")
+        fm = FingerprintManager(initial=Emulation.Chrome154)
+        ua147 = self._UA_155.replace("155.0.0.0", "147.0.0.0")
         fm.pin_to_browser(ua147, 147, "147.0.7727.24")
         assert fm.current == Emulation.Chrome147
 
     def test_ua_override_reflects_browser(self):
-        fm = FingerprintManager(initial=Emulation.Chrome153)
-        fm.pin_to_browser(self._UA_154, 154, "154.0.8037.58")
-        assert fm.ua_override == self._UA_154
+        fm = FingerprintManager(initial=Emulation.Chrome154)
+        fm.pin_to_browser(self._UA_155, 155, "155.0.8059.26")
+        assert fm.ua_override == self._UA_155
 
     def test_sec_ch_ua_uses_browser_version_not_emulation(self):
-        # TLS emulation is Chrome153 but the hints must say 154 (cookie-bound).
-        fm = FingerprintManager(initial=Emulation.Chrome153)
-        fm.pin_to_browser(self._UA_154, 154, "154.0.8037.58")
+        # TLS emulation is Chrome154 but the hints must say 155 (cookie-bound).
+        fm = FingerprintManager(initial=Emulation.Chrome154)
+        fm.pin_to_browser(self._UA_155, 155, "155.0.8059.26")
         headers = fm.sec_ch_ua_headers()
-        assert '"154"' in headers["sec-ch-ua"]
-        assert '"153"' not in headers["sec-ch-ua"]
+        assert '"155"' in headers["sec-ch-ua"]
+        assert '"154"' not in headers["sec-ch-ua"]
 
     def test_full_version_list_brands_share_real_build(self):
         # Real Chrome sends the same build for "Chromium" and "Google Chrome".
-        fm = FingerprintManager(initial=Emulation.Chrome153)
-        fm.pin_to_browser(self._UA_154, 154, "154.0.8037.58")
+        fm = FingerprintManager(initial=Emulation.Chrome154)
+        fm.pin_to_browser(self._UA_155, 155, "155.0.8059.26")
         fvl = fm.sec_ch_ua_headers()["sec-ch-ua-full-version-list"]
         builds = re.findall(r'"(?:Chromium|Google Chrome)";v="([^"]+)"', fvl)
-        assert builds == ["154.0.8037.58", "154.0.8037.58"]
+        assert builds == ["155.0.8059.26", "155.0.8059.26"]
 
     def test_pin_to_browser_prevents_rotation(self):
-        fm = FingerprintManager(initial=Emulation.Chrome153)
-        fm.pin_to_browser(self._UA_154, 154, "154.0.8037.58")
+        fm = FingerprintManager(initial=Emulation.Chrome154)
+        fm.pin_to_browser(self._UA_155, 155, "155.0.8059.26")
         fm.rotate()
-        assert fm.current == Emulation.Chrome153  # unchanged: pinned
+        assert fm.current == Emulation.Chrome154  # unchanged: pinned
 
     def test_reset_clears_all_overrides(self):
-        fm = FingerprintManager(initial=Emulation.Chrome153)
-        fm.pin_to_browser(self._UA_154, 154, "154.0.8037.58")
+        fm = FingerprintManager(initial=Emulation.Chrome154)
+        fm.pin_to_browser(self._UA_155, 155, "155.0.8059.26")
         fm.reset()
         assert fm.ua_override is None
         assert fm.ch_version_override is None
         assert fm.ch_full_version_override is None
         # sec-ch-ua falls back to the emulation version
-        assert '"153"' in fm.sec_ch_ua_headers()["sec-ch-ua"]
+        assert '"154"' in fm.sec_ch_ua_headers()["sec-ch-ua"]
 
     def test_missing_full_version_falls_back_to_major(self):
         # No real build available (e.g. UA-only) -> still sends coherent hints.
-        fm = FingerprintManager(initial=Emulation.Chrome153)
-        fm.pin_to_browser(self._UA_154, 154, None)
+        fm = FingerprintManager(initial=Emulation.Chrome154)
+        fm.pin_to_browser(self._UA_155, 155, None)
         headers = fm.sec_ch_ua_headers()
-        assert '"154"' in headers["sec-ch-ua"]
+        assert '"155"' in headers["sec-ch-ua"]
         assert headers["sec-ch-ua-full-version-list"]  # non-empty
 
     def test_newer_browser_warns_about_version_skew(self, caplog):
         # A browser newer than any wreq profile must not fail silently.
-        fm = FingerprintManager(initial=Emulation.Chrome153)
+        fm = FingerprintManager(initial=Emulation.Chrome154)
         with caplog.at_level("WARNING", logger="wafer"):
-            fm.pin_to_browser(self._UA_154, 154, "154.0.8037.58")
+            fm.pin_to_browser(self._UA_155, 155, "155.0.8059.26")
         assert any(
-            "154" in r.message and "wreq Emulation" in r.message
+            "155" in r.message and "wreq Emulation" in r.message
             for r in caplog.records
         )
 
     def test_exact_match_does_not_warn(self, caplog):
         # A browser wreq DOES have must not emit the skew warning.
-        fm = FingerprintManager(initial=Emulation.Chrome153)
-        ua153 = self._UA_154.replace("154.0.0.0", "153.0.0.0")
+        fm = FingerprintManager(initial=Emulation.Chrome154)
+        ua154 = self._UA_155.replace("155.0.0.0", "154.0.0.0")
         with caplog.at_level("WARNING", logger="wafer"):
-            fm.pin_to_browser(ua153, 153, "153.0.8010.53")
+            fm.pin_to_browser(ua154, 154, "154.0.8037.93")
         assert not any("wreq Emulation" in r.message for r in caplog.records)
 
 
@@ -299,7 +309,7 @@ class TestSessionFingerprint:
 
         s = SyncSession()
         assert hasattr(s, "_fingerprint")
-        assert s.emulation == Emulation.Chrome153
+        assert s.emulation == Emulation.Chrome154
 
     @pytest.mark.live
     @pytest.mark.skipif(
@@ -314,16 +324,16 @@ class TestSessionFingerprint:
         data = resp.json()
         headers = data["headers"]
         assert "Sec-Ch-Ua" in headers
-        assert '"153"' in headers["Sec-Ch-Ua"]
+        assert '"154"' in headers["Sec-Ch-Ua"]
 
     def test_session_rebuild_changes_emulation(self):
         from wafer import SyncSession
 
         s = SyncSession()
-        assert s.emulation == Emulation.Chrome153
+        assert s.emulation == Emulation.Chrome154
         s._fingerprint.rotate()
         s._rebuild_client()
-        assert s.emulation != Emulation.Chrome153
+        assert s.emulation != Emulation.Chrome154
 
     def test_auto_sec_ch_ua_overrides_user_header(self):
         """Auto-generated sec-ch-ua must override user-provided headers.
@@ -340,7 +350,7 @@ class TestSessionFingerprint:
         # Client-level headers should have the correct sec-ch-ua
         client_kwargs = s._build_client_kwargs()
         assert client_kwargs["headers"]["sec-ch-ua"] != "custom-bad-value"
-        assert '"153"' in client_kwargs["headers"]["sec-ch-ua"]
+        assert '"154"' in client_kwargs["headers"]["sec-ch-ua"]
         # Per-request delta should NOT include sec-ch-ua (already correct)
         built = s._build_headers("https://example.com")
         assert "sec-ch-ua" not in built
@@ -350,29 +360,29 @@ class TestSessionFingerprint:
         client hints so UA/CH-bound cookies (cf_clearance) validate."""
         from wafer import SyncSession
 
-        ua154 = (
+        ua155 = (
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/154.0.0.0 Safari/537.36"
+            "Chrome/155.0.0.0 Safari/537.36"
         )
         s = SyncSession()
-        s._fingerprint.pin_to_browser(ua154, 154, "154.0.8037.58")
+        s._fingerprint.pin_to_browser(ua155, 155, "155.0.8059.26")
         client_kwargs = s._build_client_kwargs()
         headers = client_kwargs["headers"]
         # TLS emulation stays at the newest wreq profile...
-        assert s._fingerprint.current == Emulation.Chrome153
+        assert s._fingerprint.current == Emulation.Chrome154
         assert isinstance(client_kwargs["emulation"], Emulation)
-        # ...but the wire identity is the solving browser's Chrome154.
-        assert headers["User-Agent"] == ua154
-        assert '"154"' in headers["sec-ch-ua"]
+        # ...but the wire identity is the solving browser's Chrome155.
+        assert headers["User-Agent"] == ua155
+        assert '"155"' in headers["sec-ch-ua"]
         # High-entropy hints go per request, to origins that asked for them.
         assert "sec-ch-ua-full-version-list" not in headers
         s._accept_ch["https://example.com:443"] = frozenset(
             {"sec-ch-ua-full-version-list"}
         )
         built = s._build_headers("https://example.com/")
-        assert "154.0.8037.58" in built["sec-ch-ua-full-version-list"]
-        assert s.fingerprint_envelope()["user_agent"] == ua154
+        assert "155.0.8059.26" in built["sec-ch-ua-full-version-list"]
+        assert s.fingerprint_envelope()["user_agent"] == ua155
 
     def test_user_supplied_ua_wins_over_solve_override(self):
         """An explicit session User-Agent is not clobbered by a solve."""
@@ -712,9 +722,9 @@ class TestFingerprintEnvelope:
         s = SyncSession()
         env = s.fingerprint_envelope()
         assert env["family"] == "chrome"
-        assert env["emulation"] == "Profile.Chrome153"
-        assert "Chrome/153.0.0.0" in env["user_agent"]
-        assert '"153"' in env["sec_ch_ua"]
+        assert env["emulation"] == "Profile.Chrome154"
+        assert "Chrome/154.0.0.0" in env["user_agent"]
+        assert '"154"' in env["sec_ch_ua"]
 
     def test_session_envelope_firefox(self):
         from wafer import SyncSession
@@ -952,7 +962,7 @@ class TestResponseEmulationStamp:
             start_time=0.0,
             was_retried=False,
         )
-        assert resp.emulation == "Profile.Chrome153"
+        assert resp.emulation == "Profile.Chrome154"
 
     def test_firefox_response_stamped(self):
         from wafer import SyncSession
@@ -1009,7 +1019,7 @@ class TestWreqEmulation:
 
     @pytest.mark.parametrize(
         "profile",
-        [Emulation.Chrome153, Emulation.Edge148, Emulation.Firefox151],
+        [Emulation.Chrome154, Emulation.Edge148, Emulation.Firefox152],
     )
     def test_desktop_profiles_use_host_platform(self, recorder, profile):
         from wreq import Platform
@@ -1021,7 +1031,7 @@ class TestWreqEmulation:
         assert call["headers"] is True
 
     def test_default_headers_off(self, recorder):
-        wreq_emulation(Emulation.Chrome153, default_headers=False)
+        wreq_emulation(Emulation.Chrome154, default_headers=False)
         assert recorder.calls[0]["headers"] is False
 
     @pytest.mark.parametrize(
@@ -1038,7 +1048,7 @@ class TestWreqEmulation:
         assert recorder.calls == []
 
     def test_real_emulation_object(self):
-        assert isinstance(wreq_emulation(Emulation.Chrome153), Emulation)
+        assert isinstance(wreq_emulation(Emulation.Chrome154), Emulation)
 
 
 class TestFirefoxLinuxUserAgent:

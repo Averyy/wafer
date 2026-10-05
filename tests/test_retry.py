@@ -548,7 +548,7 @@ class TestSyncRetryLoop:
 class TestFingerprintPool:
     """Opt-in pool replaces the default ladder as the rotation source."""
 
-    POOL = [Emulation.Chrome153, Emulation.Firefox151, Emulation.Edge148]
+    POOL = [Emulation.Chrome154, Emulation.Firefox152, Emulation.Edge148]
 
     def test_pool_cycles_through_identities(self, mock_sleep):
         # Each rotation steps to the next pool member (not the family ladder).
@@ -573,7 +573,7 @@ class TestFingerprintPool:
         # Rotating to the Firefox pool member must swap to Firefox headers.
         session, mock = make_sync_session(
             [
-                MockResponse(403, body="Denied"),  # -> pool[1] = Firefox151
+                MockResponse(403, body="Denied"),  # -> pool[1] = Firefox152
                 MockResponse(200, body="OK"),
             ],
             fingerprint_pool=self.POOL,
@@ -610,7 +610,7 @@ class TestFingerprintPool:
         # _rotation_delay penalty climbs above the flat 1.0s.
         for r in range(1, len(self.POOL) + 1):
             session._advance_rotation(r)
-        # Back on pool[0] (Chrome153) which now has 1 strike -> penalty 2.0.
+        # Back on pool[0] (Chrome154) which now has 1 strike -> penalty 2.0.
         assert emulation_family(session._fingerprint.current) == "chrome"
         assert session._rotation_delay() == 2.0
 
@@ -629,8 +629,8 @@ class TestFingerprintPool:
             max_rotations=5,
             max_failures=None,
         )
-        # pool[1] = Firefox151 already has 1 strike -> incoming penalty 2.0.
-        session._pool_strikes[repr(Emulation.Firefox151)] = 1
+        # pool[1] = Firefox152 already has 1 strike -> incoming penalty 2.0.
+        session._pool_strikes[repr(Emulation.Firefox152)] = 1
         session.get("https://example.com")
         # Landed on pool[1].
         assert emulation_family(session._fingerprint.current) == "firefox"
@@ -1005,8 +1005,8 @@ class TestAsyncRetryLoop:
                 MockResponse(200, body="OK"),
             ],
             fingerprint_pool=[
-                Emulation.Chrome153,
-                Emulation.Firefox151,
+                Emulation.Chrome154,
+                Emulation.Firefox152,
                 Emulation.Edge148,
             ],
             max_rotations=5,

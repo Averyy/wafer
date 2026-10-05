@@ -72,6 +72,7 @@ now reached with `patch_frame_headless()` / `patch_frame_screenxy()` instead.
 |---|---|---|
 | `--disable-blink-features=AutomationControlled` | Makes `navigator.webdriver` return `false` via native getter. | Both |
 | `--enable-gpu` | Forces real GPU. Without it, WebGL exposes `"SwiftShader"` as renderer. | Both |
+| `--disable-updater-scheduler` | Stops branded Chrome waking Google Updater 19s after launch. The updater inherits the stdio pipes Playwright waits on, so every close after that point took 17-26s on macOS (Chromium issue 481087595; measured 2026-10-05 on Chrome 154: 17.1s without, 0.2s with). Browser-process only, invisible to pages. Honored from about M148 (commit #1605857); older builds ignore it. | Both |
 | `--use-gl=angle` | Uses ANGLE for GPU rendering (pairs with `--enable-gpu`). | Both |
 | `--use-angle=gl` + `--ignore-gpu-blocklist` | On Linux/Xvfb, selects Mesa OpenGL explicitly; automatic ANGLE selection can yield `gl=none` and remove WebGL. | Linux |
 | `--use-angle=metal` | Selects Metal backend on macOS. Only on `sys.platform == "darwin"`. | Both (macOS) |

@@ -29,6 +29,7 @@ from wafer._base import (
     _to_method,
     is_certificate_verify_failure,
 )
+from wafer._bytes import as_bytes
 from wafer._challenge import (
     JS_ONLY_CHALLENGES,
     TERMINAL_CHALLENGES,
@@ -1398,7 +1399,7 @@ class SyncSession(BaseSession):
                     raise ResponseTooLarge(final_url, declared, max_response_size)
             try:
                 content = (
-                    resp.bytes()
+                    as_bytes(resp.bytes())
                     if max_response_size is None
                     else _read_body_capped(resp, max_response_size)
                 )
@@ -1977,7 +1978,7 @@ class SyncSession(BaseSession):
                     # passes the cap, never buffering the whole oversize body.
                     raw_content = _read_body_capped(resp, body_read_cap)
                 else:
-                    raw_content = resp.bytes()
+                    raw_content = as_bytes(resp.bytes())
                 if is_binary:
                     body = None
                 else:

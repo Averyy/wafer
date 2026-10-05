@@ -678,7 +678,7 @@ class TestRedditBootstrapSync:
         assert resp.challenge_type == "reddit"
         assert mock.request_count == 2
         assert mock.cookie_jar.added == [
-            (raw.decode("utf-8"), _JSON_URL)
+            (bytes(raw).decode("utf-8"), _JSON_URL)
             for raw in _gate_response().headers.get_all("set-cookie")
         ]
         _assert_reddit_browser_call(solver)
@@ -1614,7 +1614,7 @@ class TestRedditBootstrapAsync:
 
             def _remember(self, response, url):
                 for raw in response.headers.get_all("set-cookie"):
-                    self.cookie_jar.add(raw.decode(), url)
+                    self.cookie_jar.add(bytes(raw).decode(), url)
                 return response
 
             async def request(self, method, url, **kwargs):

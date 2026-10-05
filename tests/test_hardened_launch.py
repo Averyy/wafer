@@ -90,6 +90,14 @@ class TestGpuBackend:
             assert "--enable-gpu" in config.args
             assert "--use-gl=angle" in config.args
 
+    @pytest.mark.parametrize("headless", [True, False])
+    @pytest.mark.parametrize("platform", ["darwin", "linux", "win32"])
+    def test_updater_scheduler_disabled_everywhere(self, platform, headless):
+        # Chrome's 19s updater wake held Playwright's stdio pipes open and made
+        # every later close take 17-26s (Chromium issue 481087595).
+        config = hardened_launch_config(headless=headless, platform=platform)
+        assert "--disable-updater-scheduler" in config.args
+
 
 class TestProxyUdpContainment:
     def test_proxied_disables_page_controlled_udp(self):

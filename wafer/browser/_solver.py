@@ -41,7 +41,7 @@ from concurrent.futures import (
     TimeoutError as FutureTimeoutError,
 )
 from dataclasses import dataclass, field
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from wafer._cookies import browser_cookie_matches_host, registrable_domain
 from wafer._errors import ResponseTooLarge
@@ -441,8 +441,10 @@ def _response_headers(response) -> tuple[dict[str, str], list[str]]:
     """Read a Playwright response's headers without collapsing Set-Cookie."""
 
     headers: dict[str, str] = {}
+    raw_headers_read = False
     try:
         all_headers = response.all_headers()
+        raw_headers_read = True
         if isinstance(all_headers, dict):
             headers = {
                 str(name).lower(): str(value)
@@ -463,6 +465,18 @@ def _response_headers(response) -> tuple[dict[str, str], list[str]]:
         headers.pop(name, None)
 
     set_cookie: list[str] = []
+    # Never retry the raw headers after a failed read. Patchright caches a
+    # pending future before asking the driver, and a failed request (the
+    # browser closed under a timed-out render) leaves it unresolved forever,
+    # so a second call on this response never returns. That wedged the
+    # worker, and an unbounded close() behind it, after every render that
+    # timed out on a challenge (2026-10-05).
+    if not raw_headers_read:
+        logger.debug(
+            "Raw response headers unavailable; Set-Cookie not captured for %s",
+            getattr(response, "url", "?"),
+        )
+        return headers, set_cookie
     try:
         for entry in response.headers_array():
             if (
@@ -678,6 +692,11 @@ _TMD_CLEARANCE_POLL_SECONDS = 8.0
 
 _TMD_MTOP_RETRY_URL = "https://acs.aliexpress.com/h5/mtop.aliexpress.pdp.pc.query/1.0/"
 
+# AliExpress MTop gateway hosts that issue callback-less punishments for their
+# own endpoints: ``acs`` and ``recom-acs`` were seen live (2026-10-05). A
+# storefront, seller or user-content subdomain is not a gateway.
+_TMD_MTOP_GATEWAY_RE = re.compile(r"^(?:[a-z0-9-]+-)?acs\.aliexpress\.com$")
+
 # Human slide envelope, measured on the live Alibaba Baxia widget
 # (2026-07-31): a slide accepted by the SDK crossed the 258px track in 0.764s
 # emitting 34 pointermoves, i.e. 421px/s at 44 events/s. These bracket that
@@ -695,9 +714,29 @@ def _tmd_retry_target(challenge_url: str) -> str | None:
 
     When a caller does supply an ACS punishment URL, AliExpress retries its
     native MTop endpoint and Alibaba retries the strict callback embedded in
-    that issued URL. A punishment URL with no safe same-family callback fails
-    closed.
+    that issued URL.
+
+    MTop's own reCAPTCHA punishments carry no callback at all
+    (``/h5/<api>/<version>/_____tmd_____/punish?x5secdata=..&x5step=2&
+    action=captcharecaptcha``, observed 2026-10-05). Their path names the
+    exact endpoint that was refused, so that endpoint on the AliExpress host
+    that issued it (``acs`` or ``recom-acs`` live) is the retry target.
+    Without it the solved widget's fresh x5sec was never looked for and every
+    such solve was reported as a failure. Any other punishment URL with no
+    safe same-family callback still fails closed: one that carries a callback
+    the strict parser rejects, one from a host that is not an MTop gateway,
+    and every callback-less Alibaba one.
     """
+
+    # Reuse Baxia's single strict parser so callback validation cannot drift
+    # between the inner drag evidence and this outer replay-scope gate.
+    from wafer.browser._drag import (
+        _BAXIA_CALLBACK_KEYS,
+        _BAXIA_HOSTNAME_RE,
+        _baxia_punish_mtop_endpoint,
+        _expected_baxia_callback,
+        _expected_baxia_punish_path,
+    )
 
     try:
         parsed = urlparse(challenge_url)
@@ -710,6 +749,7 @@ def _tmd_retry_target(challenge_url: str) -> str | None:
         or parsed.username is not None
         or parsed.password is not None
         or port not in (None, 443)
+        or not _BAXIA_HOSTNAME_RE.fullmatch(host)
     ):
         return None
     if host == "aliexpress.com" or host.endswith(".aliexpress.com"):
@@ -718,13 +758,6 @@ def _tmd_retry_target(challenge_url: str) -> str | None:
         family = "alibaba.com"
     else:
         return None
-
-    # Reuse Baxia's single strict parser so callback validation cannot drift
-    # between the inner drag evidence and this outer replay-scope gate.
-    from wafer.browser._drag import (
-        _expected_baxia_callback,
-        _expected_baxia_punish_path,
-    )
 
     is_punishment = _expected_baxia_punish_path(parsed.path, family)
     if not is_punishment:
@@ -744,6 +777,16 @@ def _tmd_retry_target(challenge_url: str) -> str | None:
 
     callback = _expected_baxia_callback(challenge_url)
     if callback is None:
+        offered = parse_qs(parsed.query, keep_blank_values=True)
+        if (
+            family == "aliexpress.com"
+            and _TMD_MTOP_GATEWAY_RE.fullmatch(host)
+            and not any(key in offered for key in _BAXIA_CALLBACK_KEYS)
+        ):
+            endpoint = _baxia_punish_mtop_endpoint(parsed.path, family)
+            if endpoint is not None:
+                api, version = endpoint
+                return f"https://{host}/h5/{api}/{version}/"
         return None
     callback_host = (urlparse(callback).hostname or "").lower()
     if not (callback_host == family or callback_host.endswith(f".{family}")):
@@ -751,6 +794,47 @@ def _tmd_retry_target(challenge_url: str) -> str | None:
     if family == "aliexpress.com":
         return _TMD_MTOP_RETRY_URL
     return callback
+
+
+def _tmd_recaptcha_frame_present(page) -> bool:
+    """Whether any frame is an issued TMD punishment selecting reCAPTCHA.
+
+    Only a vendor-issued punishment URL is trusted: HTTPS on an Alibaba or
+    AliExpress host, with a path the strict Baxia parser accepts. A Google
+    frame alone never counts (a page may embed an unrelated widget), and
+    neither does a lookalike ``/_____tmd_____/punish`` on any other host, such
+    as an ad or user-content iframe.
+    """
+
+    from wafer._base import _tmd_is_recaptcha_challenge
+    from wafer.browser._drag import (
+        _baxia_family,
+        _expected_baxia_punish_path,
+        _safe_baxia_target,
+    )
+
+    try:
+        frames = list(page.frames)
+    except Exception:
+        return False
+    for frame in frames:
+        try:
+            url = frame.url
+        except Exception:
+            continue
+        if not isinstance(url, str):
+            continue
+        target = _safe_baxia_target(url)
+        if target is None:
+            continue
+        family = _baxia_family((target.hostname or "").lower())
+        if (
+            family is not None
+            and _expected_baxia_punish_path(target.path, family)
+            and _tmd_is_recaptcha_challenge(url)
+        ):
+            return True
+    return False
 
 
 def _tmd_cookie_applies(cookie: dict, retry_url: str = _TMD_MTOP_RETRY_URL) -> bool:
@@ -1173,6 +1257,11 @@ def hardened_launch_config(
     args = [
         "--disable-blink-features=AutomationControlled",
         "--enable-gpu",
+        # Branded Chrome wakes Google Updater 19s after launch, and the
+        # updater inherits the stdio pipes Playwright waits on, so any close
+        # after that point took 17-26s on macOS (Chromium issue 481087595).
+        # Browser-process only: nothing about it is visible to a page.
+        "--disable-updater-scheduler",
     ]
     if host == "linux":
         # Pin ANGLE to Mesa's OpenGL backend. Its automatic Linux backend
@@ -2901,10 +2990,14 @@ class BrowserSolver:
         """Break a stuck sync protocol call so the serial worker can recover.
 
         Playwright's sync API exposes no timeout for operations such as
-        ``BrowserContext.cookies``. Terminating its private driver transport
-        disconnects the current browser, which makes the blocked call return;
-        the owning worker then performs its normal cleanup and relaunches a
-        fresh driver on the next operation.
+        ``BrowserContext.cookies``. SIGTERM to its private driver does not end
+        the driver: once a browser is launched the driver handles SIGTERM by
+        closing Chrome gracefully and stays up. That disconnects the browser,
+        so a call waiting on it fails and returns; the owning worker then
+        cleans up and ``_ensure_browser`` stops this driver and starts a fresh
+        one on the next operation. Never escalate to SIGKILL: a dead driver
+        ends the sync dispatcher greenlet, and every pending call then spins
+        at 100% CPU forever instead of returning (measured 2026-10-05).
         """
 
         try:
@@ -4133,6 +4226,12 @@ class BrowserSolver:
             # ``action``, so trusting it unconditionally classified every
             # normal-flow reCAPTCHA punishment as a slider and waited for a
             # widget that never exists.
+            # A rendered page can also carry the punishment in place: the
+            # AliExpress item page shows MTop's reCAPTCHA in a dialog iframe
+            # while the main frame stays on the item URL (observed
+            # 2026-10-05, ``recom-acs.aliexpress.com``). Without an issued URL
+            # to trust, that frame's own ``action`` selects the solver; the
+            # slider path waited out the whole render budget instead.
             from wafer._base import (
                 _tmd_is_punish_url,
                 _tmd_is_recaptcha_challenge,
@@ -4141,7 +4240,9 @@ class BrowserSolver:
             issued_url = challenge_url if _tmd_is_punish_url(challenge_url) else None
             action_url = issued_url or page.url or challenge_url or ""
 
-            if _tmd_is_recaptcha_challenge(action_url):
+            if _tmd_is_recaptcha_challenge(action_url) or (
+                issued_url is None and _tmd_recaptcha_frame_present(page)
+            ):
                 from wafer.browser._recaptcha import wait_for_recaptcha
 
                 return wait_for_recaptcha(

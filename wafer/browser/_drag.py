@@ -20,7 +20,17 @@ from urllib.parse import parse_qs, urlparse
 logger = logging.getLogger("wafer")
 
 _BAXIA_ERROR_CODE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$")
-_BAXIA_MTOP_API_RE = re.compile(r"^mtop\.(alibaba|aliexpress)(?:\.[A-Za-z0-9_-]+)+$")
+# A well-formed MTop API name. On AliExpress the second segment is not a
+# family marker: its own gateway serves ``mtop.ae.*`` and
+# ``mtop.relationrecommend.*`` alongside ``mtop.aliexpress.*`` (inventoried
+# live 2026-10-05), so any name is accepted there except one naming Alibaba.
+# Alibaba keeps requiring ``mtop.alibaba.*``: no other shape has been seen.
+_BAXIA_MTOP_API_RE = re.compile(r"^mtop(?:\.[A-Za-z0-9_-]+){2,}$")
+# A plain DNS hostname. ``urlparse`` keeps characters such as ``\`` in
+# ``hostname`` that Chromium treats as a path separator, so
+# ``x.evil.com\.aliexpress.com`` would pass a suffix check here while the
+# browser navigates to ``x.evil.com``.
+_BAXIA_HOSTNAME_RE = re.compile(r"^[a-z0-9.-]+$")
 _BAXIA_MTOP_VERSION_RE = re.compile(r"^[0-9]+(?:\.[0-9]+)*$")
 _BAXIA_PUNISH_SUFFIX = "/_____tmd_____/punish"
 _NO_EVALUATE_ARGUMENT = object()
@@ -1411,6 +1421,15 @@ _BAXIA_DENIED_CALLBACK_PARTS = (
 )
 
 
+def _baxia_family(host: str) -> str | None:
+    """The Alibaba/AliExpress family a lowercase host belongs to, if any."""
+
+    for family in ("alibaba.com", "aliexpress.com"):
+        if host == family or host.endswith(f".{family}"):
+            return family
+    return None
+
+
 def _safe_baxia_target(issued_url: str):
     """Parse an immutable HTTPS Alibaba/AliExpress solve target."""
 
@@ -1425,6 +1444,7 @@ def _safe_baxia_target(issued_url: str):
         or target.username is not None
         or target.password is not None
         or port not in (None, 443)
+        or not _BAXIA_HOSTNAME_RE.fullmatch(host)
         or not any(
             host == family or host.endswith(f".{family}")
             for family in ("alibaba.com", "aliexpress.com")
@@ -1432,6 +1452,37 @@ def _safe_baxia_target(issued_url: str):
     ):
         return None
     return target
+
+
+def _baxia_punish_mtop_endpoint(path: str, family: str) -> tuple[str, str] | None:
+    """Return the ``(api, version)`` an MTop-prefixed punishment path names.
+
+    Live ACS responses prefix the punishment suffix with the exact MTop
+    endpoint that issued it (``/h5/<api>/<version>/_____tmd_____/punish``,
+    sometimes with a duplicate leading slash). Only that exact shape is
+    accepted, with an API allowed for the family (on AliExpress any MTop name
+    but ``mtop.alibaba.*``, on Alibaba only ``mtop.alibaba.*``); any other
+    prefix returns None.
+    """
+
+    if not isinstance(path, str) or not path.startswith("/"):
+        return None
+    candidate = ("/" + path.lstrip("/")).rstrip("/")
+    if not candidate.endswith(_BAXIA_PUNISH_SUFFIX):
+        return None
+    parts = candidate[: -len(_BAXIA_PUNISH_SUFFIX)].split("/")
+    if len(parts) != 4 or parts[0] or parts[1] != "h5":
+        return None
+    if _BAXIA_MTOP_API_RE.fullmatch(parts[2]) is None:
+        return None
+    named = parts[2].split(".")[1].lower()
+    if family == "alibaba.com" and named != "alibaba":
+        return None
+    if family == "aliexpress.com" and named == "alibaba":
+        return None
+    if _BAXIA_MTOP_VERSION_RE.fullmatch(parts[3]) is None:
+        return None
+    return parts[2], parts[3]
 
 
 def _expected_baxia_punish_path(path: str, family: str) -> bool:
@@ -1444,20 +1495,9 @@ def _expected_baxia_punish_path(path: str, family: str) -> bool:
 
     if not isinstance(path, str) or not path.startswith("/"):
         return False
-    normalized = "/" + path.lstrip("/")
-    candidate = normalized.rstrip("/")
-    if candidate == _BAXIA_PUNISH_SUFFIX:
+    if ("/" + path.lstrip("/")).rstrip("/") == _BAXIA_PUNISH_SUFFIX:
         return True
-    if not candidate.endswith(_BAXIA_PUNISH_SUFFIX):
-        return False
-    prefix = candidate[: -len(_BAXIA_PUNISH_SUFFIX)]
-    parts = prefix.split("/")
-    if len(parts) != 4 or parts[0] or parts[1] != "h5":
-        return False
-    api_match = _BAXIA_MTOP_API_RE.fullmatch(parts[2])
-    if api_match is None or api_match.group(1) + ".com" != family:
-        return False
-    return _BAXIA_MTOP_VERSION_RE.fullmatch(parts[3]) is not None
+    return _baxia_punish_mtop_endpoint(path, family) is not None
 
 
 def _expected_baxia_callback(issued_url: str) -> str | None:

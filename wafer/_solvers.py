@@ -16,6 +16,7 @@ from html import unescape
 from html.parser import HTMLParser
 from urllib.parse import urlencode, urljoin, urlparse
 
+from wafer._bytes import as_text
 from wafer._cookies import cookie_domain_matches, registrable_domain
 
 logger = logging.getLogger("wafer")
@@ -756,10 +757,7 @@ def reddit_cookie_names(raw_values) -> frozenset[str]:
     """Extract Set-Cookie names without retaining or exposing values."""
     names = set()
     for raw in raw_values:
-        if isinstance(raw, bytes):
-            raw = raw.decode("utf-8", errors="replace")
-        else:
-            raw = str(raw)
+        raw = as_text(raw)
         name, separator, _ = raw.partition("=")
         name = name.strip()
         if separator and name:

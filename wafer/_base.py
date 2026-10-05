@@ -19,6 +19,7 @@ from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 from wreq import CertStore, Emulation, Method
 
 from wafer import _psl
+from wafer._bytes import as_text, is_binary
 from wafer._cookies import CookieCache, _default_cookie_path
 from wafer._dart import DartIdentity
 from wafer._fingerprint import (
@@ -403,7 +404,7 @@ else:
     logger.debug("No system CA store found; using wreq defaults")
 
 # Default to newest Chrome emulation profile
-DEFAULT_EMULATION = Emulation.Chrome153
+DEFAULT_EMULATION = Emulation.Chrome154
 
 DEFAULT_HEADERS = {
     "Accept": (
@@ -453,13 +454,14 @@ def _read_body_capped(resp, cap: int) -> bytes:
     the memory-safety win). Raises ``_CapExceeded`` carrying the bytes seen
     so far; the caller wraps it in ``ResponseTooLarge`` with the URL.
 
-    Note: ``stream()`` yields ``bytes`` chunks interleaved with HTTP-trailer
-    ``HeaderMap`` objects; only ``bytes`` count toward the size.
+    Note: ``stream()`` yields binary chunks (read-only ``memoryview`` since
+    wreq 0.13, ``bytes`` before) interleaved with HTTP-trailer ``HeaderMap``
+    objects; only the binary chunks count toward the size.
     """
     buf = bytearray()
     with resp.stream() as streamer:
         for chunk in streamer:
-            if not isinstance(chunk, (bytes, bytearray)):
+            if not is_binary(chunk):
                 continue  # HTTP trailers (HeaderMap), not body bytes
             buf += chunk
             if len(buf) > cap:
@@ -472,7 +474,7 @@ async def _aread_body_capped(resp, cap: int) -> bytes:
     buf = bytearray()
     async with resp.stream() as streamer:
         async for chunk in streamer:
-            if not isinstance(chunk, (bytes, bytearray)):
+            if not is_binary(chunk):
                 continue  # HTTP trailers (HeaderMap), not body bytes
             buf += chunk
             if len(buf) > cap:
@@ -551,16 +553,16 @@ def _is_challengeable_content_type(content_type: str) -> bool:
 def _decode_headers(header_map) -> dict[str, str]:
     """Decode wreq HeaderMap to lowercase string dict.
 
-    wreq's HeaderMap: keys() returns unique bytes keys (deduped),
+    wreq's HeaderMap: keys() returns unique binary keys (deduped),
     get()/[] returns only the first value, get_all() returns all
     values for a key. We use get_all() so multi-value headers
     (especially Set-Cookie) are fully captured, joined with "; ".
     """
     result: dict[str, str] = {}
     for raw_key in header_map.keys():
-        k = raw_key.decode("ascii", errors="replace").lower()
+        k = as_text(raw_key, "ascii").lower()
         all_vals = header_map.get_all(k)
-        parts = [v.decode("utf-8", errors="replace") for v in all_vals]
+        parts = [as_text(v) for v in all_vals]
         result[k] = "; ".join(parts)
     return result
 
@@ -574,9 +576,7 @@ def _extract_location(header_map) -> str:
     raw = header_map.get("location")
     if raw is None:
         return ""
-    if isinstance(raw, bytes):
-        return raw.decode("utf-8", errors="replace")
-    return str(raw)
+    return as_text(raw)
 
 
 # The unspecified addresses. A resolver that answers with one of these has
@@ -1296,7 +1296,7 @@ class BaseSession:
           "safari" | "dart" | "opera_mini" | None``
         - ``emulation``: ``repr()`` of the Emulation, or the Profile name
           for Safari/iOS Safari/Dart/Opera Mini (e.g.
-          ``"Profile.Chrome153"``, ``"ios_safari"``)
+          ``"Profile.Chrome154"``, ``"ios_safari"``)
         - ``sec_ch_ua`` / ``sec_ch_ua_mobile`` / ``sec_ch_ua_platform``:
           the low-entropy Client Hints. ``None`` for Firefox/Safari (no
           client hints) and for Opera (wreq's Emulation emits accurate
@@ -1534,9 +1534,7 @@ class BaseSession:
             return None
         if not values:
             return None
-        text = ",".join(
-            v.decode("latin-1") if isinstance(v, bytes) else str(v) for v in values
-        )
+        text = ",".join(as_text(v, "latin-1") for v in values)
         return frozenset(t.strip().lower() for t in text.split(",") if t.strip())
 
     def _record_accept_ch(self, url: str, headers) -> None:
@@ -1682,6 +1680,15 @@ class BaseSession:
                 merged["Origin"] = self._embed_origin or ""
             merged["Sec-Fetch-Mode"] = "cors"
             merged["Sec-Fetch-Dest"] = "empty"
+            # The jar's cookies ride every embed request, which is a fetch()
+            # with credentials "include" (or an XHR with withCredentials).
+            # Chrome and Firefox both report storage access on such a
+            # cross-site request, with or without a cookie present, and never
+            # same-site. Cookies without it are a pairing no browser sends
+            # (measured 2026-10-05, Chrome 154 and Firefox 153).
+            kind = self._embed_header_kind()
+            if kind is not None and merged["Sec-Fetch-Site"] == "cross-site":
+                merged["Sec-Fetch-Storage-Access"] = embed_storage_access(kind)
             if self._embed_referers:
                 merged["Referer"] = random.choice(self._embed_referers)
             logger.debug(
@@ -2756,7 +2763,7 @@ class BaseSession:
         if self._fingerprint is not None:
             major = chrome_version(self._fingerprint.current)
         if major is None:
-            major = chrome_version(DEFAULT_EMULATION) or 153
+            major = chrome_version(DEFAULT_EMULATION) or 154
         return host_user_agent(major)
 
     def _native_prepare(
@@ -3071,10 +3078,7 @@ class BaseSession:
             return []
         normalized = []
         for raw in raw_cookies:
-            if isinstance(raw, bytes):
-                raw = raw.decode("utf-8", errors="replace")
-            else:
-                raw = str(raw)
+            raw = as_text(raw)
             normalized.append(raw)
             self._record_cookie_scope(raw, url)
         return normalized

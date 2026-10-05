@@ -1,6 +1,6 @@
 # wreq Reference
 
-Wafer wraps wreq **0.12.3+** (the `Emulation` API, formerly rnet).
+Wafer wraps wreq **0.13.0+** (the `Emulation` API, formerly rnet).
 
 ## TlsOptions Silent Failure
 
@@ -38,7 +38,7 @@ Also: **never send Host per-request** -wreq auto-sets it from the URL. Sending i
 
 ## Emulation Enum
 
-- **Not hashable.** Cannot use as a dict key. Use `repr(emulation)` instead (e.g. `"Profile.Chrome153"` -note: `Emulation.ChromeXXX` is a ClassVar pointing at `Profile.ChromeXXX`, so repr returns the `Profile.` form).
+- **Not hashable.** Cannot use as a dict key. Use `repr(emulation)` instead (e.g. `"Profile.Chrome154"` -note: `Emulation.ChromeXXX` is a ClassVar pointing at `Profile.ChromeXXX`, so repr returns the `Profile.` form).
 - **No `.name` attribute.** Use `repr()` for display and lookups.
 - **A bare profile is always macOS.** `Emulation.ChromeNNN` (a `Profile`) is built with wreq-util's default `Platform.MacOS` whatever the host is, so on Linux/Windows it sent a "Macintosh" UA next to wafer's own `sec-ch-ua-platform: "Linux"`. wafer builds desktop Chrome/Edge/Firefox/Opera as `Emulation(profile=..., platform=<host>, headers=...)` (`_fingerprint.wreq_emulation`); Safari, mobile and OkHttp profiles carry their own platform and stay bare.
 - **Default headers are a top-level navigation, and cannot be dropped one at a time.** A client or request header replaces a same-named default in place; nothing removes one. The only switch is `Emulation(..., headers=False)`, which drops the whole set (UA included) and leaves TLS and HTTP/2 untouched. wafer does that in embed mode and supplies every header plus the browser's order through `orig_headers` (see `docs/ref-sec-fetch.md`). A client-level `orig_headers` orders per-request headers too; a name it doesn't list is appended at the end, and it also fixes the name's case on HTTP/1.1.
@@ -56,11 +56,9 @@ Also: **never send Host per-request** -wreq auto-sets it from the URL. Sending i
 
 - **`resp.status` is an enum**, not an int. Call `resp.status.as_int()` to get the numeric status code.
 - **`resp.headers` is a `HeaderMap`**, not a dict. No `.items()` method.
-  - `.keys()` returns bytes. Decode with `.decode("ascii")`.
-  - `.get(key)` / `[key]` returns the **first** value only (bytes).
-  - `.get_all(key)` returns **all** values -required for multi-value headers like `Set-Cookie`.
-  - All values are bytes. Decode with `.decode("utf-8", errors="replace")`.
-- **Body reading:** sync `resp.bytes()` / `resp.text()`, async `await resp.bytes()` / `await resp.text()`.
+  - `.keys()` returns names, `.get(key)` / `[key]` the **first** value only, `.get_all(key)` **all** values (required for multi-value headers like `Set-Cookie`).
+  - Since 0.13 every name and value is a read-only `memoryview` (bytes before): no `.decode()`, and it fails `isinstance(x, bytes)`. Convert with `wafer/_bytes.py` (`as_text`, `as_bytes`, `is_binary`), never with `.decode()` or `str()`.
+- **Body reading:** sync `resp.bytes()` / `resp.text()`, async `await resp.bytes()` / `await resp.text()`. `bytes()` and stream chunks are read-only `memoryview` since 0.13; `text()` and `json()` are unaffected.
 - **No automatic redirect following.** wreq returns 3xx responses as-is. Wafer implements its own redirect loop with method conversion (POST->GET on 301/302/303).
 
 ## Client Construction
@@ -73,8 +71,14 @@ Also: **never send Host per-request** -wreq auto-sets it from the URL. Sending i
 - **v0.12 renamed `ResolverOptions` -> `DnsOptions`** (added a `system_dns: bool` first arg for the OS resolver). The `dns_options=` Client kwarg expects a `DnsOptions`; wafer uses it for the `resolve=` SSRF DNS pin (`DnsOptions().add_resolve(host, [ip_address(...)])`, see `_base._build_client_kwargs`).
 - **v0.12.1 (2026-07-11) added the latest browser profiles to the Python `Emulation` enum** (feat #597, closing "Support Chrome 149"): `Chrome148`, `Chrome149`, `Edge148`, `Firefox150`, `Firefox151`, `Safari17_6`, `Safari26_3`, `Safari26_4`, `Opera131`. Newest Chrome became `Chrome149` (then `DEFAULT_EMULATION`); the cross-family ladder pins updated to `Firefox151` / `Edge148`. `repr(Emulation.Chrome149)` is still `"Profile.Chrome149"`. The 0.12.0 -> 0.12.1 diff was profiles-only (no Client/TlsOptions/Http2Options kwarg changes); Safari H2 + Dart HTTP/1.1 + `tls_verify` re-verified unchanged.
 - **v0.12.2 (2026-09-16) added `Chrome150`-`Chrome153`** (#610) and moved the Rust core to pinned git revisions of wreq, wreq-util and btls. The Python API is unchanged apart from the four enum members, but the Rust move changed behavior three ways (all measured 2026-09-24):
-  - **Chrome's ClientHello moves between majors.** JA4 `..._d8a2da3f94cd` through 149; 150-151 add ML-DSA signature algorithms (`..._806a8c22fdea`); 152-153 add extension 0xca34 and a GREASE signature algorithm (`t13d1517h2_8daaf6152771_cb7bf5808d99`). HTTP/2 is identical across 149-153. wreq's Chrome153 matches real Google Chrome 153.0.8010.53 exactly (JA4 and sec-ch-ua). Adjacent majors are not reliably wire-identical.
+  - **Chrome's ClientHello moves between majors.** JA4 `..._d8a2da3f94cd` through 149; 150-151 add ML-DSA signature algorithms (`..._806a8c22fdea`); 152-153 add extension 0xca34 and a GREASE signature algorithm (`t13d1517h2_8daaf6152771_cb7bf5808d99`). HTTP/2 is identical across 149-153. wreq's Chrome153 matches real Google Chrome 153.0.8010.53 exactly (JA4 and sec-ch-ua). Adjacent majors are not reliably wire-identical. (154 kept 153's JA4 and HTTP/2; see v0.13.0.)
   - **Every profile's default header set became the real browser's navigation**: Chrome/Edge/Firefox gained `sec-fetch-user: ?1` (and Chrome `upgrade-insecure-requests: 1`) in the browsers' real order. That is right for navigation and made embed="xhr" send `Sec-Fetch-Mode: cors` + `Sec-Fetch-User`, hence wafer's embed mode now owns its headers.
   - **The cookie jar's `get_all()` changed shape** (see Cookie Jar above).
   - Wheel platforms are unchanged (28 files); the musllinux build moved to GitHub runners. Default Cargo features are unchanged in effect (`webpki-roots` + `tokio-rt`, same as the 6.0.0-rc.29 that 0.12.1 built against), so the fallback root store and proxy behavior did not move.
 - **v0.12.3 (2026-09-27)**: no Python API or fingerprint change (same wreq, wreq-util and btls revisions). hickory-resolver 0.26, and when the system DNS config cannot be read the resolver falls back to Cloudflare DNS instead of Google. Async request cancellation is now preserved. Re-verified on the wire (all modes, Safari, Dart, `tls_verify`, AIA, `resolve=` pin).
+- **v0.13.0 (2026-10-05)** added `Chrome154` and `Firefox152` (no new Edge; `Edge148` stays the ladder's Edge). wafer pins `>=0.13.0,<0.14`. Measured 2026-10-05:
+  - **Breaking type change:** `Response.bytes()`, stream chunks, `HeaderMap` keys/values/`get`/`get_all`/iteration, `peer_certificate` and WebSocket binary fields return read-only `memoryview`, not `bytes`. No kwarg was renamed or removed (the 0.12.3 -> 0.13.0 stub diff only adds `runtime=` options). The silent failures were the dangerous part: `_read_body_capped` skipped every chunk that was not `bytes` (empty bodies), and `str(memoryview)` turned a Location or Set-Cookie into `"<memory at 0x...>"`. `wafer/_bytes.py` converts at every wreq boundary, and `tests/conftest.py`'s mocks return read-only memoryviews so a regression fails a test. `RustPanic` is no longer raised for panics (wafer never caught it).
+  - **Chrome154 equals real Google Chrome 154.0.8037.93 exactly**: JA4 `t13d1517h2_8daaf6152771_cb7bf5808d99` (unchanged from 153), H2 `1:65536;2:0;4:6291456;6:262144|15663105|0|m,a,s,p`, navigation header order and every value including `sec-ch-ua` (`"Chromium";v="154", "Google Chrome";v="154", "Not A(Brand";v="99"`).
+  - **Every Firefox 150+ ClientHello changed**, `Firefox151` included (wreq-util #122): `TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA` (0xc009) is gone, so JA4 moves from `t13d1717h2_5b57614c22b0` to `t13d1617h2_86a278354501_3cbfd9057e0d`. That is the correction: real Firefox 151.0 and 153.0 (Playwright's builds, whose `playwright.cfg` sets no TLS prefs) send exactly the new value, so wafer's Firefox rung was off on 0.12.3.
+  - Edge148, iOS Safari and Dart are wire-identical to 0.12.3; wafer's Safari identity is too (its UA and `zstd` vary only with the 26.2/26.3 version it picks). Embed-mode header sets and orders are unchanged; `Jar.get_all()` shape is unchanged; `tls_verify` still refuses badssl expired/self-signed; the Reddit app route (Chrome154 on Android) mints and reads.
+  - The wreq-util pin (5715529) includes the UA-literal fixes from wreq-util #118.

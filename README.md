@@ -69,7 +69,7 @@ resp.needs_render   # bool -body is HTML that ships script but under 1000 chars
                     #   of visible text, i.e. a client-rendered shell. A hint
                     #   for deciding to call session.render(url)
 resp.emulation      # str | None -the identity that served this response, for
-                    #   diagnosing a 403 (e.g. "Profile.Chrome153", "safari",
+                    #   diagnosing a 403 (e.g. "Profile.Chrome154", "safari",
                     #   "reddit_app" for a Reddit JSON read via the app API)
 ```
 
@@ -100,7 +100,7 @@ from wreq import Emulation
 
 session = SyncSession(
     # TLS fingerprint (defaults to newest Chrome)
-    emulation=None,  # or Emulation.Chrome153
+    emulation=None,  # or Emulation.Chrome154
     profile=None,    # or Profile.SAFARI / IOS_SAFARI / DART / OPERA_MINI
     safari_locale="us",  # "us" or "ca" for Safari profiles
     headers=None,    # optional complete replacement for DEFAULT_HEADERS
@@ -209,7 +209,7 @@ session = SyncSession()
 
 # Specific profile
 from wreq import Emulation
-session = SyncSession(emulation=Emulation.Chrome153)
+session = SyncSession(emulation=Emulation.Chrome154)
 ```
 
 The `sec-ch-ua` header is auto-generated to match the emulated Chrome version using the same GREASE algorithm as Chromium source. As in Chrome, the low-entropy hints go on every request and the high-entropy ones only to an origin that asked with `Accept-CH` (a `Critical-CH` response is resent once); only a POST-style navigation (a form submission) carries `Cache-Control: max-age=0`.
@@ -229,7 +229,7 @@ session = SyncSession(emulation=Emulation.Edge148)
 
 # Firefox: Gecko TLS/H2, Firefox Accept and Accept-Language (...;q=0.5),
 # and NO sec-ch-ua client hints at all (Firefox sends none).
-session = SyncSession(emulation=Emulation.Firefox151)
+session = SyncSession(emulation=Emulation.Firefox152)
 ```
 
 Selecting a non-Chrome `emulation` only sets a coherent starting identity; the same cross-family rotation ladder still applies (see [Retry and Rotation](#retry-and-rotation)).
@@ -260,10 +260,10 @@ from wreq import Emulation
 wafer.sec_ch_ua(147)                          # '"Google Chrome";v="147", ...'
 wafer.sec_ch_ua(147, brand="Microsoft Edge")  # Edge brand
 wafer.full_version(147)                       # "147.0.7727.24"
-wafer.chrome_full_version(Emulation.Chrome153)  # "153.0.8010.53"
+wafer.chrome_full_version(Emulation.Chrome154)  # "154.0.8037.93"
 wafer.emulation_family(Emulation.Edge148)     # "edge"
 wafer.emulation_is_mobile(Emulation.SafariIos26_2)  # True
-wafer.build_fingerprint_envelope(Emulation.Chrome153, user_agent="...")  # full dict
+wafer.build_fingerprint_envelope(Emulation.Chrome154, user_agent="...")  # full dict
 ```
 
 On a 403 or challenge, wafer rotates across browser families (Chrome ->
@@ -512,7 +512,7 @@ Accept-Language, sec-ch-ua) so the headers stay coherent with the new TLS
 fingerprint:
 
 1. **Fresh TLS session** (rotation 1) -rebuilds the wreq client (new TLS session, empty cookie jar) on the *same* family. Often enough when the 403 is from a stale session or tainted cookies.
-2. **Firefox** (rotation 2) -`Emulation.Firefox151`: Gecko TLS/H2, no sec-ch-ua.
+2. **Firefox** (rotation 2) -`Emulation.Firefox152`: Gecko TLS/H2, no sec-ch-ua.
 3. **Safari** (rotation 3) -wafer's wire-verified Safari 26 (custom TlsOptions/Http2Options).
 4. **Edge** (rotation 4) -`Emulation.Edge148`: Chromium TLS, "Microsoft Edge" brand.
 5. **Chrome version cycling** (rotation 5+) -returns to Chrome and cycles versions.
@@ -535,7 +535,7 @@ recovery and challenge-absent Cloudflare passthrough do not pin.
 ```python
 from wreq import Emulation
 session = SyncSession(
-    fingerprint_pool=[Emulation.Chrome153, Emulation.Firefox151, Emulation.Edge148],
+    fingerprint_pool=[Emulation.Chrome154, Emulation.Firefox152, Emulation.Edge148],
     max_rotations=6,  # bound how many pool steps one request may take
 )
 ```

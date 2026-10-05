@@ -5,6 +5,8 @@ import json
 import re
 from typing import Any, NamedTuple
 
+from wafer._bytes import as_text
+
 
 class HistoryEntry(NamedTuple):
     """One followed redirect hop: the 3xx status and the URL that returned it.
@@ -295,8 +297,7 @@ class WaferResponse:
         if self._raw is None:
             val = self.headers.get(key, "")
             return [val] if val else []
-        return [v.decode() if isinstance(v, bytes) else v
-                for v in self._raw.headers.get_all(key)]
+        return [as_text(v) for v in self._raw.headers.get_all(key)]
 
     def __repr__(self) -> str:
         return f"<WaferResponse [{self.status_code}]>"

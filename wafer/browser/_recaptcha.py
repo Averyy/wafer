@@ -214,6 +214,15 @@ def _token_observation(
     }
 
 
+def _widget_torn_down(widget) -> bool:
+    """Whether the clicked widget's anchor frame no longer exists."""
+
+    try:
+        return bool(widget["anchor"].is_detached())
+    except Exception:
+        return False
+
+
 def _remaining_seconds(deadline: float) -> float:
     return max(0.0, deadline - time.monotonic())
 
@@ -324,6 +333,7 @@ def wait_for_recaptcha(
         grace_deadline = min(deadline, time.monotonic() + 5.0)
         iframe_seen = False
         checkbox_clicked = False
+        verify_count_at_click = 0
 
         # Phase 1: Click checkbox and wait for auto-pass or bframe escalation.
         while time.monotonic() < deadline:
@@ -331,6 +341,41 @@ def wait_for_recaptcha(
                 page, token_baseline, widget
             ):
                 logger.info("reCAPTCHA solved, token obtained")
+                return True
+
+            # TMD consumes an auto-passed checkbox's token itself, loads its
+            # ``third_validate_close_page`` and navigates away within about a
+            # second, destroying the widget before ``aria-checked`` can be
+            # read. Waiting on for a token in frames that no longer exist
+            # spent the whole budget and pre-empted the outer x5sec gate, so
+            # every successful AliExpress MTop solve was reported as a
+            # failure (observed 2026-10-05). Under TMD the outer gate is
+            # authoritative, so hand off to it. A generic caller has no such
+            # gate and keeps waiting for a token it can prove.
+            if (
+                protocol_completion_is_intermediate is True
+                and checkbox_clicked
+                and widget is not None
+                and _widget_torn_down(widget)
+            ):
+                # Diagnostic only: Google's last verdict since our click tells
+                # a teardown after an accepted token from one after a refusal.
+                # It cannot be required: the uvresp body read can lose the
+                # race with the teardown, and one in-page MTop dialog solve
+                # cleared with no accepted verdict recorded (2026-10-05).
+                summaries = payload_state.get("verify_summaries", [])
+                new_summaries = summaries[verify_count_at_click:]
+                verdict = (
+                    new_summaries[-1].get("classification", "unknown")
+                    if new_summaries and isinstance(new_summaries[-1], dict)
+                    else "not_observed"
+                )
+                logger.info(
+                    "reCAPTCHA widget torn down after checkbox "
+                    "(google_verdict=%s); handing off to the authoritative "
+                    "outer clearance gate",
+                    verdict,
+                )
                 return True
 
             # Find and click the checkbox iframe
@@ -366,6 +411,12 @@ def wait_for_recaptcha(
                                 needs_patch=bool(
                                     getattr(solver, "_needs_screenxy_patch", False)
                                 ),
+                            )
+                            # Summaries, not statuses: a status is appended
+                            # before its body is read, so an in-flight verify
+                            # would shift a status-based index by one.
+                            verify_count_at_click = len(
+                                payload_state.get("verify_summaries", [])
                             )
                             if _click_element(
                                 solver,
@@ -417,7 +468,10 @@ def wait_for_recaptcha(
 
             browse_seconds = min(1.0, _remaining_seconds(deadline))
             if browse_seconds <= 0:
-                break
+                # Out of budget is a timeout, not an escalation: breaking here
+                # fell through into the image phase and logged a grid that
+                # never appeared.
+                return False
             solver._replay_browse_chunk(page, state, browse_seconds)
         else:
             # Timed out without bframe or token

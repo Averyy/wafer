@@ -2317,10 +2317,11 @@ def _wait_for_post_verify_outcome(
     *,
     maximum: float = 10.0,
     protocol_intermediate_ready=None,
+    teardown_is_outcome: bool = False,
 ) -> str:
     """Poll authoritative image-grid outcomes without switching CAPTCHA mode."""
 
-    from wafer.browser._recaptcha import _check_token
+    from wafer.browser._recaptcha import _check_token, _widget_torn_down
 
     outcome_deadline = min(deadline, time.monotonic() + maximum)
     while time.monotonic() < outcome_deadline:
@@ -2332,6 +2333,16 @@ def _wait_for_post_verify_outcome(
                     return "protocol_intermediate"
             except Exception:
                 pass
+        # Only a caller with an authoritative outer gate (TMD) may treat a
+        # teardown as an outcome. TMD consumes the token and destroys the
+        # widget; when the uvresp read loses that race, the grid would
+        # otherwise be watched for 40s after it no longer exists.
+        if (
+            teardown_is_outcome
+            and token_widget is not None
+            and _widget_torn_down(token_widget)
+        ):
+            return "torn_down"
         for selector, outcome in (
             (
                 ".rc-imageselect-error-select-more,.rc-imageselect-error-dynamic-more",
@@ -2954,6 +2965,7 @@ def solve_image_grid(
                 if protocol_completion_is_intermediate is True
                 else None
             ),
+            teardown_is_outcome=protocol_completion_is_intermediate is True,
         )
         verify_statuses = diagnostics.get("verify_statuses", []) if diagnostics else []
         verify_summaries = (
@@ -3036,7 +3048,32 @@ def solve_image_grid(
                 token_baseline,
                 token_widget,
                 maximum=30.0,
+                teardown_is_outcome=protocol_completion_is_intermediate is True,
             )
+        if outcome == "torn_down" and protocol_completion_is_intermediate is True:
+            # The widget is gone after a submitted Verify. Only the outer
+            # x5sec gate can say whether that was acceptance, so hand off to
+            # it rather than reload a grid that no longer exists.
+            logger.info(
+                "reCAPTCHA widget torn down after Verify; handing off to the "
+                "authoritative outer clearance gate",
+            )
+            _collect_det_grid(
+                keyword_lower,
+                grid_type,
+                "torn_down",
+                image_bytes,
+                {
+                    "cells_selected": sorted(cells),
+                    "target_class": target_class,
+                    "initial_predictions": prediction_summary,
+                    "initial_clicks": click_dispatches,
+                    "dynamic_trace": dynamic_trace,
+                    "verify_statuses": verify_statuses,
+                    "verify_summaries": verify_summaries,
+                },
+            )
+            return True
         token_observation = None
         if (
             outcome == "pending"

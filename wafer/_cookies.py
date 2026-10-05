@@ -11,6 +11,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from wafer import _psl
+from wafer._bytes import as_text
 
 logger = logging.getLogger("wafer")
 
@@ -301,10 +302,7 @@ class CookieCache:
         cookies = []
         now = time.time()
         for raw in raw_values:
-            if isinstance(raw, bytes):
-                raw = raw.decode("utf-8", errors="replace")
-            else:
-                raw = str(raw)
+            raw = as_text(raw)
             name = _parse_cookie_name(raw)
             if not name:
                 continue
