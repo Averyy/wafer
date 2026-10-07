@@ -95,6 +95,14 @@ def _browser_attempt_key(challenge, url: str) -> tuple[str, str]:
     return (challenge.value, (urlparse(url).hostname or "").lower())
 
 
+# How long session.render() lets a render run once it lands on a challenge
+# whose in-place solve can outrun the session timeout (a reCAPTCHA that
+# escalates to image grids: 61.6s over two rounds, up to 112s over three, on
+# Google's /sorry/ page, 2026-10-06), when the caller passed no timeout of its
+# own. An explicit timeout= always wins.
+_RENDER_CHALLENGE_BUDGET = 150.0
+
+
 def _browser_solve_timeout(remaining: float) -> float:
     """Reserve part of a request deadline for cookie replay after solving.
 

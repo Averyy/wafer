@@ -342,6 +342,28 @@ def _looks_like_shape_sensor(val: str) -> bool:
     return val[0].isdigit() or any(c in _SHAPE_SEPARATORS for c in val)
 
 
+# Google's "unusual traffic" page (/sorry/index): a reCAPTCHA form posting
+# back with the blocked URL in a hidden "continue" input. Served as 429 on
+# the redirect, but a render can capture it under a 200 document, and as
+# content it is a challenge whatever the status (2026-10-06).
+_GOOGLE_SORRY_FORM_RE = re.compile(
+    r"""<form[^>]*\bid=["']captcha-form["']""", re.IGNORECASE
+)
+_GOOGLE_SORRY_CONTINUE_RE = re.compile(
+    r"""<input[^>]*\bname=["']continue["']""", re.IGNORECASE
+)
+
+
+def is_google_sorry_page(body: str) -> bool:
+    """Whether *body* is Google's reCAPTCHA "unusual traffic" page."""
+    if len(body) > 50_000 or "g-recaptcha" not in body:
+        return False
+    return (
+        _GOOGLE_SORRY_FORM_RE.search(body) is not None
+        and _GOOGLE_SORRY_CONTINUE_RE.search(body) is not None
+    )
+
+
 # Reddit's gate copy, tolerant of a curly apostrophe or reflowed whitespace.
 _REDDIT_BLOCK_COPY_RE = re.compile(r"blocked\s+by\s+network\s+security", re.IGNORECASE)
 # Without a URL, a small page is only taken for Reddit's verification when it
@@ -407,6 +429,11 @@ def detect_challenge(
     if status_code == 200 and "/_____tmd_____/punish" in body:
         logger.info("Challenge detected: tmd")
         return ChallengeType.TMD
+
+    # Google's reCAPTCHA page, at any status (see is_google_sorry_page).
+    if is_google_sorry_page(body):
+        logger.info("Challenge detected: recaptcha (google sorry)")
+        return ChallengeType.RECAPTCHA
 
     # Reddit anonymous-session gates. JSON endpoints return a large Shreddit
     # block template, while direct HTML navigation can return a small, valid
@@ -495,6 +522,19 @@ def detect_challenge(
             if "sec-if-cpt" in body or "behavioral-content" in body:
                 logger.info("Challenge detected (body): akamai behavioral")
                 return ChallengeType.AKAMAI
+
+    # The same behavioral page without either cookie: chewy.com serves it that
+    # way (2026-10-06, a 2.4KB 200 setting only device-id), and it went
+    # undetected and was returned as the product page. Matched on both markers
+    # together, which no ordinary page carries.
+    if (
+        status_code == 200
+        and len(body) < 10_000
+        and "sec-if-cpt" in body
+        and "behavioral-content" in body
+    ):
+        logger.info("Challenge detected (body): akamai behavioral")
+        return ChallengeType.AKAMAI
 
     # Compute body_lower once for all remaining case-insensitive checks
     body_lower = body.lower()

@@ -20,10 +20,14 @@ WAF-specific logic lives in dedicated modules:
 """
 
 import asyncio
+import atexit
+import contextlib
 import csv
 import importlib.resources
 import io
 import ipaddress
+import itertools
+import json
 import logging
 import math
 import os
@@ -32,8 +36,10 @@ import random
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+import weakref
 from concurrent.futures import (
     Future,
 )
@@ -51,6 +57,7 @@ from wafer._solvers import (
     is_reddit_captcha_gate,
     is_reddit_verification,
 )
+from wafer.browser._pump import bind_page, idle, unbind_page
 
 logger = logging.getLogger("wafer")
 
@@ -241,7 +248,7 @@ def _sleep_before_deadline(deadline: float, maximum: float) -> bool:
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         return False
-    time.sleep(min(maximum, remaining))
+    idle(min(maximum, remaining))
     return True
 
 
@@ -437,9 +444,33 @@ def _main_document_status(records: list[tuple[str, int]], landed) -> int | None:
     return None
 
 
-def _response_headers(response) -> tuple[dict[str, str], list[str]]:
-    """Read a Playwright response's headers without collapsing Set-Cookie."""
+# Each response's header read, failed or not, so it happens once.
+_HEADER_READS: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
 
+
+def _response_headers(response) -> tuple[dict[str, str], list[str]]:
+    """Read a Playwright response's headers without collapsing Set-Cookie.
+
+    Read once per response and remembered, a failed read included. Patchright
+    caches a pending future before asking the driver for raw headers, and a
+    failed request (the browser closed under a timed-out render) leaves it
+    unresolved forever, so any later read on that response never returns.
+    render() reads its final response twice, for the content type and for
+    the returned headers, and that second read wedged the worker, and the
+    close() behind it, after a reCAPTCHA solve timed out (2026-10-06).
+    """
+    try:
+        read = _HEADER_READS.get(response)
+    except TypeError:  # not weakly referenceable (a test double)
+        return _read_response_headers(response)
+    if read is None:
+        read = _read_response_headers(response)
+        _HEADER_READS[response] = read
+    headers, set_cookie = read
+    return dict(headers), list(set_cookie)
+
+
+def _read_response_headers(response) -> tuple[dict[str, str], list[str]]:
     headers: dict[str, str] = {}
     raw_headers_read = False
     try:
@@ -499,6 +530,13 @@ _RENDER_SETTLE_CAP = 10.0
 # Post-solve phase bound: how long the capture may spend re-navigating
 # and settling after a challenge clears, clamped to the caller deadline.
 _RENDER_POST_SOLVE_SECONDS = 30.0
+# The challenges whose in-place solve can outrun an ordinary render budget:
+# a reCAPTCHA that escalates to image grids took 61.6s over two rounds on
+# Google's /sorry/ page and up to 112s over three (2026-10-06), against the
+# session's 30s default. A render that lands on one may run to the caller's
+# challenge_budget instead (session.render() passes it only when the caller
+# gave no timeout of its own).
+_SLOW_INPLACE_CHALLENGES = frozenset({"recaptcha"})
 
 # The only content types whose serialized DOM is the resource. Everything else
 # Chrome shows inside a generated viewer document.
@@ -994,24 +1032,61 @@ def _playwright_proxy(value: str) -> dict[str, str]:
 #   outerHeight: == innerHeight (should be +80 for title/tab/toolbar)
 #   screenY/screenTop: ~22 (should be ~56 with menu bar)
 #
-# CDP Page.addScriptToEvaluateOnNewDocument only reaches same-origin
-# frames (OOPIFs are separate targets).  Cross-origin iframes need
-# the fix injected directly via frame.evaluate() - see
-# patch_frame_headless() below.
+# Every frame of a real window reports the same screen, colorDepth and
+# outer size: an iframe's outerWidth is the window's, not the iframe's.
+# Headless iframes report their own values instead (colorDepth 24, screen
+# 800x600 under a 2560x1440 top document, measured on Chrome 154), so the
+# per-page hardening computes one geometry from the viewport and injects it
+# into the page and every out-of-process iframe alike.
 #
-# The JS guard (isMac && outerWidth === innerWidth) is intentional:
-# outerWidth === innerWidth is the headless signature on macOS.  The
-# script is registered on all platforms but only activates on macOS
-# headless.  If a future Chrome changes headless outerWidth, the
-# Python-side self._headless gate still prevents headed-mode injection.
+# ``__GEOMETRY__`` is that geometry, or ``null`` to derive it from the
+# window the script runs in, which is only meaningful in a top-level
+# document. The derived form keeps the headless-signature guard
+# (outerWidth === innerWidth); the fixed form cannot use it, because an
+# iframe's native outerWidth is the window's and so always exceeds its
+# innerWidth. It skips a document it has already patched instead.
 # ---------------------------------------------------------------------------
-_HEADLESS_FIX_SCRIPT = r"""(function () {
+
+# Common macOS displays in CSS pixels at default scaling. The screen patch
+# picks the first that fits the viewport with room for window chrome.
+_MAC_DISPLAYS = (
+    (1440, 900),
+    (1512, 982),
+    (1710, 1107),
+    (1728, 1117),
+    (2560, 1440),
+)
+# What a fitted display leaves above the viewport: title bar, tabs, toolbar.
+_MAC_CHROME_HEIGHT = 120
+
+_HEADLESS_FIX_TEMPLATE = r"""(function () {
   var isMac = navigator.platform === 'MacIntel' ||
     navigator.userAgent.indexOf('Mac OS X') !== -1;
-  // In headed mode outerWidth > innerWidth (window chrome adds ~2px).
-  // In headless, outerWidth === innerWidth OR 0 (early document load
-  // during cross-origin navigation).  Skip only when > innerWidth.
-  if (!isMac || window.outerWidth > window.innerWidth) return;
+  if (!isMac) return;
+  var g = __GEOMETRY__;
+  if (g === null) {
+    // In headed mode outerWidth > innerWidth (window chrome adds ~2px).
+    // In headless, outerWidth === innerWidth OR 0 (early document load
+    // during cross-origin navigation).  Skip only when > innerWidth.
+    if (window.outerWidth > window.innerWidth) return;
+    // Screen dimensions: headless reports viewport == screen which is
+    // impossible on a real display.  Pick a plausible macOS resolution
+    // that fits the viewport.
+    var displays = __DISPLAYS__;
+    var vw = window.innerWidth, vh = window.innerHeight;
+    var sw = 2560, sh = 1440;
+    for (var i = 0; i < displays.length; i++) {
+      if (displays[i][0] > vw && displays[i][1] > vh + __CHROME_HEIGHT__) {
+        sw = displays[i][0]; sh = displays[i][1]; break;
+      }
+    }
+    g = {screenWidth: sw, screenHeight: sh,
+         outerWidth: function () { return window.innerWidth + 2; },
+         outerHeight: function () { return window.innerHeight + 80; }};
+  } else if (screen.colorDepth === 30 && screen.width === g.screenWidth &&
+             window.outerWidth === g.outerWidth) {
+    return;
+  }
   var _ts = Function.prototype.toString;
   var _m = new Map();
   var _nts = function () {
@@ -1037,32 +1112,47 @@ _HEADLESS_FIX_SCRIPT = r"""(function () {
   // dynamic-range:high = true), so there's no cross-check inconsistency.
   patch(Screen.prototype, 'colorDepth', 30);
   patch(Screen.prototype, 'pixelDepth', 30);
-  patch(window, 'outerWidth', function () { return window.innerWidth + 2; });
-  patch(window, 'outerHeight', function () { return window.innerHeight + 80; });
-  patch(window, 'screenY', function () { return 56; });
-  patch(window, 'screenTop', function () { return 56; });
-  // Screen dimensions: headless reports viewport == screen which is
-  // impossible on a real display.  Pick a plausible macOS resolution
-  // (CSS pixels at default "looks like" scaling) that fits the viewport.
-  var displays = [
-    [1440, 900],  [1512, 982],  [1710, 1107],
-    [1728, 1117], [2560, 1440]
-  ];
-  var vw = window.innerWidth, vh = window.innerHeight;
-  var sw = 2560, sh = 1440;
-  for (var i = 0; i < displays.length; i++) {
-    if (displays[i][0] > vw && displays[i][1] > vh + 120) {
-      sw = displays[i][0]; sh = displays[i][1]; break;
-    }
-  }
+  patch(window, 'outerWidth', g.outerWidth);
+  patch(window, 'outerHeight', g.outerHeight);
+  patch(window, 'screenY', 56);
+  patch(window, 'screenTop', 56);
   var menuBar = 37;
-  patch(Screen.prototype, 'width', sw);
-  patch(Screen.prototype, 'height', sh);
-  patch(Screen.prototype, 'availWidth', sw);
-  patch(Screen.prototype, 'availHeight', sh - menuBar);
+  patch(Screen.prototype, 'width', g.screenWidth);
+  patch(Screen.prototype, 'height', g.screenHeight);
+  patch(Screen.prototype, 'availWidth', g.screenWidth);
+  patch(Screen.prototype, 'availHeight', g.screenHeight - menuBar);
   patch(Screen.prototype, 'availTop', menuBar);
   patch(Screen.prototype, 'availLeft', 0);
 })();"""
+
+
+def _headless_geometry(viewport_width: int, viewport_height: int) -> dict:
+    """The window and screen a headless page of this viewport reports."""
+    screen_width, screen_height = _MAC_DISPLAYS[-1]
+    for width, height in _MAC_DISPLAYS:
+        if width > viewport_width and height > viewport_height + _MAC_CHROME_HEIGHT:
+            screen_width, screen_height = width, height
+            break
+    return {
+        "screenWidth": screen_width,
+        "screenHeight": screen_height,
+        "outerWidth": viewport_width + 2,
+        "outerHeight": viewport_height + 80,
+    }
+
+
+def _headless_fix_script(geometry: dict | None = None) -> str:
+    """The macOS headless window fix, with *geometry* fixed or derived."""
+    return (
+        _HEADLESS_FIX_TEMPLATE.replace(
+            "__GEOMETRY__", "null" if geometry is None else json.dumps(geometry)
+        )
+        .replace("__DISPLAYS__", json.dumps([list(d) for d in _MAC_DISPLAYS]))
+        .replace("__CHROME_HEIGHT__", str(_MAC_CHROME_HEIGHT))
+    )
+
+
+_HEADLESS_FIX_SCRIPT = _headless_fix_script()
 
 
 # ---------------------------------------------------------------------------
@@ -1076,13 +1166,19 @@ _HEADLESS_FIX_SCRIPT = r"""(function () {
 #
 # Previously shipped as an MV3 extension, but extensions don't load
 # in Playwright's new_context() (incognito-like).  Now injected via
-# CDP Page.addScriptToEvaluateOnNewDocument for same-origin frames.
-# Cross-origin iframes need patch_frame_screenxy() called directly.
+# CDP Page.addScriptToEvaluateOnNewDocument into the page and, through
+# auto-attach on the page's session, into every out-of-process iframe
+# before its document runs.
 # ---------------------------------------------------------------------------
 _SCREENXY_FIX_SCRIPT = r"""(function () {
   var origSX = Object.getOwnPropertyDescriptor(MouseEvent.prototype, 'screenX');
   var origSY = Object.getOwnPropertyDescriptor(MouseEvent.prototype, 'screenY');
   if (!origSX || !origSY) return;
+  // Already replaced in this document (the init script ran and the navigation
+  // fallback is re-applying it): wrapping twice can leave PointerEvent
+  // half-patched.
+  if (Function.prototype.toString.call(origSX.get).indexOf('[native code]') === -1)
+    return;
   [MouseEvent, PointerEvent].forEach(function (cls) {
     Object.defineProperty(cls.prototype, 'screenX', {
       get: function () {
@@ -1102,47 +1198,6 @@ _SCREENXY_FIX_SCRIPT = r"""(function () {
     });
   });
 })();"""
-
-
-def patch_frame_screenxy(
-    frame,
-    *,
-    needs_patch: bool = True,
-    timeout_ms: int | None = None,
-) -> None:
-    """Inject screenXY fix into a cross-origin frame.
-
-    With site isolation enabled (the default), CDP init scripts only
-    reach same-origin frames.  Cross-origin iframes (DataDome's
-    captcha-delivery, Baxia, etc.) need the fix injected directly
-    so CDP mouse events have correct screenX/screenY values.
-    """
-    if not needs_patch:
-        return
-    try:
-        if timeout_ms is None:
-            frame.evaluate(_SCREENXY_FIX_SCRIPT)
-        elif timeout_ms > 0:
-            frame.locator("html").evaluate(
-                _SCREENXY_FIX_SCRIPT,
-                timeout=timeout_ms,
-            )
-    except Exception:
-        pass
-
-
-def patch_frame_headless(frame) -> None:
-    """Inject headless fingerprint fix into a cross-origin frame.
-
-    Same rationale as patch_frame_screenxy: CDP init scripts don't
-    reach cross-origin iframes.  WAFs that check colorDepth,
-    outerWidth, screen dimensions from inside their iframe need
-    the headless patches injected directly.
-    """
-    try:
-        frame.evaluate(_HEADLESS_FIX_SCRIPT)
-    except Exception:
-        pass
 
 
 # ---------------------------------------------------------------------------
@@ -1206,6 +1261,229 @@ _VIEWPORTS = [
 ]
 
 
+_DRIVER_PRELOAD = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "_driver_preload.js"
+)
+# NODE_OPTIONS is process-wide; one driver start at a time edits it.
+_DRIVER_ENV_LOCK = threading.RLock()
+
+
+# wafer's user-agent override per browser user agent, for the driver preload:
+# it gives the override to the pages Playwright sets up itself, popups
+# included, before they run (see _driver_preload.js).
+_UA_TABLE: dict[str, dict] = {}
+_UA_FILE: list[str] = []
+_UA_LOCK = threading.Lock()
+
+
+def _remove_quietly(path: str) -> None:
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def _ua_params_file() -> str:
+    """This process's override file, created private on first use."""
+    with _UA_LOCK:
+        if not _UA_FILE:
+            fd, path = tempfile.mkstemp(prefix="wafer-ua-", suffix=".json")
+            with os.fdopen(fd, "w") as handle:
+                handle.write("{}")
+            atexit.register(_remove_quietly, path)
+            _UA_FILE.append(path)
+        return _UA_FILE[0]
+
+
+def _publish_ua_override(browser_user_agent: str | None, params: dict | None) -> None:
+    """Make *params* the override the driver gives this browser's new pages."""
+    if not browser_user_agent or not params:
+        return
+    path = _ua_params_file()
+    with _UA_LOCK:
+        if _UA_TABLE.get(browser_user_agent) == params:
+            return
+        _UA_TABLE[browser_user_agent] = params
+        fd, staged = tempfile.mkstemp(
+            prefix="wafer-ua-", suffix=".json", dir=os.path.dirname(path)
+        )
+        try:
+            with os.fdopen(fd, "w") as handle:
+                json.dump(_UA_TABLE, handle)
+            os.replace(staged, path)
+        except OSError:
+            _remove_quietly(staged)
+            logger.debug("Could not publish the user-agent override", exc_info=True)
+
+
+@contextlib.contextmanager
+def hardened_driver_env():
+    """Start Patchright's driver inside this block to leave shared workers to wafer.
+
+    Playwright pauses every new shared worker and resumes it at once, and
+    Chromium delivers that resume ahead of wafer's override, so a shared
+    worker could run its first script with the launch's empty high-entropy
+    client hints (15-17 of 100 for a ``blob:`` worker, measured on a real
+    sensor). Inside this block the driver is started with a preload
+    (``_driver_preload.js``) that keeps its browser session from attaching
+    shared workers, so :func:`harden_page` resumes each one only after its
+    override is in: 0 of 100. Wrap only the start::
+
+        with hardened_driver_env():
+            playwright = sync_playwright().start()
+
+    The preload also gives :func:`harden_page`'s user-agent override to the
+    pages the driver sets up itself, popups included, before they run (their
+    first document read the launch's empty high-entropy client hints, 3 of 3).
+    harden_page publishes it in a private per-process file named by
+    ``WAFER_UA_PARAMS``.
+
+    It appends to ``NODE_OPTIONS`` and sets ``WAFER_UA_PARAMS`` for the
+    duration and restores both after; they are process-wide, so node
+    processes other threads start in that window get them too (the preload
+    changes nothing but a Playwright driver's shared-worker auto-attach and
+    its empty per-page user-agent override).
+    """
+    escaped = _DRIVER_PRELOAD.replace("\\", "\\\\").replace('"', '\\"')
+    option = f'--require "{escaped}"'
+    params_file = _ua_params_file()
+    with _DRIVER_ENV_LOCK:
+        previous = os.environ.get("NODE_OPTIONS")
+        previous_params = os.environ.get("WAFER_UA_PARAMS")
+        os.environ["NODE_OPTIONS"] = f"{previous} {option}" if previous else option
+        os.environ["WAFER_UA_PARAMS"] = params_file
+        try:
+            yield
+        finally:
+            for name, value in (
+                ("NODE_OPTIONS", previous),
+                ("WAFER_UA_PARAMS", previous_params),
+            ):
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+
+
+@dataclass(frozen=True)
+class _MacScreen:
+    """The main display, in points, as headed Chrome reports it."""
+
+    width: int
+    height: int
+    # Work-area insets: the menu bar above, the Dock wherever it sits.
+    top: int
+    bottom: int
+    left: int
+    right: int
+    scale: int
+    color_depth: int
+
+
+# Used when AppKit cannot be asked (no window server): a 14-inch MacBook Pro
+# with its Dock hidden.
+_DEFAULT_MAC_SCREEN = _MacScreen(1512, 982, 34, 0, 0, 0, 2, 30)
+
+# NSScreen, through JavaScript for Automation: the frame, the visible frame
+# (bottom-left origin, so its y is the Dock's height when the Dock is below),
+# the backing scale, and whether the display covers P3. Chrome reports a P3
+# display as colorDepth 30 and any other as 24.
+_SCREEN_QUERY = (
+    'ObjC.import("AppKit");'
+    "var s = $.NSScreen.mainScreen;"
+    "var f = s.frame, v = s.visibleFrame;"
+    "JSON.stringify([f.size.width, f.size.height, v.origin.x, v.origin.y,"
+    " v.size.width, v.size.height, s.backingScaleFactor,"
+    " s.canRepresentDisplayGamut($.NSDisplayGamutP3)])"
+)
+_HOST_SCREEN: list = []
+_HOST_SCREEN_LOCK = threading.Lock()
+
+# What Chrome 154 on macOS draws above the page: tab strip and toolbar.
+# Headed reports outerHeight - innerHeight = 87, and headless reports the same
+# for a window sized with --window-size (measured 2026-10-06).
+_MAC_TOOLBAR_HEIGHT = 87
+
+
+def _parse_mac_screen(output: str) -> "_MacScreen | None":
+    try:
+        width, height, vx, vy, vw, vh, scale, p3 = json.loads(output)
+        width, height = round(width), round(height)
+        vx, vy, vw, vh = round(vx), round(vy), round(vw), round(vh)
+        screen = _MacScreen(
+            width=width,
+            height=height,
+            top=height - (vy + vh),
+            bottom=vy,
+            left=vx,
+            right=width - (vx + vw),
+            scale=max(1, round(scale)),
+            color_depth=30 if p3 else 24,
+        )
+    except (TypeError, ValueError):
+        return None
+    insets = (screen.top, screen.bottom, screen.left, screen.right)
+    if width <= 0 or height <= 0 or min(insets) < 0:
+        return None
+    return screen
+
+
+def _host_screen() -> "_MacScreen":
+    """The Mac's main display, asked once per process; a default without one."""
+    with _HOST_SCREEN_LOCK:
+        if _HOST_SCREEN:
+            return _HOST_SCREEN[0]
+        screen = None
+        try:
+            result = subprocess.run(
+                ["osascript", "-l", "JavaScript", "-e", _SCREEN_QUERY],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if result.returncode == 0:
+                screen = _parse_mac_screen(result.stdout.strip())
+        except (OSError, subprocess.SubprocessError):
+            pass
+        if screen is None:
+            logger.debug("Could not read the main display; using a default")
+            screen = _DEFAULT_MAC_SCREEN
+        _HOST_SCREEN.append(screen)
+        return screen
+
+
+def _screen_info_switch(screen: "_MacScreen") -> str:
+    """``--screen-info`` for *screen*: bounds and insets in device pixels."""
+    s = screen.scale
+    return (
+        f"--screen-info={{0,0 {screen.width * s}x{screen.height * s} "
+        f"colorDepth={screen.color_depth} "
+        f"workAreaTop={screen.top * s} workAreaBottom={screen.bottom * s} "
+        f"workAreaLeft={screen.left * s} workAreaRight={screen.right * s}}}"
+    )
+
+
+def _fitting_viewports(screen: "_MacScreen") -> list[tuple[int, int]]:
+    """The viewports whose window fits *screen*'s work area."""
+    width = screen.width - screen.left - screen.right
+    height = screen.height - screen.top - screen.bottom
+    return [
+        (w, h)
+        for w, h in _VIEWPORTS
+        if w <= width and h + _MAC_TOOLBAR_HEIGHT <= height
+    ]
+
+
+def _default_viewport(screen: "_MacScreen") -> tuple[int, int]:
+    fitting = _fitting_viewports(screen)
+    if fitting:
+        return max(fitting, key=lambda v: v[0] * v[1])
+    return (
+        screen.width - screen.left - screen.right,
+        screen.height - screen.top - screen.bottom - _MAC_TOOLBAR_HEIGHT,
+    )
+
+
 @dataclass(frozen=True)
 class HardenedLaunch:
     """Chromium launch settings that keep an automated browser unremarkable.
@@ -1216,7 +1494,10 @@ class HardenedLaunch:
     ``init_scripts`` are registered per page through CDP
     ``Page.addScriptToEvaluateOnNewDocument``, which needs ``Page.enable``
     first and must not have its CDP session detached afterwards -detaching
-    unregisters them.
+    unregisters them. Superseded by :func:`harden_page`, which registers them
+    itself with one window geometry for the page and its iframes; these derive
+    the geometry from their own window, which is only right in a top-level
+    document. Kept for callers that already register them.
     """
 
     args: tuple[str, ...]
@@ -1229,6 +1510,8 @@ def hardened_launch_config(
     headless: bool,
     proxied: bool = False,
     platform: str | None = None,
+    user_agent: str | None = None,
+    viewport: tuple[int, int] | None = None,
 ) -> HardenedLaunch:
     """The launch settings wafer's own solver browser uses.
 
@@ -1243,15 +1526,35 @@ def hardened_launch_config(
     unchanged. ``platform`` defaults to :data:`sys.platform`; pass it to build
     another host's configuration, which is also how this gets tested off-target.
 
-    Pair this with :func:`scrub_headless_ua`. ``--headless=new`` fixes the
-    compositor and timer resolution but leaves ``HeadlessChrome`` in the user
-    agent, and that token alone is enough to earn degraded service from sites
-    that never present a challenge at all.
+    ``user_agent`` matters only when ``headless``. Chrome puts ``HeadlessChrome``
+    in its own user agent whenever the ``--headless`` switch is present, and
+    that default reaches every target nothing overrides before it runs: a
+    service worker's script fetch and ``navigator.userAgent``, and everything
+    a shared worker does. Passing the browser's own user agent, scrubbed with
+    :func:`scrub_headless_ua`, adds ``--user-agent`` so no target falls back to
+    it. Read it from a first launch rather than composing one, so the version
+    stays truthful. Chrome then sends only low-entropy client hints by
+    default; :func:`harden_page` restores the full set on every page, iframe
+    and worker it can reach. Headed Chrome needs neither.
+
+    This requires a full Chrome (``channel="chrome"`` or ``executable_path``).
+    Playwright's default ``headless=True`` binary is chrome-headless-shell,
+    which ignores ``--headless=new`` and brands its workers ``HeadlessChrome``.
 
     The CDP screenX/screenY compatibility patch is deliberately absent. It is
     only correct on a Chrome whose event descriptors are already wrong, which
     wafer establishes with a real-input probe at solve time; applying it
     unconditionally double-counts the window offset on a native-correct build.
+
+    Headless on macOS, the launch also describes the Mac's real main display
+    to Chrome (``--screen-info``: size, menu bar and Dock, P3 color depth;
+    ``--force-device-scale-factor``: its backing scale) and opens a window of
+    ``viewport`` plus the toolbar (``--window-size``). In a context created
+    with ``no_viewport=True`` every frame then reports exactly what headed
+    Chrome on that Mac does, natively: screen, available area, colorDepth,
+    devicePixelRatio, and an outer window the toolbar's height taller than the
+    page, so :func:`harden_page` needs no window script. ``viewport`` defaults
+    to the largest common size whose window fits the display's work area.
     """
     host = sys.platform if platform is None else platform
     args = [
@@ -1312,9 +1615,29 @@ def hardened_launch_config(
             # Chrome on macOS reports 8-bit sRGB, and WAFs like Kasada
             # cross-check CSS computed styles against screen.colorDepth.
             args.append("--force-color-profile=scrgb-linear")
+            # The Mac's backing scale for every frame. Playwright's
+            # device_scale_factor reaches only the top frame, so without this a
+            # cross-site iframe reports devicePixelRatio 1 under a top document
+            # reporting 2, and an iframe nested back on the top document's site
+            # (A->B->A) drags the top document to 1 too.
+            # The real display when running on a Mac; a default when building
+            # a macOS configuration elsewhere.
+            screen = (
+                _host_screen() if sys.platform == "darwin" else _DEFAULT_MAC_SCREEN
+            )
+            args.append(f"--force-device-scale-factor={screen.scale}")
+            # The real display, natively: without it a headless page's screen
+            # is its viewport, with no menu bar or Dock, and colorDepth is 24
+            # where headed Chrome on a P3 Mac reports 30. A context with
+            # no_viewport=True then needs no window script at all.
+            args.append(_screen_info_switch(screen))
+            width, height = viewport or _default_viewport(screen)
+            args.append(f"--window-size={width},{height + _MAC_TOOLBAR_HEIGHT}")
         # Self-guarding: the script returns immediately unless it finds the
         # macOS headless signature, so registering it off-target is inert.
         init_scripts.append(_HEADLESS_FIX_SCRIPT)
+        if user_agent:
+            args.append(f"--user-agent={scrub_headless_ua(user_agent)}")
     elif host.startswith("linux"):
         # Headful browsers run under a real window manager. Start with the
         # conventional maximized desktop state so screen, outer-window, and
@@ -1332,15 +1655,1369 @@ def scrub_headless_ua(user_agent: str) -> str:
     """Remove the ``HeadlessChrome`` token a headless build puts in its UA.
 
     Headless Chrome advertises ``HeadlessChrome/<version>`` where headed Chrome
-    says ``Chrome/<version>``. Read the real value from the launched browser
+    says ``Chrome/<version>``. Read the real value from a launched browser
     (``navigator.userAgent``) rather than composing one, so the version stays
-    truthful, then apply this and hand the result to ``new_context(user_agent=…)``.
+    truthful, then apply this and pass the result to
+    ``hardened_launch_config(user_agent=…)`` for the relaunch. Not to
+    ``new_context(user_agent=…)``: Playwright attaches its own client-hint
+    metadata to a context-level user agent.
 
     Returns the input unchanged when there is nothing to scrub.
     """
     if not user_agent:
         return user_agent
     return user_agent.replace("HeadlessChrome", "Chrome")
+
+
+# For the launch that only reads the browser's own user agent. Launched
+# without --user-agent, its background traffic carries HeadlessChrome: a
+# Chrome network-time request to clients2.google.com went out through the
+# configured proxy with that UA (measured 2026-10-06). It never needs the
+# network, so it gets none: a proxy nothing listens on, and no background
+# services.
+_OFFLINE_ARGS = [
+    "--proxy-server=http://127.0.0.1:9",
+    "--proxy-bypass-list=<-loopback>",
+    "--disable-background-networking",
+]
+
+# navigator.languages is ["en-US"] without this, where a real en-US Chrome
+# reports ["en-US", "en"].
+_ACCEPT_LANGUAGE = "en-US,en"
+
+# Child targets are attached unflattened and paused until their overrides
+# are in place. Flattened sessions cannot be addressed through Playwright's
+# CDPSession, which has no way to route a message by sessionId.
+_AUTO_ATTACH = (
+    "Target.setAutoAttach",
+    {"autoAttach": True, "waitForDebuggerOnStart": True, "flatten": False},
+)
+
+# How many levels of out-of-process iframes get hardened. Each level nests the
+# message in one more JSON string, and escaping doubles the backslashes per
+# level, so a message's size grows as 2**depth; a page nesting alternating
+# cross-site iframes would otherwise make wafer build ever larger messages.
+# Real pages rarely nest cross-site frames more than three deep. Frames below
+# the cap are left to Chrome's own identity, not paused.
+_MAX_CHILD_DEPTH = 4
+
+# How long a child is held for its overrides to be acknowledged before wafer
+# resumes it. An iframe is genuinely held until every auto-attached session
+# resumes it, so this is what puts its scripts and UA in place before its
+# document runs. (Workers are not held this way; see _SERVICE_WORKER_HOLD.)
+_SETTLE_SECONDS = 1.0
+
+# Bounds on bookkeeping a page can grow by churning frames or workers.
+_MAX_PENDING_REPLIES = 256
+_MAX_HANDLED_SHARED_WORKERS = 1024
+
+
+def _ua_override_params(user_agent: str, browser_version: str | None) -> dict:
+    """``setUserAgentOverride`` params with full client-hint metadata.
+
+    The UA override always carries ``userAgentMetadata``. A user agent set any
+    other way leaves Chrome to fill the metadata itself: chrome-headless-shell
+    then brands every request ``HeadlessChrome``, and Playwright's
+    ``new_context(user_agent=…)`` reports ``architecture: x86`` and
+    ``platformVersion: 10.15.7`` on every macOS host, Apple Silicon included.
+    Sending the override without any metadata drops ``sec-ch-ua`` entirely.
+    """
+    from wafer._fingerprint import cdp_ua_metadata
+
+    params = cdp_ua_metadata(user_agent, browser_version=browser_version)
+    params["acceptLanguage"] = _ACCEPT_LANGUAGE
+    return params
+
+
+def _color_gamut_command(headless: bool, host: str) -> list[tuple[str, dict]]:
+    # --force-color-profile=scrgb-linear already makes (color: 10) and
+    # (dynamic-range: high) match headed Chrome on macOS; color-gamut is the
+    # one media feature it leaves behind.
+    if headless and host == "darwin":
+        return [
+            (
+                "Emulation.setEmulatedMedia",
+                {"features": [{"name": "color-gamut", "value": "p3"}]},
+            )
+        ]
+    return []
+
+
+def _page_hardening_commands(
+    *,
+    headless: bool,
+    ua_params: dict | None,
+    scripts: tuple[str, ...] | list[str],
+    platform: str | None = None,
+) -> list[tuple[str, dict]]:
+    """The CDP commands that harden one page, in the order they are sent.
+
+    Shared by :func:`harden_page`, :func:`harden_page_async` and the solver, so
+    the per-page half of the recipe has one source the same way the launch half
+    does. *ua_params* comes from :func:`_ua_override_params`; ``None`` skips the
+    override.
+    """
+    host = sys.platform if platform is None else platform
+    commands: list[tuple[str, dict]] = [("Page.enable", {})]
+    commands.extend(
+        ("Page.addScriptToEvaluateOnNewDocument", {"source": source})
+        for source in scripts
+    )
+    commands.extend(_color_gamut_command(headless, host))
+    if ua_params:
+        commands.append(("Emulation.setUserAgentOverride", ua_params))
+    return commands
+
+
+def _child_target_commands(
+    target_type: str,
+    *,
+    headless: bool,
+    ua_params: dict | None,
+    scripts: tuple[str, ...] | list[str],
+    platform: str | None = None,
+    depth: int = 1,
+) -> list[tuple[str, dict]]:
+    """Commands for a target auto-attached under a hardened page.
+
+    Sent while the target is paused, before ``Runtime.runIfWaitingForDebugger``.
+    Without them a cross-site iframe takes the context-level user agent
+    (or, with none, ``HeadlessChrome``), and its screen, colorDepth and outer
+    size are its own rather than the window's. Workers inherit a frame's
+    override but get the network one only from their own session, so a
+    service worker's fetches would otherwise carry the browser default.
+
+    Shared workers never attach under a page; :func:`_harden_shared_workers`
+    sends them the worker commands from a browser session.
+
+    An iframe gets exactly the page's commands, and attaches its own children
+    in turn until *depth* reaches :data:`_MAX_CHILD_DEPTH`.
+    """
+    if target_type == "iframe":
+        commands = _page_hardening_commands(
+            headless=headless, ua_params=ua_params, scripts=scripts, platform=platform
+        )
+        if depth < _MAX_CHILD_DEPTH:
+            commands.append(_AUTO_ATTACH)
+        return commands
+    if target_type in ("worker", "service_worker"):
+        commands = []
+        if ua_params:
+            # Emulation first: it reaches the worker's own inspector, which is
+            # what its navigator.userAgentData reads, and a service or shared
+            # worker is racing it (see _harden_shared_workers).
+            commands.append(("Emulation.setUserAgentOverride", ua_params))
+            commands.append(("Network.setUserAgentOverride", ua_params))
+        return commands
+    return []
+
+
+class _TargetRouter:
+    """Addresses targets auto-attached, unflattened, under one CDP session.
+
+    A child is a path of session ids from the root session. A message to it is
+    nested in one ``Target.sendMessageToTarget`` per level; its events and
+    replies come back nested in ``Target.receivedMessageFromTarget``.
+    """
+
+    def __init__(self) -> None:
+        self._ids = itertools.count(1)
+        self._pending: dict[int, str] = {}
+        self._replied: dict[int, None] = {}
+        # Sessions that detached; nothing they were sent will be answered.
+        self.gone: dict[str, None] = {}
+        # Id of the innermost message the latest wrap() built. Read it right
+        # after wrap(), before anything that can yield to another handler.
+        self.last_id = 0
+
+    def wrap(
+        self, path: tuple[str, ...], method: str, params: dict
+    ) -> tuple[str, dict]:
+        """The root-session command that delivers *method* to *path*."""
+        message_id = next(self._ids)
+        self.last_id = message_id
+        self._pending[message_id] = method
+        # Replies from a target that went away never arrive; keep the newest.
+        while len(self._pending) > _MAX_PENDING_REPLIES:
+            del self._pending[next(iter(self._pending))]
+        message = {"id": message_id, "method": method, "params": params}
+        for session_id in reversed(path[1:]):
+            message = {
+                "id": next(self._ids),
+                "method": "Target.sendMessageToTarget",
+                "params": {"sessionId": session_id, "message": json.dumps(message)},
+            }
+        return (
+            "Target.sendMessageToTarget",
+            {"sessionId": path[0], "message": json.dumps(message)},
+        )
+
+    def answered(self, message_id: int) -> bool:
+        """Whether the reply to *message_id* (from :meth:`wrap`) has arrived.
+
+        Only a recorded reply counts: an id dropped from the pending table to
+        bound it was never answered.
+        """
+        return message_id in self._replied
+
+    def _record(self, table: dict, key) -> None:
+        table[key] = None
+        while len(table) > _MAX_PENDING_REPLIES:
+            del table[next(iter(table))]
+
+    def unwrap(self, params: dict) -> tuple[tuple[str, ...], str | None, dict]:
+        """Unnest a ``Target.receivedMessageFromTarget`` from the root session.
+
+        Returns the path of the session that emitted it and, for an event, its
+        method and params. A reply returns ``None`` for the method; a failed
+        command is logged, since nothing waits on these replies.
+        """
+        path = (params["sessionId"],)
+        message = json.loads(params["message"])
+        while message.get("method") == "Target.receivedMessageFromTarget":
+            inner = message.get("params") or {}
+            path += (inner["sessionId"],)
+            message = json.loads(inner["message"])
+        if "method" in message:
+            if message["method"] == "Target.detachedFromTarget":
+                session_id = (message.get("params") or {}).get("sessionId")
+                if session_id:
+                    self._record(self.gone, session_id)
+            return path, message["method"], message.get("params") or {}
+        method = self._pending.pop(message.get("id"), None)
+        if "id" in message:
+            self._record(self._replied, message["id"])
+        if "error" in message and method is not None:
+            logger.debug(
+                "Child target %s rejected %s: %s", path, method, message["error"]
+            )
+        return path, None, {}
+
+
+def _settle(cdp, router: "_TargetRouter", message_ids, session_id=None) -> None:
+    """Wait until every one of *message_ids* is answered, within a bound.
+
+    Each round trip on *cdp* lets Playwright deliver the replies, which come
+    back as events. Stops when *session_id* detaches, and gives up after
+    :data:`_SETTLE_SECONDS`: a target that went away never answers, and the
+    caller resumes it regardless.
+    """
+    deadline = time.monotonic() + _SETTLE_SECONDS
+    while not all(router.answered(i) for i in message_ids):
+        if session_id in router.gone:
+            return
+        if time.monotonic() >= deadline:
+            logger.debug("Child target did not acknowledge its overrides")
+            return
+        cdp.send("Browser.getVersion")
+
+
+async def _settle_async(router: "_TargetRouter", message_ids, session_id=None) -> None:
+    """:func:`_settle` for async Playwright, whose loop delivers replies."""
+    start = time.monotonic()
+    deadline = start + _SETTLE_SECONDS
+    while not all(router.answered(i) for i in message_ids):
+        if session_id in router.gone:
+            return
+        if time.monotonic() >= deadline:
+            logger.debug("Child target did not acknowledge its overrides")
+            return
+        await asyncio.sleep(0.002)
+    logger.debug(
+        "Child target acknowledged %s in %.1fms",
+        list(message_ids),
+        (time.monotonic() - start) * 1000,
+    )
+
+
+def _root_auto_attach(exclude_service_workers: bool) -> tuple[str, dict]:
+    if not exclude_service_workers:
+        return _AUTO_ATTACH
+    method, params = _AUTO_ATTACH
+    # Chrome's default filter, minus the service workers held elsewhere.
+    return method, dict(
+        params,
+        filter=[
+            {"type": "service_worker", "exclude": True},
+            {"type": "browser", "exclude": True},
+            {"type": "tab", "exclude": True},
+            {},
+        ],
+    )
+
+
+def _harden_child_targets(cdp, plan, *, exclude_service_workers=False) -> None:
+    """Auto-attach under *cdp* and apply ``plan(target_type, depth)`` to each.
+
+    Every child is resumed even when applying its commands fails: it was
+    attached paused, and a paused worker or iframe hangs the page.
+    """
+    router = _TargetRouter()
+
+    def send(path, method, params) -> int:
+        # Read the id before sending: another child's handler can run while
+        # this send waits, and would move last_id on.
+        outer = router.wrap(path, method, params)
+        message_id = router.last_id
+        cdp.send(*outer)
+        return message_id
+
+    def attached(parent, event) -> None:
+        child = parent + (event["sessionId"],)
+        logger.debug(
+            "Child target %s attached at depth %d (paused=%s)",
+            event["targetInfo"]["type"],
+            len(child),
+            event.get("waitingForDebugger"),
+        )
+        try:
+            sent = [
+                send(child, method, params)
+                for method, params in plan(event["targetInfo"]["type"], len(child))
+            ]
+            _settle(cdp, router, sent, session_id=child[-1])
+        except Exception:
+            logger.debug("Could not harden child target", exc_info=True)
+        finally:
+            try:
+                send(child, "Runtime.runIfWaitingForDebugger", {})
+            except Exception:
+                logger.debug("Could not resume child target", exc_info=True)
+
+    def received(event) -> None:
+        try:
+            path, method, params = router.unwrap(event)
+            if method == "Target.attachedToTarget":
+                attached(path, params)
+        except Exception:
+            logger.debug("Could not route child target message", exc_info=True)
+
+    cdp.on("Target.attachedToTarget", lambda event: attached((), event))
+    cdp.on("Target.receivedMessageFromTarget", received)
+    cdp.on(
+        "Target.detachedFromTarget",
+        lambda event: router._record(router.gone, event.get("sessionId")),
+    )
+    cdp.send(*_root_auto_attach(exclude_service_workers))
+
+
+async def _harden_child_targets_async(
+    cdp, plan, *, exclude_service_workers=False
+) -> None:
+    """:func:`_harden_child_targets` for an async Playwright CDP session."""
+    router = _TargetRouter()
+
+    async def send(path, method, params) -> int:
+        # Read the id before awaiting: other children's handlers run at every
+        # await and would move last_id on.
+        outer = router.wrap(path, method, params)
+        message_id = router.last_id
+        await cdp.send(*outer)
+        return message_id
+
+    async def attached(parent, event) -> None:
+        child = parent + (event["sessionId"],)
+        logger.debug(
+            "Child target %s attached at depth %d (paused=%s)",
+            event["targetInfo"]["type"],
+            len(child),
+            event.get("waitingForDebugger"),
+        )
+        try:
+            sent = []
+            for method, params in plan(event["targetInfo"]["type"], len(child)):
+                sent.append(await send(child, method, params))
+            await _settle_async(router, sent, session_id=child[-1])
+        except Exception:
+            logger.debug("Could not harden child target", exc_info=True)
+        finally:
+            try:
+                await send(child, "Runtime.runIfWaitingForDebugger", {})
+            except Exception:
+                logger.debug("Could not resume child target", exc_info=True)
+
+    async def received(event) -> None:
+        try:
+            path, method, params = router.unwrap(event)
+            if method == "Target.attachedToTarget":
+                await attached(path, params)
+        except Exception:
+            logger.debug("Could not route child target message", exc_info=True)
+
+    async def attached_root(event) -> None:
+        await attached((), event)
+
+    cdp.on("Target.attachedToTarget", attached_root)
+    cdp.on("Target.receivedMessageFromTarget", received)
+    cdp.on(
+        "Target.detachedFromTarget",
+        lambda event: router._record(router.gone, event.get("sessionId")),
+    )
+    await cdp.send(*_root_auto_attach(exclude_service_workers))
+
+
+# Service and shared workers take Chrome's default identity when they start,
+# and Patchright resumes (or, for shared workers, detaches from) every worker
+# the moment it attaches, so pausing one on start does not hold it for wafer:
+# with wafer's handler delayed 400ms, 15 of 15 service workers read the
+# launch's empty high-entropy hints. What does hold a service worker is
+# Chromium's main-script throttle, which waits for every *flattened* session
+# auto-attached under the registering page to resume it
+# (devtools_instrumentation.cc, ThrottleServiceWorkerMainScriptFetch; an
+# unflattened session never gets one). A flattened child cannot be messaged
+# through Playwright's CDPSession, so it only holds the worker while an
+# unflattened session from the browser applies the override, and detaching it
+# releases the fetch. The override queues until the worker starts and is in
+# place before its script runs: 0 of 10 wrong even with the 400ms delay.
+#
+# Shared workers have no such throttle and attach to no page, so they are
+# found through the browser session, and what holds one is its script fetch.
+# The browser session intercepts every request of type Other (worker scripts
+# are typed Other), and Chrome reports a worker script's networkId as the
+# worker's own target id, so each fetch is matched to exactly its worker and
+# held until that worker's override is sent; every other request is continued
+# at once. Chrome announces the worker before its script fetch starts, so the
+# hold is in place when the fetch pauses (measured: every attach arrived
+# before its fetch).
+#
+# A shared worker created again after it closed (same name and URL) keeps its
+# target: while wafer's session is attached, Chrome reuses the agent host,
+# announces no attach and starts the worker paused for that session
+# (shared_worker_devtools_manager.cc, pause_on_start = IsAttached()). Wafer's
+# session gets Inspector.targetReloadedAfterCrash instead and resumes it
+# there; the override survives the restart. Unresumed, the worker never ran.
+_SERVICE_WORKER_HOLD = (
+    "Target.setAutoAttach",
+    {
+        "autoAttach": True,
+        "waitForDebuggerOnStart": True,
+        "flatten": True,
+        "filter": [{"type": "service_worker", "exclude": False}, {"exclude": True}],
+    },
+)
+_SHARED_WORKER_AUTO_ATTACH = (
+    "Target.setAutoAttach",
+    {
+        "autoAttach": True,
+        "waitForDebuggerOnStart": True,
+        "flatten": True,
+        "filter": [{"type": "shared_worker", "exclude": False}, {"exclude": True}],
+    },
+)
+_SHARED_WORKER_FETCH_HOLD = (
+    "Fetch.enable",
+    {
+        "patterns": [
+            {"urlPattern": "*", "resourceType": "Other", "requestStage": "Request"}
+        ]
+    },
+)
+
+
+def _first_attach(handled: dict, target_id: str) -> bool:
+    """Record *target_id*; False when it was already handled.
+
+    Bounded, oldest first: a page can start any number of named shared
+    workers. A forgotten one that re-attaches is handled once more.
+    """
+    if target_id in handled:
+        return False
+    handled[target_id] = None
+    while len(handled) > _MAX_HANDLED_SHARED_WORKERS:
+        del handled[next(iter(handled))]
+    return True
+
+
+class _BrowserChannel:
+    """The one browser-level CDP session wafer keeps per browser.
+
+    It opens the unflattened sessions that carry service and shared workers'
+    overrides, and those sessions must stay attached for the worker's life.
+    """
+
+    def __init__(self, cdp) -> None:
+        self.cdp = cdp
+        self.router = _TargetRouter()
+        self.handled: dict[str, None] = {}
+        self.shared_workers = False
+        # Whether the shared-worker listeners are on cdp; a retry after a
+        # failed install must not add a second set.
+        self.listening = False
+        # Shared worker target id -> its paused script fetches, for as long
+        # as its override is being sent.
+        self.held: dict[str, list[str]] = {}
+        # Service worker script URL -> [overrides in flight, paused fetches].
+        # A service worker's script fetch carries no networkId, and one
+        # registered by a cross-site iframe has no main-script throttle (see
+        # _SERVICE_WORKER_HOLD), so its fetch is held by URL instead.
+        self.held_urls: dict[str, list] = {}
+
+    def received(self, event) -> tuple[str, dict] | None:
+        """Route a worker's reply or event.
+
+        For a worker restarted under one of this channel's sessions, returns
+        the command that resumes it.
+        """
+        try:
+            path, method, _ = self.router.unwrap(event)
+        except Exception:
+            logger.debug("Could not route a worker reply", exc_info=True)
+            return None
+        if method != "Inspector.targetReloadedAfterCrash" or len(path) != 1:
+            return None
+        return self.router.wrap(path, "Runtime.runIfWaitingForDebugger", {})
+
+    def paused(self, event) -> tuple[str, dict] | None:
+        """Hold a worker's script fetch, or the command continuing it."""
+        held = self.held.get(event.get("networkId"))
+        if held is None:
+            entry = self.held_urls.get((event.get("request") or {}).get("url"))
+            held = entry[1] if entry is not None else None
+        if held is not None:
+            held.append(event["requestId"])
+            return None
+        return _continue_request(event["requestId"])
+
+    def hold_url(self, url: str) -> None:
+        entry = self.held_urls.setdefault(url, [0, []])
+        entry[0] += 1
+
+    def release_url(self, url: str) -> list[str]:
+        """Drop one hold on *url*; the paused fetches once none is left."""
+        entry = self.held_urls.get(url)
+        if entry is None:
+            return []
+        entry[0] -= 1
+        if entry[0] > 0:
+            return []
+        del self.held_urls[url]
+        return entry[1]
+
+
+def _continue_request(request_id: str) -> tuple[str, dict]:
+    return "Fetch.continueRequest", {"requestId": request_id}
+
+
+def _send_quietly(cdp, command, what: str) -> None:
+    try:
+        cdp.send(*command)
+    except Exception:
+        logger.debug("Could not %s", what, exc_info=True)
+
+
+async def _send_quietly_async(cdp, command, what: str) -> None:
+    try:
+        await cdp.send(*command)
+    except Exception:
+        logger.debug("Could not %s", what, exc_info=True)
+
+
+def _browser_channel(browser) -> "_BrowserChannel | None":
+    if browser is None:
+        logger.debug(
+            "No Browser object for this context; service and shared workers "
+            "keep Chrome's default identity"
+        )
+        return None
+    channel = getattr(browser, "_wafer_channel", None)
+    if isinstance(channel, _BrowserChannel):
+        return channel
+    try:
+        cdp = browser.new_browser_cdp_session()
+    except Exception:
+        logger.warning(
+            "Could not open a browser CDP session; service and shared workers "
+            "keep Chrome's default identity",
+            exc_info=True,
+        )
+        return None
+    channel = _BrowserChannel(cdp)
+
+    def received(event) -> None:
+        resume = channel.received(event)
+        if resume is not None:
+            _send_quietly(cdp, resume, "resume a restarted worker")
+
+    cdp.on("Target.receivedMessageFromTarget", received)
+    browser._wafer_channel = channel
+    return channel
+
+
+async def _browser_channel_async(browser) -> "_BrowserChannel | None":
+    """:func:`_browser_channel` for async Playwright; one session per browser."""
+    if browser is None:
+        logger.debug(
+            "No Browser object for this context; service and shared workers "
+            "keep Chrome's default identity"
+        )
+        return None
+    channel = getattr(browser, "_wafer_channel", None)
+    if isinstance(channel, _BrowserChannel):
+        return channel
+    if isinstance(channel, asyncio.Future):
+        return await channel
+    opening = asyncio.get_running_loop().create_future()
+    browser._wafer_channel = opening
+    channel = None
+    try:
+        cdp = await browser.new_browser_cdp_session()
+        channel = _BrowserChannel(cdp)
+
+        async def received(event, channel=channel) -> None:
+            resume = channel.received(event)
+            if resume is not None:
+                await _send_quietly_async(
+                    channel.cdp, resume, "resume a restarted worker"
+                )
+
+        cdp.on("Target.receivedMessageFromTarget", received)
+    except Exception:
+        logger.warning(
+            "Could not open a browser CDP session; service and shared workers "
+            "keep Chrome's default identity",
+            exc_info=True,
+        )
+    finally:
+        # Also on cancellation: an unresolved future left cached here would
+        # make every later page on this browser wait on it forever.
+        browser._wafer_channel = channel
+        if not opening.done():
+            opening.set_result(channel)
+    return channel
+
+
+def _worker_override_messages(channel, session_id: str, ua_params: dict):
+    return [
+        channel.router.wrap((session_id,), method, params)
+        for method, params in _child_target_commands(
+            "worker", headless=True, ua_params=ua_params, scripts=()
+        )
+    ]
+
+
+def _override_worker(channel, target_id: str, ua_params: dict) -> str:
+    """Attach unflattened from the browser and send the worker override.
+
+    Returns the session, which must stay attached: it carries the override.
+    """
+    session_id = channel.cdp.send(
+        "Target.attachToTarget", {"targetId": target_id, "flatten": False}
+    )["sessionId"]
+    for message in _worker_override_messages(channel, session_id, ua_params):
+        channel.cdp.send(*message)
+    return session_id
+
+
+async def _override_worker_async(channel, target_id: str, ua_params: dict) -> str:
+    session_id = (
+        await channel.cdp.send(
+            "Target.attachToTarget", {"targetId": target_id, "flatten": False}
+        )
+    )["sessionId"]
+    for message in _worker_override_messages(channel, session_id, ua_params):
+        await channel.cdp.send(*message)
+    return session_id
+
+
+def _resume_after_override(channel, session_id: str) -> tuple[str, dict]:
+    """The command that starts a paused worker after its override.
+
+    Sent on the session that carried the override, so the worker processes
+    the override first. With the driver started under hardened_driver_env,
+    nothing else resumes a shared worker; without it, Playwright already has.
+    """
+    return channel.router.wrap((session_id,), "Runtime.runIfWaitingForDebugger", {})
+
+
+def _harden_shared_workers(browser, ua_params: dict) -> None:
+    """Give every shared worker *browser* starts the page's UA override.
+
+    Installed once per browser, with the first page's override: every shared
+    worker in the browser gets it.
+    """
+    channel = _browser_channel(browser)
+    if channel is None or channel.shared_workers:
+        return
+    channel.shared_workers = True
+    cdp = channel.cdp
+
+    def attached(event) -> None:
+        info = event["targetInfo"]
+        # The unflattened sessions this channel opens emit attach events too,
+        # for service workers and for the shared worker itself. Never detach
+        # those: that drops the override they carry (measured).
+        if info["type"] != "shared_worker" or not _first_attach(
+            channel.handled, info["targetId"]
+        ):
+            return
+        target_id = info["targetId"]
+        channel.held[target_id] = []
+        try:
+            session_id = _override_worker(channel, target_id, ua_params)
+            _send_quietly(
+                cdp,
+                _resume_after_override(channel, session_id),
+                "resume shared worker",
+            )
+        except Exception:
+            # Let a later attach of the same worker try again.
+            channel.handled.pop(target_id, None)
+            logger.debug("Could not harden shared worker", exc_info=True)
+        finally:
+            for request_id in channel.held.pop(target_id, ()):
+                _send_quietly(
+                    cdp, _continue_request(request_id), "release a worker script"
+                )
+            _send_quietly(
+                cdp,
+                ("Target.detachFromTarget", {"sessionId": event["sessionId"]}),
+                "release shared worker",
+            )
+
+    def paused(event) -> None:
+        command = channel.paused(event)
+        if command is not None:
+            _send_quietly(cdp, command, "continue a request")
+
+    if not channel.listening:
+        # Before Fetch.enable: a paused request nothing continues never loads.
+        cdp.on("Target.attachedToTarget", attached)
+        cdp.on("Fetch.requestPaused", paused)
+        channel.listening = True
+    try:
+        cdp.send(*_SHARED_WORKER_FETCH_HOLD)
+    except Exception:
+        logger.debug("Could not hold shared worker scripts", exc_info=True)
+    try:
+        cdp.send(*_SHARED_WORKER_AUTO_ATTACH)
+    except Exception:
+        channel.shared_workers = False
+        logger.warning(
+            "Could not auto-attach shared workers; they keep Chrome's default "
+            "identity",
+            exc_info=True,
+        )
+
+
+async def _harden_shared_workers_async(browser, ua_params: dict) -> None:
+    """:func:`_harden_shared_workers` for an async Playwright browser."""
+    channel = await _browser_channel_async(browser)
+    if channel is None or channel.shared_workers:
+        return
+    channel.shared_workers = True
+    cdp = channel.cdp
+
+    # Both handlers are coroutines, so their tasks start in event order: the
+    # hold is recorded before a script fetch that follows the attach pauses.
+    async def attached(event) -> None:
+        info = event["targetInfo"]
+        if info["type"] != "shared_worker" or not _first_attach(
+            channel.handled, info["targetId"]
+        ):
+            return
+        target_id = info["targetId"]
+        channel.held[target_id] = []
+        try:
+            session_id = await _override_worker_async(channel, target_id, ua_params)
+            await _send_quietly_async(
+                cdp,
+                _resume_after_override(channel, session_id),
+                "resume shared worker",
+            )
+        except Exception:
+            # Let a later attach of the same worker try again.
+            channel.handled.pop(target_id, None)
+            logger.debug("Could not harden shared worker", exc_info=True)
+        finally:
+            for request_id in channel.held.pop(target_id, ()):
+                await _send_quietly_async(
+                    cdp, _continue_request(request_id), "release a worker script"
+                )
+            await _send_quietly_async(
+                cdp,
+                ("Target.detachFromTarget", {"sessionId": event["sessionId"]}),
+                "release shared worker",
+            )
+
+    async def paused(event) -> None:
+        command = channel.paused(event)
+        if command is not None:
+            await _send_quietly_async(cdp, command, "continue a request")
+
+    if not channel.listening:
+        # Before Fetch.enable: a paused request nothing continues never loads.
+        cdp.on("Target.attachedToTarget", attached)
+        cdp.on("Fetch.requestPaused", paused)
+        channel.listening = True
+    try:
+        await cdp.send(*_SHARED_WORKER_FETCH_HOLD)
+    except Exception:
+        logger.debug("Could not hold shared worker scripts", exc_info=True)
+    try:
+        await cdp.send(*_SHARED_WORKER_AUTO_ATTACH)
+    except Exception:
+        channel.shared_workers = False
+        logger.warning(
+            "Could not auto-attach shared workers; they keep Chrome's default "
+            "identity",
+            exc_info=True,
+        )
+
+
+def _hold_service_workers(page, browser, ua_params: dict) -> bool:
+    """Hold each service worker *page* registers until its override is sent.
+
+    True when installed, so the page's own auto-attach can leave service
+    workers to it.
+    """
+    channel = _browser_channel(browser)
+    if channel is None:
+        return False
+    try:
+        holder = page.context.new_cdp_session(page)
+    except Exception:
+        logger.warning("Could not hold service workers", exc_info=True)
+        return False
+
+    def attached(event) -> None:
+        info = event["targetInfo"]
+        url = info.get("url") or ""
+        is_new = info["type"] == "service_worker" and _first_attach(
+            channel.handled, info["targetId"]
+        )
+        if is_new and url:
+            channel.hold_url(url)
+        try:
+            if is_new:
+                _override_worker(channel, info["targetId"], ua_params)
+        except Exception:
+            channel.handled.pop(info["targetId"], None)
+            logger.debug("Could not harden service worker", exc_info=True)
+        finally:
+            if is_new and url:
+                for request_id in channel.release_url(url):
+                    _send_quietly(
+                        channel.cdp,
+                        _continue_request(request_id),
+                        "release a worker script",
+                    )
+            # Detaching drops this session's hold on the script fetch.
+            try:
+                holder.send(
+                    "Target.detachFromTarget", {"sessionId": event["sessionId"]}
+                )
+            except Exception:
+                logger.debug("Could not release service worker", exc_info=True)
+
+    holder.on("Target.attachedToTarget", attached)
+    try:
+        holder.send(*_SERVICE_WORKER_HOLD)
+    except Exception:
+        logger.warning("Could not hold service workers", exc_info=True)
+        try:
+            holder.detach()
+        except Exception:
+            pass
+        return False
+    return True
+
+
+async def _hold_service_workers_async(page, browser, ua_params: dict) -> bool:
+    """:func:`_hold_service_workers` for an async Playwright page."""
+    channel = await _browser_channel_async(browser)
+    if channel is None:
+        return False
+    try:
+        holder = await page.context.new_cdp_session(page)
+    except Exception:
+        logger.warning("Could not hold service workers", exc_info=True)
+        return False
+
+    async def attached(event) -> None:
+        info = event["targetInfo"]
+        url = info.get("url") or ""
+        is_new = info["type"] == "service_worker" and _first_attach(
+            channel.handled, info["targetId"]
+        )
+        if is_new and url:
+            channel.hold_url(url)
+        try:
+            if is_new:
+                await _override_worker_async(channel, info["targetId"], ua_params)
+        except Exception:
+            channel.handled.pop(info["targetId"], None)
+            logger.debug("Could not harden service worker", exc_info=True)
+        finally:
+            if is_new and url:
+                for request_id in channel.release_url(url):
+                    await _send_quietly_async(
+                        channel.cdp,
+                        _continue_request(request_id),
+                        "release a worker script",
+                    )
+            try:
+                await holder.send(
+                    "Target.detachFromTarget", {"sessionId": event["sessionId"]}
+                )
+            except Exception:
+                logger.debug("Could not release service worker", exc_info=True)
+
+    holder.on("Target.attachedToTarget", attached)
+    try:
+        await holder.send(*_SERVICE_WORKER_HOLD)
+    except Exception:
+        logger.warning("Could not hold service workers", exc_info=True)
+        try:
+            await holder.detach()
+        except Exception:
+            pass
+        return False
+    return True
+
+
+def _page_scripts(headless: bool, viewport: tuple[int, int] | None) -> list[str]:
+    """The init scripts for a page and its iframes.
+
+    One geometry for the whole page: the iframes must report the window the
+    top document does. *viewport* ``None`` falls back to deriving it in the
+    top document alone, which leaves iframes unpatched.
+    """
+    if not headless:
+        return []
+    if viewport is None:
+        return [_HEADLESS_FIX_SCRIPT]
+    return [_headless_fix_script(_headless_geometry(*viewport))]
+
+
+def _viewport_of(size) -> tuple[int, int] | None:
+    if isinstance(size, (list, tuple)) and len(size) == 2:
+        width, height = size
+    elif isinstance(size, dict):
+        width, height = size.get("width"), size.get("height")
+    else:
+        return None
+    if isinstance(width, int) and isinstance(height, int) and width > 0 and height > 0:
+        return width, height
+    return None
+
+
+def _browser_identity(
+    version: dict, user_agent: str | None, *, headless: bool
+) -> tuple[str, str | None]:
+    """The user agent and full version to harden a page with.
+
+    *version* is CDP ``Browser.getVersion``, read from the launched browser so
+    the full version is the binary's own (a reduced UA says only ``MAJOR.0.0.0``)
+    and nothing falls back to wafer's emulation tables.
+    """
+    product = version.get("product") or ""
+    raw_ua = version.get("userAgent") or ""
+    if product.startswith("HeadlessChrome/"):
+        logger.warning(
+            "harden_page: this browser is chrome-headless-shell (%s), the old "
+            "headless build Playwright runs for headless=True when no channel or "
+            "executable_path is given. It ignores --headless=new and brands its "
+            "workers HeadlessChrome; launch a full Chrome with channel='chrome' "
+            "(or executable_path) instead.",
+            product,
+        )
+    elif headless and "HeadlessChrome" in raw_ua:
+        logger.warning(
+            "harden_page: the browser's own user agent still says "
+            "HeadlessChrome, so it was launched without "
+            "hardened_launch_config(user_agent=...). Pages and iframes are "
+            "corrected, but service workers and shared workers report "
+            "HeadlessChrome."
+        )
+    full_version = product.partition("/")[2] or None
+    ua = user_agent or scrub_headless_ua(raw_ua)
+    if not ua:
+        # Without a UA there is no override, and the page keeps whatever brand
+        # the binary reports -the exact leak this exists to close.
+        raise RuntimeError(f"Browser did not report a user agent (got {version!r})")
+    return ua, full_version
+
+
+def _install_init_script_fallback(page, scripts, cdp) -> None:
+    """Re-apply fingerprint scripts on navigation when CDP injection is inert.
+
+    ``Page.addScriptToEvaluateOnNewDocument`` has returned an identifier and
+    then never executed under some Patchright builds, silently turning every
+    script registered alongside it into a no-op. So each navigation re-applies
+    them through *cdp*'s ``Runtime.evaluate``, which runs in the document's
+    own world, where page scripts read the values.
+
+    Not ``Frame.evaluate``: Patchright runs that in an isolated world page
+    scripts cannot see, and Playwright evaluates with ``userGesture: true``,
+    which leaves ``navigator.userActivation.hasBeenActive`` true on a page
+    nobody touched.
+
+    This lands just after document-start rather than before it, so it is a
+    fallback for an injection that is otherwise doing nothing at all, not a
+    replacement for real init-time injection. When the CDP registration did
+    run, each script finds its own patch already applied. The scripts are also
+    applied once, at once, to whatever document the page already shows.
+    """
+
+    if not scripts:
+        return
+
+    def _apply() -> None:
+        # Applied independently: these patch unrelated surfaces, so one
+        # failing must not deprive the page of the others.
+        for source in scripts:
+            try:
+                cdp.send(
+                    "Runtime.evaluate", {"expression": source, "userGesture": False}
+                )
+            except Exception:
+                logger.debug("Init-script fallback failed", exc_info=True)
+
+    def _reapply(frame) -> None:
+        try:
+            if frame is not page.main_frame:
+                return
+        except Exception:
+            return
+        _apply()
+
+    page.on("framenavigated", _reapply)
+    # And the document already there: a popup is hardened only after its first
+    # document loaded, so without this that document never got the patches.
+    # On a page still at about:blank it patches nothing that will be kept.
+    _apply()
+
+
+async def _install_init_script_fallback_async(page, scripts, cdp) -> None:
+    """:func:`_install_init_script_fallback` for an async Playwright page."""
+
+    if not scripts:
+        return
+
+    async def _apply() -> None:
+        for source in scripts:
+            try:
+                await cdp.send(
+                    "Runtime.evaluate", {"expression": source, "userGesture": False}
+                )
+            except Exception:
+                logger.debug("Init-script fallback failed", exc_info=True)
+
+    async def _reapply(frame) -> None:
+        try:
+            if frame is not page.main_frame:
+                return
+        except Exception:
+            return
+        await _apply()
+
+    page.on("framenavigated", _reapply)
+    await _apply()
+
+
+# Read through CDP rather than Page.evaluate, which would mark the page as
+# user-activated (see _install_init_script_fallback).
+_WINDOW_STATE = (
+    "JSON.stringify([innerWidth, innerHeight, devicePixelRatio, outerWidth,"
+    " outerHeight, screen.width, screen.availTop, screen.colorDepth])"
+)
+
+
+def _native_window(state) -> bool:
+    """Whether *state* is the launch's real display rather than an emulation.
+
+    hardened_launch_config describes the Mac's display, menu bar included, and
+    a context without viewport emulation reports it as headed Chrome does: a
+    work area below the menu bar, an outer window the toolbar's height taller
+    than the page, a screen wider than the page. Viewport emulation reports
+    the viewport as the screen, with no menu bar.
+    """
+    try:
+        inner_w, inner_h, _, _, outer_h, screen_w, avail_top, _ = json.loads(state)
+        return avail_top > 0 and outer_h > inner_h and screen_w > inner_w
+    except (TypeError, ValueError):
+        return False
+
+
+def _check_window_state(
+    state, *, headless: bool, platform: str | None = None
+) -> tuple[int, int] | None:
+    """The viewport from *state*, warning about a scale factor no Mac has."""
+    host = sys.platform if platform is None else platform
+    try:
+        width, height, ratio = json.loads(state)[:3]
+    except (TypeError, ValueError):
+        return None
+    if headless and host == "darwin" and ratio != 2:
+        logger.warning(
+            "harden_page: devicePixelRatio is %s; pass device_scale_factor=2 to "
+            "new_context. hardened_launch_config forces 2 for every frame of a "
+            "headless macOS browser, so any other value leaves the top document "
+            "disagreeing with its iframes.",
+            ratio,
+        )
+    return _viewport_of((width, height))
+
+
+# Pages hardened here, mapped to the CDP session that hardened them, so the
+# solver can read page state without Page.evaluate (see _quiet_read).
+_PAGE_SESSIONS: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+_DOCUMENT_LENGTH = (
+    "document.documentElement ? document.documentElement.outerHTML.length : 0"
+)
+
+
+def _quiet_read(page, expression: str):
+    """Evaluate *expression* in *page*'s own world, without a user gesture.
+
+    Playwright sends every evaluation with ``userGesture: true``, which marks
+    the frame and its ancestors user-activated: a solver reading page state
+    left ``navigator.userActivation.hasBeenActive`` true on a page nobody had
+    touched. Patchright also evaluates in an isolated world, which reads the
+    window without the page's fingerprint patches. *expression* is a plain
+    expression, not a function. A page this module did not harden falls back
+    to ``page.evaluate``.
+    """
+    try:
+        cdp = _PAGE_SESSIONS.get(page)
+    except TypeError:
+        cdp = None
+    if cdp is None:
+        return page.evaluate(expression)
+    reply = cdp.send(
+        "Runtime.evaluate",
+        {
+            "expression": expression,
+            "returnByValue": True,
+            "awaitPromise": True,
+            "userGesture": False,
+        },
+    )
+    if reply.get("exceptionDetails"):
+        raise RuntimeError(
+            f"Page read failed: {reply['exceptionDetails'].get('text')}"
+        )
+    return (reply.get("result") or {}).get("value")
+
+
+def _harden_popups(page, harden) -> None:
+    """Run *harden* on every popup *page* opens.
+
+    Patchright resumes a new tab itself, before this can reach it. Its first
+    document still starts right when the driver runs under
+    hardened_driver_env: the preload sends the override harden_page
+    published right before that resume, and on macOS headless the launch's
+    native display needs no script. Hardening the popup as it appears adds
+    the rest (iframes, workers) for it and every later navigation.
+    """
+
+    def on_popup(popup) -> None:
+        try:
+            harden(popup)
+        except Exception:
+            logger.debug("Could not harden popup", exc_info=True)
+
+    page.on("popup", on_popup)
+
+
+def _harden_popups_async(page, harden) -> None:
+    """:func:`_harden_popups` for an async Playwright page."""
+
+    async def on_popup(popup) -> None:
+        try:
+            await harden(popup)
+        except Exception:
+            logger.debug("Could not harden popup", exc_info=True)
+
+    page.on("popup", on_popup)
+
+
+def _apply_page_hardening(
+    page, cdp, *, headless, ua_params, scripts, browser=None
+) -> None:
+    """Harden *page* and everything it starts, given its scripts and UA.
+
+    The part :func:`harden_page` and the solver share once each has settled
+    which scripts and which user agent the page gets. In headless mode,
+    *browser* (``None`` when the context has no Browser object) also carries
+    the service- and shared-worker overrides.
+    """
+    for method, params in _page_hardening_commands(
+        headless=headless, ua_params=ua_params, scripts=scripts
+    ):
+        cdp.send(method, params)
+    held = False
+    if headless and ua_params:
+        held = _hold_service_workers(page, browser, ua_params)
+        _harden_shared_workers(browser, ua_params)
+    _harden_child_targets(
+        cdp,
+        lambda target_type, depth: _child_target_commands(
+            target_type,
+            headless=headless,
+            ua_params=ua_params,
+            scripts=scripts,
+            depth=depth,
+        ),
+        exclude_service_workers=held,
+    )
+    _install_init_script_fallback(page, scripts, cdp)
+    try:
+        _PAGE_SESSIONS[page] = cdp
+    except TypeError:
+        pass
+
+
+async def _apply_page_hardening_async(
+    page, cdp, *, headless, ua_params, scripts, browser=None
+) -> None:
+    """:func:`_apply_page_hardening` for an async Playwright page."""
+    for method, params in _page_hardening_commands(
+        headless=headless, ua_params=ua_params, scripts=scripts
+    ):
+        await cdp.send(method, params)
+    held = False
+    if headless and ua_params:
+        held = await _hold_service_workers_async(page, browser, ua_params)
+        await _harden_shared_workers_async(browser, ua_params)
+    await _harden_child_targets_async(
+        cdp,
+        lambda target_type, depth: _child_target_commands(
+            target_type,
+            headless=headless,
+            ua_params=ua_params,
+            scripts=scripts,
+            depth=depth,
+        ),
+        exclude_service_workers=held,
+    )
+    await _install_init_script_fallback_async(page, scripts, cdp)
+
+
+def harden_page(page, *, headless: bool, user_agent: str | None = None) -> None:
+    """Apply the per-page half of wafer's browser hardening.
+
+    :func:`hardened_launch_config` covers what is fixed at launch. This covers
+    what Chrome only accepts per target, through CDP, for the page and for
+    every iframe and worker it starts:
+
+    - the user agent with full client-hint metadata, so ``sec-ch-ua``,
+      ``sec-ch-ua-full-version-list`` and ``navigator.userAgentData`` agree
+      with it in every frame and worker;
+    - ``navigator.languages``;
+    - in headless mode on macOS, the window and screen patch with one
+      geometry for the page and all its iframes, and ``color-gamut``.
+
+    This is the same per-page setup :class:`BrowserSolver` applies.
+
+    Call it on a new page before its first navigation, with the same
+    ``headless`` the browser was launched with, and do not pass
+    ``user_agent=`` to ``new_context``: Playwright attaches its own client-hint
+    metadata to a context-level user agent, and cross-site iframes then report
+    ``architecture: x86`` and ``platformVersion: 10.15.7`` regardless of the
+    host. ``user_agent`` here defaults to the browser's own, scrubbed of
+    ``HeadlessChrome``; pass it only to send a different Chrome user agent.
+
+    Calling it again on the same page does nothing. The CDP session it opens
+    stays attached for the page's lifetime; detaching it would unregister the
+    scripts and release the iframes and workers it holds. Pages created
+    separately (``new_page``) need their own call. The window geometry is taken
+    from the viewport at this call.
+
+    A popup this page opens is hardened as soon as it appears. With the
+    driver started under :func:`hardened_driver_env`, its first document
+    already starts with this page's user-agent override (the preload sends it
+    before Patchright resumes the new tab); without it, that document's
+    earliest scripts read the launch's empty high-entropy client hints.
+
+    New iframes and workers are held paused until their overrides are in, and
+    with the sync API only your thread's Playwright calls deliver the events
+    that release them: wait with ``page.wait_for_timeout``, never
+    ``time.sleep``, while the page is live.
+
+    In headless mode it also holds each service worker the page or any of its
+    iframes registers until its override is in place (Chromium's main-script
+    throttle through a second page session, and a script-fetch hold for one
+    a cross-site iframe registers), and opens one browser-level CDP session
+    per browser for the service- and shared-worker overrides. Shared workers
+    are held only when the driver runs under :func:`hardened_driver_env`;
+    otherwise one that reads its high-entropy client hints within its first
+    milliseconds can still see them empty.
+
+    Requires a full Chrome, and in headless mode the launch must carry
+    ``hardened_launch_config(user_agent=...)``: service and shared workers read
+    their ``navigator.userAgent`` from the browser default before any session
+    can change it. Without it both report ``HeadlessChrome``, and this logs a
+    warning.
+    """
+    if getattr(page, "_wafer_hardened", False) is True:
+        return
+    cdp = page.context.new_cdp_session(page)
+    version = cdp.send("Browser.getVersion")
+    ua, full_version = _browser_identity(version, user_agent, headless=headless)
+    state = cdp.send(
+        "Runtime.evaluate", {"expression": _WINDOW_STATE, "returnByValue": True}
+    )
+    value = state.get("result", {}).get("value")
+    measured = _check_window_state(value, headless=headless)
+    viewport = _viewport_of(page.viewport_size) or measured
+    # The launch's real display needs no window script (_native_window).
+    scripts = (
+        [] if headless and _native_window(value) else _page_scripts(headless, viewport)
+    )
+    ua_params = _ua_override_params(ua, full_version)
+    # The pages the driver sets up itself, popups included, start with it too.
+    _publish_ua_override((version or {}).get("userAgent"), ua_params)
+    _apply_page_hardening(
+        page,
+        cdp,
+        headless=headless,
+        ua_params=ua_params,
+        scripts=scripts,
+        browser=page.context.browser,
+    )
+    _harden_popups(
+        page, lambda popup: harden_page(popup, headless=headless, user_agent=user_agent)
+    )
+    page._wafer_hardened = True
+
+
+async def harden_page_async(
+    page, *, headless: bool, user_agent: str | None = None
+) -> None:
+    """:func:`harden_page` for an async Playwright page."""
+    if getattr(page, "_wafer_hardened", False) is True:
+        return
+    cdp = await page.context.new_cdp_session(page)
+    version = await cdp.send("Browser.getVersion")
+    ua, full_version = _browser_identity(version, user_agent, headless=headless)
+    state = await cdp.send(
+        "Runtime.evaluate", {"expression": _WINDOW_STATE, "returnByValue": True}
+    )
+    value = state.get("result", {}).get("value")
+    measured = _check_window_state(value, headless=headless)
+    viewport = _viewport_of(page.viewport_size) or measured
+    # The launch's real display needs no window script (_native_window).
+    scripts = (
+        [] if headless and _native_window(value) else _page_scripts(headless, viewport)
+    )
+    ua_params = _ua_override_params(ua, full_version)
+    _publish_ua_override((version or {}).get("userAgent"), ua_params)
+    await _apply_page_hardening_async(
+        page,
+        cdp,
+        headless=headless,
+        ua_params=ua_params,
+        scripts=scripts,
+        browser=page.context.browser,
+    )
+    _harden_popups_async(
+        page,
+        lambda popup: harden_page_async(
+            popup, headless=headless, user_agent=user_agent
+        ),
+    )
+    page._wafer_hardened = True
 
 
 @dataclass
@@ -1407,6 +3084,56 @@ class InterceptResult:
     user_agent: str
 
 
+def _current_document(document_responses: list, navigation_response):
+    """The response the page's current document came from.
+
+    The last main-frame document response recorded, else the goto() response
+    when none was recorded (a cached or synthetic document).
+    """
+    return document_responses[-1] if document_responses else navigation_response
+
+
+def _response_status(response) -> int:
+    if response is None:
+        return 200
+    try:
+        return int(response.status)
+    except (TypeError, ValueError):
+        return 200
+
+
+
+def _render_budget(
+    start: float, timeout: float, challenge_budget: float | None
+) -> dict:
+    """The deadline a render shares with its worker, and how far it may move."""
+    deadline = start + timeout
+    challenge_deadline = None
+    if challenge_budget is not None and challenge_budget > timeout:
+        challenge_deadline = start + challenge_budget
+    return {"deadline": deadline, "challenge_deadline": challenge_deadline}
+
+
+def _extend_render_budget(
+    budget: dict | None, challenge_value: str, deadline: float
+) -> float:
+    """Move a render's deadline for a slow in-place challenge, if allowed."""
+    if (
+        budget is None
+        or challenge_value not in _SLOW_INPLACE_CHALLENGES
+        or budget.get("challenge_deadline") is None
+        or budget["challenge_deadline"] <= deadline
+    ):
+        return deadline
+    extended = budget["challenge_deadline"]
+    budget["deadline"] = extended
+    logger.info(
+        "Render landed on a %s challenge; its budget runs %.0fs more",
+        challenge_value,
+        extended - time.monotonic(),
+    )
+    return extended
+
 class BrowserSolver:
     """Solves WAF challenges using a real Chrome browser via patchright.
 
@@ -1436,6 +3163,9 @@ class BrowserSolver:
                 "Install it with: pip install wafer-py[browser]"
             ) from None
         self._headless = headless
+        # One window size for this solver's headless macOS browser, as a real
+        # user keeps one; chosen on the first launch (see _solver_viewport).
+        self._viewport: tuple[int, int] | None = None
         self._idle_timeout = idle_timeout
         self._solve_timeout = solve_timeout
         self._playwright = None
@@ -1704,104 +3434,155 @@ class BrowserSolver:
         if deadline is not None and time.monotonic() >= deadline:
             raise TimeoutError("Browser startup exceeded solve timeout")
 
-        # Single source of truth, shared with callers driving their own
-        # Playwright: see hardened_launch_config for why it is exported.
-        launch_config = hardened_launch_config(
-            headless=self._headless,
-            proxied=bool(self._proxy_server or self._egress_guard_proxy),
-        )
-        launch_args = list(launch_config.args)
-        ignored = list(launch_config.ignore_default_args)
+        proxied = bool(self._proxy_server or self._egress_guard_proxy)
 
         try:
             logger.debug("Starting playwright driver...")
-            self._playwright = sync_playwright().start()
+            with hardened_driver_env():
+                self._playwright = sync_playwright().start()
             if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError("Playwright startup exceeded solve timeout")
-            logger.debug("Launching Chrome (headless=%s)...", self._headless)
-            launch_timeout = 30000
-            if deadline is not None:
-                launch_timeout = min(
-                    launch_timeout,
-                    max(1, int((deadline - time.monotonic()) * 1000)),
+            if self._headless and self._browser_ua is None:
+                # The scrubbed UA has to be on the command line (see
+                # hardened_launch_config), so read the real one from a first
+                # launch. An idle relaunch keeps the UA it already has.
+                self._launch_chromium(
+                    hardened_launch_config(
+                        headless=True,
+                        proxied=proxied,
+                        viewport=self._solver_viewport(),
+                    ),
+                    deadline,
+                    offline=True,
                 )
-            launch_kwargs = {
-                # ``channel='chrome'`` may resolve a different local binary
-                # than the one validated above.  Pin the executable directly.
-                "executable_path": self._browser_executable(),
-                "headless": self._headless,
-                "args": launch_args,
-                "ignore_default_args": ignored,
-                "timeout": launch_timeout,
-            }
-            browser_proxy = self._egress_guard_proxy or self._proxy_server
-            if browser_proxy:
-                launch_kwargs["proxy"] = _playwright_proxy(browser_proxy)
-            self._browser = self._playwright.chromium.launch(**launch_kwargs)
-            self._browser.on(
-                "disconnected",
-                lambda *_args: self._runtime_ready.clear(),
+                self._browser_ua = scrub_headless_ua(self._read_browser_ua())
+                self._browser.close()
+                self._browser = None
+            # Single source of truth, shared with callers driving their own
+            # Playwright: see hardened_launch_config for why it is exported.
+            self._launch_chromium(
+                hardened_launch_config(
+                    headless=self._headless,
+                    proxied=proxied,
+                    user_agent=self._browser_ua if self._headless else None,
+                    viewport=self._solver_viewport(),
+                ),
+                deadline,
             )
-            if deadline is not None and time.monotonic() >= deadline:
-                raise TimeoutError("Browser launch exceeded solve timeout")
         except Exception:
             self._close_browser(preserve_identity=True)
             raise
 
-        launched_version = self._browser.version
-        expected_version = self._expected_browser_version()
-        if launched_version != expected_version:
-            # Same contract as _ensure_browser_installed: the launched browser
-            # is authoritative for solve paths whose browser-bound state must
-            # replay through wafer. Refusing to run would strand every solver
-            # behind a routine Chrome update.
-            logger.warning(
-                "Launched Chrome %s differs from wafer's default emulation "
-                "Chrome %s; browser-bound solve paths will align transport "
-                "identity to the launched browser",
-                launched_version,
-                expected_version,
-            )
-
-        # Capture the real Chrome full version (e.g. "145.0.7632.117")
-        # for CDP metadata.  The UA string is reduced to MAJOR.0.0.0
-        # so we can't extract the full version from there.
-        # Keep one configured envelope across an idle/disconnect relaunch.
-        # Existing HTTP sessions may already be pinned to it; republishing a
-        # newly installed Chrome version would split that identity mid-session.
-        if self._browser_version is None:
-            self._browser_version = launched_version
-
-        # Headless Chrome exposes "HeadlessChrome" in the UA string,
-        # which WAF fingerprinting (Kasada, DataDome, etc.) detects
-        # instantly.  Probe the real UA and patch it so every context
-        # we create uses the corrected value.
-        if self._headless:
-            probe = self._browser.new_page()
-            try:
-                raw_ua = probe.evaluate("navigator.userAgent")
-            finally:
-                # Without this the page leaks whenever evaluate() raises, and
-                # the half-initialised browser is then handed to callers.
-                try:
-                    probe.close()
-                except Exception:
-                    logger.debug("Could not close UA probe page", exc_info=True)
-            if not isinstance(raw_ua, str) or not raw_ua:
-                # Fail loudly. Leaving _browser_ua unset makes _create_context
-                # skip the override, and the browser then leaks
-                # "HeadlessChrome" on every request -a silent degradation of
-                # the exact property this probe exists to protect.
-                raise RuntimeError(
-                    f"Browser did not report a user agent (got {raw_ua!r})"
+        try:
+            launched_version = self._browser.version
+            expected_version = self._expected_browser_version()
+            if launched_version != expected_version:
+                # Same contract as _ensure_browser_installed: the launched
+                # browser is authoritative for solve paths whose browser-bound
+                # state must replay through wafer. Refusing to run would strand
+                # every solver behind a routine Chrome update.
+                logger.warning(
+                    "Launched Chrome %s differs from wafer's default emulation "
+                    "Chrome %s; browser-bound solve paths will align transport "
+                    "identity to the launched browser",
+                    launched_version,
+                    expected_version,
                 )
-            self._browser_ua = scrub_headless_ua(raw_ua)
+
+            # Capture the real Chrome full version (e.g. "145.0.7632.117")
+            # for CDP metadata.  The UA string is reduced to MAJOR.0.0.0
+            # so we can't extract the full version from there.
+            # Keep one configured envelope across an idle/disconnect relaunch.
+            # Existing HTTP sessions may already be pinned to it; republishing
+            # a newly installed Chrome version would split that identity
+            # mid-session.
+            if self._browser_version is None:
+                self._browser_version = launched_version
+
+            if self._headless:
+                # The relaunch must report exactly the UA it was given.
+                # Anything else means the switch did not take, and every target
+                # the page overrides cannot reach would announce
+                # "HeadlessChrome".
+                reported = self._read_browser_ua()
+                if reported != self._browser_ua or "HeadlessChrome" in reported:
+                    raise RuntimeError(
+                        f"Headless Chrome reported {reported!r} after launching "
+                        f"with --user-agent={self._browser_ua!r}"
+                    )
+        except Exception:
+            # A browser that failed these checks must not survive to the next
+            # call, which would find it connected and skip them.
+            self._close_browser(preserve_identity=True)
+            raise
 
         self._publish_browser_identity()
         self._runtime_ready.set()
 
         self._last_used = time.monotonic()
         logger.info("Browser launched (headless=%s)", self._headless)
+
+    def _launch_chromium(
+        self, launch_config: HardenedLaunch, deadline, *, offline: bool = False
+    ) -> None:
+        """Launch the pinned Chrome with *launch_config* into ``_browser``.
+
+        *offline* cuts the browser off the network entirely, for a launch that
+        only reads the browser's own user agent (see :data:`_OFFLINE_ARGS`).
+        """
+        logger.debug("Launching Chrome (headless=%s)...", self._headless)
+        launch_timeout = 30000
+        if deadline is not None:
+            launch_timeout = min(
+                launch_timeout,
+                max(1, int((deadline - time.monotonic()) * 1000)),
+            )
+        launch_kwargs = {
+            # ``channel='chrome'`` may resolve a different local binary
+            # than the one validated above.  Pin the executable directly.
+            "executable_path": self._browser_executable(),
+            "headless": self._headless,
+            "args": list(launch_config.args) + (_OFFLINE_ARGS if offline else []),
+            "ignore_default_args": list(launch_config.ignore_default_args),
+            "timeout": launch_timeout,
+        }
+        browser_proxy = self._egress_guard_proxy or self._proxy_server
+        if browser_proxy and not offline:
+            launch_kwargs["proxy"] = _playwright_proxy(browser_proxy)
+        browser = self._playwright.chromium.launch(**launch_kwargs)
+        self._browser = browser
+
+        def _disconnected(*_args) -> None:
+            # The UA probe's browser disconnecting late must not mark the
+            # relaunched one unready.
+            if self._browser is browser:
+                self._runtime_ready.clear()
+
+        browser.on("disconnected", _disconnected)
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError("Browser launch exceeded solve timeout")
+
+    def _read_browser_ua(self) -> str:
+        """The launched browser's own ``navigator.userAgent``, from about:blank."""
+        probe = self._browser.new_page()
+        try:
+            raw_ua = probe.evaluate("navigator.userAgent")
+        finally:
+            # Without this the page leaks whenever evaluate() raises, and
+            # the half-initialised browser is then handed to callers.
+            try:
+                probe.close()
+            except Exception:
+                logger.debug("Could not close UA probe page", exc_info=True)
+        if not isinstance(raw_ua, str) or not raw_ua:
+            # Fail loudly. Without a UA there is nothing to put on the
+            # command line, and the browser then leaks "HeadlessChrome" on
+            # every request -a silent degradation of the exact property this
+            # probe exists to protect.
+            raise RuntimeError(
+                f"Browser did not report a user agent (got {raw_ua!r})"
+            )
+        return raw_ua
 
     def _capture_preflight_identity(self) -> None:
         """Capture headed Chrome's reduced UA without navigating anywhere."""
@@ -1919,6 +3700,7 @@ class BrowserSolver:
     def _close_browser(self, *, preserve_identity: bool = False) -> None:
         """Shut down browser and playwright."""
         self._runtime_ready.clear()
+        unbind_page()
         if self._browser:
             try:
                 self._browser.close()
@@ -1936,10 +3718,27 @@ class BrowserSolver:
             self._browser_version = None
             self._clear_browser_identity()
 
+    def _solver_viewport(self) -> tuple[int, int] | None:
+        """The headless macOS page size: one per solver, fitting the display."""
+        if not self._headless or sys.platform != "darwin":
+            return None
+        if self._viewport is None:
+            screen = _host_screen()
+            self._viewport = random.choice(
+                _fitting_viewports(screen) or [_default_viewport(screen)]
+            )
+        return self._viewport
+
     def _create_context(self):
         """Create a new browser context with realistic settings."""
         kwargs: dict = {}
-        if self._headless:
+        if self._headless and sys.platform == "darwin":
+            # The launch sized the window and described the real display
+            # (hardened_launch_config), so the browser's own geometry is
+            # headed Chrome's: no viewport emulation, which would replace the
+            # screen with the viewport and drop the menu bar and Dock.
+            kwargs["no_viewport"] = True
+        elif self._headless:
             # Headless has no real window, so we must set a viewport
             # and DPR explicitly.
             viewport = random.choice(_VIEWPORTS)
@@ -1958,10 +3757,12 @@ class BrowserSolver:
             # real browser and detected by DataDome.  The real
             # display's DPR is already correct.
             kwargs["no_viewport"] = True
-        # Inject corrected UA so headless contexts don't leak
-        # "HeadlessChrome" to WAF fingerprinters.
-        if self._browser_ua:
-            kwargs["user_agent"] = self._browser_ua
+        # No context-level user_agent. The headless launch carries the
+        # scrubbed UA as --user-agent, and _setup_headless_patches overrides
+        # it with full client-hint metadata on every page, iframe and worker.
+        # A context-level one only adds Playwright's own metadata, which
+        # reports architecture x86 and platformVersion 10.15.7 in every
+        # cross-site iframe whatever the host.
         return self._browser.new_context(**kwargs)
 
     @staticmethod
@@ -1971,10 +3772,7 @@ class BrowserSolver:
         try:
             if max_size is None:
                 return page.content()
-            char_length = page.evaluate(
-                "() => document.documentElement"
-                " ? document.documentElement.outerHTML.length : 0"
-            )
+            char_length = _quiet_read(page, _DOCUMENT_LENGTH)
             if not isinstance(char_length, (int, float)):
                 return ""
             if char_length <= 0 or char_length > max_size:
@@ -2116,39 +3914,9 @@ class BrowserSolver:
         cdp.on("Network.dataReceived", data_received)
         return state
 
-    def _install_init_script_fallback(self, page, scripts: list) -> None:
-        """Re-apply fingerprint scripts on navigation when CDP injection is inert.
-
-        ``Page.addScriptToEvaluateOnNewDocument`` returns an identifier and
-        then never executes under Patchright, silently turning every script
-        registered alongside it into a no-op. ``Frame.evaluate`` does work, so
-        re-apply there on each navigation.
-
-        This lands just after document-start rather than before it, so it is a
-        fallback for an injection that is otherwise doing nothing at all, not
-        a replacement for real init-time injection. One navigation is one
-        fresh document, so each script is applied exactly once per document
-        and needs no idempotency check.
-        """
-
-        if not scripts:
-            return
-
-        def _reapply(frame) -> None:
-            try:
-                if frame is not page.main_frame:
-                    return
-            except Exception:
-                return
-            # Applied independently: these patch unrelated surfaces, so one
-            # failing must not deprive the page of the others.
-            for source in scripts:
-                try:
-                    frame.evaluate(source)
-                except Exception:
-                    logger.debug("Init-script fallback failed", exc_info=True)
-
-        page.on("framenavigated", _reapply)
+    def _install_init_script_fallback(self, page, scripts: list, cdp) -> None:
+        """See :func:`_install_init_script_fallback`."""
+        _install_init_script_fallback(page, scripts, cdp)
 
     def _verify_headless_patches(self, page) -> None:
         """Warn when the registered init scripts did not actually run.
@@ -2165,9 +3933,15 @@ class BrowserSolver:
         if not self._headless or getattr(page, "_wafer_patch_checked", False):
             return
         page._wafer_patch_checked = True  # type: ignore[attr-defined]
+        # Kasada and Akamai pages get no window patch on purpose (see
+        # _setup_headless_patches), so their colorDepth 24 is no failure to
+        # report. Logged as one, it sent a chewy.com Akamai solve's debugging
+        # after an init script that was never registered (2026-10-06).
+        if getattr(page, "_wafer_window_patch", True) is False:
+            return
         try:
-            state = page.evaluate(
-                "() => [window.outerWidth, window.innerWidth, screen.colorDepth]"
+            state = _quiet_read(
+                page, "[window.outerWidth, window.innerWidth, screen.colorDepth]"
             )
             outer, inner, depth = state
         except Exception:
@@ -2192,21 +3966,29 @@ class BrowserSolver:
     ) -> None:
         """Register fingerprint patches via CDP.
 
-        Must be called after page creation but before navigation.
+        Must be called after page creation but before navigation. The commands
+        come from :func:`_page_hardening_commands`, the same source
+        :func:`harden_page` uses; only the script set is the solver's own.
 
         **All modes** (headed + headless):
-        - Fixes ``navigator.languages`` to ``["en-US", "en"]`` via
-          CDP ``Emulation.setUserAgentOverride`` with ``acceptLanguage``.
-        - Injects screenX/screenY fix for CDP mouse event bug
-          (Chromium #40280325) via ``Page.addScriptToEvaluateOnNewDocument``.
+        - ``Emulation.setUserAgentOverride`` with ``userAgentMetadata`` and
+          ``acceptLanguage``, so ``sec-ch-ua``, ``navigator.userAgentData``
+          and ``navigator.languages`` agree with the user agent.
+        - The screenX/screenY fix for the CDP mouse event bug
+          (Chromium #40280325), when the real-input probe proved it.
 
         **Headless only** (additional):
-        - Injects headless fingerprint fix script (colorDepth, outerWidth,
-          outerHeight, screenY patches for macOS).  Skipped for Kasada
-          because the Function.prototype.toString wrapper is detected
-          by ips.js; scrgb-linear alone suffices for Kasada.
-        - Fixes ``navigator.userAgentData`` via CDP ``userAgentMetadata``
-          so the JS ``NavigatorUAData`` API matches the corrected UA.
+        - The headless fingerprint fix script (colorDepth, outerWidth,
+          outerHeight, screenY patches for macOS), with one geometry for the
+          page and its iframes, only when the page does not already report
+          the launch's real display (``_native_window``; a ``no_viewport``
+          macOS context does, natively). Also skipped for Kasada and Akamai,
+          whose challenge JS detects its Function.prototype.toString wrapper.
+        - ``color-gamut: p3`` on macOS.
+
+        Every iframe and worker the page starts is attached paused and given
+        the same scripts and user-agent override before it runs; see
+        :func:`_child_target_commands`.
         """
         # Guard against double registration (each call creates a new
         # CDP session and re-registers the init script).
@@ -2214,105 +3996,74 @@ class BrowserSolver:
             return
         page._wafer_headless_patched = True  # type: ignore[attr-defined]
         cdp = page.context.new_cdp_session(page)
-        cdp.send("Page.enable")
 
-        # Mirrored below into _install_init_script_fallback: the CDP
-        # registration can be accepted and never executed, so the same set has
-        # to be re-applied on navigation. Kasada/Akamai stay excluded there
-        # too, for the same toString-detection reason as the headless block.
-        fallback_scripts = []
+        # Registered through CDP and re-applied on navigation by
+        # _install_init_script_fallback, since the CDP registration can be
+        # accepted and never executed.
+        scripts = []
 
         # Native-correct Chrome keeps its original event descriptors. Only a
         # real-input probe can authorize the compatibility replacement.
         if self._needs_screenxy_patch:
-            cdp.send(
-                "Page.addScriptToEvaluateOnNewDocument",
-                {
-                    "source": _SCREENXY_FIX_SCRIPT,
-                },
+            scripts.append(_SCREENXY_FIX_SCRIPT)
+
+        # Kasada's ips.js and Akamai's behavioral challenge JS detect the
+        # Function.prototype.toString wrapper in _HEADLESS_FIX_SCRIPT. Kasada
+        # withholds x-kpsdk-r; Akamai behavioral refuses to set session
+        # cookies. scrgb-linear alone handles the CSS cross-checks.
+        # A page already showing the launch's real display needs no window
+        # script, and then Kasada and Akamai pages get the same fidelity as
+        # any other instead of going without.
+        native = False
+        if self._headless:
+            try:
+                state = cdp.send(
+                    "Runtime.evaluate",
+                    {"expression": _WINDOW_STATE, "returnByValue": True},
+                )
+                native = _native_window(state.get("result", {}).get("value"))
+            except Exception:
+                logger.debug("Could not read the window state", exc_info=True)
+        window_patch = (
+            self._headless
+            and not native
+            and challenge_type not in ("kasada", "akamai")
+        )
+        page._wafer_window_patch = window_patch  # type: ignore[attr-defined]
+        page._wafer_native_window = native  # type: ignore[attr-defined]
+        if window_patch:
+            scripts.extend(
+                _page_scripts(True, _viewport_of(page.viewport_size))
             )
-            fallback_scripts.append(_SCREENXY_FIX_SCRIPT)
 
         if self._headless:
-            # Kasada's ips.js and Akamai's behavioral challenge JS
-            # detect the Function.prototype.toString wrapper in
-            # _HEADLESS_FIX_SCRIPT.  Kasada withholds x-kpsdk-r;
-            # Akamai behavioral refuses to set session cookies.
-            # scrgb-linear alone handles the CSS cross-checks.
-            if challenge_type not in ("kasada", "akamai"):
-                cdp.send(
-                    "Page.addScriptToEvaluateOnNewDocument",
-                    {
-                        "source": _HEADLESS_FIX_SCRIPT,
-                    },
-                )
-                fallback_scripts.append(_HEADLESS_FIX_SCRIPT)
-
-            # On macOS, --force-color-profile=scrgb-linear already
-            # makes (color: 10), (dynamic-range: high), and
-            # (color-gamut: p3) match headed Chrome.  The only
-            # remaining gap is color-gamut on non-macOS headless,
-            # which CDP Emulation.setEmulatedMedia can patch.
-            if sys.platform == "darwin":
-                cdp.send(
-                    "Emulation.setEmulatedMedia",
-                    {
-                        "features": [
-                            {"name": "color-gamut", "value": "p3"},
-                        ],
-                    },
-                )
-
-            # Fix navigator.userAgentData + languages.
-            ua = self._browser_ua or ""
-            if ua:
-                self._apply_ua_metadata(
-                    cdp,
-                    ua,
-                    self._browser_version,
-                )
+            ua = self._browser_ua
+            if not ua:
+                # _ensure_browser sets it before any headless page exists.
+                # Without it there is no override, and every frame and worker
+                # would keep the launch's low-entropy client hints.
+                raise RuntimeError("Headless solver page has no user agent")
         else:
-            # Headed: fix navigator.languages AND provide
-            # userAgentMetadata.  Without metadata, the CDP
-            # setUserAgentOverride call strips sec-ch-ua HTTP
-            # headers entirely — a strong WAF detection signal.
             ua = self._browser_ua or page.evaluate("navigator.userAgent")
-            self._apply_ua_metadata(
-                cdp,
-                ua,
-                self._browser_version,
-            )
+        ua_params = _ua_override_params(ua, self._browser_version) if ua else None
+        # The pages the driver sets up itself, popups included, start with it.
+        _publish_ua_override(ua, ua_params)
 
         # Do NOT detach the CDP session - that removes registered
         # scripts.  GC-safe: Playwright's channel registry keeps it
         # alive for the page's lifetime.
-
-        self._install_init_script_fallback(page, fallback_scripts)
-
-
-    @staticmethod
-    def _apply_ua_metadata(
-        cdp,
-        ua: str,
-        browser_version: str | None = None,
-    ) -> None:
-        """Set CDP userAgentMetadata so navigator.userAgentData matches.
-
-        Delegates to ``wafer._fingerprint.cdp_ua_metadata`` which
-        reuses the same arch, bitness, platform version, and brand
-        algorithms used for HTTP sec-ch-ua headers.  Also sets
-        ``acceptLanguage`` so ``navigator.languages`` returns
-        ``["en-US", "en"]`` instead of the default ``["en-US"]``.
-
-        *browser_version* is the real full version from ``browser.version``
-        (e.g. ``"145.0.7632.117"``).  The UA string is reduced to
-        ``MAJOR.0.0.0`` so the full version can't be extracted from it.
-        """
-        from wafer._fingerprint import cdp_ua_metadata
-
-        params = cdp_ua_metadata(ua, browser_version=browser_version)
-        params["acceptLanguage"] = "en-US,en"
-        cdp.send("Emulation.setUserAgentOverride", params)
+        _apply_page_hardening(
+            page,
+            cdp,
+            headless=self._headless,
+            ua_params=ua_params,
+            scripts=scripts,
+            browser=self._browser,
+        )
+        _harden_popups(page, self._setup_headless_patches)
+        # Its iframes and workers are now attached paused and released by
+        # this thread's CDP events; solver sleeps deliver them through idle().
+        bind_page(page)
 
     # ------------------------------------------------------------------
     # Recording loader
@@ -2537,7 +4288,7 @@ class BrowserSolver:
             elapsed = time.monotonic() - t0
             delay = target_t - elapsed
             if delay > 0:
-                time.sleep(delay)
+                idle(delay)
 
             final_x = origin_x + row["dx"]
             final_y = origin_y + row["dy"]
@@ -2589,11 +4340,11 @@ class BrowserSolver:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         return False
-                    time.sleep(min(delay, remaining))
+                    idle(min(delay, remaining))
                     if delay >= remaining:
                         return False
                 else:
-                    time.sleep(delay)
+                    idle(delay)
 
             x = start_x + row["rx"] * dx
             y = start_y + row["ry"] * dy
@@ -2775,11 +4526,11 @@ class BrowserSolver:
                         remaining = deadline - time.monotonic()
                         if remaining <= 0:
                             return False
-                        time.sleep(min(delay, remaining))
+                        idle(min(delay, remaining))
                         if delay >= remaining:
                             return False
                     else:
-                        time.sleep(delay)
+                        idle(delay)
 
                 x = start_x + row["rx"] * dx
                 y = start_y + row["ry"] * abs(dx)
@@ -2873,11 +4624,11 @@ class BrowserSolver:
     ) -> None:
         """Replay a chunk of browse recording for *duration* seconds.
 
-        Falls back to ``time.sleep(duration)`` when *state* is ``None``
+        Falls back to ``idle(duration)`` when *state* is ``None``
         or the recording is exhausted.
         """
         if state is None or state.index >= len(state.rows):
-            time.sleep(duration)
+            idle(duration)
             return
 
         deadline = time.monotonic() + duration
@@ -2897,9 +4648,9 @@ class BrowserSolver:
             if delay > 0:
                 remaining = deadline - now
                 if delay > remaining:
-                    time.sleep(remaining)
+                    idle(remaining)
                     break
-                time.sleep(delay)
+                idle(delay)
 
             x = state.origin_x + row["dx"]
             y = state.origin_y + row["dy"]
@@ -2923,7 +4674,7 @@ class BrowserSolver:
         # If recording exhausted before duration, sleep remainder
         remaining = deadline - time.monotonic()
         if remaining > 0:
-            time.sleep(remaining)
+            idle(remaining)
 
     # ------------------------------------------------------------------
     # PX convenience wrappers (delegate to _perimeterx module)
@@ -3180,7 +4931,7 @@ class BrowserSolver:
                 )
 
                 if self._browser_ua is None:
-                    self._browser_ua = page.evaluate("navigator.userAgent")
+                    self._browser_ua = _quiet_read(page, "navigator.userAgent")
                     self._publish_browser_identity()
                     logger.debug("Browser UA: %s", self._browser_ua)
 
@@ -3386,7 +5137,11 @@ class BrowserSolver:
                     int((overall_deadline - time.monotonic()) * 1000),
                 )
                 dispatch_result = self._dispatch_challenge(
-                    page, challenge_type, dispatch_ms, challenge_url=url
+                    page,
+                    challenge_type,
+                    dispatch_ms,
+                    challenge_url=url,
+                    documents=main_documents,
                 )
                 challenge_absent = (
                     challenge_type == "cloudflare"
@@ -3619,7 +5374,7 @@ class BrowserSolver:
                                 len(cookies),
                             )
                             break
-                        time.sleep(1)
+                        idle(1)
 
                 if solved:
                     logger.info(
@@ -3664,6 +5419,7 @@ class BrowserSolver:
                         context.close()
                     except Exception:
                         pass
+                unbind_page()
         finally:
             self._lock.release()
 
@@ -3676,6 +5432,8 @@ class BrowserSolver:
         url: str,
         timeout: float | None = None,
         max_size: int | None = None,
+        *,
+        challenge_budget: float | None = None,
     ) -> SolveResult | None:
         """Navigate ``url`` and return the settled document as a passthrough.
 
@@ -3696,6 +5454,11 @@ class BrowserSolver:
         real content type -Chrome shows JSON, text, XML and images inside a
         generated viewer document, and serializing that would hand back the
         wrapper instead of the resource.
+
+        ``challenge_budget`` (seconds from the call) lets a render that lands
+        on a challenge whose solve can outrun ``timeout`` (a reCAPTCHA that
+        escalates to image grids) run that long instead; it never shortens
+        ``timeout``.
         """
 
         if threading.get_ident() == self._worker_ident:
@@ -3706,22 +5469,34 @@ class BrowserSolver:
         render_timeout = self._solve_timeout if timeout is None else timeout
         if render_timeout <= 0:
             return None
-        deadline = time.monotonic() + render_timeout
+        start = time.monotonic()
+        budget = _render_budget(start, render_timeout, challenge_budget)
         future = self._submit_on_worker(
             self._render_on_worker,
             url,
             render_timeout,
             max_size,
-            _deadline=deadline,
+            _deadline=budget["deadline"],
+            _budget=budget,
         )
-        try:
-            return future.result(timeout=render_timeout)
-        except FutureTimeoutError:
-            cancelled = future.cancel()
-            if not cancelled and not future.done():
-                self._recover_timed_out_worker(future)
-            logger.warning("Browser render timed out after %.1fs", render_timeout)
-            return None
+        while True:
+            # The worker moves the deadline when it lands on a slow challenge.
+            remaining = budget["deadline"] - time.monotonic()
+            try:
+                return future.result(timeout=max(0.0, remaining))
+            except FutureTimeoutError:
+                # A finished future raised it itself: not a wait to extend.
+                if not future.done() and budget["deadline"] > time.monotonic():
+                    continue
+                break
+        cancelled = future.cancel()
+        if not cancelled and not future.done():
+            self._recover_timed_out_worker(future)
+        logger.warning(
+            "Browser render timed out after %.1fs",
+            time.monotonic() - start,
+        )
+        return None
 
     def _render_on_worker(
         self,
@@ -3730,6 +5505,7 @@ class BrowserSolver:
         max_size: int | None = None,
         *,
         _deadline: float | None = None,
+        _budget: dict | None = None,
     ) -> SolveResult | None:
         """Render ``url`` on the dedicated worker and capture the DOM."""
 
@@ -3773,7 +5549,7 @@ class BrowserSolver:
                 size_guard = self._install_navigation_size_limit(page, max_size)
 
                 if self._browser_ua is None:
-                    self._browser_ua = page.evaluate("navigator.userAgent")
+                    self._browser_ua = _quiet_read(page, "navigator.userAgent")
                     self._publish_browser_identity()
                     logger.debug("Browser UA: %s", self._browser_ua)
 
@@ -3835,18 +5611,29 @@ class BrowserSolver:
                 # is a no-op when the classifier finds nothing.
                 solved_challenge = False
                 if html:
-                    nav_status = 200
-                    if navigation_response is not None:
-                        try:
-                            nav_status = int(navigation_response.status)
-                        except (TypeError, ValueError):
-                            nav_status = 200
+                    # Classified by the status of the document the DOM came
+                    # from, as the session will classify the result. Google's
+                    # /search answered 200 and then sent the page on to
+                    # /sorry/, which answered 429: classified at the goto()
+                    # status, its reCAPTCHA was not a challenge, and render
+                    # handed it back unsolved (2026-10-06).
+                    nav_status = _response_status(
+                        _current_document(document_responses, navigation_response)
+                    )
+                    def extend_for(challenge_value: str) -> float:
+                        nonlocal overall_deadline
+                        overall_deadline = _extend_render_budget(
+                            _budget, challenge_value, overall_deadline
+                        )
+                        return overall_deadline
+
                     solved = self._solve_challenge_in_place(
                         page,
                         url,
                         html,
                         overall_deadline,
                         nav_status,
+                        extend=extend_for,
                     )
                     if solved:
                         solved_challenge = True
@@ -3881,10 +5668,6 @@ class BrowserSolver:
                             )
                             if refreshed_response is not None:
                                 navigation_response = refreshed_response
-                                try:
-                                    nav_status = int(refreshed_response.status)
-                                except (TypeError, ValueError):
-                                    nav_status = 200
                         except Exception as exc:
                             logger.debug(
                                 "Post-solve render navigation timeout/error (%s)",
@@ -3901,6 +5684,11 @@ class BrowserSolver:
                             candidate = self._bounded_page_content(page, max_size)
                             if candidate:
                                 html = candidate
+                                nav_status = _response_status(
+                                    _current_document(
+                                        document_responses, navigation_response
+                                    )
+                                )
                                 if (
                                     detect_challenge(
                                         nav_status,
@@ -3919,10 +5707,7 @@ class BrowserSolver:
                     # that hydrates past the budget raises the same error as an
                     # oversize transfer instead of looking like a failed render.
                     try:
-                        rendered_length = page.evaluate(
-                            "() => document.documentElement"
-                            " ? document.documentElement.outerHTML.length : 0"
-                        )
+                        rendered_length = _quiet_read(page, _DOCUMENT_LENGTH)
                     except Exception:
                         rendered_length = 0
                     if (
@@ -3938,17 +5723,10 @@ class BrowserSolver:
                 # above was serialized from. Falls back to the goto() response
                 # when the listener recorded nothing (a cached or synthetic
                 # document that produced no response event).
-                final_response = (
-                    document_responses[-1]
-                    if document_responses
-                    else navigation_response
+                final_response = _current_document(
+                    document_responses, navigation_response
                 )
-                status = 200
-                if final_response is not None:
-                    try:
-                        status = int(final_response.status)
-                    except (TypeError, ValueError):
-                        status = 200
+                status = _response_status(final_response)
                 page_url = str(page.url) or url
 
                 # A non-HTML resource has no DOM worth serializing: Chrome
@@ -4050,6 +5828,7 @@ class BrowserSolver:
                         context.close()
                     except Exception:
                         pass
+                unbind_page()
         finally:
             self._lock.release()
 
@@ -4060,6 +5839,7 @@ class BrowserSolver:
         html: str,
         deadline: float,
         status: int = 200,
+        extend=None,
     ) -> bool:
         """Run the per-WAF handler on the interstitial a render landed on.
 
@@ -4093,6 +5873,9 @@ class BrowserSolver:
             "Render landed on a %s challenge; solving in place",
             challenge.value,
         )
+        if extend is not None:
+            deadline = extend(challenge.value)
+            remaining_ms = int((deadline - time.monotonic()) * 1000)
         try:
             solved = self._dispatch_challenge(
                 page,
@@ -4139,10 +5922,7 @@ class BrowserSolver:
         stable = 0
         while stable < _RENDER_STABLE_POLLS and time.monotonic() < settle_deadline:
             try:
-                length = page.evaluate(
-                    "() => document.documentElement"
-                    " ? document.documentElement.outerHTML.length : 0"
-                )
+                length = _quiet_read(page, _DOCUMENT_LENGTH)
             except Exception:
                 return
             if not isinstance(length, (int, float)):
@@ -4163,8 +5943,12 @@ class BrowserSolver:
         challenge_type: str | None,
         timeout_ms: int,
         challenge_url: str | None = None,
+        documents: list | None = None,
     ) -> bool | None:
-        """Route to the correct WAF-specific solver."""
+        """Route to the correct WAF-specific solver.
+
+        *documents* is the solve's live list of main-frame ``(url, status)``.
+        """
         if challenge_type == "cloudflare":
             from wafer.browser._cloudflare import (
                 wait_for_cloudflare,
@@ -4174,7 +5958,7 @@ class BrowserSolver:
         elif challenge_type == "akamai":
             from wafer.browser._akamai import wait_for_akamai
 
-            return wait_for_akamai(self, page, timeout_ms)
+            return wait_for_akamai(self, page, timeout_ms, documents=documents)
         elif challenge_type == "datadome":
             from wafer.browser._datadome import wait_for_datadome
 
@@ -4291,7 +6075,7 @@ class BrowserSolver:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return False
-            time.sleep(min(2.0, remaining))
+            idle(min(2.0, remaining))
             return time.monotonic() <= deadline
         except Exception:
             return False
@@ -4420,7 +6204,7 @@ class BrowserSolver:
                 self._setup_headless_patches(page)
 
                 if self._browser_ua is None:
-                    self._browser_ua = page.evaluate("navigator.userAgent")
+                    self._browser_ua = _quiet_read(page, "navigator.userAgent")
                     self._publish_browser_identity()
 
                 captured: list[CapturedResponse] = []
@@ -4502,7 +6286,7 @@ class BrowserSolver:
                 remaining = overall_deadline - time.monotonic()
                 if remaining <= 0:
                     return None
-                time.sleep(min(1.0, remaining))
+                idle(min(1.0, remaining))
                 if time.monotonic() > overall_deadline:
                     return None
 
@@ -4549,6 +6333,7 @@ class BrowserSolver:
                         context.close()
                     except Exception:
                         pass
+                unbind_page()
         finally:
             self._lock.release()
 
@@ -4639,6 +6424,8 @@ class BrowserSolver:
         url: str,
         timeout: float | None = None,
         max_size: int | None = None,
+        *,
+        challenge_budget: float | None = None,
     ) -> "SolveResult | None":
         """Async wrapper around :meth:`render` - identical args and result.
 
@@ -4649,7 +6436,9 @@ class BrowserSolver:
         render_timeout = self._solve_timeout if timeout is None else timeout
         if render_timeout <= 0:
             return None
-        deadline = time.monotonic() + render_timeout
+        start = time.monotonic()
+        budget = _render_budget(start, render_timeout, challenge_budget)
+        deadline = budget["deadline"]
         render_callable = self.render
         base_render = (
             getattr(render_callable, "__func__", None) is BrowserSolver.render
@@ -4665,6 +6454,7 @@ class BrowserSolver:
                     render_timeout,
                     max_size,
                     _deadline=deadline,
+                    _budget=budget,
                 )
             from wafer._base import _callable_accepts_keyword
 
@@ -4676,11 +6466,22 @@ class BrowserSolver:
             return render_callable(url, render_timeout, max_size=max_size)
 
         future = self._submit_on_worker(invoke_render)
+        wrapped = asyncio.wrap_future(future)
         try:
-            return await asyncio.wait_for(
-                asyncio.wrap_future(future),
-                timeout=render_timeout,
-            )
+            while True:
+                # The worker moves the deadline when it lands on a slow
+                # challenge; shield the future so waiting again keeps it.
+                remaining = budget["deadline"] - time.monotonic()
+                try:
+                    return await asyncio.wait_for(
+                        asyncio.shield(wrapped), timeout=max(0.0, remaining)
+                    )
+                except TimeoutError:
+                    if wrapped.done():
+                        raise  # the render's own error, not this wait's
+                    if budget["deadline"] > time.monotonic():
+                        continue
+                    raise
         except asyncio.CancelledError:
             cancelled = future.cancel()
             if not cancelled and not future.done():
@@ -4691,14 +6492,14 @@ class BrowserSolver:
             )
             raise
         except TimeoutError:
-            if time.monotonic() < deadline:
+            if wrapped.done() and time.monotonic() < budget["deadline"]:
                 raise
             cancelled = future.cancel()
             if not cancelled and not future.done():
                 self._recover_timed_out_worker(future)
             logger.warning(
                 "Browser render timed out after %.1fs (worker_continues=%s)",
-                render_timeout,
+                time.monotonic() - start,
                 not cancelled and not future.done(),
             )
             return None

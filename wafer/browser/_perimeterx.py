@@ -5,11 +5,34 @@ reference (``BrowserSolver``) for access to mouse-replay methods
 and recordings.
 """
 
+import json
 import logging
 import random
 import time
 
+from wafer.browser._pump import idle
+
 logger = logging.getLogger("wafer")
+
+
+def _measured_viewport(page) -> dict:
+    """The page's size when the context has no viewport emulation.
+
+    A headless macOS solver opens a real-sized window with ``no_viewport``,
+    where ``page.viewport_size`` is ``None``; assuming 1920x1080 put the
+    pre-hold motion outside a smaller window.
+    """
+    from wafer.browser._solver import _quiet_read
+
+    try:
+        width, height = json.loads(
+            _quiet_read(page, "JSON.stringify([innerWidth, innerHeight])")
+        )
+        if width > 0 and height > 0:
+            return {"width": width, "height": height}
+    except Exception:
+        pass
+    return {"width": 1920, "height": 1080}
 
 # JS to check progress bar fill percentage inside the PX frame.
 # Finds the absolute-positioned, z-index:-1 div inside
@@ -160,7 +183,7 @@ def find_px_button(
         except Exception:
             pass
 
-        time.sleep(0.5)
+        idle(0.5)
 
     # Final fallback: #px-captcha div (upper portion
     # where the iframe button sits, not dead center)
@@ -288,11 +311,11 @@ def replay_hold(
                 )
 
         # Small sleep to avoid busy-waiting
-        time.sleep(0.05)
+        idle(0.05)
 
     # Human reaction delay before release
     release_delay = random.uniform(0.3, 0.6)
-    time.sleep(release_delay)
+    idle(release_delay)
 
     total = time.monotonic() - hold_start
     logger.debug(
@@ -314,7 +337,7 @@ def wait_for_px_solve(page, timeout: float = 20.0) -> bool:
             _ = page.url
         except Exception:
             # Navigation in progress — good sign
-            time.sleep(1)
+            idle(1)
             continue
 
         # Check #px-captcha element specifically (not string
@@ -326,7 +349,7 @@ def wait_for_px_solve(page, timeout: float = 20.0) -> bool:
                 return True
         except Exception:
             # Page navigating
-            time.sleep(1)
+            idle(1)
             continue
 
         # Check for "try again" / error inside the PX frame
@@ -342,7 +365,7 @@ def wait_for_px_solve(page, timeout: float = 20.0) -> bool:
             except Exception:
                 pass
 
-        time.sleep(0.5)
+        idle(0.5)
 
     return False
 
@@ -364,11 +387,11 @@ def poll_perimeterx_cookies(page, timeout_ms: int) -> bool:
                 # in page.content() (ref-perimeterx.md bug #7).
                 el = page.locator("#px-captcha")
                 if el.count() == 0:
-                    time.sleep(0.5)
+                    idle(0.5)
                     return True
             except Exception:
                 pass
-        time.sleep(0.5)
+        idle(0.5)
 
     return False
 
@@ -393,7 +416,7 @@ def solve_perimeterx(solver, page, timeout_ms: int) -> bool:
                 len(page.frames),
             )
             break
-        time.sleep(0.5)
+        idle(0.5)
 
     if not challenge_found:
         logger.debug(
@@ -429,7 +452,7 @@ def solve_perimeterx(solver, page, timeout_ms: int) -> bool:
         # wait for full networkidle (30s+ on PX sites with
         # persistent connections).  find_px_button already
         # polls until the button is rendered and visible.
-        time.sleep(random.uniform(0.5, 1.0))
+        idle(random.uniform(0.5, 1.0))
 
         # Locate the button via DOM (polls up to 30s)
         result = find_px_button(page)
@@ -438,10 +461,7 @@ def solve_perimeterx(solver, page, timeout_ms: int) -> bool:
             return False
 
         target_x, target_y, btn_frame = result
-        viewport = page.viewport_size or {
-            "width": 1920,
-            "height": 1080,
-        }
+        viewport = page.viewport_size or _measured_viewport(page)
 
         # Log button position + bounding box details
         try:
@@ -487,7 +507,7 @@ def solve_perimeterx(solver, page, timeout_ms: int) -> bool:
         # Brief hover pause (human reads button text)
         hover_pause = random.uniform(0.3, 0.8)
         logger.debug("Hovering for %.2fs", hover_pause)
-        time.sleep(hover_pause)
+        idle(hover_pause)
 
         # Hold (pass the real frame for progress monitoring)
         replay_hold(
@@ -504,7 +524,7 @@ def solve_perimeterx(solver, page, timeout_ms: int) -> bool:
             "PX attempt %d failed, retrying",
             attempt + 1,
         )
-        time.sleep(random.uniform(1.0, 2.0))
+        idle(random.uniform(1.0, 2.0))
 
         # Challenge may have disappeared (redirect = success)
         if not has_px_challenge(page):

@@ -749,7 +749,10 @@ clearance survives the next ordinary request. Verified on `miata.net`
 (Cloudflare): plain TLS gets a 403 challenge, the render returns the real 200
 page in ~7s, and the follow-up `session.get()` returns 200 with no challenge. If the document is still a challenge
 after that, `ChallengeDetected` is raised rather than the interstitial being
-returned as content.
+returned as content. A reCAPTCHA that escalates to image grids can take 60-110s,
+longer than the session's 30s default, so without a `timeout=` a render that
+lands on one may run up to 150s; an explicit `timeout=` always wins. Google
+search pages solved this way (its `/sorry/` reCAPTCHA) in 16-62s.
 
 Rendered challenge classification starts with the document's real status.
 Blocking-status fallback detection is limited to structurally recognized
@@ -770,43 +773,109 @@ resp = session.get("https://api.example.com/v1/data")  # JSON API
 
 On a challenge, the browser navigates `solve_origin`, runs the challenge there, earns the (registrable-domain-scoped) cookies, and they replay to the API host on the retried TLS request. Applies to **all** challenge types (it generalizes the Imperva "Error 15" origin-page solve); an explicit `solve_origin` overrides Imperva's auto-derived origin. Where to earn the token is wafer's job; the per-site *value* of `solve_origin` (which page mints it) is yours to supply.
 
-### Driving your own browser (`hardened_launch_config`)
+### Driving your own browser (`hardened_launch_config`, `harden_page`)
 
 `session.render()` returns the settled document. When you need the per-exchange
 request/response log instead -observing which XHR a page issues, and what it
-answered -you have to drive Playwright yourself. wafer exports the launch
-configuration its own solver uses so you don't reimplement it:
+answered -you have to drive Playwright yourself. wafer exports the hardening its
+own solver uses so you don't reimplement it: `hardened_driver_env` for starting
+Playwright, `hardened_launch_config` for the launch, `harden_page` (or
+`harden_page_async`) for each page.
 
 ```python
-from wafer.browser import hardened_launch_config, scrub_headless_ua
+from patchright.async_api import async_playwright
 
-config = hardened_launch_config(headless=True)   # proxied=False, platform=sys.platform
+from wafer.browser import (
+    harden_page_async,
+    hardened_driver_env,
+    hardened_launch_config,
+    scrub_headless_ua,
+)
+
+# Start the driver under hardened_driver_env, so shared workers wait for
+# harden_page instead of being resumed by Playwright before it can act.
+with hardened_driver_env():
+    pw = await async_playwright().start()
+
+# Headless: read the browser's own UA from a first launch, then relaunch with it
+# on the command line. Chrome puts "HeadlessChrome" in its default UA, and
+# service and shared workers read that default before anything can change it.
+base = hardened_launch_config(headless=True)
+probe = await pw.chromium.launch(
+    channel="chrome",
+    headless=True,
+    # No network for this launch: its background traffic (Chrome's time
+    # sync, for one) would carry the HeadlessChrome UA it was started with.
+    args=list(base.args)
+    + ["--proxy-server=http://127.0.0.1:9", "--disable-background-networking"],
+    ignore_default_args=list(base.ignore_default_args),
+)
+page = await probe.new_page()
+ua = scrub_headless_ua(await page.evaluate("navigator.userAgent"))
+await probe.close()
+
+config = hardened_launch_config(headless=True, user_agent=ua)
 browser = await pw.chromium.launch(
+    channel="chrome",
     headless=True,
     args=list(config.args),
     ignore_default_args=list(config.ignore_default_args),
 )
+# No viewport emulation: the launch sized the window and described the Mac's
+# real display, so every frame reports headed Chrome's geometry natively.
+context = await browser.new_context(no_viewport=True)   # no user_agent= either
+page = await context.new_page()
+await harden_page_async(page, headless=True)   # before the first navigation
 ```
 
-`config.init_scripts` holds the per-page CDP scripts (empty when `headless=False`);
-register each with `Page.addScriptToEvaluateOnNewDocument` after `Page.enable`, and
-do not detach the CDP session afterwards -that unregisters them.
+`harden_page` gives the page, and every iframe and worker it starts, the user agent
+with full client-hint metadata, so `sec-ch-ua`, `sec-ch-ua-full-version-list` and
+`navigator.userAgentData` agree in every frame and worker; it also fixes
+`navigator.languages`. In headless mode on macOS, `hardened_launch_config`
+describes the Mac's real main display to Chrome (size, menu bar, Dock, P3 color
+depth, scale) and opens a real-sized window; with `no_viewport=True` every frame
+then reports exactly what headed Chrome on that Mac does (screen, available area,
+`colorDepth`, `devicePixelRatio`, a window 87px taller than the page) with no
+script injected. `hardened_launch_config(viewport=(w, h))` picks the page size;
+by default it is the largest common size that fits the display. Headed Chrome
+needs only `hardened_launch_config(headless=False)` and
+`harden_page(page, headless=False)`.
 
-`--headless=new` does not remove the `HeadlessChrome` token from the user agent, so
-scrub it separately. Read the launched browser's own value rather than composing
-one, which keeps the version truthful:
+Things that silently undo it:
 
-```python
-raw = await page.evaluate("navigator.userAgent")
-context = await browser.new_context(user_agent=scrub_headless_ua(raw))
-```
+- **A context-level `user_agent=`.** Playwright attaches its own client-hint
+  metadata to it, and cross-site iframes then report `architecture: x86` and
+  `platformVersion: 10.15.7` whatever the host.
+- **Playwright's default headless binary.** `headless=True` with no `channel` or
+  `executable_path` launches chrome-headless-shell, which ignores
+  `--headless=new` and brands its workers `HeadlessChrome`. `harden_page` warns.
+- **A headless launch without `user_agent=`.** Service and shared workers then
+  report `HeadlessChrome`. `harden_page` warns.
+- **A `viewport=` on a headless macOS context.** Viewport emulation replaces
+  the display with the viewport (no menu bar or Dock), so `harden_page` falls
+  back to a window script whose geometry is plausible but not the Mac's own. A
+  `device_scale_factor` other than the display's then also leaves the top
+  document disagreeing with its iframes (`harden_page` warns).
+- **`Page.evaluate` to patch or read page state.** Patchright evaluates in an
+  isolated world the page cannot see, and Playwright flags every evaluation as a
+  user gesture, which leaves `navigator.userActivation.hasBeenActive` true.
 
-That token alone is enough to earn throttling or challenges from sites that present
-neither to an ordinary browser. Set `proxied=True` only when the browser runs behind
-a proxy: it adds UDP-containment switches that otherwise change the launch
-fingerprint for no benefit. The CDP screenX/screenY patch is deliberately excluded,
-because it is only correct on a Chrome whose event descriptors are already wrong -
-wafer establishes that with a real-input probe at solve time.
+With the sync API, wait with `page.wait_for_timeout`, not `time.sleep`: new
+iframes and workers are held paused until your thread's next Playwright call
+releases them (in headless mode, so are worker scripts and `<object>` loads).
+Start Playwright under `hardened_driver_env()`, wrapping only the start. It lets
+`harden_page` decide when new shared workers and popups start, so each starts
+with its full client hints; without it, one that reads them in its first script
+can see them empty (headless only). It sets the process-wide `NODE_OPTIONS` and
+`WAFER_UA_PARAMS` for the length of the block. Popups are hardened as they
+appear; pages you create with `new_page()` need their own `harden_page` call.
+With a `viewport=` context, the patched window geometry is fixed from the
+viewport when `harden_page` runs. Set
+`proxied=True` only when the browser runs behind a proxy: it adds UDP-containment
+switches that otherwise change the launch fingerprint for no benefit. The CDP
+screenX/screenY patch is deliberately excluded, because it is only correct on a
+Chrome whose event descriptors are already wrong - wafer establishes that with a
+real-input probe at solve time.
 
 ## Imperva / Incapsula (no-browser bypass)
 

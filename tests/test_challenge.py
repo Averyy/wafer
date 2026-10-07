@@ -156,6 +156,21 @@ class TestAkamai:
         body = '<div class="sec-if-cpt">Please verify</div>'
         assert detect_challenge(200, headers, body) == ChallengeType.AKAMAI
 
+    def test_behavioral_page_without_akamai_cookies(self):
+        # chewy.com, 2026-10-06: the behavioral interstitial as a 2.4KB 200
+        # that sets only device-id. It was returned as the product page.
+        headers = _h(set_cookie="device-id=3a77; Path=/")
+        body = (
+            '<div id="sec-if-cpt-container"><div class="behavioral-content">'
+            '<div class="behavioral-button progress-btn-disabled"></div>'
+            "</div></div>"
+        )
+        assert detect_challenge(200, headers, body) == ChallengeType.AKAMAI
+
+    def test_one_behavioral_marker_without_cookies_is_not_enough(self):
+        body = '<div class="behavioral-content">Our behavioral research</div>'
+        assert detect_challenge(200, {}, body) is None
+
     def test_abck_cookie_200_large_body_not_challenge(self):
         """Large 200 response with _abck is normal content, not a challenge."""
         headers = _h(set_cookie="_abck=abc123; Path=/")
@@ -1372,6 +1387,46 @@ class TestReCaptcha:
     def test_recaptcha_in_js_only_challenges(self):
         from wafer._challenge import JS_ONLY_CHALLENGES
         assert ChallengeType.RECAPTCHA in JS_ONLY_CHALLENGES
+
+
+_GOOGLE_SORRY = (
+    "<html><head><title>https://www.google.com/search?q=x&amp;sei=abc</title>"
+    "</head><body><form id=\"captcha-form\" action=\"index\" method=\"post\">"
+    "<script src=\"https://www.google.com/recaptcha/enterprise.js\"></script>"
+    "<div id=\"recaptcha\" class=\"g-recaptcha\" data-sitekey=\"k\"></div>"
+    "<input type=\"hidden\" name=\"q\" value=\"EgR\">"
+    "<input type=\"hidden\" name=\"continue\" "
+    "value=\"https://www.google.com/search?q=x&amp;sei=abc\"></form></body></html>"
+)
+
+
+class TestGoogleSorryPage:
+    """Google's "unusual traffic" reCAPTCHA page is a challenge at any status.
+
+    It is served as 429 after a redirect, but a render captured it under a
+    200 document after a solve and returned it as the search results.
+    """
+
+    @pytest.mark.parametrize("status", [200, 429])
+    def test_detected_at_any_status(self, status):
+        assert detect_challenge(status, {}, _GOOGLE_SORRY) == ChallengeType.RECAPTCHA
+
+    def test_single_quoted_attributes(self):
+        body = _GOOGLE_SORRY.replace('"', "'")
+        assert detect_challenge(200, {}, body) == ChallengeType.RECAPTCHA
+
+    def test_a_page_with_a_recaptcha_form_is_not_the_sorry_page(self):
+        # A contact form with a widget and a redirect field, but not Google's
+        # captcha form, stays content at 200.
+        body = (
+            '<form id="contact"><div class="g-recaptcha" data-sitekey="k">'
+            '</div><input type="hidden" name="continue" value="/thanks"></form>'
+        )
+        assert detect_challenge(200, {}, body) is None
+
+    def test_a_large_page_quoting_the_markup_is_not_the_sorry_page(self):
+        body = "<html><body>" + "result " * 10_000 + _GOOGLE_SORRY + "</body></html>"
+        assert detect_challenge(200, {}, body) is None
 
 
 # ---------------------------------------------------------------------------

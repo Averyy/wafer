@@ -9,6 +9,7 @@ import wreq.exceptions
 from wreq import Method
 
 from wafer._base import (
+    _RENDER_CHALLENGE_BUDGET,
     BaseSession,
     _browser_attempt_key,
     _browser_attempt_timeout,
@@ -673,6 +674,7 @@ class SyncSession(BaseSession):
         use_solve_origin: bool = True,
         challenge_url: str | None = None,
         render: bool = False,
+        render_challenge_budget: float | None = None,
     ) -> WaferResponse | bool:
         """Attempt browser-based challenge solving.
 
@@ -769,6 +771,11 @@ class SyncSession(BaseSession):
                 "max_size",
             ):
                 render_kwargs["max_size"] = max_size
+            if render_challenge_budget is not None and _callable_accepts_keyword(
+                self._browser_solver.render,
+                "challenge_budget",
+            ):
+                render_kwargs["challenge_budget"] = render_challenge_budget
             result = self._browser_solver.render(url, **render_kwargs)
             browser_attempts = 0
         for browser_attempt in range(browser_attempts):
@@ -1221,6 +1228,11 @@ class SyncSession(BaseSession):
             max_size=effective_max_size,
             use_solve_origin=False,
             render=True,
+            # A reCAPTCHA that escalates to image grids outruns the session
+            # timeout; let it finish unless the caller set a timeout.
+            render_challenge_budget=(
+                _RENDER_CHALLENGE_BUDGET if timeout is None else None
+            ),
         )
         if not isinstance(result, WaferResponse):
             raise ConnectionFailed(url, "browser render produced no document")

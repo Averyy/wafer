@@ -10,6 +10,7 @@ import wreq.exceptions
 from wreq import Method
 
 from wafer._base import (
+    _RENDER_CHALLENGE_BUDGET,
     BaseSession,
     _aread_body_capped,
     _browser_attempt_key,
@@ -782,6 +783,7 @@ class AsyncSession(BaseSession):
         url: str,
         timeout: float | None,
         max_size: int | None,
+        challenge_budget: float | None = None,
     ):
         """Await the solver's render, preferring its native async entry point."""
 
@@ -795,6 +797,11 @@ class AsyncSession(BaseSession):
             "max_size",
         ):
             kwargs["max_size"] = max_size
+        if challenge_budget is not None and _callable_accepts_keyword(
+            render_callable,
+            "challenge_budget",
+        ):
+            kwargs["challenge_budget"] = challenge_budget
         if callable(async_render):
             return await async_render(url, **kwargs)
         return await asyncio.to_thread(render_callable, url, **kwargs)
@@ -810,6 +817,7 @@ class AsyncSession(BaseSession):
         use_solve_origin: bool = True,
         challenge_url: str | None = None,
         render: bool = False,
+        render_challenge_budget: float | None = None,
     ) -> WaferResponse | bool:
         """Attempt browser-based challenge solving.
 
@@ -904,7 +912,9 @@ class AsyncSession(BaseSession):
             )
         result = None
         if render:
-            result = await self._arender_via_solver(url, solve_timeout, max_size)
+            result = await self._arender_via_solver(
+                url, solve_timeout, max_size, render_challenge_budget
+            )
             browser_attempts = 0
         for browser_attempt in range(browser_attempts):
             if deadline is not None:
@@ -1382,6 +1392,11 @@ class AsyncSession(BaseSession):
             max_size=effective_max_size,
             use_solve_origin=False,
             render=True,
+            # A reCAPTCHA that escalates to image grids outruns the session
+            # timeout; let it finish unless the caller set a timeout.
+            render_challenge_budget=(
+                _RENDER_CHALLENGE_BUDGET if timeout is None else None
+            ),
         )
         if not isinstance(result, WaferResponse):
             raise ConnectionFailed(url, "browser render produced no document")

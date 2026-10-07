@@ -13,7 +13,7 @@ import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import ANY, MagicMock, PropertyMock, call, patch
+from unittest.mock import MagicMock, PropertyMock, call, patch
 
 import pytest
 from wreq import Emulation
@@ -420,12 +420,30 @@ class TestBrowserSolverInit:
         finally:
             solver.close()
 
-    def test_cross_origin_screenxy_patch_is_a_noop_when_native_is_correct(self):
-        frame = MagicMock()
-        from wafer.browser._solver import patch_frame_screenxy
+    @pytest.mark.parametrize("needs_patch", [False, True])
+    def test_iframes_get_the_screenxy_script_only_for_a_proven_bug(self, needs_patch):
+        # Cross-origin iframes get it through auto-attach on the page's CDP
+        # session, before their document runs, on the same probe result.
+        from wafer.browser._solver import _SCREENXY_FIX_SCRIPT
 
-        patch_frame_screenxy(frame, needs_patch=False)
-        frame.evaluate.assert_not_called()
+        solver = BrowserSolver()
+        solver._needs_screenxy_patch = needs_patch
+        solver._browser_ua = "Mozilla/5.0 Chrome/149.0.0.0 Safari/537.36"
+        solver._browser_version = "149.0.7827.155"
+        page = MagicMock()
+        page._wafer_headless_patched = False
+        try:
+            with patch("wafer.browser._solver._harden_child_targets") as harden:
+                solver._setup_headless_patches(page)
+            plan = harden.call_args.args[1]
+            sources = [
+                p["source"]
+                for m, p in plan("iframe", 1)
+                if m == "Page.addScriptToEvaluateOnNewDocument"
+            ]
+            assert (_SCREENXY_FIX_SCRIPT in sources) is needs_patch
+        finally:
+            solver.close()
 
     def test_browser_identity_snapshot_pins_while_solver_lock_is_held(self):
         solver = BrowserSolver()
@@ -4030,39 +4048,18 @@ class TestHasPxChallenge:
 
 
 class TestBaxiaViewport:
-    def test_main_frame_is_not_screenxy_double_patched(self):
+    @pytest.mark.parametrize("in_child_frame", [False, True])
+    def test_slider_frame_is_never_evaluated_into(self, in_child_frame):
+        # The page's CDP session already gave every frame the screenX/Y script
+        # before its document ran. Frame.evaluate would wrap MouseEvent twice,
+        # land in Patchright's isolated world, and flag a user gesture.
         from wafer.browser._drag import solve_baxia
 
         solver = MagicMock()
         solver._slide_recordings = [object()]
+        solver._needs_screenxy_patch = True
         page = MagicMock()
-
-        with (
-            patch(
-                "wafer.browser._drag._find_baxia_frame",
-                return_value=page,
-            ),
-            patch(
-                "wafer.browser._drag._attempt_baxia_drag",
-                return_value=True,
-            ),
-            patch(
-                "wafer.browser._solver.patch_frame_screenxy",
-            ) as screenxy_patch,
-        ):
-            assert solve_baxia(solver, page, 1000)
-
-        screenxy_patch.assert_not_called()
-
-    @pytest.mark.parametrize("needs_patch", [False, True])
-    def test_child_frame_screenxy_patch_uses_immutable_probe_result(self, needs_patch):
-        from wafer.browser._drag import solve_baxia
-
-        solver = MagicMock()
-        solver._slide_recordings = [object()]
-        solver._needs_screenxy_patch = needs_patch
-        page = MagicMock()
-        frame = MagicMock()
+        frame = MagicMock() if in_child_frame else page
 
         with (
             patch(
@@ -4073,17 +4070,10 @@ class TestBaxiaViewport:
                 "wafer.browser._drag._attempt_baxia_drag",
                 return_value=True,
             ),
-            patch(
-                "wafer.browser._solver.patch_frame_screenxy",
-            ) as screenxy_patch,
         ):
             assert solve_baxia(solver, page, 1000)
 
-        screenxy_patch.assert_called_once_with(
-            frame,
-            needs_patch=needs_patch,
-            timeout_ms=ANY,
-        )
+        frame.evaluate.assert_not_called()
 
     def test_fresh_context_excludes_recent_rejected_drag_recording(self):
         from wafer.browser._drag import _attempt_baxia_drag
@@ -4981,9 +4971,6 @@ class TestBaxiaViewport:
                     set(),
                     {("alibaba.com", "/", "new-clearance")},
                 ],
-            ),
-            patch(
-                "wafer.browser._solver.patch_frame_screenxy",
             ),
         ):
             assert (
@@ -7753,13 +7740,12 @@ class TestTmdRecaptchaWidgetTeardown:
         solver._replay_browse_chunk.side_effect = lambda *args: time.sleep(0.02)
 
         started = time.monotonic()
-        with patch("wafer.browser._solver.patch_frame_screenxy"):
-            result = rc.wait_for_recaptcha(
-                solver,
-                page,
-                timeout_ms,
-                protocol_completion_is_intermediate=intermediate,
-            )
+        result = rc.wait_for_recaptcha(
+            solver,
+            page,
+            timeout_ms,
+            protocol_completion_is_intermediate=intermediate,
+        )
         return result, time.monotonic() - started, anchor
 
     def test_tmd_hands_off_when_the_clicked_widget_is_torn_down(self):
@@ -7777,11 +7763,14 @@ class TestTmdRecaptchaWidgetTeardown:
         assert result is False
         assert elapsed >= 1.4
 
-    def test_generic_recaptcha_never_treats_teardown_as_success(self):
+    def test_generic_recaptcha_hands_off_when_the_page_takes_the_token(self):
+        # A checkbox that passes hands the token to the page's callback,
+        # which navigates (Google's /sorry/ form); render() and solve()
+        # classify the page the browser lands on.
         result, _, anchor = self._run(intermediate=False, detached=True)
 
-        assert result is False
-        anchor.is_detached.assert_not_called()
+        assert result is True
+        anchor.is_detached.assert_called()
 
     def test_exhausted_checkbox_budget_never_enters_the_image_phase(self, caplog):
         # Running out of budget while a preloaded bframe sits hidden used to
@@ -9026,7 +9015,6 @@ class TestTmdClearanceEvidence:
                 "wafer.browser._recaptcha_grid.solve_image_grid",
                 return_value=True,
             ) as solve_grid,
-            patch("wafer.browser._solver.patch_frame_screenxy"),
         ):
             assert wait_for_recaptcha(solver, page, 10_000)
 
@@ -9478,7 +9466,9 @@ class TestRecaptchaGridDeadline:
             assert observe.call_args_list[1].kwargs["maximum"] == 30.0
 
     @staticmethod
-    def _solve_grid_with_outcomes(protocol_intermediate, outcomes):
+    def _solve_grid_with_outcomes(
+        protocol_intermediate, outcomes, classification="unreadable"
+    ):
         """Run one submitted grid whose uvresp read lost the teardown race."""
         import io
 
@@ -9506,7 +9496,7 @@ class TestRecaptchaGridDeadline:
 
         def submit(*_args, **_kwargs):
             diagnostics["verify_statuses"].append(200)
-            diagnostics["verify_summaries"].append({"classification": "unreadable"})
+            diagnostics["verify_summaries"].append({"classification": classification})
             return 10.0, 20.0, True
 
         with (
@@ -9579,7 +9569,7 @@ class TestRecaptchaGridDeadline:
         )
         reload.assert_not_called()
 
-    def test_generic_grid_never_opts_into_teardown_outcome(self):
+    def test_generic_grid_watches_for_teardown(self):
         solved, observe, _reload = self._solve_grid_with_outcomes(
             False, ["pending", "pending"]
         )
@@ -9587,9 +9577,34 @@ class TestRecaptchaGridDeadline:
         assert solved is False
         assert observe.call_args_list
         assert all(
-            call.kwargs["teardown_is_outcome"] is False
+            call.kwargs["teardown_is_outcome"] is True
             for call in observe.call_args_list
         )
+
+    @pytest.mark.parametrize(
+        "outcomes",
+        [["torn_down"], ["pending", "torn_down"]],
+        ids=["first-window", "extended-window"],
+    )
+    def test_generic_teardown_after_an_accepted_answer_is_solved(self, outcomes):
+        # Google's /sorry/ page posts the token from the widget's callback
+        # and navigates: Verify, userverify 200 (protocol_solved), POST
+        # /sorry/index, 302 to the search with GOOGLE_ABUSE_EXEMPTION, while
+        # the solver watched the vanished grid and reported failure.
+        solved, _observe, reload = self._solve_grid_with_outcomes(
+            False, outcomes, classification="protocol_solved"
+        )
+
+        assert solved is True
+        reload.assert_not_called()
+
+    def test_generic_teardown_without_an_accepted_answer_fails(self):
+        solved, _observe, reload = self._solve_grid_with_outcomes(
+            False, ["torn_down"], classification="unreadable"
+        )
+
+        assert solved is False
+        reload.assert_not_called()
 
     @pytest.mark.parametrize(
         ("teardown_is_outcome", "expected"),
@@ -11143,15 +11158,62 @@ class TestHeadlessPatchVerification:
         finally:
             solver.close(timeout=5)
 
+    @pytest.mark.parametrize("challenge_type", ["akamai", "kasada"])
+    def test_a_page_left_unpatched_on_purpose_is_not_reported(
+        self, caplog, challenge_type
+    ):
+        # Kasada and Akamai pages get no window patch (their challenge JS
+        # detects its toString wrapper); the warning claimed an init script
+        # "registered but never ran" on a chewy.com Akamai solve (2026-10-06).
+        solver = BrowserSolver(headless=True)
+        solver._browser_ua = "Mozilla/5.0 Chrome/154.0.0.0"
+        solver._browser = MagicMock()
+        page = self._page(1538, 1536, 24)
+        page._wafer_headless_patched = False
+        page.viewport_size = {"width": 1536, "height": 864}
+        try:
+            solver._setup_headless_patches(page, challenge_type=challenge_type)
+            assert page._wafer_window_patch is False
+            with caplog.at_level(logging.WARNING, logger="wafer"):
+                solver._verify_headless_patches(page)
+            assert "did not apply" not in caplog.text
+        finally:
+            solver._browser = None
+            solver.close(timeout=5)
+
+    def test_a_patched_page_is_still_checked(self):
+        solver = BrowserSolver(headless=True)
+        solver._browser_ua = "Mozilla/5.0 Chrome/154.0.0.0"
+        solver._browser = MagicMock()
+        page = self._page(1366, 1366, 24)
+        page._wafer_headless_patched = False
+        page.viewport_size = {"width": 1366, "height": 768}
+        try:
+            solver._setup_headless_patches(page, challenge_type="datadome")
+            assert page._wafer_window_patch is True
+        finally:
+            solver._browser = None
+            solver.close(timeout=5)
+
 
 class TestInitScriptFallback:
-    """CDP init scripts register and then never run under Patchright.
+    """CDP init scripts have registered and then never run under Patchright.
 
     _setup_headless_patches registers via Page.addScriptToEvaluateOnNewDocument,
-    which returns an identifier and silently never executes, leaving every
-    fingerprint patch inert. Frame.evaluate does work, so the same scripts are
-    re-applied on navigation.
+    which has returned an identifier and silently never executed, leaving every
+    fingerprint patch inert. So the same scripts are re-applied on navigation,
+    through CDP Runtime.evaluate: Frame.evaluate runs in Patchright's isolated
+    world, invisible to the page, and with userGesture=true, which marks the
+    page as user-activated.
     """
+
+    @staticmethod
+    def _evaluated(cdp):
+        return [
+            c.args[1]
+            for c in cdp.send.call_args_list
+            if c.args and c.args[0] == "Runtime.evaluate"
+        ]
 
     def test_scripts_are_reapplied_on_main_frame_navigation(self):
         solver = BrowserSolver(headless=True)
@@ -11159,33 +11221,66 @@ class TestInitScriptFallback:
             page = MagicMock()
             main = MagicMock()
             page.main_frame = main
+            cdp = MagicMock()
             handlers = {}
             page.on.side_effect = lambda ev, fn: handlers.__setitem__(ev, fn)
 
-            solver._install_init_script_fallback(page, ["SCRIPT_A", "SCRIPT_B"])
+            solver._install_init_script_fallback(page, ["SCRIPT_A", "SCRIPT_B"], cdp)
+            # Applied at once to the document already there (a popup's first),
+            # then again on each main-frame navigation.
+            assert [e["expression"] for e in self._evaluated(cdp)] == [
+                "SCRIPT_A",
+                "SCRIPT_B",
+            ]
             handlers["framenavigated"](main)
 
-            assert [c.args[0] for c in main.evaluate.call_args_list] == [
+            assert [e["expression"] for e in self._evaluated(cdp)] == [
+                "SCRIPT_A",
+                "SCRIPT_B",
                 "SCRIPT_A",
                 "SCRIPT_B",
             ]
         finally:
             solver.close(timeout=5)
 
+    def test_never_grants_user_activation(self):
+        """A gesture-flagged evaluation leaves hasBeenActive true on a page
+        nobody touched, which real headed Chrome never reports."""
+        solver = BrowserSolver(headless=True)
+        try:
+            page = MagicMock()
+            main = MagicMock()
+            page.main_frame = main
+            cdp = MagicMock()
+            handlers = {}
+            page.on.side_effect = lambda ev, fn: handlers.__setitem__(ev, fn)
+
+            solver._install_init_script_fallback(page, ["SCRIPT"], cdp)
+            handlers["framenavigated"](main)
+
+            assert all(e["userGesture"] is False for e in self._evaluated(cdp))
+            # Frame.evaluate is both gesture-flagged and, under Patchright,
+            # confined to an isolated world.
+            main.evaluate.assert_not_called()
+        finally:
+            solver.close(timeout=5)
+
     def test_subframes_are_left_alone(self):
-        """Only the main frame; OOPIFs have their own patch path."""
+        """Only the main frame; out-of-process iframes get their own scripts."""
         solver = BrowserSolver(headless=True)
         try:
             page = MagicMock()
             page.main_frame = MagicMock()
             other = MagicMock()
+            cdp = MagicMock()
             handlers = {}
             page.on.side_effect = lambda ev, fn: handlers.__setitem__(ev, fn)
 
-            solver._install_init_script_fallback(page, ["SCRIPT"])
+            solver._install_init_script_fallback(page, ["SCRIPT"], cdp)
+            applied_at_install = len(self._evaluated(cdp))
             handlers["framenavigated"](other)
 
-            other.evaluate.assert_not_called()
+            assert len(self._evaluated(cdp)) == applied_at_install
         finally:
             solver.close(timeout=5)
 
@@ -11193,7 +11288,7 @@ class TestInitScriptFallback:
         solver = BrowserSolver(headless=True)
         try:
             page = MagicMock()
-            solver._install_init_script_fallback(page, [])
+            solver._install_init_script_fallback(page, [], MagicMock())
             page.on.assert_not_called()
         finally:
             solver.close(timeout=5)
@@ -11204,15 +11299,21 @@ class TestInitScriptFallback:
             page = MagicMock()
             main = MagicMock()
             page.main_frame = main
-            main.evaluate.side_effect = [RuntimeError("boom"), None]
+            cdp = MagicMock()
+            cdp.send.side_effect = [None, None, RuntimeError("boom"), None]
             handlers = {}
             page.on.side_effect = lambda ev, fn: handlers.__setitem__(ev, fn)
 
-            solver._install_init_script_fallback(page, ["A", "B"])
+            solver._install_init_script_fallback(page, ["A", "B"], cdp)
             handlers["framenavigated"](main)  # must not raise
 
             # B still applied despite A raising: they patch unrelated surfaces.
-            assert [c.args[0] for c in main.evaluate.call_args_list] == ["A", "B"]
+            assert [c.args[1]["expression"] for c in cdp.send.call_args_list] == [
+                "A",
+                "B",
+                "A",
+                "B",
+            ]
         finally:
             solver.close(timeout=5)
 
@@ -11425,6 +11526,95 @@ class TestAsyncSessionRender:
             await session.render("https://example.com/")
 
 
+class _BudgetRecordingSolver(_RenderingSolver):
+    """A solver whose render accepts the reCAPTCHA challenge budget."""
+
+    def render(self, url, timeout=None, max_size=None, challenge_budget=None):
+        self.render_calls.append(
+            {"url": url, "timeout": timeout, "challenge_budget": challenge_budget}
+        )
+        return self._result
+
+    async def arender(self, url, timeout=None, max_size=None, challenge_budget=None):
+        return self.render(url, timeout=timeout, challenge_budget=challenge_budget)
+
+
+class TestRenderChallengeBudget:
+    """A render that lands on a reCAPTCHA may outrun the session timeout.
+
+    Image grids took 61.6s over two rounds on Google's /sorry/ page against
+    the session's 30s default, so render() could never pass the solver. An
+    explicit timeout= always wins.
+    """
+
+    def test_extension_only_for_slow_challenges_and_only_longer(self):
+        from wafer.browser._solver import _extend_render_budget, _render_budget
+
+        budget = _render_budget(100.0, 30.0, 150.0)
+        assert budget == {"deadline": 130.0, "challenge_deadline": 250.0}
+        assert _extend_render_budget(budget, "cloudflare", 130.0) == 130.0
+        assert budget["deadline"] == 130.0
+        assert _extend_render_budget(budget, "recaptcha", 130.0) == 250.0
+        assert budget["deadline"] == 250.0
+        # Never shorter than the timeout, and nothing without a budget.
+        assert _render_budget(100.0, 200.0, 150.0)["challenge_deadline"] is None
+        assert _extend_render_budget(None, "recaptcha", 130.0) == 130.0
+
+    def _solver_whose_worker_extends(self, extend: bool, work: float):
+        solver = BrowserSolver(solve_timeout=300)
+
+        def worker(url, timeout=None, max_size=None, *, _deadline=None, _budget=None):
+            if extend:
+                _budget["deadline"] = _budget["challenge_deadline"]
+            time.sleep(work)
+            return "rendered"
+
+        solver._render_on_worker = worker
+        return solver
+
+    def test_render_waits_for_an_extended_worker(self):
+        solver = self._solver_whose_worker_extends(True, 0.6)
+        try:
+            result = solver.render("https://x.test/", 0.3, challenge_budget=5)
+            assert result == "rendered"
+        finally:
+            solver.close()
+
+    def test_render_still_times_out_without_an_extension(self):
+        solver = self._solver_whose_worker_extends(False, 0.6)
+        try:
+            assert solver.render("https://x.test/", 0.3, challenge_budget=5) is None
+        finally:
+            solver.close(timeout=5)
+
+    def test_arender_waits_for_an_extended_worker(self):
+        solver = self._solver_whose_worker_extends(True, 0.6)
+        try:
+            result = asyncio.run(
+                solver.arender("https://x.test/", 0.3, challenge_budget=5)
+            )
+            assert result == "rendered"
+        finally:
+            solver.close()
+
+    def test_session_passes_the_budget_without_a_timeout(self):
+        solver = _BudgetRecordingSolver()
+        session, _ = make_sync_session([MockResponse(200)], browser_solver=solver)
+        session.render("https://example.com/")
+        session.render("https://example.com/", timeout=20)
+        assert solver.render_calls[0]["challenge_budget"] == 150.0
+        assert solver.render_calls[1]["challenge_budget"] is None
+
+    @pytest.mark.asyncio
+    async def test_async_session_passes_the_budget_without_a_timeout(self):
+        solver = _BudgetRecordingSolver()
+        session, _ = make_async_session([MockResponse(200)], browser_solver=solver)
+        await session.render("https://example.com/")
+        await session.render("https://example.com/", timeout=20)
+        assert solver.render_calls[0]["challenge_budget"] == 150.0
+        assert solver.render_calls[1]["challenge_budget"] is None
+
+
 class TestRenderedHeaders:
     def test_forces_utf8_html_content_type(self):
         """The DOM is re-serialized, so the original charset no longer holds."""
@@ -11468,6 +11658,43 @@ class TestRenderedHeaders:
         assert headers == {"content-type": "text/html"}
         assert set_cookie == []
         response.headers_array.assert_not_called()
+
+    def test_a_failed_read_is_not_repeated_by_a_later_call(self):
+        # render() reads its final response twice (content type, then the
+        # returned headers); after the browser closed under a timed-out
+        # reCAPTCHA solve, the second call blocked forever (2026-10-06).
+        from wafer.browser._solver import _rendered_headers, _response_headers
+
+        response = MagicMock()
+        response.all_headers.side_effect = [
+            RuntimeError("Target closed"),
+            AssertionError("blocks forever"),
+        ]
+        response.headers = {"Content-Type": "text/html"}
+
+        assert _response_headers(response)[0] == {"content-type": "text/html"}
+        headers, set_cookie = _rendered_headers(response)
+        assert headers == {"content-type": "text/html; charset=utf-8"}
+        assert set_cookie == []
+        assert response.all_headers.call_count == 1
+
+    def test_a_read_is_reused_and_never_aliased(self):
+        from wafer.browser._solver import _rendered_headers, _response_headers
+
+        response = MagicMock()
+        response.all_headers.return_value = {"Content-Type": "application/json"}
+        response.headers_array.return_value = [
+            {"name": "Set-Cookie", "value": "a=1"}
+        ]
+        first, cookies = _response_headers(response)
+        rendered, _ = _rendered_headers(response)
+        again, cookies_again = _response_headers(response)
+        assert response.all_headers.call_count == 1
+        assert response.headers_array.call_count == 1
+        # _rendered_headers rewrote its copy, not the remembered read.
+        assert rendered["content-type"] == "text/html; charset=utf-8"
+        assert first == again == {"content-type": "application/json"}
+        assert cookies == cookies_again == ["a=1"]
 
     def test_successful_raw_header_read_keeps_every_set_cookie(self):
         from wafer.browser._solver import _response_headers
@@ -11634,6 +11861,72 @@ class TestRenderOnWorker:
         assert dispatch.call_count == 1
         assert dispatch.call_args[0][1] == "cloudflare"
         assert b"real page content" in result.response.body
+
+    def test_interstitial_reached_after_a_200_is_solved_in_place(self):
+        """Google's /search answers 200, then the page moves on to /sorry/ (429).
+
+        Classified at the goto() status, the reCAPTCHA there was no challenge
+        and render returned it unsolved, while the session then rejected the
+        same body as one.
+        """
+        sorry = (
+            "<html><head><script src='https://www.google.com/recaptcha/api.js'>"
+            "</script></head><body><div class='g-recaptcha'></div></body></html>"
+        )
+        real = "<html><body>" + "search results " * 50 + "</body></html>"
+        interstitial_document = _fake_document_response(
+            "https://www.google.com/sorry/index?continue=x", 429
+        )
+        solver, context, page = self._setup(
+            dom=sorry,
+            nav_status=200,
+            extra_responses=[interstitial_document],
+            page_url="https://www.google.com/sorry/index?continue=x",
+        )
+        page.content.side_effect = (
+            lambda: sorry if page.goto.call_count == 1 else real
+        )
+        with patch.object(
+            solver, "_dispatch_challenge", return_value=True
+        ) as dispatch:
+            result = self._run(solver, context, timeout=30)
+        assert dispatch.call_count == 1
+        assert dispatch.call_args[0][1] == "recaptcha"
+        assert b"search results" in result.response.body
+
+    @pytest.mark.parametrize(
+        ("dom", "extended"),
+        [
+            (
+                "<html><body><form id='captcha-form' action='index'>"
+                "<div class='g-recaptcha'></div>"
+                "<input type='hidden' name='continue' value='x'></form></body></html>",
+                True,
+            ),
+            (
+                "<html><body><script>window._cf_chl_opt={};</script>"
+                "Just a moment...</body></html>",
+                False,
+            ),
+        ],
+        ids=["recaptcha", "cloudflare"],
+    )
+    def test_a_recaptcha_gets_the_challenge_budget(self, dom, extended):
+        from wafer.browser._solver import _render_budget
+
+        solver, context, page = self._setup(dom=dom, nav_status=429)
+        budget = _render_budget(time.monotonic(), 5.0, 120.0)
+        granted = []
+
+        def dispatch(page, challenge_type, timeout_ms, **kwargs):
+            granted.append(timeout_ms)
+            return False
+
+        with patch.object(solver, "_dispatch_challenge", side_effect=dispatch):
+            self._run(solver, context, timeout=5, _budget=budget)
+        assert granted
+        assert (granted[0] > 60_000) is extended
+        assert (budget["deadline"] > time.monotonic() + 60) is extended
 
     def test_solved_challenge_replays_original_navigation_before_capture(self):
         """The earned clearance must be applied to a fresh target request."""

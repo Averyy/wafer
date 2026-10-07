@@ -6,6 +6,8 @@ import re
 import time
 from urllib.parse import urlsplit
 
+from wafer.browser._pump import idle
+
 logger = logging.getLogger("wafer")
 
 
@@ -218,7 +220,9 @@ def _widget_torn_down(widget) -> bool:
     """Whether the clicked widget's anchor frame no longer exists."""
 
     try:
-        return bool(widget["anchor"].is_detached())
+        # Exactly True: Playwright returns a bool, and only a real detach may
+        # end the checkbox phase.
+        return widget["anchor"].is_detached() is True
     except Exception:
         return False
 
@@ -271,7 +275,7 @@ def _click_element(solver, page, state, frame, selector, deadline: float):
     pause = min(random.uniform(0.08, 0.22), _remaining_seconds(deadline))
     if pause <= 0:
         return False
-    time.sleep(pause)
+    idle(pause)
     if _remaining_seconds(deadline) <= 0:
         return False
     page.mouse.click(target_x, target_y)
@@ -349,12 +353,14 @@ def wait_for_recaptcha(
             # read. Waiting on for a token in frames that no longer exist
             # spent the whole budget and pre-empted the outer x5sec gate, so
             # every successful AliExpress MTop solve was reported as a
-            # failure (observed 2026-10-05). Under TMD the outer gate is
-            # authoritative, so hand off to it. A generic caller has no such
-            # gate and keeps waiting for a token it can prove.
+            # failure (observed 2026-10-05). Google's /sorry/ page does the
+            # same: a checkbox that passes hands the token to the page's
+            # callback, which posts the form and navigates. Under TMD the
+            # outer x5sec gate is authoritative; render() and solve() classify
+            # the page the browser lands on. Either way the answer is in the
+            # resulting page, not in frames that no longer exist.
             if (
-                protocol_completion_is_intermediate is True
-                and checkbox_clicked
+                checkbox_clicked
                 and widget is not None
                 and _widget_torn_down(widget)
             ):
@@ -372,8 +378,8 @@ def wait_for_recaptcha(
                 )
                 logger.info(
                     "reCAPTCHA widget torn down after checkbox "
-                    "(google_verdict=%s); handing off to the authoritative "
-                    "outer clearance gate",
+                    "(google_verdict=%s); the page took the token, handing "
+                    "off to the caller's check of the resulting page",
                     verdict,
                 )
                 return True
@@ -401,16 +407,6 @@ def wait_for_recaptcha(
                                 "reCAPTCHA diagnostic: phase=anchor-found "
                                 "remaining_ms=%d",
                                 int(_remaining_seconds(deadline) * 1000),
-                            )
-                            from wafer.browser._solver import (
-                                patch_frame_screenxy,
-                            )
-
-                            patch_frame_screenxy(
-                                frame,
-                                needs_patch=bool(
-                                    getattr(solver, "_needs_screenxy_patch", False)
-                                ),
                             )
                             # Summaries, not statuses: a status is appended
                             # before its body is read, so an in-flight verify
@@ -481,13 +477,6 @@ def wait_for_recaptcha(
         bframe = _find_bframe(page, widget)
         if not bframe:
             return False
-
-        from wafer.browser._solver import patch_frame_screenxy
-
-        patch_frame_screenxy(
-            bframe,
-            needs_patch=bool(getattr(solver, "_needs_screenxy_patch", False)),
-        )
 
         # Phase 2: Solve image grid challenge.
         logger.info("reCAPTCHA escalated to image challenge")

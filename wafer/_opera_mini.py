@@ -2,8 +2,8 @@
 
 Opera Mini in Extreme/Mini mode routes through Opera's Presto proxy servers,
 which render pages server-side and return compressed OBML. Google detects the
-Presto UA string and serves SSR HTML with parseable /url?q= result links
-instead of the JS-heavy SPA served to Chrome/Chromium.
+Presto UA string and serves server-rendered result HTML instead of the
+JS-required shell served to Chrome/Chromium.
 
 This module generates realistic Opera Mini header sets with:
 - Confirmed real Opera Mini client versions (from APKMirror + real UA captures)

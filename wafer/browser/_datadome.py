@@ -18,6 +18,8 @@ import logging
 import random
 import time
 
+from wafer.browser._pump import idle
+
 logger = logging.getLogger("wafer")
 
 
@@ -74,7 +76,7 @@ def _try_click_confirm(solver, page, dd_frame, state) -> bool:
                     )
                 except Exception:
                     page.mouse.move(target_x, target_y)
-                time.sleep(random.uniform(0.1, 0.3))
+                idle(random.uniform(0.1, 0.3))
                 page.mouse.click(target_x, target_y)
                 logger.debug("Clicked DataDome confirm button")
                 return True
@@ -104,7 +106,7 @@ def _click_element(solver, page, state, locator):
         )
     except Exception:
         page.mouse.move(target_x, target_y)
-    time.sleep(random.uniform(0.1, 0.3))
+    idle(random.uniform(0.1, 0.3))
     page.mouse.click(target_x, target_y)
     return True
 
@@ -191,18 +193,6 @@ def wait_for_datadome(solver, page, timeout_ms: int) -> bool:
         if dd_frame:
             if not iframe_seen:
                 iframe_first_seen = time.monotonic()
-                from wafer.browser._solver import (
-                    patch_frame_headless,
-                    patch_frame_screenxy,
-                )
-                patch_frame_screenxy(
-                    dd_frame,
-                    needs_patch=bool(
-                        getattr(solver, "_needs_screenxy_patch", False)
-                    ),
-                )
-                if solver._headless:
-                    patch_frame_headless(dd_frame)
             iframe_seen = True
 
             # Phase 1: click confirm button (if present)

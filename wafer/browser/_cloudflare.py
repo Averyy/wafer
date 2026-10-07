@@ -84,14 +84,6 @@ def wait_for_cloudflare(solver, page, timeout_ms: int) -> bool | None:
             pass
 
         if cf_frame is not None:
-            if not iframe_seen:
-                from wafer.browser._solver import patch_frame_screenxy
-                patch_frame_screenxy(
-                    cf_frame,
-                    needs_patch=bool(
-                        getattr(solver, "_needs_screenxy_patch", False)
-                    ),
-                )
             iframe_seen = True
             now = time.monotonic()
             if now - last_click >= 5.0:

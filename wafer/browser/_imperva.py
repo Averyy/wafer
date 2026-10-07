@@ -8,6 +8,7 @@ from urllib.parse import urlparse
 from wafer._challenge import is_imperva_interstitial
 from wafer._cookies import registrable_domain as _registrable_domain
 from wafer._errors import ResponseTooLarge
+from wafer.browser._pump import idle
 
 logger = logging.getLogger("wafer")
 
@@ -144,7 +145,7 @@ def solve_imperva_embedder(solver, page, embedder: str, timeout_ms: int) -> bool
             # Cookie set; let the sensor settle (it may still refresh the
             # reese84 value shortly after first issue), then succeed.
             solver._replay_browse_chunk(page, state, 1)
-            time.sleep(min(1.5, max(0.0, deadline - time.monotonic())))
+            idle(min(1.5, max(0.0, deadline - time.monotonic())))
             return True
         solver._replay_browse_chunk(page, state, 2)
 

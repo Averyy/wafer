@@ -17,6 +17,8 @@ import time
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from wafer.browser._pump import idle
+
 logger = logging.getLogger("wafer")
 
 _BAXIA_ERROR_CODE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$")
@@ -191,7 +193,7 @@ def _wait_for_puzzle(page, vendor: str, timeout_ms: int) -> bool:
     if vendor == "geetest":
         try:
             page.wait_for_selector(_GT["bg"], state="visible", timeout=timeout_ms)
-            time.sleep(0.5)  # settle for image render
+            idle(0.5)  # settle for image render
             return True
         except Exception:
             logger.warning("GeeTest puzzle not visible within timeout")
@@ -300,7 +302,7 @@ def solve_drag(solver, page, timeout_ms: int) -> bool:
     while time.monotonic() < capture_deadline:
         if captured["bg"] and captured["piece"]:
             break
-        time.sleep(min(0.2, max(0.0, capture_deadline - time.monotonic())))
+        idle(min(0.2, max(0.0, capture_deadline - time.monotonic())))
 
     bg_png = captured["bg"]
     piece_png = captured["piece"]
@@ -398,7 +400,7 @@ def solve_drag(solver, page, timeout_ms: int) -> bool:
 
     # ── Verify result ────────────────────────────────────────────
     for _ in range(10):
-        time.sleep(0.3)
+        idle(0.3)
         result = _check_result(page, vendor)
         if result is True:
             logger.info("Drag puzzle solved!")
@@ -1401,7 +1403,7 @@ def _sleep_with_deadline(deadline: float | None, duration: float) -> bool:
     remaining = _remaining(deadline)
     if remaining <= 0:
         return False
-    time.sleep(min(duration, remaining))
+    idle(min(duration, remaining))
     return _remaining(deadline) > 0
 
 
@@ -2108,17 +2110,6 @@ def _attempt_baxia_drag(
                     return False
 
             frame = reset_frame
-            if frame is not page:
-                from wafer.browser._solver import patch_frame_screenxy
-
-                patch_frame_screenxy(
-                    frame,
-                    needs_patch=bool(getattr(solver, "_needs_screenxy_patch", False)),
-                    timeout_ms=max(
-                        1,
-                        min(1_000, int(_remaining(deadline) * 1000)),
-                    ),
-                )
 
     return False
 
@@ -2166,21 +2157,10 @@ def solve_baxia(
         logger.warning("Baxia NoCaptcha slider not found")
         return False
 
-    # The main frame already receives the conditional init script in
-    # BrowserSolver._prepare_page. Reapplying it here wraps MouseEvent twice
-    # and can leave PointerEvent half-patched. Only an OOPIF needs a direct
-    # compatibility injection.
-    if frame is not page:
-        from wafer.browser._solver import patch_frame_screenxy
-
-        patch_frame_screenxy(
-            frame,
-            needs_patch=bool(getattr(solver, "_needs_screenxy_patch", False)),
-            timeout_ms=max(
-                1,
-                min(1_000, int(_remaining(deadline) * 1000)),
-            ),
-        )
+    # Nothing to inject here: the page's CDP session already gave this frame,
+    # an out-of-process one included, the conditional screenX/Y script before
+    # its document ran (see _child_target_commands). Reapplying it would wrap
+    # MouseEvent twice and can leave PointerEvent half-patched.
 
     # Wait for handle to be visible
     try:

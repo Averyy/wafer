@@ -328,6 +328,11 @@ session.render(url: str, *, timeout=None, max_response_size=None) -> WaferRespon
 # AND the session pins its replay identity to the solving browser, so the
 # clearance survives the next ordinary get() -- the same pin an automatic
 # browser solve performs. A render that met no challenge does not pin.
+# timeout defaults to the session timeout (30s). With no timeout= passed, a
+# render that lands on a reCAPTCHA may run up to 150s from the call (image-grid
+# solves can take over a minute); every other render keeps the session
+# timeout, and an explicit timeout= is never extended. A render that runs out
+# of budget mid-solve returns promptly and leaves the solver usable.
 # Raises ChallengeDetected if the document is STILL a challenge after that,
 # ConnectionFailed if the browser produced no document, ResponseTooLarge if the
 # document exceeds the cap (whether the transfer or the hydrated DOM is what
@@ -897,6 +902,10 @@ capabilities and trade-offs.
 - No challenge detection, no retry, no browser solving, no Reddit app route
 - Rate limiting still works
 - Useful for fetching server-side rendered pages that Opera Mini triggers
+- Google search: send `client=ms-opera-mini-android` and `channel=new` with
+  `q`, as Opera Mini's search box does; without them `/search` answers a plain
+  403, not a challenge. With them it returns server-rendered results:
+  `session.get("https://www.google.com/search", params={"q": query, "hl": "en", "client": "ms-opera-mini-android", "channel": "new"})`
 
 ---
 
@@ -1068,6 +1077,8 @@ from wafer.browser import (
     InterceptResult,
     SolveResult,
     format_cookie_str,
+    harden_page,
+    harden_page_async,
     hardened_launch_config,
     preflight_recaptcha_models,
     preload_recaptcha_models,
@@ -1086,33 +1097,126 @@ models_ready = preload_recaptcha_models(timeout=60.0)
 # Raising deployment gate: returns None only when both pinned models loaded.
 preflight_recaptcha_models(timeout=60.0)
 
-# Chromium launch settings for driving your own Playwright, when you need the
-# per-exchange request/response log rather than the settled document that
-# session.render() returns. Everything else about the browser stays yours.
+# Hardening for driving your own Playwright, when you need the per-exchange
+# request/response log rather than the settled document that session.render()
+# returns. Two halves: hardened_launch_config for the launch, harden_page for
+# each page. Requires a full Chrome (channel="chrome" or executable_path):
+# Playwright's default headless=True binary is chrome-headless-shell, which
+# ignores --headless=new and brands its workers "HeadlessChrome".
 config: HardenedLaunch = hardened_launch_config(
     headless=True,      # required
     proxied=False,      # True only when the browser runs behind a proxy; it
                         # adds UDP-containment switches that otherwise change
                         # the launch fingerprint for no benefit
     platform=None,      # defaults to sys.platform
+    user_agent=None,    # headless only: the browser's own UA, scrubbed. Adds
+                        # --user-agent, without which service and shared
+                        # workers report "HeadlessChrome". Ignored when headed.
+    viewport=None,      # headless macOS only: (width, height) of the page.
+                        # Default: the largest common size that fits the display.
 )
+# Headless on macOS the launch describes the Mac's main display (read once per
+# process) to Chrome, so with new_context(no_viewport=True) every frame reports
+# the same screen, color depth, scale and window size as headed Chrome. A
+# viewport= context replaces the display with the viewport; harden_page then
+# patches the geometry with a script instead.
 config.args                 # tuple[str, ...] -> chromium.launch(args=[...])
 config.ignore_default_args  # tuple[str, ...] -> ignore_default_args=[...]
-config.init_scripts         # tuple[str, ...] -> register each via CDP
-                            # Page.addScriptToEvaluateOnNewDocument after
-                            # Page.enable; do not detach the CDP session
-                            # afterwards, which unregisters them. Empty when
-                            # headless=False.
+config.init_scripts         # tuple[str, ...] -> superseded by harden_page,
+                            # which registers them itself with one window
+                            # geometry for the page and its iframes
 
-# --headless=new leaves "HeadlessChrome" in the user agent, and that token alone
-# earns degraded service (throttling, challenges) from sites that present no
-# challenge to a normal browser. Read the launched browser's own UA and scrub it
-# rather than composing one, so the version stays truthful.
-raw = page.evaluate("navigator.userAgent")
-context = browser.new_context(user_agent=scrub_headless_ua(raw))
+hardened_driver_env()   # context manager; wrap only the Playwright start:
+with hardened_driver_env():
+    pw = sync_playwright().start()         # or: await async_playwright().start()
+# Starts Playwright's driver so harden_page controls when new shared workers
+# and popups start: each starts with its full client hints instead of reading
+# them empty in its first script. Use it whenever you call harden_page;
+# BrowserSolver does this itself. A context with its own user_agent= or
+# locale= keeps Playwright's override for its pages.
+# - It sets NODE_OPTIONS (appending to yours) and WAFER_UA_PARAMS for the
+#   block and restores both after. They are process-wide, so a node process
+#   another thread starts during the block inherits them. A lock serializes
+#   concurrent starts, so `with hardened_driver_env(), sync_playwright() as p:`
+#   holds it for the whole block and delays any BrowserSolver starting then.
+
+# The headless recipe. Read the UA from a first launch (Chrome builds
+# "HeadlessChrome" into its default UA, and workers read that default before
+# anything can change it), relaunch with it, then harden each page before its
+# first navigation:
+probe = browser_type.launch(channel="chrome", headless=True,
+                            args=list(hardened_launch_config(headless=True).args)
+                            + ["--proxy-server=http://127.0.0.1:9",
+                               "--disable-background-networking"], ...)
+# The probe gets no network: launched without --user-agent, its background
+# traffic (Chrome's time sync) carries HeadlessChrome.
+ua = scrub_headless_ua(probe.new_page().evaluate("navigator.userAgent"))
+probe.close()
+config = hardened_launch_config(headless=True, user_agent=ua)
+browser = browser_type.launch(channel="chrome", headless=True,
+                              args=list(config.args),
+                              ignore_default_args=list(config.ignore_default_args))
+context = browser.new_context(no_viewport=True)  # macOS headless; no user_agent=
+page = context.new_page()
+harden_page(page, headless=True)             # sync Playwright
+
+# Async Playwright, same steps with awaits:
+page = await context.new_page()
+await harden_page_async(page, headless=True)
+
+# Headed: hardened_launch_config(headless=False), then
+# harden_page(page, headless=False). No probe launch, no user_agent.
+
+harden_page(page, *, headless: bool, user_agent: str | None = None) -> None
+# Gives the page, and every iframe and worker it starts (nested iframes,
+# workers inside iframes, service workers), the user agent with full client-hint
+# metadata, so sec-ch-ua, sec-ch-ua-full-version-list and
+# navigator.userAgentData agree everywhere; fixes navigator.languages; in
+# headless mode on macOS, gives the page and all its iframes one window and
+# screen geometry. In headless mode it also opens one browser-level CDP session
+# per browser so shared workers get the same identity (the first page's
+# override wins). It is the same per-page hardening BrowserSolver applies to
+# its own pages, which additionally decide the screenX/Y patch per machine.
+# - headless must match the launch. user_agent defaults to the browser's own,
+#   scrubbed; pass it only to send a different Chrome UA.
+# - Call it on a new page before its first navigation. Calling it again on the
+#   same page does nothing. Popups the page opens are hardened as they appear;
+#   under hardened_driver_env their first document already starts with this
+#   page's user-agent override (without it, its earliest scripts read empty
+#   high-entropy client hints). Pages created with new_page() need their own
+#   call.
+# - Sync API: new iframes and workers are held paused until your thread's next
+#   Playwright call releases them. Wait with page.wait_for_timeout(), never
+#   time.sleep(), while the page is live. Async callers are unaffected.
+# - With a viewport= context, the patched window geometry is fixed from the
+#   viewport at this call; a later set_viewport_size() leaves it stale.
+#   Iframes nested more than four cross-site levels deep are left to Chrome's
+#   own identity.
+# - Headless: worker scripts and <object>/<embed> loads also wait for your
+#   thread (with the sync API, its next Playwright call). Without
+#   hardened_driver_env, a shared worker that reads its high-entropy client
+#   hints at once can see them empty. headless=False is unaffected.
+# - The CDP session it opens stays attached for the page's lifetime; never
+#   detach it.
+# - Raises RuntimeError if the browser reports no user agent.
+# - Logs a warning (and still hardens) for chrome-headless-shell, for a
+#   headless launch without hardened_launch_config(user_agent=...), and for a
+#   macOS headless devicePixelRatio other than 2.
+# Silent ways to undo it:
+# - new_context(user_agent=...): Playwright attaches its own client-hint
+#   metadata, and cross-site iframes report architecture x86 and
+#   platformVersion 10.15.7 whatever the host.
+# - new_context(viewport=...) on macOS headless: the screen becomes the
+#   viewport, and a device_scale_factor other than the display's leaves the
+#   top document disagreeing with its iframes. Use no_viewport=True.
+# - page.evaluate() to patch or read page state: Patchright evaluates in an
+#   isolated world the page cannot see, and Playwright flags every evaluation
+#   as a user gesture (navigator.userActivation.hasBeenActive becomes true).
 
 solver = BrowserSolver(
-    headless=False,       # default; headless has lower solve coverage
+    headless=False,       # default; headless has lower solve coverage. Headless
+                          # launches Chrome twice on first start (once to read
+                          # its UA, once with it on the command line).
     idle_timeout=300.0,   # default: 300s. Close browser after N seconds idle
     solve_timeout=30.0,   # default: 30s. Max seconds per solve attempt.
                           # The call's timeout= (session default or per-request)
@@ -1188,8 +1292,13 @@ result: SolveResult | None = solver.solve(url, challenge_type)
 #   session pins.
 
 # Manual render (the browser-rendered fetch behind session.render()):
-result: SolveResult | None = solver.render(url, timeout=None, max_size=None)
-await solver.arender(url, timeout=None, max_size=None)   # async counterpart
+result: SolveResult | None = solver.render(url, timeout=None, max_size=None,
+                                          challenge_budget=None)
+await solver.arender(url, timeout=None, max_size=None,
+                     challenge_budget=None)              # async counterpart
+# challenge_budget: seconds from the call a render may run once it lands on a
+# reCAPTCHA (default None: no extension; session.render() passes 150 when the
+# caller gave no timeout). It never shortens timeout.
 # Same SolveResult shape. result.response is always populated on success and
 # holds the settled document; prefer session.render(), which wraps this in a
 # WaferResponse and merges the cookies for you.

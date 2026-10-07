@@ -20,6 +20,8 @@ import uuid
 from pathlib import Path
 from urllib.parse import urlparse
 
+from wafer.browser._pump import idle
+
 logger = logging.getLogger("wafer")
 
 # ---------------------------------------------------------------------------
@@ -1126,9 +1128,9 @@ def _sleep_with_deadline(deadline: float, duration: float) -> bool:
     if remaining <= 0:
         return False
     if remaining == float("inf"):
-        time.sleep(duration)
+        idle(duration)
         return True
-    time.sleep(min(duration, remaining))
+    idle(min(duration, remaining))
     return time.monotonic() < deadline
 
 
@@ -2333,10 +2335,10 @@ def _wait_for_post_verify_outcome(
                     return "protocol_intermediate"
             except Exception:
                 pass
-        # Only a caller with an authoritative outer gate (TMD) may treat a
-        # teardown as an outcome. TMD consumes the token and destroys the
-        # widget; when the uvresp read loses that race, the grid would
-        # otherwise be watched for 40s after it no longer exists.
+        # A page that consumes the token destroys the widget (TMD does, and
+        # so does Google's /sorry/ form); watching a grid that no longer
+        # exists only burned the budget. The caller decides what the
+        # teardown means: TMD's outer gate, or an accepted answer.
         if (
             teardown_is_outcome
             and token_widget is not None
@@ -2965,7 +2967,10 @@ def solve_image_grid(
                 if protocol_completion_is_intermediate is True
                 else None
             ),
-            teardown_is_outcome=protocol_completion_is_intermediate is True,
+            # Every caller: a page that consumes the token itself (Google's
+            # /sorry/ form posts it from the widget's callback) destroys the
+            # widget, and the grid was then watched for 40s after it was gone.
+            teardown_is_outcome=True,
         )
         verify_statuses = diagnostics.get("verify_statuses", []) if diagnostics else []
         verify_summaries = (
@@ -3048,8 +3053,54 @@ def solve_image_grid(
                 token_baseline,
                 token_widget,
                 maximum=30.0,
-                teardown_is_outcome=protocol_completion_is_intermediate is True,
+                teardown_is_outcome=True,
             )
+        if outcome == "torn_down" and protocol_completion_is_intermediate is not True:
+            # Google accepted the answer and the page took the token: its
+            # callback submitted the form and navigated, which is what tore
+            # the widget down (Google's /sorry/ page, 2026-10-06: Verify,
+            # userverify 200, POST /sorry/index, 302 to the search with
+            # GOOGLE_ABUSE_EXEMPTION set, 200 results, while this reported
+            # failure). The accepted answer can still be in flight when the
+            # page leaves, so give it a moment. The caller classifies the page
+            # the browser landed on, which settles whether it cleared.
+            accept_deadline = min(deadline, time.monotonic() + 3.0)
+            accepted = _has_new_protocol_solved_response(
+                diagnostics, verify_count_before
+            )
+            while not accepted and time.monotonic() < accept_deadline:
+                if not _sleep_with_deadline(accept_deadline, 0.1):
+                    break
+                accepted = _has_new_protocol_solved_response(
+                    diagnostics, verify_count_before
+                )
+            if not accepted:
+                logger.info(
+                    "reCAPTCHA widget gone after Verify with no accepted "
+                    "answer recorded"
+                )
+                return False
+            logger.info(
+                "reCAPTCHA answer accepted and the page took the token "
+                "(attempt %d)",
+                attempt + 1,
+            )
+            _collect_det_grid(
+                keyword_lower,
+                grid_type,
+                "solved",
+                image_bytes,
+                {
+                    "cells_selected": sorted(cells),
+                    "target_class": target_class,
+                    "initial_predictions": prediction_summary,
+                    "initial_clicks": click_dispatches,
+                    "dynamic_trace": dynamic_trace,
+                    "verify_statuses": verify_statuses,
+                    "verify_summaries": verify_summaries,
+                },
+            )
+            return True
         if outcome == "torn_down" and protocol_completion_is_intermediate is True:
             # The widget is gone after a submitted Verify. Only the outer
             # x5sec gate can say whether that was acceptance, so hand off to

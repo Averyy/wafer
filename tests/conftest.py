@@ -8,6 +8,8 @@ from collections import OrderedDict
 from email.utils import parsedate_to_datetime
 from urllib.parse import urlparse
 
+import pytest
+
 from wafer._base import (
     DEFAULT_CONNECT_TIMEOUT,
     DEFAULT_EMULATION,
@@ -656,3 +658,18 @@ def make_async_session(responses, **session_kwargs):
 
     session._retire_session = _noop_retire
     return session, mock
+
+
+@pytest.fixture(autouse=True)
+def _unbind_hardened_page():
+    """A page bound by one test's solver setup must not reach the next test.
+
+    ``wafer.browser._pump.idle`` waits on a bound page instead of sleeping, so a
+    mock page left bound would silently turn later tests' sleeps into no-ops.
+    """
+    yield
+    try:
+        from wafer.browser import _pump
+    except ImportError:
+        return
+    _pump.unbind_page()

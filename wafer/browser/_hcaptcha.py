@@ -4,6 +4,8 @@ import logging
 import random
 import time
 
+from wafer.browser._pump import idle
+
 logger = logging.getLogger("wafer")
 
 
@@ -47,7 +49,7 @@ def wait_for_hcaptcha(solver, page, timeout_ms: int) -> bool:
         cb_frame = _find_frame(page, "frame=checkbox")
         if cb_frame:
             break
-        time.sleep(0.3)
+        idle(0.3)
 
     if not cb_frame:
         logger.info(
@@ -55,12 +57,6 @@ def wait_for_hcaptcha(solver, page, timeout_ms: int) -> bool:
             "browser likely passed through"
         )
         return False
-
-    from wafer.browser._solver import patch_frame_screenxy
-    patch_frame_screenxy(
-        cb_frame,
-        needs_patch=bool(getattr(solver, "_needs_screenxy_patch", False)),
-    )
 
     # Phase 3: Move mouse naturally to checkbox, then click.
     try:
@@ -89,7 +85,7 @@ def wait_for_hcaptcha(solver, page, timeout_ms: int) -> bool:
         page.mouse.move(target_x, target_y)
 
     # Brief hover before clicking (humans don't click instantly)
-    time.sleep(random.uniform(0.1, 0.3))
+    idle(random.uniform(0.1, 0.3))
     page.mouse.click(target_x, target_y)
     logger.debug("Clicked hCaptcha checkbox at (%.0f, %.0f)", target_x, target_y)
 
