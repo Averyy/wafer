@@ -46,6 +46,9 @@ def _challenge_then_document(documents) -> bool:
     return False
 
 
+_BEHAVIORAL_GRACE = 15.0
+
+
 def wait_for_akamai(solver, page, timeout_ms: int, documents=None) -> bool:
     """Wait for Akamai _abck cookie to be set/updated.
 
@@ -78,17 +81,32 @@ def wait_for_akamai(solver, page, timeout_ms: int, documents=None) -> bool:
         "sec-if-cpt" in initial_head or "behavioral-content" in initial_head
     )
 
+    # When _abck changes on a behavioral page, the sensor ran but the
+    # server may have rejected the fingerprint. Give the page a grace
+    # window to navigate; if it doesn't, bail early instead of burning
+    # the full timeout.
+    behavioral_deadline = None
+
     while time.monotonic() < deadline:
+        if behavioral_deadline and time.monotonic() >= behavioral_deadline:
+            logger.info(
+                "Akamai behavioral: sensor ran but page did not "
+                "navigate within %.0fs, giving up", _BEHAVIORAL_GRACE,
+            )
+            return False
+
         cookies = page.context.cookies()
         for cookie in cookies:
             if cookie["name"] == "_abck":
                 if cookie["value"] != initial_abck:
-                    # For behavioral challenges the sensor always updates
-                    # _abck, even when the server rejects the fingerprint.
-                    # Require the page to navigate to real content too.
                     if not is_behavioral:
                         solver._replay_browse_chunk(page, state, 1)
                         return True
+                    if behavioral_deadline is None:
+                        behavioral_deadline = min(
+                            deadline,
+                            time.monotonic() + _BEHAVIORAL_GRACE,
+                        )
                 break
 
         if is_behavioral or _challenge_then_document(documents):

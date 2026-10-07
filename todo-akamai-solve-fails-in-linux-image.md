@@ -1,10 +1,11 @@
 # TODO: homedepot.com's Akamai challenge is not passed in fetchaller's Linux image, and the solver reports it solved
 
 **Owner:** wafer
-**Status:** PARTIAL FIX. The false positive "solved" log is fixed - behavioral
-challenges no longer accept an `_abck` cookie change alone as success; the page
-must navigate to real content. The underlying environment issue (Akamai refuses
-the browser under x86 emulation) remains and needs confirming on native amd64.
+**Status:** PARTIAL FIX. The false positive "solved" log is fixed, and a 15s
+grace window bails early when the sensor runs but the page doesn't navigate
+(was burning 112s). The underlying issue is confirmed on native amd64: Akamai
+refuses the browser under Xvfb regardless of architecture. Likely cause is the
+software-rendered WebGL renderer (Mesa/SwiftShader).
 **Reported by:** fetchaller (Docker re-test after the 0.7.2 upgrade)
 
 ---
@@ -79,15 +80,20 @@ Two things:
   the gateway answered 200 in the same container, and the macOS solve passed
   in between them.
 
-## Caveat you will want to resolve first
+## ~~Caveat you will want to resolve first~~ RESOLVED
 
-These image runs were on an Apple Silicon Mac, so the linux/amd64 image runs
-**under x86 emulation**. Chrome is markedly slower there, and Akamai's sensor
-measures timing. I could not run the image on native amd64 from here.
-Production is native amd64 (also headed under Xvfb, so no GPU: WebGL goes
-through SwiftShader/llvmpipe either way). The AliExpress MTop reCAPTCHA solve
-*did* pass in the same emulated image (25.7 s, with the image grid), so the
-solver itself works there. It is Akamai that refuses.
+~~These image runs were on an Apple Silicon Mac, so the linux/amd64 image runs
+under x86 emulation.~~
+
+**Confirmed on native amd64 (2026-10-07).** Same image rebuilt with wafer
+0.7.3 and Chrome 154.0.8037.92, running on native x86_64 hardware (no Rosetta).
+Same failure: the sensor runs, `_abck` updates, but the page never navigates.
+The solve now times out cleanly (no false "solved" log) and bails after a 15s
+grace window once the sensor has run.
+
+The cause is the Xvfb environment - most likely the software-rendered WebGL
+renderer (Mesa/llvmpipe) which Akamai's sensor flags. A real GPU or GPU
+passthrough to Docker would likely fix it, but that is infrastructure, not code.
 
 ## Repro
 
@@ -121,3 +127,34 @@ if __name__ == "__main__":
 
 On macOS, run the same script with
 `BROWSER_EXECUTABLE_PATH="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"`.
+
+---
+
+## Re-test on wafer 0.7.3 (fetchaller, 2026-10-07, same image rebuilt)
+
+- **False positive: fixed.** In the image, all four `/c/` pages challenged and
+  every solve now ends as `ChallengeDetected akamai`, no "Browser solved" line.
+- **The refusal itself: unchanged.** Akamai still never passes the browser in
+  the image. One container got a plain 200 with no challenge at all (0.9 s),
+  which looks like Akamai's first-view grace for a new visitor, not a solve.
+- **New cost: a failed solve now takes ~112 s, not ~16 s.** The solver waits
+  for a navigation that never comes, then logs `Browser solve timed out after
+  112.2s (challenge_type=akamai worker_continues=True)`, `Browser worker recovery
+  requested (driver_interrupted=True)` and `Browser solve failed
+  (challenge_type=akamai error=TargetClosedError)`. That's 115 s per request
+  before the caller hears anything. Worth asking whether an Akamai behavioural
+  page that hasn't moved after N seconds can be called failed sooner.
+- **Failed solves look like what triggers Akamai's wider refusal.** Twice today
+  a run of failed solves in the image (2, then 8) was followed within minutes
+  by homedepot.com's edge refusing even the cookieless federation-gateway reads
+  (HTTP 206 `{"error":[{"message":"Generic errors"}]}`, `Server: AkamaiGHost`)
+  for ~20 minutes, on the Mac as well as in the image. A successful macOS solve
+  followed by gateway reads did not cause it. That's correlation from two
+  episodes, not proof, but it means a failing solver costs more than its own
+  request. fetchaller now holds homedepot.com pages for 10 minutes after one
+  failed solve, and holds the gateway after a refusal.
+
+**UPDATE (2026-10-07):** Confirmed on native amd64: same failure. The caveat
+about x86 emulation is resolved - it's the Xvfb environment, not Rosetta.
+wafer 0.7.4 adds a 15s grace window so a rejected behavioral solve bails in
+~15s instead of ~112s.
