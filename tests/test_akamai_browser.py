@@ -76,6 +76,38 @@ class TestWaitForAkamai:
         ]
         assert wait_for_akamai(_solver(), page, 5_000)
 
+    def test_behavioral_abck_change_without_navigation_is_not_solved(self):
+        # The sensor always updates _abck, even when the server rejects
+        # the fingerprint and never lets the browser through. A behavioral
+        # challenge is only solved when the page navigates to real content.
+        page = _page([_STUB])
+        first = True
+
+        def cookies():
+            nonlocal first
+            if first:
+                first = False
+                return [{"name": "_abck", "value": "old"}]
+            return [{"name": "_abck", "value": "new"}]
+
+        page.context.cookies.side_effect = cookies
+        assert not wait_for_akamai(_solver(), page, 100)
+
+    def test_behavioral_abck_change_with_navigation_is_solved(self):
+        # The sensor updates _abck AND the page navigates to real content.
+        page = _page([_STUB, _STUB, _REAL])
+        first = True
+
+        def cookies():
+            nonlocal first
+            if first:
+                first = False
+                return [{"name": "_abck", "value": "old"}]
+            return [{"name": "_abck", "value": "new"}]
+
+        page.context.cookies.side_effect = cookies
+        assert wait_for_akamai(_solver(), page, 5_000)
+
     def test_reads_never_go_through_page_content(self):
         # page.content() is a Playwright evaluation sent as a user gesture,
         # which marks the page user-activated.

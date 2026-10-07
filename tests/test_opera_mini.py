@@ -235,6 +235,105 @@ class TestOperaMiniIdentity:
         assert len(locales) >= 3
 
 
+class TestFollowRedirects:
+    def test_follow_redirects_false_returns_302(self):
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        from threading import Thread
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(302)
+                self.send_header("Location", "https://example.com/")
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        port = server.server_address[1]
+        t = Thread(target=server.handle_request, daemon=True)
+        t.start()
+        try:
+            identity = OperaMiniIdentity()
+            status, headers, body, final_url, _ = identity.request(
+                f"http://127.0.0.1:{port}/redir",
+                follow_redirects=False,
+                timeout=5,
+            )
+            assert status == 302
+            assert headers.get("location") == "https://example.com/"
+            assert final_url == f"http://127.0.0.1:{port}/redir"
+        finally:
+            server.server_close()
+            t.join(timeout=2)
+
+    def test_follow_redirects_true_follows(self):
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        from threading import Thread
+
+        call_count = 0
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                nonlocal call_count
+                call_count += 1
+                if self.path == "/redir":
+                    self.send_response(302)
+                    port = self.server.server_address[1]
+                    self.send_header(
+                        "Location",
+                        f"http://127.0.0.1:{port}/dest",
+                    )
+                    self.end_headers()
+                else:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html")
+                    self.end_headers()
+                    self.wfile.write(b"<html>ok</html>")
+
+            def log_message(self, *args):
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        port = server.server_address[1]
+        def _serve_two():
+            server.handle_request()
+            server.handle_request()
+
+        t = Thread(target=_serve_two, daemon=True)
+        t.start()
+        try:
+            identity = OperaMiniIdentity()
+            status, headers, body, final_url, _ = identity.request(
+                f"http://127.0.0.1:{port}/redir",
+                follow_redirects=True,
+                timeout=5,
+            )
+            assert status == 200
+            assert call_count == 2
+        finally:
+            server.server_close()
+            t.join(timeout=2)
+
+    def test_sync_session_follow_redirects_false(self):
+        from wafer import SyncSession
+
+        session = SyncSession(
+            profile=Profile.OPERA_MINI,
+            follow_redirects=False,
+        )
+
+        def fake_request(url, *, headers=None, timeout=30.0,
+                         max_size=None, **kw):
+            assert kw.get("follow_redirects") is False
+            return (302, {"location": "https://dest/"}, b"", url, [])
+
+        session._om_identity.request = fake_request
+        resp = session.get("https://example.com/redir")
+        assert resp.status_code == 302
+        assert resp.headers.get("location") == "https://dest/"
+
+
 class TestTimeoutClassification:
     def test_connect_timeout_raises_wafer_timeout(self):
         """urllib wraps CONNECT-phase timeouts in URLError(reason=
@@ -367,7 +466,7 @@ class TestOperaMiniSetCookie:
 
         session = SyncSession(profile=Profile.OPERA_MINI)
 
-        def fake_request(url, *, headers=None, timeout=30.0, max_size=None):
+        def fake_request(url, *, headers=None, timeout=30.0, max_size=None, **_kw):
             return (
                 200,
                 {"set-cookie": "a=1; Path=/; b=2; Path=/"},
@@ -387,7 +486,7 @@ class TestOperaMiniSetCookie:
         session = SyncSession(profile=Profile.OPERA_MINI)
         body = "<html>привет</html>".encode("windows-1251")
 
-        def fake_request(url, *, headers=None, timeout=30.0, max_size=None):
+        def fake_request(url, *, headers=None, timeout=30.0, max_size=None, **_kw):
             return (
                 200,
                 {"content-type": "text/html; charset=windows-1251"},
@@ -409,7 +508,7 @@ class TestOperaMiniSetCookie:
         session = SyncSession(profile=Profile.OPERA_MINI)
         body = bytes(range(256)) * 4
 
-        def fake_request(url, *, headers=None, timeout=30.0, max_size=None):
+        def fake_request(url, *, headers=None, timeout=30.0, max_size=None, **_kw):
             return (
                 200,
                 {"content-type": "application/octet-stream"},
@@ -429,7 +528,7 @@ class TestOperaMiniSetCookie:
 
         session = AsyncSession(profile=Profile.OPERA_MINI)
 
-        def fake_request(url, *, headers=None, timeout=30.0, max_size=None):
+        def fake_request(url, *, headers=None, timeout=30.0, max_size=None, **_kw):
             return (
                 200,
                 {"set-cookie": "a=1; Path=/; b=2; Path=/"},

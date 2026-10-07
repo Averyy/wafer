@@ -6546,12 +6546,25 @@ class TestPostSolvePassthroughLanding:
             for name, handler in [c.args for c in page.on.call_args_list]:
                 if name != "response":
                     continue
-                for doc_url, status in documents:
+                for entry in documents:
+                    if len(entry) == 2:
+                        doc_url, status = entry
+                        doc_body = None
+                        doc_headers = None
+                    else:
+                        doc_url, status, doc_body = entry[:3]
+                        doc_headers = entry[3] if len(entry) > 3 else None
                     doc = MagicMock()
                     doc.url = doc_url
                     doc.status = status
                     doc.request.resource_type = "document"
                     doc.request.frame = page.main_frame
+                    if doc_body is not None:
+                        doc.body.return_value = doc_body
+                        doc.all_headers.return_value = doc_headers or {
+                            "content-type": "text/html; charset=utf-8",
+                        }
+                        doc.headers_array.return_value = []
                     handler(doc)
             return response
 
@@ -6611,6 +6624,40 @@ class TestPostSolvePassthroughLanding:
             url, url, documents=[(url + "?__cf_chl_tk=abc", 403), (url, 203)]
         )
         assert result.response.status == 203
+
+    def test_passthrough_uses_network_body_not_dom(self):
+        url = "https://fcc.report/FCC-ID/2AC7Z-ESPWROOM32"
+        server_body = b"<html><body>Server-sent content</body></html>"
+        result = self._solve(
+            url, url, documents=[(url, 200, server_body)]
+        )
+        assert result.response is not None
+        assert result.response.body == server_body
+        assert result.response.body != self._HTML.encode("utf-8")
+
+    def test_passthrough_falls_back_to_dom_when_body_fails(self):
+        url = "https://fcc.report/FCC-ID/2AC7Z-ESPWROOM32"
+        result = self._solve(
+            url, url, documents=[(url, 200)]
+        )
+        assert result.response is not None
+        assert result.response.body == self._HTML.encode("utf-8")
+
+    def test_passthrough_uses_network_headers(self):
+        url = "https://fcc.report/FCC-ID/2AC7Z-ESPWROOM32"
+        server_body = b"<html><body>Real content here</body></html>"
+        headers = {
+            "content-type": "text/html; charset=iso-8859-1",
+            "x-custom": "value",
+        }
+        result = self._solve(
+            url, url, documents=[(url, 200, server_body, headers)]
+        )
+        assert result.response is not None
+        ct = result.response.headers["content-type"]
+        assert ct == "text/html; charset=iso-8859-1"
+        assert result.response.headers.get("x-custom") == "value"
+
 
 class TestSolvePerimeterx:
     def _make_solver_with_recordings(self):

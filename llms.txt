@@ -900,6 +900,7 @@ capabilities and trade-offs.
 - Impersonates Opera Mini in Extreme data-saving mode
 - GET only (raises ValueError on POST, PUT, etc.)
 - No challenge detection, no retry, no browser solving, no Reddit app route
+- `follow_redirects` and `max_redirects` are honoured
 - Rate limiting still works
 - Useful for fetching server-side rendered pages that Opera Mini triggers
 - Google search: send `client=ms-opera-mini-android` and `channel=new` with

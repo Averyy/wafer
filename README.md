@@ -275,7 +275,7 @@ fingerprint before cycling Chrome versions. See
 
 `Profile.OPERA_MINI` impersonates Opera Mini in Extreme/Mini data-saving mode. Bypasses wreq entirely -uses Python's stdlib `urllib` with system OpenSSL, producing a server-side proxy TLS fingerprint (OpenSSL, not BoringSSL). HTTP/1.1 only, no `Sec-Ch-Ua` or `Sec-Fetch-*` headers.
 
-Because Opera Mini cannot execute JavaScript, **challenge detection, fingerprint rotation, retry logic, and browser solving are all disabled**. Rate limiting still applies. GET only (`ValueError` on other methods).
+Because Opera Mini cannot execute JavaScript, **challenge detection, fingerprint rotation, retry logic, and browser solving are all disabled**. Rate limiting, `follow_redirects`, and `max_redirects` still apply. GET only (`ValueError` on other methods).
 
 ```python
 from wafer import SyncSession, AsyncSession, Profile

@@ -1547,6 +1547,8 @@ class SyncSession(BaseSession):
                     headers=extra_headers,
                     timeout=timeout,
                     max_size=max_response_size,
+                    follow_redirects=self.follow_redirects,
+                    max_redirects=self.max_redirects,
                 )
             )
             if self._rate_limiter:

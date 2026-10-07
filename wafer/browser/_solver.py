@@ -426,19 +426,35 @@ def _network_url_identity(parsed) -> tuple[str, str, int | None, str, str]:
     return (*_origin_path_identity(parsed), parsed.query)
 
 
-def _main_document_status(records: list[tuple[str, int]], landed) -> int | None:
+def _main_document_status(records: list[tuple], landed) -> int | None:
     """Status of the latest main-frame document served for ``landed``.
 
-    ``records`` holds (url, status) for every main-frame document response
-    in order. Query and fragment are ignored, as a challenge's own reload
-    often adds and then strips a token query. None when the page never had
-    a document response of its own (a client-side route change).
+    ``records`` holds ``(url, status, response)`` for every main-frame
+    document response in order. Query and fragment are ignored, as a
+    challenge's own reload often adds and then strips a token query. None
+    when the page never had a document response of its own (a client-side
+    route change).
     """
     target = _origin_path_identity(landed)
-    for record_url, status in reversed(records):
+    for record_url, status, *_ in reversed(records):
         try:
             if _origin_path_identity(urlparse(record_url)) == target:
                 return status
+        except ValueError:
+            continue
+    return None
+
+
+def _main_document_response(records: list[tuple], landed):
+    """The Playwright response for the latest main-frame document at ``landed``.
+
+    Returns None when no matching document was recorded.
+    """
+    target = _origin_path_identity(landed)
+    for record_url, _status, response in reversed(records):
+        try:
+            if _origin_path_identity(urlparse(record_url)) == target:
+                return response
         except ValueError:
             continue
     return None
@@ -5078,10 +5094,10 @@ class BrowserSolver:
                     else set()
                 )
 
-                # Every main-frame document's status, so a post-solve
-                # passthrough reports what the server answered for the page it
-                # returns instead of assuming 200.
-                main_documents: list[tuple[str, int]] = []
+                # Every main-frame document's (url, status, response), so a
+                # post-solve passthrough can return the server's actual body
+                # and headers instead of the JS-mutated DOM.
+                main_documents: list[tuple[str, int, object]] = []
 
                 def _record_main_document(response) -> None:
                     try:
@@ -5091,7 +5107,7 @@ class BrowserSolver:
                             and request.frame == page.main_frame
                         ):
                             main_documents.append(
-                                (str(response.url), int(response.status))
+                                (str(response.url), int(response.status), response)
                             )
                     except Exception:
                         return
@@ -5357,21 +5373,50 @@ class BrowserSolver:
                             # its cookie inline.
                             break
                         if len(html) > 1024 and not is_challenge and not is_block:
-                            body = html.encode("utf-8")
-                            # Re-read cookies after redirect —
+                            # Re-read cookies after redirect -
                             # new page may have set more.
                             cookies = context.cookies()
+                            # Use the network response body (the bytes the
+                            # server sent) instead of the live DOM, which
+                            # includes scripts injected at runtime.
+                            net_response = _main_document_response(
+                                main_documents, landed,
+                            )
+                            body = None
+                            headers: dict[str, str] = {}
+                            set_cookie: list[str] = []
+                            used_network = False
+                            if net_response is not None:
+                                try:
+                                    body = net_response.body()
+                                    if not isinstance(body, bytes):
+                                        body = None
+                                except Exception:
+                                    body = None
+                                if body is not None:
+                                    headers, set_cookie = _response_headers(
+                                        net_response,
+                                    )
+                                    used_network = True
+                            if body is None:
+                                body = html.encode("utf-8")
+                                headers = {
+                                    "content-type": "text/html; charset=utf-8",
+                                }
                             captured = CapturedResponse(
                                 url=page.url,
                                 status=landed_status or 200,
-                                headers={"content-type": ("text/html; charset=utf-8")},
+                                headers=headers,
                                 body=body,
+                                set_cookie=set_cookie,
                             )
                             logger.info(
-                                "%s passthrough (%d bytes, %d cookies)",
+                                "%s passthrough (%d bytes, %d cookies, "
+                                "source=%s)",
                                 challenge_type or "unknown",
                                 len(body),
                                 len(cookies),
+                                "network" if used_network else "dom",
                             )
                             break
                         idle(1)

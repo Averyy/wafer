@@ -1725,6 +1725,8 @@ class AsyncSession(BaseSession):
             if timeout <= 0:
                 raise WaferTimeout(url, timeout_secs)
             loop = asyncio.get_event_loop()
+            _fr = self.follow_redirects
+            _mr = self.max_redirects
             (
                 status,
                 resp_headers,
@@ -1738,6 +1740,8 @@ class AsyncSession(BaseSession):
                     headers=extra_headers,
                     timeout=timeout,
                     max_size=max_response_size,
+                    follow_redirects=_fr,
+                    max_redirects=_mr,
                 ),
             )
             if self._rate_limiter:

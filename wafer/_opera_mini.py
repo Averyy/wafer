@@ -30,6 +30,7 @@ from datetime import date
 from http.cookiejar import CookieJar
 from urllib.request import (
     HTTPCookieProcessor,
+    HTTPRedirectHandler,
     HTTPSHandler,
     Request,
     build_opener,
@@ -224,6 +225,13 @@ _LOCALE_ACCEPT_LANG = {
 }
 
 
+class _NoRedirectHandler(HTTPRedirectHandler):
+    """Redirect handler that refuses to follow, letting urllib raise."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 class OperaMiniIdentity:
     """A bound Opera Mini device identity for a session.
 
@@ -249,11 +257,16 @@ class OperaMiniIdentity:
 
         # HTTP transport: stdlib urllib with system OpenSSL.
         # Gives perfect header control and realistic TLS fingerprint.
-        ssl_ctx = ssl.create_default_context()
+        self._ssl_ctx = ssl.create_default_context()
         self._cookie_jar = CookieJar()
         self._opener = build_opener(
-            HTTPSHandler(context=ssl_ctx),
+            HTTPSHandler(context=self._ssl_ctx),
             HTTPCookieProcessor(self._cookie_jar),
+        )
+        self._no_redirect_opener = build_opener(
+            HTTPSHandler(context=self._ssl_ctx),
+            HTTPCookieProcessor(self._cookie_jar),
+            _NoRedirectHandler,
         )
 
     def _build_ua(self) -> str:
@@ -302,18 +315,20 @@ class OperaMiniIdentity:
         headers: dict[str, str] | None = None,
         timeout: float = 30.0,
         max_size: int | None = None,
+        follow_redirects: bool = True,
+        max_redirects: int = 10,
     ) -> tuple[int, dict[str, str], bytes, str, list[str]]:
         """Send an HTTP GET via stdlib urllib (bypasses wreq).
 
         Returns (status_code, headers_dict, body_bytes, final_url,
-        set_cookies). body_bytes is the decompressed body — the caller
+        set_cookies). body_bytes is the decompressed body - the caller
         builds a WaferResponse with text=None so charset resolution
         happens lazily (header/meta-tag aware, not hardcoded UTF-8) and
         binary bodies survive byte-exact. final_url reflects the actual
         URL after any redirects (for SSRF checks). set_cookies holds the
         individual Set-Cookie header values (the flat headers_dict joins
         multi-value headers with "; ", which is lossy for Set-Cookie).
-        Uses system OpenSSL for TLS — no Chrome header leakage,
+        Uses system OpenSSL for TLS - no Chrome header leakage,
         more realistic fingerprint for Opera Mini proxy.
 
         ``max_size`` (bytes) caps the response body: an over-cap declared
@@ -330,9 +345,22 @@ class OperaMiniIdentity:
         for k, v in merged.items():
             req.add_header(k, v)
 
+        if not follow_redirects:
+            opener = self._no_redirect_opener
+        elif max_redirects != 10:
+            handler = HTTPRedirectHandler()
+            handler.max_redirections = max_redirects
+            opener = build_opener(
+                HTTPSHandler(context=self._ssl_ctx),
+                HTTPCookieProcessor(self._cookie_jar),
+                handler,
+            )
+        else:
+            opener = self._opener
+
         logger.debug("Opera Mini GET %s", url)
         try:
-            resp = self._opener.open(req, timeout=timeout)
+            resp = opener.open(req, timeout=timeout)
         except urllib.error.HTTPError as e:
             # urllib raises on non-2xx. Catch and return as normal
             # response so callers get a WaferResponse (same as Chrome path).

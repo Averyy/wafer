@@ -1,10 +1,10 @@
 # TODO: iOS impersonation (Mobile Safari + native app) -scoping spec
 
 **Owner:** wafer
-**Status:** PARTIAL. `Profile.IOS_SAFARI` was implemented from a real iPhone
-Safari 26.5.2 capture on 2026-07-26. `Profile.IOS_APP` is not started.
-Earlier wreq measurements were taken against tools.scrapfly.io; the real
-device capture was taken against tls.peet.ws.
+**Status:** IOS_SAFARI COMPLETE (wire-verified, shipped). IOS_APP BLOCKED on
+two external questions (App Attest / mobile WAF SDK) that must be answered
+from a real app capture before any code work starts. This is a planning spec,
+not a bug.
 **Goal:** an iPhone Mobile Safari identity (`Profile.IOS_SAFARI`, complete)
 and a future native-app identity (`Profile.IOS_APP`, NSURLSession / CFNetwork)
 alongside the existing `SAFARI` / `DART` / `OPERA_MINI` profiles. iPad remains

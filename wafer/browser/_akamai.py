@@ -39,7 +39,7 @@ def _challenge_then_document(documents) -> bool:
     page before the handler first looks, so the stub is gone by then
     (2026-10-06); its document history still shows the challenge.
     """
-    statuses = [status for _, status in list(documents or ())]
+    statuses = [status for _, status, *_ in list(documents or ())]
     for index, status in enumerate(statuses):
         if status in _CHALLENGE_STATUSES:
             return index < len(statuses) - 1 and 200 <= statuses[-1] < 300
@@ -83,11 +83,14 @@ def wait_for_akamai(solver, page, timeout_ms: int, documents=None) -> bool:
         for cookie in cookies:
             if cookie["name"] == "_abck":
                 if cookie["value"] != initial_abck:
-                    solver._replay_browse_chunk(page, state, 1)
-                    return True
+                    # For behavioral challenges the sensor always updates
+                    # _abck, even when the server rejects the fingerprint.
+                    # Require the page to navigate to real content too.
+                    if not is_behavioral:
+                        solver._replay_browse_chunk(page, state, 1)
+                        return True
+                break
 
-        # Behavioral challenge: check if the page navigated to
-        # real content (challenge JS auto-resolved and redirected)
         if is_behavioral or _challenge_then_document(documents):
             length, head = _document_head(page)
             if length > _STUB_SIZE and "sec-if-cpt" not in head[:5000]:

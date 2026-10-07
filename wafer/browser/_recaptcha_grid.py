@@ -400,6 +400,11 @@ def _ensure_models():
         opts = ort.SessionOptions()
         opts.inter_op_num_threads = 1
         opts.intra_op_num_threads = 2
+        # The exported models declare rank-1 output shapes that the graph
+        # infers as rank-2 ({-1} vs {-1,1}). ORT warns "Error merging
+        # shape info" on every load. Harmless - solves work - but each
+        # line contains "Error", noisy in production logs.
+        opts.log_severity_level = 3
 
         # cls: only download "s" - "x" exists on HF as backup but is 40%
         # larger with <1% accuracy gain (92.1% vs 92.5%).
