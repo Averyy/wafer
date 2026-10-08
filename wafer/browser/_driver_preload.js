@@ -105,6 +105,33 @@ function patchSession(exports) {
   proto.__waferUserAgent = true;
 }
 
+// A detached element made the driver exit. Patchright's
+// ElementHandle.evaluateExpression starts adopting the handle into the
+// evaluation's world and never awaits that promise (javascript.js:
+// `context.adoptIfNeeded(this) === null`). When the page navigates during the
+// call, the adoption's DOM.describeNode rejects with "Cannot find context with
+// specified id", nothing handles it, and Node's default for an unhandled
+// rejection killed the whole driver. Every later browser call then hung to its
+// timeout: Alibaba's slider accepted, navigated during a locator.evaluate
+// poll, and the search failed at 179s after three dead contexts (fetchaller,
+// 2026-10-08). A CDP protocol error only reports a target or context that is
+// gone, and the call that needed it has already settled, so it is dropped.
+// Any other unhandled rejection still ends the driver, as before.
+function isProtocolError(reason) {
+  return Boolean(
+    reason &&
+      (reason.constructor && reason.constructor.name === 'ProtocolError' ||
+        typeof reason.method === 'string' && 'type' in reason)
+  );
+}
+
+process.on('unhandledRejection', (reason) => {
+  if (isProtocolError(reason)) {
+    return;
+  }
+  throw reason;
+});
+
 const load = Module._load;
 Module._load = function () {
   const exports = load.apply(this, arguments);

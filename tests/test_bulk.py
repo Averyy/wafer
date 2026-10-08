@@ -211,7 +211,7 @@ class TestRotateEvery:
             responses, rotate_every=2
         )
         rebuild_calls = []
-        session._rebuild_client = lambda: rebuild_calls.append(1)
+        session._rebuild_client = lambda **_: rebuild_calls.append(1)
 
         for _ in range(4):
             session.get("https://example.com/page")
@@ -224,7 +224,7 @@ class TestRotateEvery:
         responses = [MockResponse(200, body="ok")] * 3
         session, mock = make_sync_session(responses)
         rebuild_calls = []
-        session._rebuild_client = lambda: rebuild_calls.append(1)
+        session._rebuild_client = lambda **_: rebuild_calls.append(1)
 
         for _ in range(3):
             session.get("https://example.com/page")
@@ -327,7 +327,7 @@ class TestAsyncRotateEvery:
             responses, rotate_every=2
         )
         rebuild_calls = []
-        session._rebuild_client = lambda: rebuild_calls.append(1)
+        session._rebuild_client = lambda **_: rebuild_calls.append(1)
 
         for _ in range(4):
             await session.get("https://example.com/page")

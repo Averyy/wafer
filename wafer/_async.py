@@ -178,7 +178,7 @@ class AsyncSession(BaseSession):
         except Exception:
             logger.debug("Failed to cache response cookies")
 
-    def _rebuild_client(self) -> None:
+    def _rebuild_client(self, *, keep_cookies: bool = False) -> None:
         """Rebuild the wreq client with a fresh TLS session and cookie jar.
 
         Creates a new wreq.Client, discarding the old client's connection
@@ -191,12 +191,32 @@ class AsyncSession(BaseSession):
         TLS fingerprint that earned them, and replaying them on a different
         fingerprint can trigger WAF flags. For rotate_every (unlinkable
         request sequences), cookie loss is the desired isolation property.
+
+        ``keep_cookies`` keeps the jar instead (the new client shares it), for
+        a browser solve: the session adopts the solving browser's identity
+        rather than abandoning one, so its own cookies are not the identity
+        being discarded. Emptying the jar there dropped app state the solve
+        never touched: MTop's ``_m_h5_tk`` vanished across a TMD solve and the
+        signed retry answered ``FAIL_SYS_TOKEN_EMPTY`` (fetchaller,
+        2026-10-08). The browser's cookies then replace same-name ones.
         """
-        self._client = self._publish_under_generation(
-            lambda: wreq.Client(**self._build_client_kwargs())
+        jar = (
+            getattr(self._client, "cookie_jar", None) if keep_cookies else None
         )
+
+        def build():
+            kwargs = self._build_client_kwargs()
+            if jar is not None:
+                kwargs.pop("cookie_store", None)
+                kwargs["cookie_provider"] = jar
+            return wreq.Client(**kwargs)
+
+        self._client = self._publish_under_generation(build)
         self._client_generation += 1
-        self._hydrate_jar_from_cache()
+        if jar is None:
+            # A kept jar already holds what the cache had, and re-adding the
+            # cached copies would overwrite newer values set since.
+            self._hydrate_jar_from_cache()
         logger.debug("Client rebuilt with emulation=%s", self.emulation)
 
     async def _retire_session(self, domain: str) -> None:
@@ -1123,18 +1143,24 @@ class AsyncSession(BaseSession):
                     result.user_agent, chrome_ver, full_ver
                 )
 
-        # A real solve changes the replay identity and needs a rebuilt client.
+        # A real solve changes the replay identity and needs a rebuilt client,
+        # on the same jar (see _rebuild_client).
         # A challenge-absent passthrough earned no clearance identity: rebuilding
         # there would discard unrelated in-memory cookies. Merge its browser
         # cookies into the existing jar below instead.
         if not challenge_absent_passthrough:
-            self._rebuild_client()
+            self._rebuild_client(keep_cookies=True)
 
-        # Also inject directly into jar (covers cache-disabled case)
+        # Also inject directly into jar (covers cache-disabled case). The jar
+        # was kept, so each browser cookie replaces the session's same-name
+        # one rather than joining it.
         for cookie in target_cookies:
             try:
                 raw = format_cookie_str(cookie)
                 cookie_domain = cookie.get("domain")
+                self._drop_jar_cookie(
+                    cookie.get("name", ""), url, cookie_domain, cookie.get("path")
+                )
                 self._record_cookie_scope(
                     raw,
                     url,

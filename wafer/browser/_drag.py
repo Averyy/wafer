@@ -15,7 +15,7 @@ import re
 import struct
 import time
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, parse_qsl, urlparse
 
 from wafer.browser._pump import idle
 
@@ -1572,30 +1572,69 @@ def _expected_baxia_application_target(issued_url: str) -> str | None:
     return issued._replace(fragment="").geturl()
 
 
+def _url_extends(current, target) -> bool:
+    """Whether parsed URL ``current`` is ``target`` with only parameters added.
+
+    Same scheme, host, port and path, and every query parameter of ``target``
+    present with its value (compared decoded, so ``%20`` and ``+`` agree).
+    After an accepted slide, Alibaba's search lands on the issued URL plus
+    ``has4Tab`` and ``tab`` (2026-10-08).
+    """
+
+    try:
+        if (
+            current.scheme,
+            (current.hostname or "").lower(),
+            current.port,
+            current.path,
+        ) != (
+            target.scheme,
+            (target.hostname or "").lower(),
+            target.port,
+            target.path,
+        ):
+            return False
+        remaining = parse_qsl(current.query, keep_blank_values=True)
+        for pair in parse_qsl(target.query, keep_blank_values=True):
+            if pair not in remaining:
+                return False
+            remaining.remove(pair)
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
 def _page_left_punish(
     page,
     issued_url: str,
     *,
     challenge_gone: bool = False,
 ) -> bool:
-    """Require the exact callback or a cleared exact application target.
+    """Require the exact callback or a cleared application target.
 
     An unchanged application URL cannot alone prove success because an inline
     slider can be displayed over that URL.  Callers may recognize it only
-    after independently proving the Baxia handle is gone.
+    after independently proving the Baxia handle is gone. The application
+    target may come back with parameters added (``_url_extends``): Alibaba's
+    search does after every late accept, and an exact match logged each of
+    those as "pending" until the outer gate's cookie check caught up.
     """
 
     expected = _expected_baxia_callback(issued_url)
+    application = False
     if expected is None:
         if not challenge_gone:
             return False
         expected = _expected_baxia_application_target(issued_url)
         if expected is None:
             return False
+        application = True
     try:
         current = urlparse(page.url)._replace(fragment="")
         target = urlparse(expected)._replace(fragment="")
-        return current == target
+        if current == target:
+            return True
+        return application and _url_extends(current, target)
     except Exception:
         return False
 

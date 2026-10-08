@@ -1536,7 +1536,7 @@ class TestRedditBootstrapAsync:
         )
         new_client = NewClient()
 
-        def rebuild():
+        def rebuild(**_):
             session._client = new_client
             session._client_generation += 1
 

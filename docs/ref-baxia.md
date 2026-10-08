@@ -185,6 +185,30 @@ did a cold real Chrome's own item page: its first `pdp.pc.query`, sent with
 keep solving the issued URL as the fallback. After 22 minutes with no traffic
 the same real Chrome's item page passed again, and so did a primed session.
 
+The browser's timezone decides it too. fetchaller's Linux image (UTC, the
+container default) primed 4 of 4 times and was punished on every first call
+(2026-10-08). Reproduced in that image from a Toronto IP, one variable at a
+time, with the primed pdp call:
+
+| Browser timezone | Answer |
+|---|---|
+| UTC (container default) | punished, 4 of 4 |
+| America/Toronto (the IP's) | `SUCCESS`, 4 of 4 |
+| America/Los_Angeles | `SUCCESS` |
+| Europe/London | punished |
+
+macOS on local time passed in between. So the clock has to be plausible for the
+IP's location, not exact. `BrowserSolver(timezone=...)` sets `TZ` for the
+browser process only (native, every frame and worker agree), and a UTC clock
+logs a one-time WARNING at launch. Cold solves in the same image succeeded 4 of
+4 on either clock (UTC 1 and 8 image rounds, Toronto 2 and 2): too few runs to
+say the clock changes how many rounds Google asks for.
+
+A TMD solve used to empty the session's jar: the client rebuilt after the
+identity pin started a fresh one, so an MTop `_m_h5_tk` set over HTTP was gone
+and the signed retry answered `FAIL_SYS_TOKEN_EMPTY` (fetchaller, 3 runs). The
+rebuild now keeps the jar, and the browser's cookies replace same-name ones.
+
 `browser_prime` used to return `False` here although it had imported the
 cookies: the homepage shows no challenge, so the solver hands back a
 passthrough document rather than a solve. It now returns `True` when the
@@ -266,6 +290,14 @@ punishment markup still present, and a small transition shell are not success.
 The outer TMD gate repeats the cookie-scope check against the original
 application target, Alibaba's strict callback, or AliExpress's native MTop
 endpoint as appropriate; cookies never cross those domain families.
+
+The application target may come back with parameters added, and still counts:
+same scheme, host, port and path, and every issued parameter with its value
+(`_url_extends`, compared decoded). After an accepted slide Alibaba's search
+lands on the issued URL plus `has4Tab` and `tab`, about 1s after release.
+Demanding an exact URL logged every such accept as "pending" until the gate's
+`x5sec` check caught up, and an accept that minted no new `x5sec` could not be
+captured at all (2026-10-08). The strict callback still has to match exactly.
 
 ### Widget Destruction = Rejection
 

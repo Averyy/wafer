@@ -429,7 +429,9 @@ bootstrap fails:
   `_baxia_sec_cookie_` that AliExpress's page script sets with a reCAPTCHA
   punishment (20-130s of image rounds). `session.browser_prime("https://www.aliexpress.com/")`
   before the first MTop call imports that cookie and `_m_h5_tk` in about 17s,
-  and MTop then normally answers without one; when it still punishes (as it
+  and MTop then normally answers without one, provided the browser's clock fits
+  the IP's location (a UTC container is punished every time; pass
+  `BrowserSolver(timezone="America/Toronto")` or set `TZ`); when it still punishes (as it
   then does a real browser's own item page), solve the issued URL with
   `session.browser_solve_challenge(url, "tmd")`. See `docs/ref-baxia.md`.
 - **Reddit** -JSON reads go through Reddit's Android app API as a logged-out
@@ -660,6 +662,8 @@ solver = BrowserSolver(
     # proxy="http://user:pass@proxy.example:8080",  # optional manual use
     egress_guard_proxy=None,  # optional loopback SOCKS5 destination guard
     executable_path=None, # optional Chrome/Chromium executable override
+    timezone=None,        # IANA zone for the browser, e.g. "America/Toronto";
+                          # match the egress IP (a UTC container is challenged)
 )
 # Non-blocking readiness signal for health checks. It becomes true after Chrome
 # launches and clears immediately on disconnect, idle close, or explicit close.

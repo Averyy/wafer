@@ -527,7 +527,7 @@ def make_sync_session(responses, **session_kwargs):
     jar = MockJar() if use_cookie_jar else None
     mock = MockClient(responses, cookie_jar=jar)
     session._client = mock
-    session._rebuild_client = lambda: None
+    session._rebuild_client = lambda **_: None
     session._retire_session = lambda domain: None
     return session, mock
 
@@ -651,7 +651,7 @@ def make_async_session(responses, **session_kwargs):
     jar = MockJar() if use_cookie_jar else None
     mock = AsyncMockClient(async_responses, cookie_jar=jar)
     session._client = mock
-    session._rebuild_client = lambda: None
+    session._rebuild_client = lambda **_: None
 
     async def _noop_retire(domain):
         pass

@@ -1379,6 +1379,32 @@ class BaseSession:
             return self._profile.value
         return None
 
+    def _drop_jar_cookie(
+        self, name: str, url: str, domain: str | None, path: str | None
+    ) -> None:
+        """Remove ``name`` from the jar where a browser cookie will land.
+
+        wreq's ``Jar.remove`` matches one exact scope (the URL's host and the
+        cookie's path), so this clears the browser cookie's own scope (its
+        domain, or the request host when host-only) and a host-only copy on
+        the request host. Never raises.
+        """
+        jar = getattr(getattr(self, "_client", None), "cookie_jar", None)
+        if jar is None or not name:
+            return
+        parsed = urlparse(url)
+        scheme = parsed.scheme or "https"
+        hosts = {(parsed.hostname or "").lower()}
+        if domain:
+            hosts.add(domain.lstrip(".").lower())
+        for host in hosts:
+            if not host:
+                continue
+            try:
+                jar.remove(name, f"{scheme}://{host}{path or '/'}")
+            except Exception:
+                logger.debug("Failed to drop cookie %s before injection", name)
+
     def _browser_passthrough_response(self, result):
         """The WaferResponse for the document a browser result captured."""
         from wafer._response import WaferResponse

@@ -286,6 +286,9 @@ session.browser_solve_challenge(url: str, challenge_type: str, *,
 # True from either means browser state was earned and imported, NOT that your
 # application request succeeded: reissue that request yourself and validate
 # the result. timeout defaults to the session timeout; <= 0 returns False.
+# A solve adds the browser's cookies to the session's jar and keeps the ones
+# the session already held (an MTop _m_h5_tk survives a TMD solve); a browser
+# cookie replaces the session's cookie of the same name.
 # A response whose Content-Type is JSON, XML, plain text or CSV is never
 # checked for challenges, so a punishment returned inside an API's JSON body
 # reaches you as an ordinary response. AliExpress MTop is the common case: a
@@ -301,7 +304,12 @@ session.browser_solve_challenge(url: str, challenge_type: str, *,
 # that. Call browser_prime("https://www.aliexpress.com/") once before the
 # first MTop call: it imports _baxia_sec_cookie_ and usually _m_h5_tk too
 # (about 17s, headed or headless), and MTop then answers SUCCESS with no
-# captcha. Not always: when AliExpress punishes a real browser's own item
+# captcha. The browser's clock must fit the IP's location: from a Toronto IP,
+# a primed call from a UTC container (or on Europe/London) was punished every
+# time, and the same container on America/Toronto or America/Los_Angeles
+# passed every time. Run the solver on the egress IP's zone,
+# BrowserSolver(timezone="America/Toronto"), or set TZ for the process.
+# Not always: when AliExpress punishes a real browser's own item
 # page too, the primed call still gets FAIL_SYS_USER_VALIDATE, so keep the
 # browser_solve_challenge path above as the fallback. The homepage normally
 # shows no challenge; browser_prime still returns True there when it imported
@@ -1066,6 +1074,11 @@ same as the web's; `resp.url` / `resp.history` show the host you asked for, and
 `resp.emulation == "reddit_app"`. With `cache_dir`, the install and its token
 persist in `reddit-app.state`; sessions sharing a `cache_dir` share them.
 Reddit's own JSON errors (a private subreddit's 403, a 404) are returned as is.
+The route applies whatever the session's `profile` or `emulation` (except
+`Profile.OPERA_MINI`): it is its own Android-app identity with its own client
+and cookies, not the session's, so a Safari, iOS Safari or Dart session's
+Reddit reads go out as the app too. `reddit_app=False` keeps Reddit reads on
+the session's own identity.
 
 - Budget: 100 reads per 10 minutes. No pacing is required; at `rate_limit=6`
   or higher it is never reached (`rate_limit` spaces `www.` and `api.`
@@ -1265,6 +1278,12 @@ solver = BrowserSolver(
                           # is not an upstream identity proxy and does not need
                           # a matching Session(proxy=).
     executable_path=None, # optional str/os.PathLike Chrome executable override
+    timezone=None,        # IANA zone for the browser process (TZ), e.g.
+                          # "America/Toronto"; None keeps the process's own.
+                          # Unknown names raise ValueError. Use the egress IP's
+                          # zone: sites that compare the two challenge a
+                          # mismatch, and a UTC clock (a container default) logs
+                          # a one-time WARNING at launch.
 )
 # Linux (Docker, Xvfb): with no GPU the solver renders WebGL on SwiftShader,
 # chosen automatically (no /dev/dri render node, or Mesa fell back to llvmpipe).
@@ -1283,6 +1302,11 @@ solver.browser_identity -> tuple[str, str] | None  # (user_agent, full_version)
 # Read-only, non-blocking lifecycle signal. True only while the launched Chrome
 # process remains connected; it clears on disconnect, idle close, and close().
 assert solver.runtime_ready is False
+# If Playwright's driver process dies while the solver is busy, its worker can
+# never return: wafer logs one ERROR ("Browser driver exited ... cannot
+# recover"), runtime_ready stays False, every later solve/render/intercept
+# returns None at once and preflight() raises RuntimeError. Create a new
+# BrowserSolver (or restart the process).
 # Startup checks the browser's four-part version against
 # chrome_full_version(DEFAULT_EMULATION). A difference is logged and accepted,
 # not rejected: Chrome auto-updates ahead of the newest available emulation, so

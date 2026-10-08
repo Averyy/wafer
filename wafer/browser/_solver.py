@@ -698,15 +698,23 @@ def _capture_tmd_browser_passthrough(
     navigation without minting a transferable ``x5sec``; in that case wafer
     may return the validated browser document for this GET, but must not claim
     that a subsequent wreq replay is unlocked.
+
+    The page may have landed on the requested URL with parameters added
+    (Alibaba's search adds ``has4Tab``/``tab`` after an accept); the captured
+    response carries the URL it actually came from.
     """
+
+    from wafer.browser._drag import _url_extends
 
     try:
         requested = urlparse(requested_url)
         page_url = str(page.url)
         current = urlparse(page_url)
-        if (
-            requested.scheme not in {"http", "https"}
-            or _network_url_identity(requested) != _network_url_identity(current)
+        if requested.scheme not in {"http", "https"} or (
+            _network_url_identity(requested) != _network_url_identity(current)
+            and not _url_extends(
+                current._replace(fragment=""), requested._replace(fragment="")
+            )
         ):
             return None
     except (TypeError, ValueError):
@@ -1528,6 +1536,53 @@ _WEBGL_RENDERER = """() => {
   const info = gl.getExtension('WEBGL_debug_renderer_info');
   return info ? gl.getParameter(info.UNMASKED_RENDERER_WEBGL) : null;
 }"""
+
+
+# The IANA names of a zero-offset clock with no daylight saving.
+_UTC_ZONES = frozenset(
+    {
+        "UTC",
+        "UCT",
+        "GMT",
+        "GMT0",
+        "Zulu",
+        "Universal",
+        "Greenwich",
+        "Etc/UTC",
+        "Etc/UCT",
+        "Etc/GMT",
+        "Etc/GMT0",
+        "Etc/GMT+0",
+        "Etc/GMT-0",
+        "Etc/Zulu",
+        "Etc/Universal",
+        "Etc/Greenwich",
+    }
+)
+
+
+def _clock_is_utc() -> bool:
+    """Whether a browser launched by this process will run on UTC.
+
+    Chrome takes its timezone from ``TZ``, else the system zone, as the time
+    module does; a zero offset with no daylight saving is UTC (Europe/London,
+    which keeps summer time, is not).
+    """
+    tz = os.environ.get("TZ")
+    if tz is not None:
+        name = tz.strip().lstrip(":")
+        return not name or name in _UTC_ZONES
+    return time.timezone == 0 and not time.daylight
+
+
+def _known_timezones() -> frozenset:
+    """IANA zone names, or empty where the system has no zone data."""
+    try:
+        import zoneinfo
+
+        return frozenset(zoneinfo.available_timezones())
+    except Exception:
+        return frozenset()
 
 
 def _linux_gpu_available() -> bool:
@@ -3236,6 +3291,7 @@ class BrowserSolver:
         proxy: str | None = None,
         egress_guard_proxy: str | None = None,
         executable_path: str | os.PathLike[str] | None = None,
+        timezone: str | None = None,
     ):
         try:
             import patchright  # noqa: F401
@@ -3289,6 +3345,23 @@ class BrowserSolver:
             if not executable_path:
                 raise ValueError("executable_path must not be empty")
         self._executable_path = executable_path
+        if timezone is not None:
+            known = _known_timezones()
+            if (
+                not isinstance(timezone, str)
+                or not timezone.strip()
+                or (known and timezone not in known)
+            ):
+                raise ValueError(
+                    "timezone must be an IANA name such as 'America/Toronto'"
+                )
+        # The browser process's TZ: Chrome reads it natively, so every frame
+        # and worker agrees, and the caller's own clock is left alone.
+        self._timezone = timezone
+        self._utc_clock_warned = False
+        # Set when the driver process died under a busy worker, which can
+        # never return (see _recover_timed_out_worker).
+        self._driver_lost = False
         # Patchright's synchronous Playwright objects are greenlet-bound to
         # the thread that created them. Every public browser operation,
         # including preflight and close, must therefore use one dedicated
@@ -3643,6 +3716,19 @@ class BrowserSolver:
         self._publish_browser_identity()
         self._runtime_ready.set()
 
+        if not self._timezone and not self._utc_clock_warned and _clock_is_utc():
+            # A server or container default no desktop browser reports. Sites
+            # that check the browser's timezone against the IP's location
+            # challenge it: AliExpress MTop punished every primed call from
+            # fetchaller's UTC container and passed the same container on
+            # its IP's timezone, 3 of 3 each (2026-10-08).
+            self._utc_clock_warned = True
+            logger.warning(
+                "Browser clock is UTC, which sites that compare it with the "
+                "IP's location challenge; pass BrowserSolver(timezone=...) "
+                "or set TZ to the egress IP's timezone"
+            )
+
         self._last_used = time.monotonic()
         logger.info("Browser launched (headless=%s)", self._headless)
 
@@ -3673,6 +3759,8 @@ class BrowserSolver:
         browser_proxy = self._egress_guard_proxy or self._proxy_server
         if browser_proxy and not offline:
             launch_kwargs["proxy"] = _playwright_proxy(browser_proxy)
+        if self._timezone:
+            launch_kwargs["env"] = {**os.environ, "TZ": self._timezone}
         browser = self._playwright.chromium.launch(**launch_kwargs)
         self._browser = browser
 
@@ -4842,6 +4930,14 @@ class BrowserSolver:
     # Solve dispatch
     # ------------------------------------------------------------------
 
+    def _worker_lost(self, operation: str) -> bool:
+        """Whether *operation* must be refused because the driver died."""
+        if self._driver_lost:
+            logger.warning(
+                "Browser %s skipped: this solver's driver exited", operation
+            )
+        return self._driver_lost
+
     def _submit_on_worker(self, callback, *args, **kwargs):
         with self._executor_lock:
             if self._executor_closed:
@@ -4904,10 +5000,34 @@ class BrowserSolver:
         except Exception:
             return False
 
+    def _driver_exit_code(self) -> int | None:
+        """The Playwright driver process's exit code, or None while it runs."""
+        try:
+            process = self._playwright._impl_obj._connection._transport._proc
+            return process.returncode
+        except Exception:
+            return None
+
     def _recover_timed_out_worker(self, future) -> None:
         if future.done():
             return
         self._mark_worker_recovering(future)
+        exit_code = self._driver_exit_code()
+        if exit_code is not None and not self._driver_lost:
+            # Nothing can interrupt this worker: a dead driver ends the sync
+            # dispatcher and the pending call spins forever (see
+            # _interrupt_playwright_transport). Every later operation would
+            # queue behind it and time out in turn, which is how one driver
+            # crash cost a caller three full solve timeouts and a render
+            # (fetchaller, 2026-10-08). Report it once and refuse new work.
+            self._driver_lost = True
+            logger.error(
+                "Browser driver exited (code %s) while the solver worker was "
+                "busy; this BrowserSolver cannot recover. Create a new one, "
+                "or restart the process",
+                exit_code,
+            )
+            return
         interrupted = self._interrupt_playwright_transport()
         logger.warning(
             "Browser worker recovery requested (driver_interrupted=%s)",
@@ -4917,6 +5037,11 @@ class BrowserSolver:
     def preflight(self) -> None:
         """Launch Chrome on the solver worker to verify runtime readiness."""
 
+        if self._driver_lost:
+            raise RuntimeError(
+                "BrowserSolver's driver exited while its worker was busy; "
+                "create a new BrowserSolver"
+            )
         self._run_on_worker(self._preflight_on_worker)
 
     def _preflight_on_worker(self) -> None:
@@ -4945,6 +5070,8 @@ class BrowserSolver:
                 replay,
                 max_size,
             )
+        if self._worker_lost("solve"):
+            return None
         if not _valid_browser_url(url) or (
             embedder is not None and not _valid_browser_url(embedder)
         ):
@@ -5635,6 +5762,8 @@ class BrowserSolver:
 
         if threading.get_ident() == self._worker_ident:
             return self._render_on_worker(url, timeout, max_size)
+        if self._worker_lost("render"):
+            return None
         if not _valid_browser_url(url):
             logger.warning("Refusing invalid browser navigation target")
             return None
@@ -6279,6 +6408,8 @@ class BrowserSolver:
     ) -> InterceptResult | None:
         """Intercept iframe traffic within one end-to-end deadline."""
 
+        if self._worker_lost("iframe intercept"):
+            return None
         if not _valid_browser_url(embedder_url):
             logger.warning("Refusing invalid iframe embedder navigation target")
             return None
@@ -6541,6 +6672,8 @@ class BrowserSolver:
         manually (``await solver.asolve(url)``) without blocking the loop.
         Pure dispatch - all solve logic lives in :meth:`solve`.
         """
+        if self._worker_lost("solve"):
+            return None
         solve_timeout = self._solve_timeout if timeout is None else timeout
         if solve_timeout <= 0:
             return None
@@ -6620,6 +6753,8 @@ class BrowserSolver:
         the render drives Playwright's blocking API, so awaiting it directly
         would stall the event loop.
         """
+        if self._worker_lost("render"):
+            return None
         render_timeout = self._solve_timeout if timeout is None else timeout
         if render_timeout <= 0:
             return None
@@ -6702,6 +6837,8 @@ class BrowserSolver:
         Dispatches the blocking interception to a thread executor so it can
         be awaited from an event loop without blocking it. Pure dispatch.
         """
+        if self._worker_lost("iframe intercept"):
+            return None
         intercept_timeout = self._solve_timeout if timeout is None else timeout
         if intercept_timeout <= 0:
             return None

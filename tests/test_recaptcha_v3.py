@@ -448,7 +448,7 @@ class TestMintFromEmbedSession:
             embed_origin="https://widget.example.com",
         )
 
-        def rebuild():
+        def rebuild(**_):
             session._client_headers = session._compute_client_headers()
 
         session._rebuild_client = rebuild
@@ -531,7 +531,7 @@ class TestMintFromEmbedSessionAsync:
             embed_origin="https://widget.example.com",
         )
 
-        def rebuild():
+        def rebuild(**_):
             session._client_headers = session._compute_client_headers()
 
         session._rebuild_client = rebuild

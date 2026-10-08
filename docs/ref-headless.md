@@ -126,6 +126,17 @@ Where each came from, and what fixes it:
   it patches fails there rather than silently restoring the race. Dropping
   `--user-agent` instead would give full high-entropy hints natively (0 of
   300 empty) but `HeadlessChrome` in `navigator.userAgent` in 300 of 300.
+- **The preload also keeps the driver alive through a detached element.**
+  Patchright's `ElementHandle.evaluateExpression` (javascript.js) starts an
+  element adoption into the evaluation's world and never awaits it; when the
+  page navigates during the call, that `DOM.describeNode` rejects with nothing
+  handling it, and Node's default for an unhandled rejection ended the whole
+  driver. A dead driver ends the sync dispatcher, so the worker's pending call
+  spins forever and every later solve timed out behind it (Alibaba's slider
+  navigating mid-poll, 179s, 2026-10-08). The preload drops unhandled CDP
+  `ProtocolError`s (a target or context that is gone) and re-throws anything
+  else. If a driver still dies under a busy worker, `BrowserSolver` logs one
+  ERROR and refuses later work at once instead of queuing it.
 - **Which solver sites use shared workers** (headless, 2026-10-06).
   realtor.com started one and chewy.com two, all from `blob:` URLs;
   Cloudflare, DataDome (allegro.pl, idealista.com), Imperva, AWS WAF and

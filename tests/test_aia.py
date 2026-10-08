@@ -945,7 +945,7 @@ class TestSessionIntegration:
             [_VERIFY_ERROR, MockResponse(200, body="page")]
         )
         rebuilt = []
-        session._rebuild_client = lambda: rebuilt.append(True)
+        session._rebuild_client = lambda **_: rebuilt.append(True)
         with patch.object(
             _aia,
             "resolve_missing_intermediates",
@@ -995,7 +995,7 @@ class TestSessionIntegration:
             [_VERIFY_ERROR, AsyncMockResponse(200, body="page")]
         )
         rebuilt = []
-        session._rebuild_client = lambda: rebuilt.append(True)
+        session._rebuild_client = lambda **_: rebuilt.append(True)
         with patch.object(
             _aia,
             "resolve_missing_intermediates",
@@ -1385,7 +1385,7 @@ class TestCertFailureIsBounded:
         session, mock = make_sync_session(
             [_VERIFY_ERROR], max_retries=2, max_rotations=0
         )
-        session._rebuild_client = lambda: None
+        session._rebuild_client = lambda **_: None
         with patch.object(
             _aia,
             "resolve_missing_intermediates",
@@ -1399,7 +1399,7 @@ class TestCertFailureIsBounded:
 
     def test_the_chase_runs_once_however_many_attempts_follow(self, pki):
         session, _ = make_sync_session([_VERIFY_ERROR], max_retries=2, max_rotations=0)
-        session._rebuild_client = lambda: None
+        session._rebuild_client = lambda **_: None
         with patch.object(
             _aia,
             "resolve_missing_intermediates",
@@ -1434,7 +1434,7 @@ class TestCertFailureIsBounded:
         session, mock = make_async_session(
             [_VERIFY_ERROR], max_retries=2, max_rotations=0
         )
-        session._rebuild_client = lambda: None
+        session._rebuild_client = lambda **_: None
         with patch.object(
             _aia,
             "resolve_missing_intermediates",
@@ -1592,7 +1592,7 @@ class TestEgressContracts:
             [_VERIFY_ERROR, MockResponse(200, body="page")]
         )
         session._proxy_url = "http://proxy.test:8080"
-        session._rebuild_client = lambda: None
+        session._rebuild_client = lambda **_: None
         with patch.object(
             _aia,
             "resolve_missing_intermediates",
