@@ -424,6 +424,14 @@ bootstrap fails:
   When the total request deadline can fund them, wafer tries up to three fresh
   browser contexts with distinct recorded drags and a fair share of the
   remaining time, reserving up to 15 seconds for HTTP replay.
+  AliExpress MTop is the exception to solving: protected APIs such as
+  `mtop.aliexpress.pdp.pc.query` answer every call from a session without the
+  `_baxia_sec_cookie_` that AliExpress's page script sets with a reCAPTCHA
+  punishment (20-130s of image rounds). `session.browser_prime("https://www.aliexpress.com/")`
+  before the first MTop call imports that cookie and `_m_h5_tk` in about 17s,
+  and MTop then normally answers without one; when it still punishes (as it
+  then does a real browser's own item page), solve the issued URL with
+  `session.browser_solve_challenge(url, "tmd")`. See `docs/ref-baxia.md`.
 - **Reddit** -JSON reads go through Reddit's Android app API as a logged-out
   app install, so they meet no web gate (`resp.emulation == "reddit_app"`;
   `reddit_app=False` turns it off). Everything else (HTML, account requests,
@@ -480,7 +488,10 @@ Features:
 - Per-domain JSON files with thread-safe atomic writes
 - TTL-based expiration (respects `Expires` / `Max-Age`)
 - LRU eviction (max 50 entries per domain by default)
-- Cookies from browser solving are automatically cached
+- Cookies from browser solving are automatically cached, never rejected ones: a
+  solve's cookies are dropped when its retry is still challenged, and a render
+  that ends on a WAF challenge keeps none, so a rejected solve never poisons
+  other sessions sharing the directory
 
 ## Rate Limiting
 
@@ -733,7 +744,8 @@ the resource; `resp.json()` on a rendered API URL works normally. Status and hea
 always describe the document the body came from, including after a client-side
 redirect. The browser follows redirects regardless of `follow_redirects`, so
 `resp.url` is the final URL and `resp.history` is empty. Cookies the page set are
-merged into the session jar.
+merged into the session jar. A render that ends on a WAF challenge raises
+`ChallengeDetected` and keeps none of its cookies.
 
 A session with no `browser_solver=` creates one on its first render and closes it
 on exit; from then on that session can also browser-solve challenges on ordinary

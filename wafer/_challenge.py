@@ -201,6 +201,20 @@ JS_ONLY_CHALLENGES = frozenset({
 })
 
 
+# Challenge types the session answers inline over the transport, with no
+# browser (``_try_inline_solve``; keep the two in step). They are site gates
+# behind the WAF or hand over their own clearance, so a browser solve or
+# render whose follow-up lands on one did get past the layer the browser was
+# for: its cookies are kept (fccid.io's Continue gate behind Cloudflare).
+INLINE_CHALLENGES = frozenset({
+    ChallengeType.ACW,
+    ChallengeType.AMAZON,
+    ChallengeType.COOKIE_GATE,
+    ChallengeType.POW,
+    ChallengeType.RADWARE,
+})
+
+
 def _has_cookie(set_cookie: str, name: str) -> bool:
     """Check if a Set-Cookie header sets a cookie with the given name.
 
@@ -313,6 +327,11 @@ _SHAPE_SEPARATORS = frozenset("-_.=/+")
 # timings, cache hit counts, single words) are common on x-*-a headers from
 # CDNs and must not be mistaken for a Shape sensor token.
 _SHAPE_MIN_TOKEN_LEN = 8
+
+# The statuses Akamai serves its behavioral page under: 200 to a new visitor
+# (homedepot.com, chewy.com), 429 at chewy.com, and 403, Akamai's own block
+# status, for which the generic-JS fallback below would otherwise take it.
+_AKAMAI_BEHAVIORAL_STATUSES = (200, 403, 429)
 
 
 def _looks_like_shape_sensor(val: str) -> bool:
@@ -517,8 +536,8 @@ def detect_challenge(
         ):
             logger.info("Challenge detected (body): akamai")
             return ChallengeType.AKAMAI
-        # Akamai behavioral challenge — 200 with tiny challenge page
-        if status_code == 200 and len(body) < 10_000:
+        # Akamai behavioral challenge — tiny challenge page
+        if status_code in _AKAMAI_BEHAVIORAL_STATUSES and len(body) < 10_000:
             if "sec-if-cpt" in body or "behavioral-content" in body:
                 logger.info("Challenge detected (body): akamai behavioral")
                 return ChallengeType.AKAMAI
@@ -526,9 +545,11 @@ def detect_challenge(
     # The same behavioral page without either cookie: chewy.com serves it that
     # way (2026-10-06, a 2.4KB 200 setting only device-id), and it went
     # undetected and was returned as the product page. Matched on both markers
-    # together, which no ordinary page carries.
+    # together, which no ordinary page carries. Not only at 200: under 429 or
+    # 403 the generic-JS fallback below took it, and the generic wait reports
+    # success on any page that goes quiet.
     if (
-        status_code == 200
+        status_code in _AKAMAI_BEHAVIORAL_STATUSES
         and len(body) < 10_000
         and "sec-if-cpt" in body
         and "behavioral-content" in body

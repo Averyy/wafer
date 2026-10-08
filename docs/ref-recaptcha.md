@@ -47,7 +47,34 @@ wafer/browser/
 
 **4x4 multi-round**: One photo divided into 16 cells. DET model runs object detection on full image, maps bounding boxes to grid cells. Google shows 2-4 grids in sequence ("Next" for intermediate, "Verify" on final). Pass/fail only known after final verify.
 
-Grid type auto-detected via DOM: `.rc-imageselect-table-44` = 4x4, `.rc-imageselect-desc-no-canonical` = dynamic 3x3.
+Grid size comes from the one grid table on screen: `.rc-imageselect-table-44` = 4x4, `-33` = 3x3. Detection first waits (up to 4s) until exactly one table is present and none carries an `rc-imageselect-carousel-*` class, because Google slides the next round of a multi-round challenge in with a carousel and for a moment both tables exist. For a 3x3 grid, instructions that continue after the keyword ("Click verify once there are none left") mark it dynamic; the text itself is never compared. That is only a first guess: the first clicks settle it. A static tile keeps its image and takes `rc-imageselect-tileselected` (acknowledged as `selected`); a dynamic tile fades and is replaced. If every click was acknowledged `selected` the grid is handled as static, otherwise as dynamic. Downgrading a grid the prompt called dynamic also needs the clicked tiles still showing their own images, selected, with no replacement arriving, 0.8s after the last click.
+
+## Round handling (live, 2026-10-08)
+
+Measured on AliExpress MTop reCAPTCHA punishments (`challenge_type="tmd"`, 150s budget), with per-poll DOM and network instrumentation. Five defects lost rounds or whole solves:
+
+- **Mid-carousel reads.** On a 4x4 "Next" the button turned to "Skip" 45 ms after the click while the old image was still on screen. Any marker change counted as a new round, the next attempt read the grid mid-carousel (two `table-44`s; the old strict `table-44` locator raised), called it `dynamic_3x3`, could not find a `tile-33` image and reloaded, throwing away a valid round. Seen in all three baseline runs. A new round now needs a new image or prompt (`_new_round`), and detection waits for the carousel to settle.
+- **Grid type from `rc-imageselect-desc-no-canonical`.** By its name that class marks a prompt without a canonical example image, and it did not track dynamic grids in either direction. A dynamic "cars" grid without the class was read as static: Verify was pressed while its clicked tiles were still being replaced, no userverify went out, and the solve gave up at 89s of 150s. A static grid with it was read as dynamic and waited 8s for replacements that never came. Fixed by the click-behaviour check above.
+- **Reload after "Please try again".** Google answers a wrong submission with a new grid (new image, sometimes a new keyword). The solver clicked reload on top of it. It now continues on Google's grid when one appears within 3s and reloads only when the grid did not change.
+- **Stale error messages.** A "try again" or "select all" message still showing from an earlier round is read before Verify and ignored as this round's verdict until it disappears; if it comes back, that is the verdict. One still showing after a userverify and 40s of no change reloads.
+- **Giving up on a grid nothing was submitted for.** A lost tile click, unresolved dynamic replacements, a grid that never settled, a Verify that did not dispatch, and a Verify that sent no userverify (counted when the request is sent, so an answer in flight is still waited for) each ended the whole solve. Nothing reached Google in any of them, so no verdict can arrive late; they now reload for a fresh grid while budget remains. A userverify that went out and got no visible result after 40s still ends the solve, leaving the page to the caller's check.
+
+Before (3 cold sessions, old code): solved in 2 of 3 (50.1s, 81.4s; one gave up at 88.9s), 4-5 rounds each, 5 avoidable reloads. After (6 cold sessions): solved in 6 of 6 (103.8s/7 rounds, 63.0s/4, 20.3s/1, 80.8s/6, 18.5s/1, 97.3s/4), no avoidable reloads, Google's own replacement grid used 5 times. The number of rounds is Google's call; long runs were chains of five 4x4 rounds. Under TMD a missing anchor now waits 20s instead of 5s before deciding the browser passed through, since the issued URL already names a reCAPTCHA. This one is inferred, not observed: the anchor appeared within 3s in all 9 runs, but the 5s path ends a solve roughly 15-25s after the call (launch, navigation, browse, grace, then the 8s x5sec poll), which fits a consumer's unexplained 26s failure. An exception inside the solver now logs at WARNING with its type; it used to end the solve with a DEBUG line only.
+
+## Tile score floor
+
+A 3x3 tile (grid or dynamic replacement) is clicked when the target is its top class and scores at least `_MIN_TILE_CONFIDENCE = 0.70` (was 0.10, a leftover from a nano model whose softmax was spread thin). Checked against the unlabeled demo-page tiles in `training/recaptcha/collected_cls` (never in a training set): the shipped classifier scored all 33,485 "cars" tiles, and samples of its Car picks were labeled by eye, about 30 per score band:
+
+| p(Car) band | Share of picks | Cars / labeled |
+|---|---|---|
+| 0.30-0.50 | 5.1% | 2 / 30 |
+| 0.50-0.60 | 5.4% | 1 / 29 |
+| 0.60-0.70 | 5.1% | 9 / 29 |
+| 0.70-0.80 | 5.4% | 11 / 28 |
+| 0.80-0.97 | 16.6% | 30 / 58 |
+| 0.97-1.00 | 62.1% | 29 / 29 |
+
+A tile that is more likely wrong than right fails the grid whether clicked or not, so it is better left alone; below 0.70 every band's 95% interval stays under even odds. Bus and hydrant picks at 0.50-0.80 agreed (9/19, 3/18). Car-ish tiles whose top class was something else held no cars (0/29 at 0.05-0.50), so the argmax rule costs little there. Live grids were mixed and few: picks at 0.641 and 0.653 were wrong, one at 0.697 right, and one solve was accepted with a true car at 0.563 left out (the new floor at work). The floor does not explain every wrong verdict: on clean (noise-free) live grids most misses were tiles where another class won (a cyclist on a crosswalk at 0.162, a small white hydrant at 0.063).
 
 ## Keyword Matching
 
@@ -93,6 +120,8 @@ See `docs/ref-models.md` for model training, data collection pipeline, and retra
 
 - DET model sometimes over-selects (9-11 of 16 cells) due to low confidence threshold
 - Non-COCO keywords on 4x4 grids cause a reload (wastes one round)
+- A tile holding two classes is skipped when the other one wins (live misses: a cyclist on a crosswalk, a hydrant beside a wall)
+- "Please select all matching images" still reloads; the selection is not extended
 - Boat and Parking Meter classes are collection-only (model outputs 14 classes, not 16)
 - First request downloads ~63 MB of models (cached after that)
 

@@ -293,6 +293,22 @@ session.browser_solve_challenge(url: str, challenge_type: str, *,
 # the issued punishment URL in resp.json()["data"]["url"]. Pass that URL with
 # challenge_type="tmd", then reissue the MTop call; its token bootstrap
 # (FAIL_SYS_TOKEN_EMPTY plus a fresh _m_h5_tk cookie) follows as usual.
+# That punishment is a Google reCAPTCHA and costs 20-130s of image rounds.
+# Avoid it instead: a session that has never run AliExpress's page script
+# lacks the _baxia_sec_cookie_ that script sets in the browser, and protected
+# MTop APIs (mtop.aliexpress.pdp.pc.query, signed or not) punish every call
+# without it. No header shape, TLS or warm-up GET of an HTML page changes
+# that. Call browser_prime("https://www.aliexpress.com/") once before the
+# first MTop call: it imports _baxia_sec_cookie_ and usually _m_h5_tk too
+# (about 17s, headed or headless), and MTop then answers SUCCESS with no
+# captcha. Not always: when AliExpress punishes a real browser's own item
+# page too, the primed call still gets FAIL_SYS_USER_VALIDATE, so keep the
+# browser_solve_challenge path above as the fallback. The homepage normally
+# shows no challenge; browser_prime still returns True there when it imported
+# cookies for the origin, so True is not proof that MTop will answer SUCCESS.
+# Read the token with
+# session.get_cookie("_m_h5_tk", "https://acs.aliexpress.com/") and sign with
+# it; bootstrap as usual if the page did not mint one.
 
 # Browser-rendered fetch (sync on SyncSession; coroutine on AsyncSession):
 session.render(url: str, *, timeout=None, max_response_size=None) -> WaferResponse
@@ -314,6 +330,12 @@ session.render(url: str, *, timeout=None, max_response_size=None) -> WaferRespon
 # The browser follows redirects regardless of follow_redirects, so resp.url is
 # the final URL and resp.history is empty. Cookies the page set are merged into
 # the session jar, so a following get() reuses them.
+# A render that ends on a WAF challenge raises ChallengeDetected (the document
+# is on .response, with .challenge_type set) and keeps none of its cookies: not
+# in the jar, not in cache_dir, no identity pin. The exception is a site gate
+# wafer answers over the transport (cookie_gate, pow, acw, amazon, radware):
+# reaching one means the browser got past the WAF, so its cookies are kept
+# and a following get() clears the gate inline.
 # A session with no browser_solver= creates one on the first render and closes
 # it on exit; from then on that session can browser-solve challenges on
 # ordinary requests too. Passing browser_solver= keeps the caller's ownership.
@@ -797,6 +819,14 @@ cookies (browser-solved WAF challenges, inline solvers) are persisted to disk.
 Normal `Set-Cookie` headers stay in-memory and are lost on session rebuild (WAFs
 can bind cookies to TLS fingerprints). Set `cache_dir` when browser or inline
 solver cookies must persist across sessions.
+Rejected cookies are never written. A browser solve inside `get()` holds its
+cookies until the retry answers: a retry from the same site that is still
+challenged, or a bare 403, drops them, so a rejected solve never hands its
+cookies to the next session sharing the directory. Anything else keeps them
+(a 2xx/3xx, an inline site gate behind the WAF, or no verdict at all, such as
+a 404 or the call timing out right after the solve). A passthrough is proven by its own body and is written at once.
+`browser_prime()` and `browser_solve_challenge()` write at once too: no retry
+follows inside wafer, so validate your own follow-up request.
 Thread-safe (per-domain locks, atomic writes via temp file + rename). Multiple
 threads can share the same `cache_dir` path safely. Multiple processes sharing
 the same path may lose updates under concurrent writes to the same domain.
@@ -1115,6 +1145,11 @@ config: HardenedLaunch = hardened_launch_config(
                         # workers report "HeadlessChrome". Ignored when headed.
     viewport=None,      # headless macOS only: (width, height) of the page.
                         # Default: the largest common size that fits the display.
+    gpu=None,           # Linux only: True renders WebGL on the GPU through Mesa,
+                        # False on Chrome's SwiftShader. Default: True when the
+                        # process can open a /dev/dri/renderD* node. Without a
+                        # GPU, Mesa's renderer is llvmpipe, which Akamai refuses
+                        # outright; SwiftShader passes.
 )
 # Headless on macOS the launch describes the Mac's main display (read once per
 # process) to Chrome, so with new_context(no_viewport=True) every frame reports
@@ -1231,6 +1266,10 @@ solver = BrowserSolver(
                           # a matching Session(proxy=).
     executable_path=None, # optional str/os.PathLike Chrome executable override
 )
+# Linux (Docker, Xvfb): with no GPU the solver renders WebGL on SwiftShader,
+# chosen automatically (no /dev/dri render node, or Mesa fell back to llvmpipe).
+# Nothing to configure. Akamai refuses a llvmpipe browser outright, so a
+# container image needs no GPU passthrough for Akamai sites.
 # Proxy configuration is mutable only before Chromium launches.
 solver.proxy_server -> str | None
 solver.egress_guard_proxy -> str | None

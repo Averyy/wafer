@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>Error Page</title>
+    <style>
+        body{font:14px Arial;margin:0;display:flex;flex-direction:column;min-height:100vh;color:#333}
+        .hdr{background:#f96302;color:#fff;padding:8px;text-align:center}
+        .err{flex:1;display:flex;flex-direction:column;justify-content:center;align-items:center;text-align:center;padding:20px}
+        .msg{font-size:24px;color:#d81118;margin:20px 0}
+        .btn{background:#f96302;color:#fff;border:0;padding:15px 30px;border-radius:6px;cursor:pointer;font-size:16px;font-weight:bold;box-shadow:0 2px 4px rgba(0,0,0,0.2);transition:all 0.3s}
+        .ftr{background:#333;color:#fff;padding:10px;text-align:center}
+        .ftr a{color:#fff;text-decoration:underline}
+    </style>
+</head>
+<body>
+    <div class="hdr">#1 Home Improvement Retailer</div>
+
+    <main class="err">
+        <div class="msg">Oops!! Something went wrong. Please refresh page</div>
+        <button class="btn" id="refreshBtn" type="button">Refresh</button>
+    </main>
+
+    <script>
+        (function () {
+            var HOME_URL = 'https://www.homedepot.com/';
+
+            document.addEventListener('DOMContentLoaded', function () {
+                document.getElementById('refreshBtn').addEventListener('click', function () {
+                    window.location.href = HOME_URL;
+                });
+            });
+        })();
+
+        window.digitalData = window.digitalData || {};
+        window.digitalData.page = window.digitalData.page || {};
+        window.digitalData.page.pageInfo = window.digitalData.page.pageInfo || {};
+        window.digitalData.page.pageInfo.pageName =
+            window.digitalData.page.pageInfo.pageName || 'error page';
+    </script>
+
+    <script defer type="text/javascript"
+        src="https://assets.thdstatic.com/core/global-privacy-control/v1.6.0/gpc.js">
+    </script>
+
+    <div class="ftr">
+        How doers get more done&trade;<br>
+        Need Help? Visit our
+        <a href="https://www.homedepot.com/c/customer-service"
+           target="_blank"
+           rel="noopener noreferrer">Customer Service Center</a>
+    </div>
+</body>
+</html>

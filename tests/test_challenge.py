@@ -171,6 +171,31 @@ class TestAkamai:
         body = '<div class="behavioral-content">Our behavioral research</div>'
         assert detect_challenge(200, {}, body) is None
 
+    @pytest.mark.parametrize("status", [403, 429])
+    def test_behavioral_page_on_block_status_without_cookies(self, status):
+        # Under a block status the generic-JS fallback took it, and render()
+        # then ran the generic wait instead of Akamai's.
+        body = (
+            '<!DOCTYPE html><html><body><script src="/838iat0j8/x?v=1&t=2">'
+            '</script><div id="sec-if-cpt-container" role="main" '
+            'style="display: none"><div class="behavioral-content">'
+            '<div class="behavioral-button progress-btn-disabled"></div>'
+            "</div></div><script>location.reload(true);</script></body></html>"
+        )
+        assert detect_challenge(status, {}, body) == ChallengeType.AKAMAI
+
+    def test_abck_cookie_429_small_behavioral(self):
+        headers = _h(set_cookie="_abck=abc123; Path=/")
+        body = '<div class="sec-if-cpt">Please verify</div><script></script>'
+        assert detect_challenge(429, headers, body) == ChallengeType.AKAMAI
+
+    def test_one_behavioral_marker_on_403_without_cookies_is_not_akamai(self):
+        body = (
+            '<div class="behavioral-content">Our behavioral research</div>'
+            "<script></script>"
+        )
+        assert detect_challenge(403, {}, body) == ChallengeType.GENERIC_JS
+
     def test_abck_cookie_200_large_body_not_challenge(self):
         """Large 200 response with _abck is normal content, not a challenge."""
         headers = _h(set_cookie="_abck=abc123; Path=/")

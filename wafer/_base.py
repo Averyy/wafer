@@ -20,7 +20,7 @@ from wreq import CertStore, Emulation, Method
 
 from wafer import _psl
 from wafer._bytes import as_text, is_binary
-from wafer._cookies import CookieCache, _default_cookie_path
+from wafer._cookies import CookieCache, _default_cookie_path, registrable_domain
 from wafer._dart import DartIdentity
 from wafer._fingerprint import (
     HIGH_ENTROPY_HINTS,
@@ -1378,6 +1378,101 @@ class BaseSession:
         if self._profile is not None:
             return self._profile.value
         return None
+
+    def _browser_passthrough_response(self, result):
+        """The WaferResponse for the document a browser result captured."""
+        from wafer._response import WaferResponse
+
+        return WaferResponse(
+            status_code=result.response.status,
+            headers=result.response.headers,
+            url=result.response.url,
+            content=result.response.body,
+            was_retried=True,
+            emulation=self._serving_emulation_repr(),
+            # Individual Set-Cookie values from the captured response
+            # (the flat headers dict joins multi-value headers with
+            # "; ", which is lossy for Set-Cookie). Mirrors native-TLS.
+            raw_set_cookie=getattr(result.response, "set_cookie", None) or None,
+        )
+
+    @staticmethod
+    def _cap_browser_body(result, max_size: int | None) -> None:
+        """Enforce the response-size cap on a browser body.
+
+        It never went through the wreq capped-read path.
+        """
+        body = result.response.body
+        if max_size is not None and len(body) > max_size:
+            from wafer._errors import ResponseTooLarge
+
+            raise ResponseTooLarge(result.response.url, len(body), max_size)
+
+    @staticmethod
+    def _validated_browser_cookies(
+        pending: list,
+        status: int,
+        challenge,
+        host: str | None = None,
+    ) -> list:
+        """Settle the cookies a browser solve deferred, once its retry answered.
+
+        A solve that hands back no document is only proven by the retry it
+        enables. Writing its cookies to ``cache_dir`` before that persisted a
+        rejected sensor's cookies as clearance whenever the solve reported
+        success and the WAF disagreed, and every session sharing the cache then
+        replayed them until they expired. *pending* holds ``(cache_domain,
+        entries, registrable_domain)``; only entries for *host*'s registrable
+        domain are settled, since another host's answer (after a cross-host
+        redirect) says nothing about them. Returns the ``(cache_domain,
+        entries)`` to persist when the answer got through, drops them when it
+        is still challenged or denied (a bare 403), and keeps them pending when
+        it says neither (a 429, 5xx or other 4xx); ``_flush_browser_cookies``
+        writes those when the call ends. A site gate the session answers inline
+        (``INLINE_CHALLENGES``) means the retry got past the WAF the browser
+        solved, so it counts as through.
+        """
+        from wafer._challenge import INLINE_CHALLENGES
+
+        if not pending:
+            return []
+        reg = registrable_domain(host) if host else None
+        mine = [entry for entry in pending if reg is None or entry[2] == reg]
+        if not mine:
+            return []
+        if challenge not in INLINE_CHALLENGES and (
+            challenge is not None or status == 403
+        ):
+            logger.info(
+                "Browser solve did not clear the retry (%s); not caching "
+                "its cookies",
+                challenge.value if challenge is not None else status,
+            )
+            settled = []
+        elif challenge is None and status >= 400:
+            return []
+        else:
+            settled = [(entry[0], entry[1]) for entry in mine]
+        pending[:] = [entry for entry in pending if entry not in mine]
+        return settled
+
+    def _flush_browser_cookies(self, pending: list) -> None:
+        """Write the deferred browser cookies no answer rejected.
+
+        Called however the request ends (a timeout right after the solve, an
+        exhausted retry, a cancellation), so a clearance nothing disproved is
+        kept as it was before solves were deferred. Synchronous: it runs in a
+        ``finally`` that may be unwinding a cancelled task.
+        """
+        if not pending or self._cookie_cache is None:
+            pending.clear()
+            return
+        for cache_domain, entries, *_ in pending:
+            try:
+                self._cookie_cache.save(cache_domain, entries)
+            except Exception:
+                logger.debug("Failed to persist browser cookies")
+        pending.clear()
 
     def _compute_client_headers(self) -> dict[str, str]:
         """Compute client-level headers snapshot.

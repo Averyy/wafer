@@ -351,6 +351,25 @@ def _wait_for_reddit(page, timeout_ms: int) -> bool:
     return _reddit_browser_cookie_evidence(page)
 
 
+def _page_snapshot(page) -> tuple[str, str, frozenset] | None:
+    """The page's URL, document and cookies, to tell whether anything changed.
+
+    Read without a user gesture (``_quiet_read``); ``None`` when unreadable.
+    """
+    try:
+        dom = _quiet_read(page, "document.documentElement.outerHTML")
+        cookies = frozenset(
+            (c.get("name"), c.get("domain"), c.get("path"), c.get("value"))
+            for c in page.context.cookies()
+        )
+        url = str(page.url)
+    except Exception:
+        return None
+    if not isinstance(dom, str):
+        return None
+    return url, dom, cookies
+
+
 def _is_passthrough_challenge_html(html: str) -> bool:
     """Reject structurally identifiable WAF bodies in shared passthroughs."""
 
@@ -1500,6 +1519,31 @@ def _default_viewport(screen: "_MacScreen") -> tuple[int, int]:
     )
 
 
+_DRI_DIR = "/dev/dri"
+# Mesa's CPU rasterizers, as WebGL's unmasked renderer names them.
+_SOFTWARE_GL_RE = re.compile(r"llvmpipe|softpipe|lavapipe|swrast", re.IGNORECASE)
+_WEBGL_RENDERER = """() => {
+  const gl = document.createElement('canvas').getContext('webgl');
+  if (!gl) return null;
+  const info = gl.getExtension('WEBGL_debug_renderer_info');
+  return info ? gl.getParameter(info.UNMASKED_RENDERER_WEBGL) : null;
+}"""
+
+
+def _linux_gpu_available() -> bool:
+    """Whether this process can open a DRI render node, i.e. use a GPU.
+
+    Without one, Mesa's OpenGL driver is its llvmpipe software rasterizer.
+    """
+    try:
+        nodes = [n for n in os.listdir(_DRI_DIR) if n.startswith("renderD")]
+    except OSError:
+        return False
+    return any(
+        os.access(os.path.join(_DRI_DIR, node), os.R_OK | os.W_OK) for node in nodes
+    )
+
+
 @dataclass(frozen=True)
 class HardenedLaunch:
     """Chromium launch settings that keep an automated browser unremarkable.
@@ -1528,6 +1572,7 @@ def hardened_launch_config(
     platform: str | None = None,
     user_agent: str | None = None,
     viewport: tuple[int, int] | None = None,
+    gpu: bool | None = None,
 ) -> HardenedLaunch:
     """The launch settings wafer's own solver browser uses.
 
@@ -1557,6 +1602,16 @@ def hardened_launch_config(
     Playwright's default ``headless=True`` binary is chrome-headless-shell,
     which ignores ``--headless=new`` and brands its workers ``HeadlessChrome``.
 
+    ``gpu`` matters only on Linux, and picks WebGL's renderer. With a GPU,
+    ANGLE runs on Mesa's OpenGL driver for it. Without one that driver is
+    Mesa's software rasterizer, ``llvmpipe``, which Akamai refuses outright,
+    so ANGLE runs on Chrome's own SwiftShader instead, which Akamai accepts
+    (homedepot.com under Xvfb, 2026-10-08: llvmpipe refused 6 of 6, SwiftShader
+    passed 4 of 4). ``None`` decides by whether this process can open a DRI
+    render node (``/dev/dri/renderD*``); a container without GPU passthrough
+    has none. :class:`BrowserSolver` also checks the renderer it got and
+    relaunches on SwiftShader when a render node still led to ``llvmpipe``.
+
     The CDP screenX/screenY compatibility patch is deliberately absent. It is
     only correct on a Chrome whose event descriptors are already wrong, which
     wafer establishes with a real-input probe at solve time; applying it
@@ -1583,16 +1638,27 @@ def hardened_launch_config(
         "--disable-updater-scheduler",
     ]
     if host == "linux":
-        # Pin ANGLE to Mesa's OpenGL backend. Its automatic Linux backend
-        # selection can resolve to ``gl=none`` under Xvfb, making WebGL
-        # disappear entirely even though the image includes Mesa DRI.
-        args.extend(
-            [
-                "--use-gl=angle",
-                "--use-angle=gl",
-                "--ignore-gpu-blocklist",
-            ]
-        )
+        # Pin ANGLE's backend either way. Its automatic Linux selection can
+        # resolve to ``gl=none`` under Xvfb, making WebGL disappear entirely,
+        # and Akamai refuses a browser with no WebGL as it refuses llvmpipe.
+        if _linux_gpu_available() if gpu is None else gpu:
+            args.extend(
+                [
+                    "--use-gl=angle",
+                    "--use-angle=gl",
+                    "--ignore-gpu-blocklist",
+                ]
+            )
+        else:
+            args.extend(
+                [
+                    "--use-gl=angle",
+                    "--use-angle=swiftshader",
+                    # Chrome no longer falls back to SwiftShader for WebGL on
+                    # its own; without this WebGL is unavailable on it.
+                    "--enable-unsafe-swiftshader",
+                ]
+            )
     else:
         args.append("--use-gl=angle")
     if proxied:
@@ -3197,6 +3263,10 @@ class BrowserSolver:
         # ``None`` means no browser has been probed yet; after probing it is
         # immutable for this solver's configured executable.
         self._needs_screenxy_patch: bool | None = None
+        # Linux only: whether WebGL renders on the GPU through Mesa (True) or
+        # on SwiftShader (False). ``None`` until the first launch decides it;
+        # kept across idle relaunches so the browser does not change renderer.
+        self._linux_gpu: bool | None = None
         # A transport session can read this while the browser worker is busy.
         # Publish one immutable pair at a time; never take the long-lived
         # browser-operation lock in that read path.
@@ -3460,6 +3530,9 @@ class BrowserSolver:
             raise TimeoutError("Browser startup exceeded solve timeout")
 
         proxied = bool(self._proxy_server or self._egress_guard_proxy)
+        linux = sys.platform.startswith("linux")
+        if linux and self._linux_gpu is None:
+            self._linux_gpu = _linux_gpu_available()
 
         try:
             logger.debug("Starting playwright driver...")
@@ -3476,6 +3549,7 @@ class BrowserSolver:
                         headless=True,
                         proxied=proxied,
                         viewport=self._solver_viewport(),
+                        gpu=self._linux_gpu,
                     ),
                     deadline,
                     offline=True,
@@ -3485,15 +3559,35 @@ class BrowserSolver:
                 self._browser = None
             # Single source of truth, shared with callers driving their own
             # Playwright: see hardened_launch_config for why it is exported.
-            self._launch_chromium(
-                hardened_launch_config(
-                    headless=self._headless,
-                    proxied=proxied,
-                    user_agent=self._browser_ua if self._headless else None,
-                    viewport=self._solver_viewport(),
-                ),
-                deadline,
-            )
+            def launch() -> None:
+                self._launch_chromium(
+                    hardened_launch_config(
+                        headless=self._headless,
+                        proxied=proxied,
+                        user_agent=self._browser_ua if self._headless else None,
+                        viewport=self._solver_viewport(),
+                        gpu=self._linux_gpu,
+                    ),
+                    deadline,
+                )
+
+            launch()
+            if linux and self._linux_gpu:
+                # A render node does not guarantee Mesa can use it (no driver
+                # for the device, a VM's display adapter): WebGL then lands on
+                # llvmpipe all the same, which Akamai refuses. Check what the
+                # browser actually got, once, and move to SwiftShader.
+                renderer = self._read_webgl_renderer()
+                if renderer and _SOFTWARE_GL_RE.search(renderer):
+                    logger.info(
+                        "WebGL is on Mesa's software rasterizer (%s); "
+                        "relaunching on SwiftShader",
+                        renderer,
+                    )
+                    self._linux_gpu = False
+                    self._browser.close()
+                    self._browser = None
+                    launch()
         except Exception:
             self._close_browser(preserve_identity=True)
             raise
@@ -3591,6 +3685,25 @@ class BrowserSolver:
         browser.on("disconnected", _disconnected)
         if deadline is not None and time.monotonic() >= deadline:
             raise TimeoutError("Browser launch exceeded solve timeout")
+
+    def _read_webgl_renderer(self) -> str | None:
+        """The launched browser's unmasked WebGL renderer, from about:blank."""
+        try:
+            probe = self._browser.new_page()
+        except Exception:
+            logger.debug("Could not open the WebGL probe page", exc_info=True)
+            return None
+        try:
+            renderer = probe.evaluate(_WEBGL_RENDERER)
+        except Exception:
+            logger.debug("Could not read the WebGL renderer", exc_info=True)
+            renderer = None
+        finally:
+            try:
+                probe.close()
+            except Exception:
+                logger.debug("Could not close WebGL probe page", exc_info=True)
+        return renderer if isinstance(renderer, str) else None
 
     def _read_browser_ua(self) -> str:
         """The launched browser's own ``navigator.userAgent``, from about:blank."""
@@ -5935,6 +6048,8 @@ class BrowserSolver:
         if extend is not None:
             deadline = extend(challenge.value)
             remaining_ms = int((deadline - time.monotonic()) * 1000)
+        generic = challenge.value == "generic_js"
+        before = _page_snapshot(page) if generic else None
         try:
             solved = self._dispatch_challenge(
                 page,
@@ -5948,6 +6063,19 @@ class BrowserSolver:
                 challenge.value,
                 type(exc).__name__,
             )
+            return False
+        # The generic wait reports success on any page that goes quiet. When
+        # nothing moved, the same document and the same cookies, nothing was
+        # earned, and re-navigating and polling it through the post-solve
+        # window only delays the answer: homedepot.com's Akamai deny page cost
+        # 32s that way (2026-10-08).
+        if (
+            generic
+            and solved is not False
+            and before is not None
+            and _page_snapshot(page) == before
+        ):
+            logger.info("Generic challenge page did not change; not re-capturing")
             return False
         # None means "no challenge was present after all" (the Cloudflare
         # handler reports absence that way); re-capturing is right there too.

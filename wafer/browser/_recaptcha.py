@@ -10,6 +10,12 @@ from wafer.browser._pump import idle
 
 logger = logging.getLogger("wafer")
 
+# How long after the initial browse a missing anchor frame means the browser
+# passed through with no widget. Under TMD the punishment URL itself names a
+# reCAPTCHA, so only a much longer wait can mean anything.
+_ANCHOR_GRACE_SECONDS = 5.0
+_TMD_ANCHOR_GRACE_SECONDS = 20.0
+
 
 def _is_recaptcha_frame(url: str, kind: str) -> bool:
     """Match Google and recaptcha.net API v2/enterprise iframe URLs."""
@@ -334,7 +340,19 @@ def wait_for_recaptcha(
         if initial_browse <= 0:
             return False
         solver._replay_browse_chunk(page, state, initial_browse)
-        grace_deadline = min(deadline, time.monotonic() + 5.0)
+        # The grace detects a browser that passed through with no widget at
+        # all. Under TMD the issued URL already says a reCAPTCHA is coming
+        # (action=captcharecaptcha) through two nested punishment documents,
+        # so a slow load must not end a 150 s solve after 5 s.
+        grace_deadline = min(
+            deadline,
+            time.monotonic()
+            + (
+                _TMD_ANCHOR_GRACE_SECONDS
+                if protocol_completion_is_intermediate
+                else _ANCHOR_GRACE_SECONDS
+            ),
+        )
         iframe_seen = False
         checkbox_clicked = False
         verify_count_at_click = 0
@@ -457,8 +475,11 @@ def wait_for_recaptcha(
 
             if not iframe_seen and time.monotonic() > grace_deadline:
                 logger.info(
-                    "No reCAPTCHA iframe after 5s, "
-                    "browser likely passed through"
+                    "No reCAPTCHA iframe after %.0fs, "
+                    "browser likely passed through",
+                    _TMD_ANCHOR_GRACE_SECONDS
+                    if protocol_completion_is_intermediate
+                    else _ANCHOR_GRACE_SECONDS,
                 )
                 return False
 
@@ -510,8 +531,14 @@ def wait_for_recaptcha(
                 )
             )
         return False
-    except Exception:
-        logger.debug("reCAPTCHA interaction failed", exc_info=True)
+    except Exception as exc:
+        # Warning, not debug: this ends the solve with its budget unspent,
+        # and at INFO an early end otherwise left no line at all.
+        logger.warning(
+            "reCAPTCHA interaction failed (%s); ending the solve",
+            type(exc).__name__,
+        )
+        logger.debug("reCAPTCHA interaction failure detail", exc_info=True)
         return False
     finally:
         _cleanup_listener()

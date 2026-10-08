@@ -921,9 +921,16 @@ def _detect_in_grid(
     return sorted(cells)
 
 
-# Tile selection thresholds (tuned for nano model's probability distribution -
-# nano spreads softmax across 14 classes, so absolute values are low)
-_MIN_TILE_CONFIDENCE = 0.10  # tile must exceed this to be selected
+# Score floor for clicking a 3x3 tile (grid and dynamic replacement) whose top
+# class is the target. 0.10 dated from a nano model that spread its softmax
+# thin; the shipped EfficientNet is confident, and its mid-range picks are
+# mostly wrong. Hand-labeled picks of the shipped classifier on unlabeled
+# "cars" tiles (collected_cls, 2026-10-08, 30 per band): 2/30 cars at
+# 0.30-0.50, 1/29 at 0.50-0.60, 9/29 at 0.60-0.70, 11/28 at 0.70-0.80, 29/29
+# at 0.97+. Bus and hydrant agreed (0.50-0.80: 9/19 and 3/18). A tile more
+# likely wrong than right fails the grid whether clicked or not, so skip it.
+# Live picks at 0.641 and 0.653 were wrong, one at 0.697 was right.
+_MIN_TILE_CONFIDENCE = 0.70
 
 
 def _select_tiles(
@@ -934,12 +941,13 @@ def _select_tiles(
     """Given (N, 14) probs, return 0-based list of tiles to click.
 
     Selects tiles where the target class is the argmax (highest predicted
-    class). The nano model reliably puts the correct class as argmax even
-    though absolute probabilities are low (~0.15-0.20). Tiles where a
-    different class is argmax are almost never correct.
+    class) and scores at least ``min_confidence``. On the noisy demo-page
+    tiles, those whose top class was something else held no cars (0 of 29
+    scoring 0.05-0.5). Clean live grids do lose tiles to it: a cyclist on a
+    crosswalk, a small hydrant (2026-10-08), where another class wins.
 
-    If more than 5 tiles match (likely false positives from the nano model),
-    keeps only the top 5 by score to avoid over-selection.
+    If more than 5 tiles match, keeps only the top 5 by score to avoid
+    over-selection.
     """
     if target_class is None:
         return None
@@ -1017,10 +1025,20 @@ def _setup_payload_intercept(page):
     """
     captured = {
         "payload": None,
+        "verify_requests": 0,
         "verify_statuses": [],
         "verify_summaries": [],
         "cleanup": lambda: None,
     }
+
+    def _on_request(request):
+        # Counted when sent, so a Verify whose answer is still in flight is
+        # not mistaken for one that never reached Google.
+        try:
+            if _is_userverify_url(request.url):
+                captured["verify_requests"] += 1
+        except Exception:
+            pass
 
     def _on_response(response):
         url = response.url
@@ -1057,8 +1075,14 @@ def _setup_payload_intercept(page):
             except Exception:
                 pass
 
+    page.on("request", _on_request)
     page.on("response", _on_response)
-    captured["cleanup"] = lambda: page.remove_listener("response", _on_response)
+
+    def _cleanup():
+        page.remove_listener("request", _on_request)
+        page.remove_listener("response", _on_response)
+
+    captured["cleanup"] = _cleanup
     return captured
 
 
@@ -1140,7 +1164,16 @@ def _sleep_with_deadline(deadline: float, duration: float) -> bool:
 
 
 def _click_tile(
-    solver, page, bframe, cell, grid_size, cur_x, cur_y, deadline=float("inf")
+    solver,
+    page,
+    bframe,
+    cell,
+    grid_size,
+    cur_x,
+    cur_y,
+    deadline=float("inf"),
+    *,
+    ack_reasons: list[str] | None = None,
 ):
     """Click a grid tile using mouse path replay.
 
@@ -1148,6 +1181,10 @@ def _click_tile(
         cell: 0-based cell index (row-major).
         grid_size: 3 or 4.
         cur_x, cur_y: Current mouse position.
+        ack_reasons: when given, the acknowledgment reason of a dispatched
+            click is appended. ``selected`` means the tile kept its image and
+            took the selected class (static 3x3 and 4x4 grids); any other
+            reason means Google replaced or faded the tile (dynamic 3x3).
 
     Returns ``(target_x, target_y, dispatched)``. Coordinates alone cannot
     prove that a physical click reached the live tile.
@@ -1235,6 +1272,8 @@ def _click_tile(
                 cell,
                 reason,
             )
+            if ack_reasons is not None:
+                ack_reasons.append(reason)
             return target_x, target_y, True
         if not _sleep_with_deadline(acknowledge_deadline, 0.1):
             break
@@ -2216,15 +2255,87 @@ def _handle_dynamic_replacements(
 # ---------------------------------------------------------------------------
 
 
+# Between the rounds of a multi-round challenge reCAPTCHA slides the next grid
+# in with a carousel: for a moment the bframe holds two grid tables, the old
+# one classed ``rc-imageselect-carousel-leaving-left`` and the new one
+# ``rc-imageselect-carousel-offscreen-right`` (observed live, 2026-10-08).
+# Reading the grid then classified a 4x4 round as a 3x3 one (a strict
+# ``table-44`` locator raised on two matches), its image could not be found,
+# and the solver reloaded, discarding a valid round of the challenge.
+_GRID_SETTLE_SECONDS = 4.0
+
+_GRID_LAYOUT_SCRIPT = """() => {
+    const tables = Array.from(document.querySelectorAll(
+        'table.rc-imageselect-table-33, table.rc-imageselect-table-44'
+    ));
+    return tables.map(table => {
+        const image = table.querySelector(
+            'img.rc-image-tile-33, img.rc-image-tile-44'
+        );
+        return {
+            size: table.classList.contains('rc-imageselect-table-44') ? 4 : 3,
+            moving: Array.from(table.classList).some(
+                name => name.startsWith('rc-imageselect-carousel')
+            ),
+            image: Boolean(image && image.getAttribute('src')),
+        };
+    });
+}"""
+
+# Whether the instructions continue after the keyword. A dynamic 3x3 grid
+# says "Click verify once there are none left" there; a static one says
+# nothing more (live, 2026-10-08: 5 dynamic and 1 static grid). The text
+# itself is never compared, so this holds in every locale.
+_PROMPT_FOLLOWUP_SCRIPT = """() => {
+    const wrapper = document.querySelector('.rc-imageselect-desc-wrapper');
+    const strong = wrapper && wrapper.querySelector('strong');
+    if (!strong || !wrapper.lastChild) return null;
+    const range = document.createRange();
+    range.setStartAfter(strong);
+    range.setEndAfter(wrapper.lastChild);
+    return Boolean(range.toString().trim());
+}"""
+
+
+def _settled_grid_size(bframe, deadline: float) -> int | None:
+    """Return 3 or 4 once exactly one grid table is in place, else None."""
+
+    settle_deadline = min(deadline, time.monotonic() + _GRID_SETTLE_SECONDS)
+    while time.monotonic() < settle_deadline:
+        try:
+            tables = bframe.evaluate(_GRID_LAYOUT_SCRIPT)
+        except Exception:
+            tables = None
+        if isinstance(tables, list) and len(tables) == 1:
+            table = tables[0]
+            if (
+                isinstance(table, dict)
+                and table.get("moving") is False
+                and table.get("image") is True
+                and table.get("size") in (3, 4)
+            ):
+                return table["size"]
+        if not _sleep_with_deadline(settle_deadline, 0.15):
+            break
+    return None
+
+
 def _detect_grid_type(bframe, deadline: float = float("inf")):
     """Detect grid type from DOM structure.
 
-    Uses the actual table class (rc-imageselect-table-33 vs table-44)
-    and tile count to determine grid type, avoiding locale-dependent
-    text matching.
+    Waits for a single grid table that is not mid-carousel, then uses its
+    class (``rc-imageselect-table-33`` vs ``-44``) for the grid size. For a
+    3x3 grid, instructions that continue after the keyword mark it dynamic.
+    That is a first guess only: ``solve_image_grid`` confirms it from how the
+    tiles answer the first clicks (see ``_observed_grid_type``).
 
     Returns ("static_3x3" | "dynamic_3x3" | "4x4", keyword_text).
     """
+    # Settle first, so the keyword is read from the round that is on screen.
+    size = _settled_grid_size(bframe, deadline)
+    if size is None:
+        return None, None
+
     # Extract target keyword from <strong> element
     timeout = _remaining_timeout_ms(deadline, 3000)
     if timeout is None:
@@ -2238,36 +2349,37 @@ def _detect_grid_type(bframe, deadline: float = float("inf")):
 
     if not keyword:
         return None, None
-
-    # Detect 4x4 by table class (rc-imageselect-table-44)
-    timeout = _remaining_timeout_ms(deadline, 500)
-    if timeout is None:
-        return None, None
+    if size == 4:
+        return "4x4", keyword
     try:
-        is_4x4 = bframe.locator("table.rc-imageselect-table-44").is_visible(
-            timeout=timeout
-        )
-        if is_4x4:
-            return "4x4", keyword
+        dynamic = bframe.evaluate(_PROMPT_FOLLOWUP_SCRIPT) is True
     except Exception:
-        pass
+        dynamic = False
+    return ("dynamic_3x3" if dynamic else "static_3x3"), keyword
 
-    # 3x3 grid - detect dynamic vs static by checking if the
-    # desc uses the "no" class (rc-imageselect-desc-no-canonical)
-    # which indicates "select all matching images" (dynamic replacement)
-    timeout = _remaining_timeout_ms(deadline, 500)
-    if timeout is None:
-        return None, None
-    try:
-        is_dynamic = bframe.locator(".rc-imageselect-desc-no-canonical").is_visible(
-            timeout=timeout
-        )
-        if is_dynamic:
-            return "dynamic_3x3", keyword
-    except Exception:
-        pass
 
-    return "static_3x3", keyword
+def _observed_grid_type(
+    detected: str,
+    ack_reasons: list[str],
+    clicked: int,
+) -> str:
+    """Correct a 3x3 grid's type from how its tiles answered our clicks.
+
+    A static tile keeps its image and takes the selected class; a dynamic
+    tile fades and is replaced. Every click in eight live solves
+    (2026-10-08: 42 on dynamic grids, 51 on static and 4x4 ones) followed
+    that rule, while the old DOM guess
+    (``rc-imageselect-desc-no-canonical``) was wrong twice: a dynamic "cars"
+    grid read as static had Verify pressed while its replacements were still
+    arriving, and a static one read as dynamic waited 8 s for replacements
+    that never came. Without a reason for every click the guess stands.
+    """
+
+    if detected == "4x4" or not ack_reasons or len(ack_reasons) != clicked:
+        return detected
+    if all(reason == "selected" for reason in ack_reasons):
+        return "static_3x3"
+    return "dynamic_3x3"
 
 
 def _grid_state_marker(bframe, deadline: float):
@@ -2301,6 +2413,57 @@ def _grid_state_marker(bframe, deadline: float):
         return None
 
 
+def _new_round(previous_marker, marker) -> bool:
+    """Whether ``marker`` shows a different challenge round than before.
+
+    The image or the prompt must differ. The button label alone changes
+    within a round (Skip/Next/Verify follow the selection), and on a 4x4
+    "Next" it turned to "Skip" while the old image was still showing, which
+    started the next attempt on a grid that was mid-carousel.
+    """
+
+    if previous_marker is None or marker is None:
+        return False
+    return marker[0] != previous_marker[0] or marker[1] != previous_marker[1]
+
+
+_ERROR_OUTCOME_SELECTORS = (
+    (
+        ".rc-imageselect-error-select-more,.rc-imageselect-error-dynamic-more",
+        "more",
+    ),
+    (".rc-imageselect-incorrect-response", "incorrect"),
+)
+
+
+def _visible_error_outcomes(bframe, deadline: float) -> frozenset[str]:
+    """Error verdicts already on screen, read before a submission."""
+
+    visible = set()
+    for selector, outcome in _ERROR_OUTCOME_SELECTORS:
+        timeout = _remaining_timeout_ms(deadline, 250)
+        if timeout is None:
+            break
+        try:
+            if bframe.locator(selector).first.is_visible(timeout=timeout) is True:
+                visible.add(outcome)
+        except Exception:
+            continue
+    return frozenset(visible)
+
+
+def _wait_for_new_round(bframe, deadline: float, previous_marker) -> bool:
+    """Wait briefly for Google to put a new grid up after a verdict."""
+
+    wait_deadline = min(deadline, time.monotonic() + 3.0)
+    while time.monotonic() < wait_deadline:
+        if _new_round(previous_marker, _grid_state_marker(bframe, wait_deadline)):
+            return True
+        if not _sleep_with_deadline(wait_deadline, 0.2):
+            break
+    return False
+
+
 def _safe_grid_state_marker(marker):
     """Return diagnostic state without persisting signed payload URLs."""
 
@@ -2325,11 +2488,21 @@ def _wait_for_post_verify_outcome(
     maximum: float = 10.0,
     protocol_intermediate_ready=None,
     teardown_is_outcome: bool = False,
+    ignore_outcomes: frozenset[str] = frozenset(),
 ) -> str:
-    """Poll authoritative image-grid outcomes without switching CAPTCHA mode."""
+    """Poll authoritative image-grid outcomes without switching CAPTCHA mode.
+
+    ``ignore_outcomes`` names error messages that were already showing
+    before the submission, so a stale "try again" from an earlier round is
+    not read as this round's verdict. A new round is recognized by its image
+    or prompt, never the button label alone: on a 4x4 "Next" the label turns
+    to "Skip" while the old image is still on screen (live, 2026-10-08).
+    """
 
     from wafer.browser._recaptcha import _check_token, _widget_torn_down
 
+    # A stale message that goes away and comes back is this round's verdict.
+    ignore_outcomes = set(ignore_outcomes)
     outcome_deadline = min(deadline, time.monotonic() + maximum)
     while time.monotonic() < outcome_deadline:
         if _check_token(page, token_baseline, token_widget):
@@ -2350,27 +2523,22 @@ def _wait_for_post_verify_outcome(
             and _widget_torn_down(token_widget)
         ):
             return "torn_down"
-        for selector, outcome in (
-            (
-                ".rc-imageselect-error-select-more,.rc-imageselect-error-dynamic-more",
-                "more",
-            ),
-            (".rc-imageselect-incorrect-response", "incorrect"),
-        ):
+        for selector, outcome in _ERROR_OUTCOME_SELECTORS:
             timeout = _remaining_timeout_ms(outcome_deadline, 250)
             if timeout is None:
                 return "pending"
             try:
-                if bframe.locator(selector).first.is_visible(timeout=timeout):
-                    return outcome
+                visible = bframe.locator(selector).first.is_visible(timeout=timeout)
             except Exception:
-                pass
+                continue
+            if outcome in ignore_outcomes:
+                if visible is False:
+                    ignore_outcomes.discard(outcome)
+                continue
+            if visible:
+                return outcome
         marker = _grid_state_marker(bframe, outcome_deadline)
-        if (
-            previous_marker is not None
-            and marker is not None
-            and marker != previous_marker
-        ):
+        if _new_round(previous_marker, marker):
             return "changed"
         if not _sleep_with_deadline(outcome_deadline, 0.2):
             break
@@ -2397,6 +2565,37 @@ def _has_new_protocol_solved_response(
     ):
         return False
     return summaries[-1].get("classification") == "protocol_solved"
+
+
+def _verify_request_count(diagnostics: dict | None) -> int | None:
+    """userverify requests sent so far, or None when not being counted."""
+
+    value = diagnostics.get("verify_requests") if diagnostics else None
+    if type(value) is not int:
+        return None
+    return value
+
+
+def _verify_reached_google(
+    diagnostics: dict | None,
+    status_count_before: int,
+    request_count_before: int | None,
+) -> bool:
+    """Whether a userverify went out after the Verify click.
+
+    An answer counts, and so does a request still waiting for one. Without
+    request counting, only an answer can prove it.
+    """
+
+    statuses = diagnostics.get("verify_statuses", []) if diagnostics else []
+    if isinstance(statuses, list) and len(statuses) > status_count_before:
+        return True
+    requests = _verify_request_count(diagnostics)
+    return (
+        requests is not None
+        and request_count_before is not None
+        and requests > request_count_before
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2464,6 +2663,28 @@ def solve_image_grid(
 
     cur_x = state.current_x if state else random.uniform(400, 700)
     cur_y = state.current_y if state else random.uniform(300, 500)
+
+    def _fresh_grid(reason: str) -> bool:
+        """Trade a grid nothing was submitted on for a fresh one.
+
+        These states used to end the whole solve. Under TMD that abandoned a
+        single-use punishment with most of its budget unspent: a live solve
+        gave up at 89 s of 150 s (2026-10-08). Nothing reached Google, so no
+        verdict can still arrive for this grid, and a reload keeps going.
+        """
+
+        nonlocal cur_x, cur_y
+        logger.info("reCAPTCHA %s; reloading for a fresh grid", reason)
+        cur_x, cur_y, reloaded = _click_reload(
+            solver,
+            page,
+            bframe,
+            cur_x,
+            cur_y,
+            deadline,
+        )
+        return reloaded
+
     for attempt in range(max_attempts):
         if time.monotonic() > deadline:
             logger.debug("Image grid solver deadline exceeded")
@@ -2803,6 +3024,8 @@ def solve_image_grid(
         # be followed by Verify on a partial selection.
         random.shuffle(cells)
         clicked_cells = []
+        ack_reasons: list[str] = []
+        click_lost = False
         for cell in cells:
             if not _sleep_with_deadline(deadline, random.uniform(0.15, 0.45)):
                 return False
@@ -2815,15 +3038,53 @@ def solve_image_grid(
                 cur_x,
                 cur_y,
                 deadline,
+                ack_reasons=ack_reasons,
             )
             if not dispatched:
                 click_dispatches.append({"cell": cell, "dispatched": False})
                 logger.info("Grid tile click did not dispatch for cell %d", cell)
-                return False
+                click_lost = True
+                break
             click_dispatches.append({"cell": cell, "dispatched": True})
             clicked_cells.append(cell)
         if time.monotonic() >= deadline:
             break
+        if click_lost:
+            if not _fresh_grid("tile click was lost before Verify"):
+                return False
+            continue
+
+        observed_type = _observed_grid_type(
+            grid_type, ack_reasons, len(clicked_cells)
+        )
+        if (
+            grid_type == "dynamic_3x3"
+            and observed_type == "static_3x3"
+            and not (
+                _sleep_with_deadline(deadline, 0.8)
+                and _dynamic_base_selection_state(
+                    bframe,
+                    grid_size,
+                    set(clicked_cells),
+                    keyword_lower,
+                    deadline,
+                )
+                is not None
+            )
+        ):
+            # Skipping the replacement wait needs the tiles still showing
+            # their own images, selected, with no replacement arriving. A
+            # dynamic tile that showed the selected class before fading must
+            # not be submitted mid-swap.
+            observed_type = grid_type
+        if observed_type != grid_type:
+            logger.info(
+                "reCAPTCHA grid answered clicks as %s, not %s (%s)",
+                observed_type,
+                grid_type,
+                ",".join(ack_reasons),
+            )
+            grid_type = observed_type
 
         # Handle dynamic replacements - wait for new tiles to appear
         dynamic_base_fallback = False
@@ -2846,9 +3107,7 @@ def solve_image_grid(
                 trace=dynamic_trace,
             )
             if not dynamic_complete:
-                logger.info(
-                    "Dynamic replacements unresolved; preserving grid without Verify"
-                )
+                # Never Verify a partial dynamic answer; nothing was submitted.
                 _collect_det_grid(
                     keyword_lower,
                     grid_type,
@@ -2862,7 +3121,9 @@ def solve_image_grid(
                         "dynamic_trace": dynamic_trace,
                     },
                 )
-                return False
+                if not _fresh_grid("dynamic replacements unresolved"):
+                    return False
+                continue
             dynamic_base_fallback = bool(
                 dynamic_trace
                 and dynamic_trace[-1].get("outcome")
@@ -2889,10 +3150,9 @@ def solve_image_grid(
                     "snapshot": snapshot,
                 },
             )
-            logger.info(
-                "reCAPTCHA grid did not settle before Verify; preserving grid"
-            )
-            return False
+            if not _fresh_grid("grid did not settle before Verify"):
+                return False
+            continue
         if dynamic_base_fallback and _dynamic_base_selection_state(
             bframe,
             grid_size,
@@ -2915,17 +3175,23 @@ def solve_image_grid(
                     "snapshot": snapshot,
                 },
             )
-            logger.info(
-                "reCAPTCHA fallback invariants changed before Verify; "
-                "preserving grid"
-            )
-            return False
+            if not _fresh_grid("fallback invariants changed before Verify"):
+                return False
+            continue
         previous_marker = _grid_state_marker(bframe, deadline)
+        if previous_marker is None and _sleep_with_deadline(deadline, 0.2):
+            # Without a baseline no new round can be recognized afterwards,
+            # and Google's own replacement grid would be reloaded away.
+            previous_marker = _grid_state_marker(bframe, deadline)
+        # A "try again" left over from an earlier round must not be read as
+        # this submission's verdict.
+        stale_errors = _visible_error_outcomes(bframe, deadline)
         # Capture before the physical click: Google can return userverify
         # while path replay/click focus handling is still unwinding.
         verify_count_before = len(
             diagnostics.get("verify_statuses", []) if diagnostics else []
         )
+        verify_requests_before = _verify_request_count(diagnostics)
         cur_x, cur_y, submitted = _click_verify(
             solver,
             page,
@@ -2949,8 +3215,9 @@ def solve_image_grid(
             ),
         )
         if not submitted:
-            logger.info("reCAPTCHA submit did not dispatch; preserving grid")
-            return False
+            if not _fresh_grid("submit did not dispatch"):
+                return False
+            continue
 
         # Final round: wait for an authoritative outcome. Do not click the
         # audio control as a diagnostic; that switches CAPTCHA modes and can
@@ -2976,6 +3243,7 @@ def solve_image_grid(
             # /sorry/ form posts it from the widget's callback) destroys the
             # widget, and the grid was then watched for 40s after it was gone.
             teardown_is_outcome=True,
+            ignore_outcomes=stale_errors,
         )
         verify_statuses = diagnostics.get("verify_statuses", []) if diagnostics else []
         verify_summaries = (
@@ -3038,13 +3306,16 @@ def solve_image_grid(
             return True
         if (
             outcome == "pending"
-            and len(verify_statuses) > verify_count_before
+            and _verify_reached_google(
+                diagnostics, verify_count_before, verify_requests_before
+            )
             and time.monotonic() < deadline
         ):
-            # The physical submission reached Google's userverify endpoint,
-            # so an unchanged grid is an in-flight result rather than a lost
-            # click. Enterprise TMD wrappers can apply the returned state well
-            # after the first observation window. Keep watching the exact
+            # The physical submission reached Google's userverify endpoint
+            # (answered, or still in flight), so an unchanged grid is an
+            # in-flight result rather than a lost click. Enterprise TMD
+            # wrappers can apply the returned state well after the first
+            # observation window. Keep watching the exact
             # submitted grid; never reload or toggle its selected tiles.
             logger.info(
                 "reCAPTCHA userverify reached the server; extending "
@@ -3059,6 +3330,7 @@ def solve_image_grid(
                 token_widget,
                 maximum=30.0,
                 teardown_is_outcome=True,
+                ignore_outcomes=stale_errors,
             )
         if outcome == "torn_down" and protocol_completion_is_intermediate is not True:
             # Google accepted the answer and the page took the token: its
@@ -3180,6 +3452,35 @@ def solve_image_grid(
             )
             continue
 
+        if outcome == "pending" and not _verify_reached_google(
+            diagnostics, verify_count_before, verify_requests_before
+        ):
+            # No userverify went out, so Google holds no answer for this grid
+            # and none can arrive late. Live (2026-10-08), Verify pressed on
+            # a dynamic grid still swapping tiles sent nothing; the solve then
+            # gave up here at 89 s of its 150 s.
+            if _new_round(previous_marker, _grid_state_marker(bframe, deadline)):
+                logger.info(
+                    "reCAPTCHA put up another round without an answer after "
+                    "attempt %d",
+                    attempt + 1,
+                )
+                continue
+            if not _fresh_grid("Verify sent no answer to Google"):
+                return False
+            continue
+
+        if outcome == "pending" and stale_errors & _visible_error_outcomes(
+            bframe, deadline
+        ):
+            # An error from before the submission never went away, so this
+            # one may have drawn the same verdict without it being visible as
+            # new. A grid still wearing it this long after an answer is not
+            # going to produce a token.
+            if not _fresh_grid("error message from before Verify never cleared"):
+                return False
+            continue
+
         if outcome == "pending":
             # A missing immediate token is not a wrong answer.  In
             # particular, Enterprise can keep the correctly answered dynamic
@@ -3210,10 +3511,19 @@ def solve_image_grid(
             )
             return False
 
+        # Google answers a wrong submission with a new grid of its own
+        # (live, 2026-10-08: twice, a new image and once a new keyword under
+        # "Please try again"). Reloading on top of it threw that grid away.
+        replaced = outcome == "incorrect" and _wait_for_new_round(
+            bframe, deadline, previous_marker
+        )
         logger.info(
-            "reCAPTCHA image attempt %d outcome=%s; loading a fresh grid",
+            "reCAPTCHA image attempt %d outcome=%s; %s",
             attempt + 1,
             outcome,
+            "continuing on the grid Google put up"
+            if replaced
+            else "loading a fresh grid",
         )
         _collect_det_grid(
             keyword_lower,
@@ -3234,6 +3544,8 @@ def solve_image_grid(
                 ),
             },
         )
+        if replaced:
+            continue
         cur_x, cur_y, reloaded = _click_reload(
             solver,
             page,

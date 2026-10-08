@@ -140,6 +140,58 @@ it distrusts with `FAIL_SYS_USER_VALIDATE` and an issued URL of the form
   tore the widget down, `torn_down` handed off, and the gate found a new
   `x5sec`; the product came back in 59.5 s.
 
+##### Why a cold session draws it, and how to avoid it (2026-10-08)
+
+Every cold session's MTop token bootstrap drew the reCAPTCHA. The decisive
+input is one cookie, `_baxia_sec_cookie_` (`.aliexpress.com`, about 1 KB,
+URL-encoded JSON beginning `{"lwrid":...`, six-month expiry), which Baxia's
+page script sets in the browser. wafer's request shape is not involved.
+Measured live with wafer only, one request at a time, against
+`mtop.aliexpress.pdp.pc.query`:
+
+| Session state before the unsigned bootstrap | Request shape | Answer |
+|---|---|---|
+| cold | navigation GET, `Referer: www` (the consumer's) | `FAIL_SYS_USER_VALIDATE`, captcharecaptcha |
+| cold | `embed="xhr"` (Origin, `cors`/`empty`) | same |
+| cold | JSONP script shape (`*/*`, `no-cors`/`script`), the browser's own params | same |
+| after a wreq GET of `www.aliexpress.com/` | navigation | same |
+| after a wreq GET of the item page (adds `ali_apache_id`, `JSESSIONID`) | script | same |
+| cold, `_m_h5_tk` minted first via `mtop.ae.cookie.render` (no captcha) | signed pdp call | same |
+| only `_baxia_sec_cookie_` copied from a real Chrome visit of `www` | script | `FAIL_SYS_TOKEN_EMPTY` + `_m_h5_tk` |
+| only `_baxia_sec_cookie_` copied | navigation, `data={}` (the consumer's exact shape) | `FAIL_SYS_TOKEN_EMPTY` + `_m_h5_tk` |
+| same real Chrome visit, nothing copied (control) | script | `FAIL_SYS_USER_VALIDATE` |
+
+A real Chrome (system 154, cold profile) opening an item page sends this same
+API as its first MTop call with token `undefined` and gets
+`FAIL_SYS_TOKEN_EMPTY`, then `SUCCESS`; its request carries
+`_baxia_sec_cookie_`. Benign APIs (`mtop.ae.cookie.render`) mint `_m_h5_tk`
+without it, but the token alone does not get a signed pdp call through.
+
+wafer cannot mint the cookie over HTTP, so the avoidance is a browser visit
+of the origin before the first MTop call:
+`session.browser_prime("https://www.aliexpress.com/")`. It imports
+`_baxia_sec_cookie_` and the page's own `_m_h5_tk`; the next signed
+`pdp.pc.query` answered `SUCCESS` (57 KB) in 4 of 4 cold sessions (16.7s,
+16.8s and 16.7s headed, 17.0s headless, total including the browser launch),
+with three product reads in a row in the headless run. Solving the punishment instead
+took 18.5-103.8s over 1-7 image rounds (8 of 9 live solves succeeded, see
+`docs/ref-recaptcha.md`), and 75-130s for the consumer that reported it.
+
+It does not get past a punishment a browser gets too. About 40 minutes into
+back-to-back test sessions from one machine (some 25 punished bootstraps,
+solves and primes), the primed call drew the reCAPTCHA in 3 of 3 runs, and so
+did a cold real Chrome's own item page: its first `pdp.pc.query`, sent with
+`_baxia_sec_cookie_`, answered `FAIL_SYS_USER_VALIDATE`. Prime first, and
+keep solving the issued URL as the fallback. After 22 minutes with no traffic
+the same real Chrome's item page passed again, and so did a primed session.
+
+`browser_prime` used to return `False` here although it had imported the
+cookies: the homepage shows no challenge, so the solver hands back a
+passthrough document rather than a solve. It now returns `True` when the
+passthrough imported cookies for the origin (`state_only` in
+`_try_browser_solve`; live, `True` with `SUCCESS` after it). `True` still says
+nothing about MTop's answer.
+
 The MTop API name in a punishment path is not a family marker. An inventory
 of the MTop calls live AliExpress pages make (2026-10-05) found
 `mtop.ae.cookie.render` and `mtop.relationrecommend.aliexpressrecommend.recommend`

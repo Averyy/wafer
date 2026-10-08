@@ -86,12 +86,74 @@ class TestGpuBackend:
         config = hardened_launch_config(headless=True, platform="darwin")
         assert "--use-angle=metal" in config.args
 
-    def test_linux_pins_mesa_opengl(self):
+    def test_linux_with_a_gpu_pins_mesa_opengl(self):
         # Automatic ANGLE selection can resolve to gl=none under Xvfb, which
         # removes WebGL entirely.
-        config = hardened_launch_config(headless=True, platform="linux")
+        config = hardened_launch_config(headless=True, platform="linux", gpu=True)
         assert "--use-angle=gl" in config.args
         assert "--ignore-gpu-blocklist" in config.args
+        assert "--use-angle=swiftshader" not in config.args
+
+    @pytest.mark.parametrize("headless", [True, False])
+    def test_linux_without_a_gpu_uses_swiftshader(self, headless):
+        # Mesa's OpenGL driver is then llvmpipe, which Akamai refused 6 of 6
+        # at homedepot.com under Xvfb; SwiftShader passed 4 of 4 (2026-10-08).
+        config = hardened_launch_config(
+            headless=headless, platform="linux", gpu=False
+        )
+        assert "--use-gl=angle" in config.args
+        assert "--use-angle=swiftshader" in config.args
+        assert "--enable-unsafe-swiftshader" in config.args
+        assert "--use-angle=gl" not in config.args
+        assert "--ignore-gpu-blocklist" not in config.args
+
+    @pytest.mark.parametrize("available", [True, False])
+    def test_linux_default_follows_the_render_node(self, available):
+        with patch(
+            "wafer.browser._solver._linux_gpu_available", return_value=available
+        ):
+            config = hardened_launch_config(headless=False, platform="linux")
+        assert ("--use-angle=gl" in config.args) is available
+        assert ("--use-angle=swiftshader" in config.args) is not available
+
+    def test_gpu_is_ignored_off_linux(self):
+        for gpu in (True, False, None):
+            config = hardened_launch_config(headless=True, platform="darwin", gpu=gpu)
+            assert "--use-angle=metal" in config.args
+            assert "--use-angle=swiftshader" not in config.args
+            assert "--use-angle=gl" not in config.args
+
+
+class TestLinuxGpuAvailable:
+    def test_no_dri_directory_means_no_gpu(self, tmp_path):
+        from wafer.browser import _solver
+
+        with patch.object(_solver, "_DRI_DIR", str(tmp_path / "missing")):
+            assert _solver._linux_gpu_available() is False
+
+    def test_card_node_alone_is_not_a_render_node(self, tmp_path):
+        from wafer.browser import _solver
+
+        (tmp_path / "card0").write_text("")
+        with patch.object(_solver, "_DRI_DIR", str(tmp_path)):
+            assert _solver._linux_gpu_available() is False
+
+    def test_accessible_render_node_is_a_gpu(self, tmp_path):
+        from wafer.browser import _solver
+
+        (tmp_path / "renderD128").write_text("")
+        with patch.object(_solver, "_DRI_DIR", str(tmp_path)):
+            assert _solver._linux_gpu_available() is True
+
+    def test_render_node_without_permission_is_not_a_gpu(self, tmp_path):
+        from wafer.browser import _solver
+
+        (tmp_path / "renderD128").write_text("")
+        with (
+            patch.object(_solver, "_DRI_DIR", str(tmp_path)),
+            patch.object(_solver.os, "access", return_value=False),
+        ):
+            assert _solver._linux_gpu_available() is False
 
     def test_gpu_forced_on_every_platform(self):
         for platform in ("darwin", "linux", "win32"):
@@ -307,6 +369,57 @@ class TestSolverUsesTheSharedConfig:
                 sync_playwright.return_value.start.return_value = playwright
                 with pytest.raises(RuntimeError, match="did not report a user agent"):
                     solver._ensure_browser()
+        finally:
+            solver.close()
+
+    def _linux_launch(self, *, gpu, renderers):
+        browsers = []
+        for renderer in renderers:
+            browser = MagicMock()
+            browser.version = "149.0.7827.201"
+            browser.new_page.return_value.evaluate.return_value = renderer
+            browsers.append(browser)
+        with (
+            patch("wafer.browser._solver.sys.platform", "linux"),
+            patch("wafer.browser._solver._linux_gpu_available", return_value=gpu),
+        ):
+            return self._launch(headless=False, browsers=browsers)
+
+    def test_linux_without_a_gpu_launches_on_swiftshader_once(self):
+        solver, launches = self._linux_launch(gpu=False, renderers=["unused"])
+        try:
+            assert len(launches) == 1
+            assert "--use-angle=swiftshader" in launches[0].kwargs["args"]
+            assert solver._linux_gpu is False
+        finally:
+            solver.close()
+
+    def test_linux_gpu_keeps_mesa_when_it_renders_on_the_gpu(self):
+        solver, launches = self._linux_launch(
+            gpu=True,
+            renderers=["ANGLE (Intel, Mesa Intel(R) UHD Graphics 630, OpenGL 4.6)"],
+        )
+        try:
+            assert len(launches) == 1
+            assert "--use-angle=gl" in launches[0].kwargs["args"]
+            assert solver._linux_gpu is True
+        finally:
+            solver.close()
+
+    def test_linux_render_node_that_still_gives_llvmpipe_relaunches(self):
+        solver, launches = self._linux_launch(
+            gpu=True,
+            renderers=[
+                "ANGLE (Mesa/X.org, llvmpipe (LLVM 15.0.6 256 bits), OpenGL 4.5)",
+                "unused",
+            ],
+        )
+        try:
+            assert len(launches) == 2
+            assert "--use-angle=gl" in launches[0].kwargs["args"]
+            assert "--use-angle=swiftshader" in launches[1].kwargs["args"]
+            # Kept for the idle relaunch, so the renderer never flips back.
+            assert solver._linux_gpu is False
         finally:
             solver.close()
 
