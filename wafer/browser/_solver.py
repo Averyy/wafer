@@ -3403,15 +3403,24 @@ class BrowserSolver:
             # the installed browser's exact UA/client hints.
             actual = _browser_executable_version(chrome, timeout)
             if actual != expected:
-                logger.warning(
-                    "Installed Chrome %s differs from wafer's default emulation "
-                    "Chrome %s; browser-bound solve paths will align transport "
-                    "identity to the installed browser (bump "
-                    "DEFAULT_EMULATION/_CHROME_BUILDS once wreq ships this "
-                    "Chrome so the TLS shape tracks it too)",
-                    actual,
-                    expected,
-                )
+                actual_major = actual.split(".")[0] if actual else ""
+                expected_major = expected.split(".")[0] if expected else ""
+                if actual_major != expected_major:
+                    logger.warning(
+                        "Installed Chrome %s differs from wafer's default "
+                        "emulation Chrome %s; the TLS shape may diverge "
+                        "(bump DEFAULT_EMULATION/_CHROME_BUILDS once wreq "
+                        "ships this Chrome)",
+                        actual,
+                        expected,
+                    )
+                else:
+                    logger.debug(
+                        "Installed Chrome %s (wafer emulation is %s, "
+                        "same major)",
+                        actual,
+                        expected,
+                    )
             else:
                 logger.debug(
                     "Validated exact Chrome %s executable at %s", actual, chrome
@@ -3493,17 +3502,22 @@ class BrowserSolver:
             launched_version = self._browser.version
             expected_version = self._expected_browser_version()
             if launched_version != expected_version:
-                # Same contract as _ensure_browser_installed: the launched
-                # browser is authoritative for solve paths whose browser-bound
-                # state must replay through wafer. Refusing to run would strand
-                # every solver behind a routine Chrome update.
-                logger.warning(
-                    "Launched Chrome %s differs from wafer's default emulation "
-                    "Chrome %s; browser-bound solve paths will align transport "
-                    "identity to the launched browser",
-                    launched_version,
-                    expected_version,
-                )
+                launched_major = launched_version.split(".")[0]
+                expected_major = expected_version.split(".")[0]
+                if launched_major != expected_major:
+                    logger.warning(
+                        "Launched Chrome %s differs from wafer's default "
+                        "emulation Chrome %s; the TLS shape may diverge",
+                        launched_version,
+                        expected_version,
+                    )
+                else:
+                    logger.debug(
+                        "Launched Chrome %s (wafer emulation is %s, "
+                        "same major)",
+                        launched_version,
+                        expected_version,
+                    )
 
             # Capture the real Chrome full version (e.g. "145.0.7632.117")
             # for CDP metadata.  The UA string is reduced to MAJOR.0.0.0
