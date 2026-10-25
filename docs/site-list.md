@@ -405,6 +405,12 @@ Wafer has **no Arkose Labs solver**. Arkose presents 3D puzzle CAPTCHAs (rotate,
 | `github.com` | Arkose Labs | untested | Login flow; challenge on suspicious logins |
 | `ea.com` | Arkose Labs | untested | EA account login |
 
+### Brave Search first-party proof of work
+
+| URL | Challenge Type | Status | Notes |
+|---|---|---|---|
+| `search.brave.com/search` | Brave Argon2id + blind-token PoW | browser-passthrough | 2026-10-25: real page-2 HTTP 429 classified as `brave`; browser PoW POST returned 200 and reloaded a 200 search document. Initial capture rejected Brave's `_rr=1` reload; corrected validator has regression coverage. Later paced multi-query/page and session-restart runs passed without challenges. Direct browser solve returned 213,542 network bytes, 200, `challenge_absent=True`. Corrected challenged capture and real HTTP clearance replay/persistence remain unverified because subsequent probes triggered no gate. [Protocol and verification record](ref-brave.md). |
+
 ### In-House Systems (no generic solver)
 
 | URL | Challenge Type | Status | Notes |

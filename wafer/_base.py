@@ -855,6 +855,9 @@ class BaseSession:
         else:
             self._rate_limiter = None
 
+        # Anonymous Brave spare tokens belong to this session, never a shared solver.
+        self._brave_state: dict = {}
+
         # Session health: consecutive failure count per hostname
         self._domain_failures: dict[str, int] = {}
         self._tried_safari = profile in (
@@ -2862,6 +2865,27 @@ class BaseSession:
         if hdrs:
             merged.update(hdrs)
         return imperva_embedder(url, merged, body)
+
+    def _brave_browser_replay(self, replay: dict | None) -> dict:
+        """Private browser exchange context: per-session state and pacing."""
+        from wafer._brave import BRAVE_COOKIES, BRAVE_ORIGIN
+
+        cookies = []
+        for name in BRAVE_COOKIES:
+            value = self.get_cookie(name, BRAVE_ORIGIN + "/search")
+            if value is not None:
+                cookies.append({
+                    "name": name, "value": value, "url": BRAVE_ORIGIN,
+                    "secure": True, "sameSite": "Strict",
+                })
+        return {
+            **(replay or {}),
+            "_brave": {
+                "state": self._brave_state,
+                "limiter": self._rate_limiter,
+                "cookies": cookies,
+            },
+        }
 
     def _browser_replay(self, method, kwargs) -> dict:
         """Replay descriptor (method/body/content-type) for an in-page XHR.

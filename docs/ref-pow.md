@@ -1,5 +1,9 @@
 # Proof-of-Work Gate Solver
 
+Brave Search uses a separate `brave` browser handler for Argon2id and blind
+tokens; see [Brave Search proof of work](ref-brave.md). This page describes
+only the inline SHA-256 `pow` gate.
+
 A home-grown, vendor-less bot gate: the origin (fronted by Varnish / Fastly)
 answers every page with a SHA-256 puzzle and lets the request through once a
 cookie proves the puzzle was solved. Measured on `redflagdeals.com`, on both

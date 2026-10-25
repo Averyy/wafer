@@ -987,7 +987,7 @@ These are all automatic. Do not write code to handle these yourself:
 
 ## Challenge Types
 
-Wafer detects 22 WAF/challenge types automatically. When a challenge cannot be
+Wafer identifies 24 WAF/challenge/block types automatically. When a challenge cannot be
 solved, `ChallengeDetected.challenge_type` and `resp.challenge_type` contain
 one of these strings:
 
@@ -1016,6 +1016,8 @@ one of these strings:
                  replay Google's `sei` handoff without launching a browser.
                  Server acceptance is unconfirmed; Google may still return the
                  separate `/sorry` reCAPTCHA challenge.
+"brave"        - Brave Search first-party Argon2id/blind-token PoW gate;
+                 requires BrowserSolver, distinct from inline "pow".
 "vercel"       - Vercel bot protection
 "arkose"       - Arkose Labs / FunCaptcha (no dedicated solver; not solvable)
 "geetest"      - GeeTest v4
@@ -1030,8 +1032,8 @@ one of these strings:
 ```
 
 Some challenges (Cloudflare, DataDome, AWS WAF, Kasada, Vercel, hCaptcha,
-reCAPTCHA, generic_js) require a browser solver - TLS fingerprint rotation alone
-cannot help. Pass a `BrowserSolver` to the session to handle these automatically.
+reCAPTCHA, Brave Search PoW, generic_js) require a browser solver - TLS
+fingerprint rotation alone cannot help. Pass a `BrowserSolver` to the session to handle these automatically.
 
 Detection != solving. `"arkose"` has NO dedicated solver: without a
 `browser_solver` it raises `ChallengeDetected`; with one it falls through to a
@@ -1046,6 +1048,24 @@ dedicated solver, but it passes their passive JS checks). The inline set
 `searchguard`) does not launch a browser for its normal path. SearchGuard
 requires QuickJS-NG, installed by the `[browser]` extra, and a successful VM
 run does not guarantee Google will accept its handoff.
+
+Brave Search (`"brave"`) uses the site's own browser code for Argon2 and the
+complete blind-token protocol. Attach a BrowserSolver and allow a sufficient
+end-to-end timeout (for example 150s, solver 120s); `max_rotations=0`,
+`max_retries=0`, `rate_limit=6` are supported. Wafer clicks Verify once for a
+large issued set, never restarts a small auto-started set, and stops on error,
+rejection, non-PoW captcha or timeout. Failure returns an identified response
+with `max_rotations=0`, otherwise raises ChallengeDetected; it never rotates
+identities. Only a real successful search network document with the original
+query/page is returned. Challenge-free browser navigation is an honest
+`challenge_absent=True` passthrough. First-party browser exchanges share the
+session limiter and request deadline. Validated cookies use the normal HTTP
+jar/cache; spare blind tokens remain in origin-scoped, session-local memory,
+not on disk or in a shared BrowserSolver. Direct solver calls have no session
+limiter or retained spare tokens. Use `get()`; `render()` reports this gate
+without solving. Real PoW acceptance has been observed, but corrected capture,
+HTTP cookie replay and clearance persistence still need a fresh live gate to
+verify. See `docs/ref-brave.md` for the verification record.
 
 Radware serves its captcha interstitial as a plain HTTP 200 from its own host
 (`validate.perfdrive.com`) after a redirect off the origin, so a Radware block
@@ -1377,7 +1397,8 @@ result: SolveResult | None = solver.solve(url, challenge_type)
 # result.challenge_absent: bool - no transferable clearance identity was
 #   earned. True for a validated Cloudflare main-document response when no
 #   challenge iframe appeared, a challenge-free TMD GET returned as
-#   browser-only passthrough without x5sec, and a render that met no challenge.
+#   browser-only passthrough without x5sec, a challenge-free Brave navigation,
+#   and a render that met no challenge.
 #   Automatic session handling returns those without pinning the fingerprint
 #   or rebuilding the wreq client; False means clearance WAS earned and the
 #   session pins.

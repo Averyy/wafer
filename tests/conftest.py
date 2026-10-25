@@ -458,6 +458,7 @@ def make_sync_session(responses, **session_kwargs):
     session._reddit_app_ratelimit_until = 0.0
     session._reddit_app_mint_lock = None
     session._rate_limiter = session_kwargs.get("rate_limiter", None)
+    session._brave_state = {}
     session._domain_failures = {}
     session._last_url = {}
     session._body_capable_domains = set()
@@ -576,6 +577,7 @@ def make_async_session(responses, **session_kwargs):
     session._reddit_app_ratelimit_until = 0.0
     session._reddit_app_mint_lock = None
     session._rate_limiter = session_kwargs.get("rate_limiter", None)
+    session._brave_state = {}
     session._domain_failures = {}
     session._last_url = {}
     session._body_capable_domains = set()

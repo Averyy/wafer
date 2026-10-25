@@ -1,4 +1,4 @@
-"""Challenge detection for 22 WAF types.
+"""Challenge detection for supported WAF types.
 
 Pure logic, no I/O. Inspects status code, headers, and body to identify
 which WAF/challenge system is blocking a request.
@@ -14,6 +14,7 @@ import logging
 import re
 from urllib.parse import urlparse
 
+from wafer._brave import is_brave_challenge
 from wafer._solvers import (
     is_cookie_gate,
     is_pow_challenge,
@@ -161,6 +162,7 @@ class ChallengeType(enum.Enum):
     AMAZON = "amazon"
     REDDIT = "reddit"
     SEARCHGUARD = "searchguard"
+    BRAVE = "brave"
     VERCEL = "vercel"
     ARKOSE = "arkose"
     GEETEST = "geetest"
@@ -190,6 +192,7 @@ TERMINAL_CHALLENGES = frozenset({ChallengeType.CLOUDFLARE_BLOCK})
 # same IP rarely helps, and each failed attempt poisons the IP for
 # the subsequent browser solve.
 JS_ONLY_CHALLENGES = frozenset({
+    ChallengeType.BRAVE,
     ChallengeType.AWSWAF,
     ChallengeType.CLOUDFLARE,
     ChallengeType.DATADOME,
@@ -439,6 +442,10 @@ def detect_challenge(
     if result is not None:
         logger.info("Challenge detected (header): %s", result.value)
         return result
+
+    if url is not None and is_brave_challenge(body, url):
+        logger.info("Challenge detected: brave")
+        return ChallengeType.BRAVE
 
     # --- Inline-solvable challenges (cheapest first) ---
 

@@ -932,6 +932,8 @@ class AsyncSession(BaseSession):
         # caching so the token lands on the API host's registrable domain.
         if use_solve_origin and self._solve_origin:
             embedder = self._solve_origin
+        if challenge is ChallengeType.BRAVE:
+            replay = self._brave_browser_replay(replay)
         solve_kwargs = {
             "timeout": solve_timeout,
             "embedder": embedder,
@@ -1005,6 +1007,17 @@ class AsyncSession(BaseSession):
                 )
         if result is None:
             return False
+        if challenge is ChallengeType.BRAVE:
+            from wafer.browser._brave import capture_brave_response
+
+            # Enforce the search contract even for a custom browser_solver,
+            # before importing or caching any of its state.
+            captured = result.response
+            if captured is None or capture_brave_response(
+                captured, captured.url, url, max_size,
+                allow_pow_reload=not getattr(result, "challenge_absent", False),
+            ) is None:
+                return False
 
         domain = extract_domain(url) or ""
 
@@ -2731,7 +2744,9 @@ class AsyncSession(BaseSession):
                         continue
 
                 # No browser solver — rotation can't help JS-only challenges
-                if self._browser_solver is None and challenge in JS_ONLY_CHALLENGES:
+                if (
+                    self._browser_solver is None and challenge in JS_ONLY_CHALLENGES
+                ) or challenge is ChallengeType.BRAVE:
                     self._enforce_final_cap(raw_content, current_url, max_response_size)
                     if self.max_rotations == 0:
                         return self._make_response(

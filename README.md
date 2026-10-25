@@ -355,7 +355,7 @@ and limitations.
 
 ## Challenge Detection
 
-Wafer detects 21 WAF challenge types from response status, headers, and body.
+Wafer identifies 24 WAF challenge/block types from status, headers, and body.
 **Detection is not the same as solving** - the "Solved by" column shows how each
 type is actually handled: `inline` (over HTTP, no browser), `browser` (needs a
 configured `browser_solver`), or `detect-only` (raises `ChallengeDetected`; no
@@ -378,6 +378,8 @@ solver - you must handle it yourself).
 | TMD | TMD session validation pattern | inline (+ browser slider) |
 | Amazon | CAPTCHA page with `amzn` markers | inline |
 | Reddit | cold-session JSON block, 200 HTML verification, or "Prove your humanity" reCAPTCHA page (JSON reads skip them via the app API) | inline first; optional browser cookie recovery; a reCAPTCHA that survives is `recaptcha` |
+| Brave Search PoW | First-party Svelte `/captcha` work set or hydrated captcha wrapper on `search.brave.com` | browser (Argon2id + complete blind-token protocol) |
+| Google SearchGuard | Google `/search` JS shell with SearchGuard protocol markers | inline QuickJS-NG; server acceptance unconfirmed |
 | Arkose / FunCaptcha | `arkoselabs.com` or `funcaptcha` markers | **detect-only** (no solver; the generic browser fallback can't pass FunCaptcha) |
 | GeeTest v4 | `initGeetest4`, `gcaptcha4.geetest.com`, `gt4.js` | browser |
 | hCaptcha | `hcaptcha.com` script, `h-captcha` div | browser |
@@ -392,17 +394,20 @@ When a challenge is detected, wafer escalates automatically:
 2. For Imperva, a native OpenSSL transport that TLS-fingerprinting sites
    free-pass (no browser - see [Imperva bypass](#imperva--incapsula-no-browser-bypass))
 3. Browser solver if configured (JS challenges: Cloudflare, DataDome, reCAPTCHA,
-   and Imperva `reese84` under heavy load)
+   Brave Search PoW, and Imperva `reese84` under heavy load)
 4. Cross-family fingerprint rotation: fresh current family -> Firefox -> Safari -> Edge
 5. Raises `ChallengeDetected` if all attempts fail
 
 A terminal block skips all of it. A Cloudflare WAF *block* page is a denial, not
 a challenge: nothing is issued to solve, and no identity answers it differently.
 Wafer raises `RequestBlocked` on the first response, spending no budget.
+Brave also skips rotation: its bounded browser attempt either returns validated
+search content or reports the identified challenge. Ordinary 429s retain their
+rate-limit handling.
 
 ## Inline Solvers
 
-Seven challenge types have an inline path that does not require a browser.
+Eight challenge types have an inline path that does not require a browser.
 Reddit can optionally fall back to the configured browser if its strict inline
 bootstrap fails:
 
@@ -689,7 +694,7 @@ if result:
     print(result.cookies)     # extracted cookies
     print(result.user_agent)  # browser's real UA
     print(result.response)    # CapturedResponse | None
-    print(result.challenge_absent)  # True only for validated CF absence
+    print(result.challenge_absent)  # True for validated content without new clearance
 ```
 
 Uses [Patchright](https://github.com/Kaliiiiiiiiii-Vinyzu/patchright-python)
@@ -697,8 +702,8 @@ Uses [Patchright](https://github.com/Kaliiiiiiiiii-Vinyzu/patchright-python)
 of wreq's newest emulation; version skew is logged and accepted. Solve paths
 that earn browser-bound challenge state align the session's User-Agent/client
 hints to the launched browser. Reddit recovery and challenge-absent Cloudflare
-passthrough do not pin the session. The browser instance persists until its
-idle timeout and solver operations are serialized. A solver passed to a
+or Brave passthrough do not pin the session. The browser instance persists until
+its idle timeout and solver operations are serialized. A solver passed to a
 session remains caller-owned: call `solver.close()` when it is no longer
 needed, or rely on `idle_timeout`; exiting the session does not close it.
 
@@ -729,7 +734,30 @@ auto-resolve + confirm click; interactive captchas are not solved), PerimeterX
 (including press-and-hold), Imperva, Kasada, F5 Shape, AWS WAF, GeeTest v4
 (slide puzzle), Alibaba Baxia (slider), hCaptcha (checkbox), reCAPTCHA v2
 (checkbox + image grid via EfficientNet + D-FINE), Reddit fixed-origin cookie
-recovery, and generic JS challenges.
+recovery, Brave Search proof of work, and generic JS challenges.
+
+### Brave Search proof of work
+
+Brave's large first-party HTTP 429 interstitial is `challenge_type="brave"`.
+Pass a `BrowserSolver` and allow enough time, for example
+`SyncSession(browser_solver=solver, timeout=150, rate_limit=6,
+max_retries=0, max_rotations=0)` with `BrowserSolver(solve_timeout=120)`.
+Both sync and async sessions use the same bounded handler. It runs Brave's own
+Argon2 and blind-token code, clicks Verify once for large sets, lets small sets
+auto-start, and stops on rejection, error, a non-PoW captcha, or timeout.
+
+Only the real completed search network response with the original query/page
+is returned. A browser navigation that encounters no gate returns that exact
+response without claiming clearance. First-party browser exchanges respect the
+session limiter and total deadline. Validated cookies use the normal jar/cache;
+spare blind tokens are scoped to the origin and session in memory, never shared
+through BrowserSolver or persisted to disk. `get()` supports this solve path;
+`render()` reports an encountered Brave gate without solving it.
+
+Live Brave work acceptance and the subsequent 200 search document were observed.
+The corrected accepted-reload capture is regression tested; later live probes
+were challenge free. Real HTTP clearance-cookie replay and persistence remain
+unverified. See [Brave protocol, limits, and evidence](docs/ref-brave.md).
 
 ### Rendering a JavaScript-built page (`session.render`)
 
@@ -1053,7 +1081,8 @@ wafer/
   _sync.py          # SyncSession -wraps wreq.blocking.Client
   _async.py         # AsyncSession -wraps wreq.Client
   _response.py      # WaferResponse wrapper
-  _challenge.py     # Challenge detection (21 WAF types)
+  _challenge.py     # Challenge detection (24 WAF/challenge/block types)
+  _brave.py         # Brave Search structural detection and URL identity
   _solvers.py       # Inline solvers (ACW, PoW, Amazon, TMD, Reddit)
   _cookies.py       # JSON disk cache with TTL and LRU
   _fingerprint.py   # Emulation profiles, sec-ch-ua generation
@@ -1071,6 +1100,7 @@ wafer/
   browser/
     __init__.py     # BrowserSolver, SolveResult, CapturedResponse, InterceptResult
     _solver.py      # Core BrowserSolver + mouse replay
+    _brave.py       # Brave Search Argon2id/blind-token PoW handler
     _cloudflare.py  # Cloudflare challenge solver
     _akamai.py      # Akamai challenge solver
     _datadome.py    # DataDome challenge solver

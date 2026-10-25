@@ -6,6 +6,7 @@ methods, and the ``solve()`` / ``intercept_iframe()`` dispatch.
 
 WAF-specific logic lives in dedicated modules:
 
+- ``_brave`` — Brave Search Argon2id/blind-token proof of work
 - ``_cloudflare`` — Cloudflare Turnstile
 - ``_akamai`` — Akamai _abck
 - ``_datadome`` — DataDome
@@ -49,6 +50,7 @@ from concurrent.futures import (
 from dataclasses import dataclass, field
 from urllib.parse import parse_qs, unquote, urlparse
 
+from wafer._brave import is_brave_challenge
 from wafer._cookies import browser_cookie_matches_host, registrable_domain
 from wafer._errors import ResponseTooLarge
 from wafer._fingerprint import chrome_full_version
@@ -395,6 +397,7 @@ def _is_passthrough_challenge_html(html: str) -> bool:
         # A site's own "Continue" gate behind the WAF (fccid.io): the session
         # solves it inline on the replay, so it is never content.
         or is_cookie_gate(html)
+        or is_brave_challenge(html)
     )
 
 
@@ -3957,9 +3960,11 @@ class BrowserSolver:
             )
         return self._viewport
 
-    def _create_context(self):
+    def _create_context(self, *, storage_state: dict | None = None):
         """Create a new browser context with realistic settings."""
         kwargs: dict = {}
+        if storage_state is not None:
+            kwargs["storage_state"] = storage_state
         if self._headless and sys.platform == "darwin":
             # The launch sized the window and described the real display
             # (hardened_launch_config), so the browser's own geometry is
@@ -5186,8 +5191,16 @@ class BrowserSolver:
                 return None
 
             context = None
+            page = None
             try:
-                context = self._create_context()
+                if challenge_type == "brave":
+                    from wafer.browser._brave import brave_storage_state
+
+                    context = self._create_context(
+                        storage_state=brave_storage_state(replay)
+                    )
+                else:
+                    context = self._create_context()
                 page = context.new_page()
                 self._setup_headless_patches(
                     page,
@@ -5370,6 +5383,18 @@ class BrowserSolver:
                 # a JSON/XHR API that can't be top-navigated, so we run the
                 # challenge on the real page and let the earned cookies replay
                 # to the API host. Falls back to ``url`` for the normal case.
+                brave_setup = None
+                if challenge_type == "brave":
+                    from wafer.browser._brave import prepare_brave
+
+                    if (
+                        embedder is not None
+                        or (replay or {}).get("method", "GET") != "GET"
+                    ):
+                        return None
+                    brave_setup = prepare_brave(
+                        context, page, url, replay, overall_deadline
+                    )
                 nav_target = embedder or url
                 navigation_response = None
                 try:
@@ -5382,7 +5407,11 @@ class BrowserSolver:
                     nav_ms = _navigation_budget_ms(overall_deadline)
                     navigation_response = page.goto(
                         nav_target,
-                        wait_until="domcontentloaded",
+                        wait_until=(
+                            "commit"
+                            if challenge_type == "brave"
+                            else "domcontentloaded"
+                        ),
                         timeout=nav_ms,
                     )
                 except Exception as exc:
@@ -5397,6 +5426,17 @@ class BrowserSolver:
                         int(size_guard["size"]),
                         max_size,
                     )
+
+                if challenge_type == "brave":
+                    from wafer.browser._brave import finish_brave
+
+                    result = finish_brave(
+                        self, context, page, url, main_documents,
+                        overall_deadline, max_size, brave_setup, size_guard,
+                    )
+                    if result is not None:
+                        self._last_used = time.monotonic()
+                    return result
 
                 # WAF-specific wait strategy — clamp to remaining budget
                 dispatch_ms = max(
@@ -5710,6 +5750,13 @@ class BrowserSolver:
                 )
                 return None
             finally:
+                if challenge_type == "brave" and page is not None:
+                    cancel = getattr(page, "_wafer_brave_cancel", None)
+                    if cancel is not None:
+                        try:
+                            cancel()
+                        except Exception:
+                            pass
                 if context:
                     try:
                         context.close()
@@ -6262,7 +6309,9 @@ class BrowserSolver:
 
         *documents* is the solve's live list of main-frame ``(url, status)``.
         """
-        if challenge_type == "cloudflare":
+        if challenge_type == "brave":
+            return False  # session.get() uses the bounded network-only path
+        elif challenge_type == "cloudflare":
             from wafer.browser._cloudflare import (
                 wait_for_cloudflare,
             )
