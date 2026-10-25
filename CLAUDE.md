@@ -72,7 +72,7 @@ Core dependencies are `wreq` and `cryptography`. `cryptography` backs AIA chasin
 
 ## Releasing
 
-Version is derived from git tags via `hatch-vcs` -never hardcode a version in `pyproject.toml`. To release: `git tag v0.X.0 && git push origin v0.X.0`. The `publish.yml` Action handles the rest.
+Version is derived from git tags via `hatch-vcs` -never hardcode a version in `pyproject.toml`. To release: `git tag v0.X.0 && git push origin v0.X.0`. The `publish.yml` Action tests, builds and publishes to PyPI, then creates or publishes the matching GitHub Release and marks it latest. A prepared draft's release notes are preserved.
 
 ## Commands
 
