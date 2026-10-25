@@ -2,6 +2,11 @@
 
 Wafer wraps wreq **0.13.0+** (the `Emulation` API, formerly rnet).
 
+Version check, 2026-10-25: installed and locked **0.13.0** matches the latest
+stable version on [PyPI](https://pypi.org/project/wreq/) and the
+[upstream release](https://github.com/0x676e67/wreq-python/releases/tag/v0.13.0),
+published 2026-10-05. No dependency upgrade was needed.
+
 ## TlsOptions Silent Failure
 
 **`TlsOptions(**kwargs)`, `Http2Options(**kwargs)`, AND `wreq.Client(**kwargs)` / `wreq.blocking.Client(**kwargs)` all silently accept ANY kwargs -including typos and wrong names.** There is no validation and no error. A kwarg being "accepted" means nothing. Only wire / behavior verification proves it works. Authoritative kwarg names are in the `.pyi` stubs' `Params` / `ClientConfig` TypedDicts.

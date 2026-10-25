@@ -140,69 +140,79 @@ it distrusts with `FAIL_SYS_USER_VALIDATE` and an issued URL of the form
   tore the widget down, `torn_down` handed off, and the gate found a new
   `x5sec`; the product came back in 59.5 s.
 
-##### Why a cold session draws it, and how to avoid it (2026-10-08)
+##### Priming, timezones, and MTop acceptance (closed 2026-10-25)
 
-Every cold session's MTop token bootstrap drew the reCAPTCHA. The decisive
-input is one cookie, `_baxia_sec_cookie_` (`.aliexpress.com`, about 1 KB,
-URL-encoded JSON beginning `{"lwrid":...`, six-month expiry), which Baxia's
-page script sets in the browser. wafer's request shape is not involved.
-Measured live with wafer only, one request at a time, against
-`mtop.aliexpress.pdp.pc.query`:
+`browser_prime(True)` means scoped browser state was imported. It does not
+mean that an application accepted that state. AliExpress's homepage can set
+`_baxia_sec_cookie_` and `_m_h5_tk` without a visible challenge, while a
+subsequent signed MTop call still returns `FAIL_SYS_USER_VALIDATE`. JSON
+responses are not automatically challenge-checked; callers must inspect the
+MTop `ret` and validate the returned product.
 
-| Session state before the unsigned bootstrap | Request shape | Answer |
-|---|---|---|
-| cold | navigation GET, `Referer: www` (the consumer's) | `FAIL_SYS_USER_VALIDATE`, captcharecaptcha |
-| cold | `embed="xhr"` (Origin, `cors`/`empty`) | same |
-| cold | JSONP script shape (`*/*`, `no-cors`/`script`), the browser's own params | same |
-| after a wreq GET of `www.aliexpress.com/` | navigation | same |
-| after a wreq GET of the item page (adds `ali_apache_id`, `JSESSIONID`) | script | same |
-| cold, `_m_h5_tk` minted first via `mtop.ae.cookie.render` (no captcha) | signed pdp call | same |
-| only `_baxia_sec_cookie_` copied from a real Chrome visit of `www` | script | `FAIL_SYS_TOKEN_EMPTY` + `_m_h5_tk` |
-| only `_baxia_sec_cookie_` copied | navigation, `data={}` (the consumer's exact shape) | `FAIL_SYS_TOKEN_EMPTY` + `_m_h5_tk` |
-| same real Chrome visit, nothing copied (control) | script | `FAIL_SYS_USER_VALIDATE` |
+The original 2026-10-08 investigation overgeneralized a small comparison:
+four primed Toronto-clock calls passed and four UTC-clock calls were
+challenged, but later both Toronto-clock calls in the consumer's image were
+challenged. On 2026-10-09, fresh unautomated Chrome profiles also drew the
+challenge while the user's established profile reportedly passed. Those
+observations did not isolate which saved state mattered or establish that
+every fresh profile would be challenged. Claims that a timezone guarantees
+success, or that the failure was an IP-wide condition, were not established.
 
-A real Chrome (system 154, cold profile) opening an item page sends this same
-API as its first MTop call with token `undefined` and gets
-`FAIL_SYS_TOKEN_EMPTY`, then `SUCCESS`; its request carries
-`_baxia_sec_cookie_`. Benign APIs (`mtop.ae.cookie.render`) mint `_m_h5_tk`
-without it, but the token alone does not get a signed pdp call through.
+Current-code retest, 2026-10-25: fresh headed browser contexts, empty HTTP jars,
+no cookie cache, explicit HTTP calls spaced at least six seconds apart, product
+`4000085910726`, wreq 0.13.0 and Patchright 1.59.1. Docker used the original
+`fetchaller-mcp:test` linux/amd64 image under Apple Silicon emulation, with
+Xvfb/JWM, Chrome for Testing 154.0.8037.92, and the current wafer source mounted
+read-only. Native macOS used Chrome 155.0.8059.85; wreq's newest profile was
+Chrome154, so wafer logged the version mismatch. No personal browser state
+was read or imported.
 
-wafer cannot mint the cookie over HTTP, so the avoidance is a browser visit
-of the origin before the first MTop call:
-`session.browser_prime("https://www.aliexpress.com/")`. It imports
-`_baxia_sec_cookie_` and the page's own `_m_h5_tk`; the next signed
-`pdp.pc.query` answered `SUCCESS` (57 KB) in 4 of 4 cold sessions (16.7s,
-16.8s and 16.7s headed, 17.0s headless, total including the browser launch),
-with three product reads in a row in the headless run. Solving the punishment instead
-took 18.5-103.8s over 1-7 image rounds (8 of 9 live solves succeeded, see
-`docs/ref-recaptcha.md`), and 75-130s for the consumer that reported it.
+| Environment | Browser timezone | Prime | First signed product call |
+|---|---|---|---|
+| Native macOS | America/Toronto | True; Baxia and signing cookies present | `SUCCESS`, about 61 KB of data, expected product ID |
+| Native macOS | UTC | True; Baxia and signing cookies present | `FAIL_SYS_USER_VALIDATE` |
+| Original Docker image | America/Toronto | True; Baxia and signing cookies present | `SUCCESS`, about 61 KB of data, expected product ID |
+| Original Docker image | UTC | True; Baxia and signing cookies present | `FAIL_SYS_USER_VALIDATE` |
 
-It does not get past a punishment a browser gets too. About 40 minutes into
-back-to-back test sessions from one machine (some 25 punished bootstraps,
-solves and primes), the primed call drew the reCAPTCHA in 3 of 3 runs, and so
-did a cold real Chrome's own item page: its first `pdp.pc.query`, sent with
-`_baxia_sec_cookie_`, answered `FAIL_SYS_USER_VALIDATE`. Prime first, and
-keep solving the issued URL as the fallback. After 22 minutes with no traffic
-the same real Chrome's item page passed again, and so did a primed session.
+A browser-side `Intl.DateTimeFormat` probe in the container confirmed
+America/Toronto (offset 240 minutes) and UTC (offset 0). These are measured
+outcomes, not acceptance rates or a guarantee about the next request. They
+show that priming and the timezone option still work in the previously
+reported environment, and that a fresh profile can return product data.
 
-The browser's timezone decides it too. fetchaller's Linux image (UTC, the
-container default) primed 4 of 4 times and was punished on every first call
-(2026-10-08). Reproduced in that image from a Toronto IP, one variable at a
-time, with the primed pdp call:
+The native UTC recovery check then exercised the actual failure path: the
+primed signed call was challenged, `browser_solve_challenge(issued_url, "tmd")`
+completed the issued reCAPTCHA, the signing token remained present, and the
+signed retry returned `SUCCESS` plus the expected product ID in 36.7 seconds
+total. The same UTC prime/challenge/recovery flow in the original Docker image
+also solved a real image grid, retained the signing token and returned the
+expected product in 51.5 seconds. Both live repro processes exited zero only
+after validating that result. The caller must reread the signing token after
+recovery and bootstrap again if none is present; a successful state import
+alone is not product success. Solving may still exhaust the caller's deadline.
 
-| Browser timezone | Answer |
-|---|---|
-| UTC (container default) | punished, 4 of 4 |
-| America/Toronto (the IP's) | `SUCCESS`, 4 of 4 |
-| America/Los_Angeles | `SUCCESS` |
-| Europe/London | punished |
+`BrowserSolver(timezone=...)` sets `TZ` for the browser process. An inherited
+UTC clock logs a one-time configuration warning, without claiming that UTC
+must fail or that changing it must succeed. Keep the explicit issued-URL
+solve-and-retry path even when priming with the intended clock.
 
-macOS on local time passed in between. So the clock has to be plausible for the
-IP's location, not exact. `BrowserSolver(timezone=...)` sets `TZ` for the
-browser process only (native, every frame and worker agree), and a UTC clock
-logs a one-time WARNING at launch. Cold solves in the same image succeeded 4 of
-4 on either clock (UTC 1 and 8 image rounds, Toronto 2 and 2): too few runs to
-say the clock changes how many rounds Google asks for.
+The live repro now takes `--timezone` and optional `--recover`, uses no cookie
+cache, spaces HTTP requests, and exits nonzero unless both MTop `SUCCESS` and
+the expected product ID are observed. Previously it exited zero even when
+its last log line reported rejection:
+
+```bash
+uv run python tests/live_mtop_recaptcha.py prime --timezone America/Toronto
+uv run python tests/live_mtop_recaptcha.py prime --timezone UTC --recover
+```
+
+The timezone investigation is closed: the reported container can return
+product data, and its challenged requests can recover through the existing
+solver. The defects addressed here were the unconditional acceptance claims
+and a live diagnostic that reported process success for rejected MTop calls.
+No transport or cookie-import regression was reproduced. Persistent browser
+state remains a separate proposal; it is not required for either successful
+path observed above.
 
 A TMD solve used to empty the session's jar: the client rebuilt after the
 identity pin started a fresh one, so an MTop `_m_h5_tk` set over HTTP was gone

@@ -35,57 +35,6 @@ async def om_session():
         yield session
 
 
-class TestGoogleSSR:
-    """Verify Opera Mini profile triggers Google SSR (server-side rendering)."""
-
-    async def test_google_returns_ssr_html(self, om_session):
-        """Google serves the server-rendered page, not the JS-required shell.
-
-        wafer's job is which variant Google serves this identity; how the
-        results are marked up is Google's to change and the caller's to parse,
-        so nothing here pins link or element structure.
-        """
-        resp = await om_session.get(
-            "https://www.google.com/search",
-            params={
-                "q": "python programming",
-                "hl": "en",
-                "client": "ms-opera-mini-android",
-                "channel": "new",
-            },
-        )
-        assert resp.status_code == 200
-        assert len(resp.text) > 30000, (
-            f"Response too small ({len(resp.text)} bytes)"
-        )
-        # The shell is a noscript refresh to /httpservice/retry/enablejs.
-        assert "/httpservice/retry/enablejs" not in resp.text, (
-            "Got the JS-required shell, not the server-rendered page"
-        )
-
-        # Title should contain the search query
-        titles = re.findall(r"<title>(.*?)</title>", resp.text)
-        assert titles, "No <title> found"
-        assert "python" in titles[0].lower(), (
-            f"Title doesn't contain query: {titles[0]}"
-        )
-
-    async def test_google_not_blocked(self, om_session):
-        """Google doesn't block or CAPTCHA the Opera Mini profile."""
-        resp = await om_session.get(
-            "https://www.google.com/search",
-            params={
-                "q": "weather today",
-                "hl": "en",
-                "client": "ms-opera-mini-android",
-                "channel": "new",
-            },
-        )
-        assert resp.status_code == 200
-        assert "unusual traffic" not in resp.text.lower()
-        assert "captcha" not in resp.text.lower()
-
-
 class TestDDG:
     """Verify Opera Mini profile works with DuckDuckGo HTML endpoint."""
 
@@ -106,9 +55,8 @@ class TestDDG:
 class TestBrave:
     """Brave Search through wafer's default profile.
 
-    Brave answers the Opera Mini profile with a 429 captcha page (v0.7.1 and
-    later alike, 2026-10-07) and the default profile with results, so this
-    covers the route to use; docs/todo-opera-mini-brave.md tracks the other.
+    The default profile returned results on 2026-10-07. Opera Mini is not
+    required for this route.
     """
 
     async def test_brave_returns_results(self, chrome_session):

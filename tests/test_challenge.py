@@ -6,6 +6,7 @@ import time
 import pytest
 
 from wafer._challenge import (
+    INLINE_CHALLENGES,
     JS_ONLY_CHALLENGES,
     TERMINAL_CHALLENGES,
     ChallengeType,
@@ -1452,6 +1453,31 @@ class TestGoogleSorryPage:
     def test_a_large_page_quoting_the_markup_is_not_the_sorry_page(self):
         body = "<html><body>" + "result " * 10_000 + _GOOGLE_SORRY + "</body></html>"
         assert detect_challenge(200, {}, body) is None
+
+
+class TestGoogleSearchGuard:
+    _SHELL = (
+        '<noscript><meta content="0;url=/httpservice/retry/enablejs"></noscript>'
+        '<script>var g="knitsail";</script>'
+        '<script>var challenge_version=1;document.cookie="SG_SS=";</script>'
+    )
+
+    def test_detected_only_on_google_search(self):
+        assert detect_challenge(
+            200, {}, self._SHELL, url="https://www.google.com/search?q=x"
+        ) == ChallengeType.SEARCHGUARD
+
+    def test_not_detected_on_other_hosts_or_paths(self):
+        assert detect_challenge(
+            200, {}, self._SHELL, url="https://example.com/search?q=x"
+        ) is None
+        assert detect_challenge(
+            200, {}, self._SHELL, url="https://www.google.com/"
+        ) is None
+
+    def test_inline_and_browser_fallback_classifications(self):
+        assert ChallengeType.SEARCHGUARD in INLINE_CHALLENGES
+        assert ChallengeType.SEARCHGUARD in JS_ONLY_CHALLENGES
 
 
 # ---------------------------------------------------------------------------

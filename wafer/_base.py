@@ -1948,6 +1948,36 @@ class BaseSession:
             "default_headers": False
         }
 
+    def _script_navigation_headers(
+        self, url: str, page_url: str, extra: dict[str, str] | None = None
+    ) -> tuple[dict[str, str], dict]:
+        """Build a JS-initiated document navigation without user activation."""
+        # These describe the new navigation, not the caller's initial request.
+        # In particular, a homepage form's explicit Referer must not replace
+        # the challenge shell as the script handoff's Referer.
+        navigation_headers = {
+            "referer", "sec-fetch-site", "sec-fetch-mode", "sec-fetch-dest",
+            "sec-fetch-user",
+        }
+        extra = {
+            key: value for key, value in (extra or {}).items()
+            if key.lower() not in navigation_headers
+        }
+        headers, options = self._reddit_leg_headers(url, page_url)
+        if not options:
+            return self._build_headers(url, {**extra, "Referer": page_url}), {}
+        # default_headers=False also removes wreq's client headers. Merge the
+        # normal request delta into the complete navigation set so per-request
+        # overrides still apply to the SearchGuard handoff.
+        for name, value in self._build_headers(url, extra).items():
+            if name.lower() in navigation_headers:
+                continue
+            old = next((key for key in headers if key.lower() == name.lower()), None)
+            if old is not None:
+                del headers[old]
+            headers[name] = value
+        return headers, options
+
     def _align_sec_fetch_site(
         self, merged: dict[str, str], url: str, extra: dict[str, str] | None
     ) -> None:
@@ -3378,6 +3408,34 @@ class BaseSession:
             if value is not None:
                 return value
         return None
+
+    def _document_cookie(self, url: str) -> str:
+        """Cookies visible to page JavaScript at ``url`` (excluding HttpOnly)."""
+        client = getattr(self, "_client", None)
+        jar = getattr(client, "cookie_jar", None) if client is not None else None
+        if jar is None:
+            return ""
+        try:
+            cookies = jar.get_all()
+        except Exception:
+            return ""
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower().rstrip(".")
+        request_path = parsed.path or "/"
+        secure_ok = parsed.scheme == "https"
+        readable = [
+            cookie for cookie in cookies
+            if cookie.name and not getattr(cookie, "http_only", False)
+        ]
+        visible = []
+        for name in dict.fromkeys(cookie.name for cookie in readable):
+            value = self._scoped_cookie_value(
+                readable, name, host, request_path, secure_ok,
+                native=False, jar=jar,
+            )
+            if value is not None:
+                visible.append(f"{name}={value}")
+        return "; ".join(visible)
 
     def cookie_scope_summary(self, url: str) -> list[dict[str, object]]:
         """Return bounded, value-free wreq cookie scope diagnostics.

@@ -1,19 +1,24 @@
-"""Live test: AliExpress MTop token bootstrap, its reCAPTCHA, and avoiding it.
+"""Live test: AliExpress MTop token bootstrap, priming, and challenge recovery.
 
-A cold session's unsigned call to a protected MTop API is answered
-FAIL_SYS_USER_VALIDATE with an action=captcharecaptcha punishment URL unless
-the session holds the _baxia_sec_cookie_ AliExpress's page script sets.
+Protected MTop APIs can answer FAIL_SYS_USER_VALIDATE even after the browser
+has supplied _baxia_sec_cookie_. Priming imports state; the product response
+decides whether that state is accepted.
 
     uv run python tests/live_mtop_recaptcha.py solve [headless]
         cold bootstrap -> browser_solve_challenge(url, "tmd", timeout=165)
         -> signed pdp.pc.query retry
     uv run python tests/live_mtop_recaptcha.py prime [headless]
         browser_prime("https://www.aliexpress.com/") -> signed pdp.pc.query
+    uv run python tests/live_mtop_recaptcha.py prime --timezone UTC --recover
+        prime -> signed call -> solve any issued challenge -> signed retry
 
-Each mode prints the outcome and wall time. One run at a time; leave 5s+
-between runs (CLAUDE.md). See docs/ref-baxia.md.
+--timezone sets BrowserSolver's browser-process clock; omitted keeps the
+process default. Exit status is zero only for SUCCESS plus the expected product
+ID. One run at a time; leave 5s+ between requests and runs (CLAUDE.md).
+See docs/ref-baxia.md.
 """
 
+import argparse
 import asyncio
 import hashlib
 import json
@@ -75,10 +80,35 @@ def _token(session) -> str | None:
     return cookie.split("_")[0] if cookie else None
 
 
-async def main(mode: str, headless: bool) -> None:
-    solver = BrowserSolver(headless=headless)
+async def _solve_issued(session, body: dict, started: float) -> bool:
+    data = body.get("data")
+    issued = data.get("url") if isinstance(data, dict) else None
+    if not issued:
+        return False
+    token_before = _token(session)
+    solved = await session.browser_solve_challenge(issued, "tmd", timeout=165)
+    log.info(
+        "browser_solve_challenge=%s after %.1fs; token before=%s after=%s",
+        solved,
+        time.monotonic() - started,
+        bool(token_before),
+        bool(_token(session)),
+    )
+    return solved
+
+
+async def main(
+    mode: str, headless: bool, timezone: str | None, recover: bool
+) -> bool:
+    solver = BrowserSolver(headless=headless, timezone=timezone)
     try:
-        async with wafer.AsyncSession(max_rotations=0, browser_solver=solver) as s:
+        async with wafer.AsyncSession(
+            max_rotations=0,
+            max_retries=0,
+            cache_dir=None,
+            rate_limit=6,
+            browser_solver=solver,
+        ) as s:
             started = time.monotonic()
             if mode == "prime":
                 primed = await s.browser_prime(
@@ -90,6 +120,8 @@ async def main(mode: str, headless: bool) -> None:
                     time.monotonic() - started,
                     sorted(c["name"] for c in s.cookie_scope_summary(URL)),
                 )
+                if not primed:
+                    return False
             else:
                 body = await _mtop(s, "undefined", {})
                 data = body.get("data")
@@ -97,31 +129,54 @@ async def main(mode: str, headless: bool) -> None:
                 log.info(
                     "bootstrap ret=%s punishment=%s", body.get("ret"), bool(issued)
                 )
-                if issued:
-                    solved = await s.browser_solve_challenge(
-                        issued, "tmd", timeout=165
-                    )
-                    log.info(
-                        "browser_solve_challenge=%s after %.1fs",
-                        solved,
-                        time.monotonic() - started,
-                    )
+                if issued and not await _solve_issued(s, body, started):
+                    return False
             token = _token(s)
             if token is None:
                 await _mtop(s, "undefined", {})
                 token = _token(s)
             body = await _mtop(s, token or "", PRODUCT)
+            if recover and "FAIL_SYS_USER_VALIDATE" in body.get("ret", []):
+                log.info("primed signed call was challenged; solving issued URL")
+                if not await _solve_issued(s, body, started):
+                    return False
+                token = _token(s)
+                if token is None:
+                    await _mtop(s, "undefined", {})
+                    token = _token(s)
+                body = await _mtop(s, token or "", PRODUCT)
+            data = body.get("data")
+            result = data.get("result") if isinstance(data, dict) else None
+            price = result.get("PRICE") if isinstance(result, dict) else None
+            product_id = price.get("productId") if isinstance(price, dict) else None
+            succeeded = (
+                any(str(ret).startswith("SUCCESS::") for ret in body.get("ret", []))
+                and str(product_id) == PRODUCT["productId"]
+            )
             log.info(
-                "signed %s ret=%s total=%.1fs",
+                "signed %s ret=%s product_id=%s validated=%s total=%.1fs",
                 API,
                 body.get("ret"),
+                product_id,
+                succeeded,
                 time.monotonic() - started,
             )
+            return succeeded
     finally:
         solver.close()
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2 or sys.argv[1] not in ("solve", "prime"):
-        sys.exit(__doc__)
-    asyncio.run(main(sys.argv[1], "headless" in sys.argv[2:]))
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("mode", choices=("solve", "prime"))
+    parser.add_argument("headless", nargs="?", choices=("headless",))
+    parser.add_argument("--timezone")
+    parser.add_argument("--recover", action="store_true")
+    args = parser.parse_args()
+    sys.exit(
+        0
+        if asyncio.run(
+            main(args.mode, bool(args.headless), args.timezone, args.recover)
+        )
+        else 1
+    )

@@ -3717,16 +3717,13 @@ class BrowserSolver:
         self._runtime_ready.set()
 
         if not self._timezone and not self._utc_clock_warned and _clock_is_utc():
-            # A server or container default no desktop browser reports. Sites
-            # that check the browser's timezone against the IP's location
-            # challenge it: AliExpress MTop punished every primed call from
-            # fetchaller's UTC container and passed the same container on
-            # its IP's timezone, 3 of 3 each (2026-10-08).
+            # Surface a commonly unintended container default. A clock alone
+            # does not determine whether an application accepts browser state.
             self._utc_clock_warned = True
             logger.warning(
-                "Browser clock is UTC, which sites that compare it with the "
-                "IP's location challenge; pass BrowserSolver(timezone=...) "
-                "or set TZ to the egress IP's timezone"
+                "Browser clock is UTC; if unintended, pass "
+                "BrowserSolver(timezone=...) or set TZ. Changing the "
+                "timezone does not guarantee challenge-free requests"
             )
 
         self._last_used = time.monotonic()

@@ -277,6 +277,12 @@ fingerprint before cycling Chrome versions. See
 
 Because Opera Mini cannot execute JavaScript, **challenge detection, fingerprint rotation, retry logic, and browser solving are all disabled**. Rate limiting, `follow_redirects`, and `max_redirects` still apply. GET only (`ValueError` on other methods).
 
+Google Search rejects this profile with HTTP 403. For verified browserless Google
+web results and pagination, use the [Docs research HTTP API](docs/ref-google-research.md).
+It works with ordinary HTTP clients without impersonation, a browser, or a wafer
+upgrade. The [fetchaller handoff](docs/google-search-fetchaller-handoff.md) covers
+request parsing, pagination, and the verified document pool.
+
 ```python
 from wafer import SyncSession, AsyncSession, Profile
 
@@ -424,16 +430,16 @@ bootstrap fails:
   When the total request deadline can fund them, wafer tries up to three fresh
   browser contexts with distinct recorded drags and a fair share of the
   remaining time, reserving up to 15 seconds for HTTP replay.
-  AliExpress MTop is the exception to solving: protected APIs such as
-  `mtop.aliexpress.pdp.pc.query` answer every call from a session without the
-  `_baxia_sec_cookie_` that AliExpress's page script sets with a reCAPTCHA
-  punishment (20-130s of image rounds). `session.browser_prime("https://www.aliexpress.com/")`
-  before the first MTop call imports that cookie and `_m_h5_tk` in about 17s,
-  and MTop then normally answers without one, provided the browser's clock fits
-  the IP's location (a UTC container is punished every time; pass
-  `BrowserSolver(timezone="America/Toronto")` or set `TZ`); when it still punishes (as it
-  then does a real browser's own item page), solve the issued URL with
-  `session.browser_solve_challenge(url, "tmd")`. See `docs/ref-baxia.md`.
+  AliExpress MTop can return `FAIL_SYS_USER_VALIDATE` and an issued punishment
+  URL inside an ordinary JSON response, which is not automatically
+  challenge-checked. `session.browser_prime("https://www.aliexpress.com/")`
+  imports browser state such as `_baxia_sec_cookie_` and `_m_h5_tk`, and can
+  avoid that challenge. Its `True` result means state was imported; validate
+  the signed MTop response separately. `BrowserSolver(timezone=...)` controls
+  the browser clock, but neither priming nor a timezone guarantees acceptance.
+  If challenged, solve the issued URL with
+  `session.browser_solve_challenge(url, "tmd")`, read the signing token again,
+  and retry within the caller's deadline. See `docs/ref-baxia.md`.
 - **Reddit** -JSON reads go through Reddit's Android app API as a logged-out
   app install, so they meet no web gate (`resp.emulation == "reddit_app"`;
   `reddit_app=False` turns it off). Everything else (HTML, account requests,
@@ -663,7 +669,8 @@ solver = BrowserSolver(
     egress_guard_proxy=None,  # optional loopback SOCKS5 destination guard
     executable_path=None, # optional Chrome/Chromium executable override
     timezone=None,        # IANA zone for the browser, e.g. "America/Toronto";
-                          # match the egress IP (a UTC container is challenged)
+                          # None inherits the process clock; no guarantee of
+                          # avoiding challenges
 )
 # Non-blocking readiness signal for health checks. It becomes true after Chrome
 # launches and clears immediately on disconnect, idle close, or explicit close.

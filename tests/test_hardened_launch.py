@@ -424,8 +424,8 @@ class TestSolverUsesTheSharedConfig:
             solver.close()
 
     def test_timezone_reaches_the_browser_process(self):
-        # AliExpress MTop punished every primed call from a UTC container and
-        # passed the same container on its IP's timezone (2026-10-08).
+        # Set the browser process's native clock, rather than a page-only
+        # override that can disagree with frames or workers.
         solver = BrowserSolver(headless=False, timezone="America/Toronto")
         playwright = MagicMock()
         playwright.chromium.launch.return_value = _browser_reporting(_SCRUBBED_UA)

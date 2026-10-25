@@ -71,6 +71,10 @@ makes Chrome resend once with them. A plain navigation sends no
 - Reddit's verification form goes out as its script submits it: `same-origin`,
   `Referer: https://www.reddit.com/`, no `Sec-Fetch-User` (Chrome 153 capture;
   see `docs/ref-reddit.md`).
+- Google's SearchGuard `sei` handoff is also a script navigation. Chromium
+  retries carry the shell URL as Referer and `Sec-Fetch-Site: same-origin`, and
+  omit `Sec-Fetch-User`. The latter requires per-request
+  `default_headers=False` with a complete header set.
 
 ## Embed Mode Header Details
 

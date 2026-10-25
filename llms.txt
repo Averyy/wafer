@@ -296,24 +296,18 @@ session.browser_solve_challenge(url: str, challenge_type: str, *,
 # the issued punishment URL in resp.json()["data"]["url"]. Pass that URL with
 # challenge_type="tmd", then reissue the MTop call; its token bootstrap
 # (FAIL_SYS_TOKEN_EMPTY plus a fresh _m_h5_tk cookie) follows as usual.
-# That punishment is a Google reCAPTCHA and costs 20-130s of image rounds.
-# Avoid it instead: a session that has never run AliExpress's page script
-# lacks the _baxia_sec_cookie_ that script sets in the browser, and protected
-# MTop APIs (mtop.aliexpress.pdp.pc.query, signed or not) punish every call
-# without it. No header shape, TLS or warm-up GET of an HTML page changes
-# that. Call browser_prime("https://www.aliexpress.com/") once before the
-# first MTop call: it imports _baxia_sec_cookie_ and usually _m_h5_tk too
-# (about 17s, headed or headless), and MTop then answers SUCCESS with no
-# captcha. The browser's clock must fit the IP's location: from a Toronto IP,
-# a primed call from a UTC container (or on Europe/London) was punished every
-# time, and the same container on America/Toronto or America/Los_Angeles
-# passed every time. Run the solver on the egress IP's zone,
-# BrowserSolver(timezone="America/Toronto"), or set TZ for the process.
-# Not always: when AliExpress punishes a real browser's own item
-# page too, the primed call still gets FAIL_SYS_USER_VALIDATE, so keep the
-# browser_solve_challenge path above as the fallback. The homepage normally
-# shows no challenge; browser_prime still returns True there when it imported
-# cookies for the origin, so True is not proof that MTop will answer SUCCESS.
+# That punishment can require multiple reCAPTCHA image rounds; solving may
+# exhaust the supplied timeout. Priming is an optional way to acquire browser
+# state before the first MTop call:
+# browser_prime("https://www.aliexpress.com/") imports cookies such as
+# _baxia_sec_cookie_ and often _m_h5_tk. It can avoid a challenge, but True
+# means imported state, not that MTop accepted it. Validate the signed
+# response's ret and product data. BrowserSolver(timezone="America/Toronto")
+# or process TZ controls the browser's clock; a matching timezone does not
+# guarantee acceptance. Keep the browser_solve_challenge path above for an
+# issued FAIL_SYS_USER_VALIDATE response, then reread the signing token and
+# reissue the API request within the caller's deadline. See docs/ref-baxia.md
+# for current native/container measurements and their limits.
 # Read the token with
 # session.get_cookie("_m_h5_tk", "https://acs.aliexpress.com/") and sign with
 # it; bootstrap as usual if the page did not mint one.
@@ -490,7 +484,8 @@ resp.needs_render   # bool - the body is HTML that ships script but under 1000
 
 # Retry metadata:
 resp.elapsed        # float (seconds)
-resp.was_retried    # bool
+resp.was_retried    # bool - true after a normal retry, rotation, inline solve,
+                    # or browser solve
 resp.retries        # int (normal retries used)
 resp.rotations      # int (fingerprint rotations used)
 resp.inline_solves  # int (inline challenge solves)
@@ -941,10 +936,36 @@ capabilities and trade-offs.
 - `follow_redirects` and `max_redirects` are honoured
 - Rate limiting still works
 - Useful for fetching server-side rendered pages that Opera Mini triggers
-- Google search: send `client=ms-opera-mini-android` and `channel=new` with
-  `q`, as Opera Mini's search box does; without them `/search` answers a plain
-  403, not a challenge. With them it returns server-rendered results:
-  `session.get("https://www.google.com/search", params={"q": query, "hl": "en", "client": "ms-opera-mini-android", "channel": "new"})`
+- Google Search no longer serves Opera Mini server-rendered results. The legacy
+  user agent gets HTTP 403; modern identities get Google's JavaScript
+  SearchGuard shell. With the `[browser]` extra installed, wafer runs the shell
+  in QuickJS-NG without launching a browser and replays its `sei` handoff.
+  Google's acceptance is unconfirmed, and it may still return a `/sorry`
+  reCAPTCHA. See `docs/ref-searchguard.md`.
+
+### Google web search (verified HTTP route)
+
+- Use the Google Docs research-search JSON API for general web results and
+  pagination. It works with ordinary HTTP clients without TLS impersonation,
+  JavaScript, a browser, login, or authentication cookies. No wafer upgrade or
+  `[browser]` extra is required; ordinary `SyncSession.post()` and
+  `AsyncSession.post()` work.
+- The caller POSTs a URL-encoded form with a JSON `request` field to an
+  eligible public document's `/explore/search` endpoint. The document supplies
+  request context; it does not restrict results to Docs or Scholar. Returned
+  records contain URLs, titles, and snippets, plus a next-page cursor.
+- This is an explicit caller-side API request, not automatic rerouting of
+  `session.get("https://www.google.com/search?...")`. Use a normal session;
+  `Profile.OPERA_MINI` is GET-only and Google rejects its search requests.
+- An eligible public document remains a dependency. Three publicly linked
+  Kubernetes documents passed real first- and second-page requests on
+  2026-10-25. Treat the configured IDs as a bounded fallback pool, and never
+  follow `/sorry` or an authentication redirect.
+- Complete request/response recipes: `docs/ref-google-research.md`.
+  Plain-HTTP integration and error handling: `docs/google-search-fetchaller-handoff.md`.
+  Verified IDs and evidence: `docs/google-search-document-pool.json`.
+- Normal `/search` SearchGuard acceptance remains unconfirmed. Ranking and
+  filter equivalence between that page and this research API is not established.
 
 ---
 
@@ -966,7 +987,7 @@ These are all automatic. Do not write code to handle these yourself:
 
 ## Challenge Types
 
-Wafer detects 21 WAF/challenge types automatically. When a challenge cannot be
+Wafer detects 22 WAF/challenge types automatically. When a challenge cannot be
 solved, `ChallengeDetected.challenge_type` and `resp.challenge_type` contain
 one of these strings:
 
@@ -990,6 +1011,11 @@ one of these strings:
 "reddit"       - Reddit cold-session JSON/HTML gate (inline first; optional browser recovery)
                  (Reddit JSON reads normally never see it: they go through
                  Reddit's Android app API instead - see "Reddit" below)
+"searchguard"  - Google Search JavaScript gate; uses QuickJS-NG from the
+                 `[browser]` extra to mint the short-lived `SG_SS` cookie and
+                 replay Google's `sei` handoff without launching a browser.
+                 Server acceptance is unconfirmed; Google may still return the
+                 separate `/sorry` reCAPTCHA challenge.
 "vercel"       - Vercel bot protection
 "arkose"       - Arkose Labs / FunCaptcha (no dedicated solver; not solvable)
 "geetest"      - GeeTest v4
@@ -1016,8 +1042,10 @@ a score token, not a visible challenge, and is minted browser-free via
 `session.mint_recaptcha_v3(...)` (see "reCAPTCHA v3 token minting").
 `"vercel"`/`"generic_js"` also get the generic browser JS-wait (no
 dedicated solver, but it passes their passive JS checks). The inline set
-(`acw`, `pow`, `cookie_gate`, `tmd`, `amazon`, `reddit`, `radware`) needs no
-browser for its normal path.
+(`acw`, `pow`, `cookie_gate`, `tmd`, `amazon`, `reddit`, `radware`,
+`searchguard`) does not launch a browser for its normal path. SearchGuard
+requires QuickJS-NG, installed by the `[browser]` extra, and a successful VM
+run does not guarantee Google will accept its handoff.
 
 Radware serves its captcha interstitial as a plain HTTP 200 from its own host
 (`validate.perfdrive.com`) after a redirect off the origin, so a Radware block
@@ -1280,10 +1308,9 @@ solver = BrowserSolver(
     executable_path=None, # optional str/os.PathLike Chrome executable override
     timezone=None,        # IANA zone for the browser process (TZ), e.g.
                           # "America/Toronto"; None keeps the process's own.
-                          # Unknown names raise ValueError. Use the egress IP's
-                          # zone: sites that compare the two challenge a
-                          # mismatch, and a UTC clock (a container default) logs
-                          # a one-time WARNING at launch.
+                          # Unknown names raise ValueError. An inherited UTC
+                          # clock logs a one-time WARNING at launch. Timezone
+                          # selection does not guarantee avoiding challenges.
 )
 # Linux (Docker, Xvfb): with no GPU the solver renders WebGL on SwiftShader,
 # chosen automatically (no /dev/dri render node, or Mesa fell back to llvmpipe).

@@ -79,6 +79,7 @@ from wafer._reddit_app import (
 )
 from wafer._response import HistoryEntry, WaferResponse, resolve_charset
 from wafer._retry import RetryState, calculate_backoff, parse_retry_after
+from wafer._searchguard import solve_searchguard
 from wafer._solvers import (
     REDDIT_BROWSER_OUTCOME_ESTABLISHED,
     REDDIT_BROWSER_OUTCOME_FAILED,
@@ -498,8 +499,9 @@ class SyncSession(BaseSession):
         deadline: float | None = None,
         origin_url: str | None = None,
         seen_clearance: str | None = None,
-    ) -> bool:
-        """Attempt inline challenge solving. Returns True if solved.
+        request_user_agent: str | None = None,
+    ) -> bool | str:
+        """Attempt inline challenge solving. Returns True or a retry URL.
 
         ``url`` is where the challenge was served, which after a redirect is
         not necessarily what the caller asked for. ``origin_url`` carries the
@@ -517,7 +519,21 @@ class SyncSession(BaseSession):
             if remaining <= 0:
                 return False
             sub_timeout = datetime.timedelta(seconds=remaining)
-        if challenge == ChallengeType.ACW:
+        if challenge == ChallengeType.SEARCHGUARD:
+            result = solve_searchguard(
+                body,
+                url,
+                request_user_agent or self._serving_user_agent() or "",
+                self._document_cookie(url),
+            )
+            if result:
+                cookie, handoff_url = result
+                self._record_cookie_scope(cookie, url)
+                self._client.cookie_jar.add(cookie, url)
+                logger.info("Google SearchGuard VM executed; replaying sei handoff")
+                return handoff_url
+
+        elif challenge == ChallengeType.ACW:
             cookie_value = solve_acw(body)
             if cookie_value:
                 cookie_str = f"acw_sc__v2={cookie_value}; Path=/"
@@ -1674,6 +1690,7 @@ class SyncSession(BaseSession):
         m = _to_method(method) if isinstance(method, str) else method
         domain = extract_domain(url) or url
         current_url = url
+        searchguard_replay_from: str | None = None
 
         # Snapshot of the caller's request as it stood before any redirect.
         # Following a 301/302/303 downgrades a POST to GET per RFC, drops the
@@ -1842,8 +1859,14 @@ class SyncSession(BaseSession):
             wreq_url = (
                 _canonicalize_url_host(current_url) if self._resolve else current_url
             )
+            request_kwargs = kwargs
+            if searchguard_replay_from is not None:
+                script_headers, script_options = self._script_navigation_headers(
+                    current_url, searchguard_replay_from, extra_headers
+                )
+                request_kwargs = {**kwargs, **script_options, "headers": script_headers}
             try:
-                resp = self._client.request(m, wreq_url, **kwargs)
+                resp = self._client.request(m, wreq_url, **request_kwargs)
             except Exception as e:
                 # Every attempt now carries a timeout kwarg -- attempt_timeout
                 # if set, else the remaining-budget clamp -- so any wreq
@@ -1974,6 +1997,7 @@ class SyncSession(BaseSession):
                 continue
 
             status = resp.status.as_int()
+            searchguard_replay_from = None
             self._record_response_cookie_scopes(current_url, resp)
 
             # Record request timestamp for rate limiting
@@ -2043,6 +2067,7 @@ class SyncSession(BaseSession):
             was_retried = (
                 state.normal_retries > 0
                 or state.rotation_retries > 0
+                or state.inline_solves > 0
                 or bool(browser_attempted)
             )
             content_type = headers.get("content-type", "")
@@ -2355,16 +2380,32 @@ class SyncSession(BaseSession):
                     and inline_allowed
                     and state.inline_solves < state.max_inline_solves
                 ):
+                    inline_kwargs = {
+                        "origin_url": url,
+                        "seen_clearance": radware_clearance_seen,
+                    }
+                    if challenge is ChallengeType.SEARCHGUARD:
+                        inline_kwargs["request_user_agent"] = next(
+                            (value for key, value in kwargs["headers"].items()
+                             if key.lower() == "user-agent"),
+                            None,
+                        )
                     inline_solved = self._try_inline_solve(
                         challenge,
                         body,
                         current_url,
                         deadline,
-                        origin_url=url,
-                        seen_clearance=radware_clearance_seen,
+                        **inline_kwargs,
                     )
                 if challenge is not None and inline_solved:
                     state.inline_solves += 1
+                    if isinstance(inline_solved, str):
+                        if challenge is ChallengeType.SEARCHGUARD:
+                            # The VM navigates from the shell to its sei URL.
+                            # Record that navigation's referrer before replay.
+                            self._record_url(current_url)
+                            searchguard_replay_from = current_url
+                        current_url = inline_solved
                     if challenge is ChallengeType.RADWARE:
                         # Remember what this replay rides on, so a block that
                         # comes back with the same cookies stops the loop.
