@@ -69,9 +69,16 @@ Every first-party browser exchange uses the session's hostname limiter, includin
 initial navigation, key fetch, PoW submission, and reload. There are at most two
 main-frame documents, one PoW submission, and two key requests (to allow Brave's
 own v1 fallback). Pending first-party requests are bounded to 32 and released
-from the browser event pump; route callbacks never sleep, so headless workers
-and iframe hardening keep running. Remaining routes are aborted and handlers
-removed before context close. CDN assets keep normal browser scheduling. All work shares the
+by an independent task on the browser's asyncio loop. Release continues while
+a synchronous DOM read, response-body read, or navigation is waiting; it does
+not depend on the handler returning to its polling loop. Route callbacks never
+sleep, so headless workers and iframe hardening keep running. Remaining routes
+are aborted and handlers removed before context close. Required token-key, PoW,
+and main-document requests have priority over optional feedback, keeping the
+site's feedback bursts from consuming the recovery deadline. Every actual send
+still respects the same limiter. Cleanup cancels pending pacing waits and lets
+already-sent driver operations settle. CDN assets keep normal
+browser scheduling. All work shares the
 request deadline, response-size guard, and solver's configured proxy/egress.
 A direct `solver.solve()` has its own timeout but no session limiter/state.
 
@@ -86,9 +93,14 @@ other extra parameters or changed queries/pages are rejected.
 
 If the browser navigation is challenge free while HTTP was challenged, its
 validated network response is returned with `challenge_absent=True`, without
-claiming a new clearance identity or changing the HTTP fingerprint. Fresh
-clearance additionally requires an observed accepted PoW exchange and the real
-Brave cookie on the successful document.
+claiming a new clearance identity or changing the HTTP fingerprint. Recovery
+requires an observed gate and the validated successful search network document.
+This can follow accepted new PoW or reuse of an already-verified spare blind
+token. Both are recovery (`challenge_absent=False`); this flag alone does not
+prove a fresh PoW submission or portable cookie. A consumed cookie may already
+be absent when the response is captured. Wafer allows up to three seconds,
+inside the existing deadline, for the search app to prepare its next cookie;
+it never substitutes a synthetic token when that handoff produces none.
 
 Only validated success exports cookies to the HTTP jar and normal cookie cache.
 Only the exact origin's `app.blindtoken.tokens[.v2]` keys survive into subsequent
@@ -100,11 +112,106 @@ session/process relies on ordinary persisted cookies and can solve again if
 needed. Runtime cookie replay and restart acceptance must be measured separately
 from browser success.
 
+**Token cookies are consumable.** In the live run, one native HTTP search
+carrying the real browser-issued token returned 200 and deleted that cookie.
+The next gated search recovered using the retained spare-token pool, without
+another PoW submission. Wafer lets Brave's own code consume the next token;
+it does not keep replaying a spent cookie or synthesize token values. A fresh
+process loaded an unspent cookie from disk and returned a 219,276-byte 200
+search document with no browser configured; that read consumed the cookie too.
+Restart persistence covers an unspent cookie, not an unlimited clearance grant.
+The in-memory spare pool is intentionally not persisted. Once a restarted
+session consumes its cached cookie, a subsequent gate can require new PoW.
+
 ## Verification record (2026-10-25)
 
-Run the guarded end-to-end probe with `uv run python tests/live_brave.py`.
-It stops at the first unresolved response and labels challenge-free runs
-untested for PoW solving.
+### Accepted-reload stall
+
+The original polling-only route queue could deadlock after accepted PoW. A live
+native reproduction, without MCP or fetchaller's proxy, established the exact
+blocked sub-call: CDP `Runtime.evaluate` inside `_quiet_read`, before
+`page.content()` was called. Chrome was navigating to the accepted exact-query
+`_rr=1` reload, whose route was waiting for the six-second limiter. Only the
+outer handler loop could release that route, and that loop was blocked in the
+read. The 234.9-second browser deadline interrupted the driver; extending the
+deadline did not fix the circular wait.
+
+Route release now runs independently on the driver's event loop, including
+during pending sync protocol calls. The bridge uses the intercepted route's
+underlying asynchronous implementation on its owning loop. The real-driver
+probe `tests/live_brave_pacing.py` deliberately awaits concurrent token-key
+fetches inside `evaluate()` and a paced `reload()` without an outer polling
+loop. Unit regressions also cover pacing, cancellation, deadline, rejection,
+and route failure. Debug logs report route paths/queue lengths and DOM-read
+entry/exit without issued work or cookie values.
+
+The stronger real-driver probe also exposed bursts of `/api/feedback` requests
+queued before the final document. A FIFO for every first-party request could
+delay the reload past its budget even after the read deadlock was removed.
+Required exchanges now retain FIFO ordering ahead of optional feedback; no
+telemetry exception bypasses the session's limiter.
+
+### Recovery verified after the fix
+
+These live runs used installed macOS Chrome 155, headed and headless.
+
+- Final wafer suite: **2,845 passed, 25 skipped**, including **64 Brave cases**;
+  Ruff, lockfile validation, and diff checks passed. Fetchaller's full suite
+  against the local fix: **4,603 passed, 5 skipped**, with five dependency
+  deprecation warnings. Source distribution and wheel built successfully.
+- Native headed run: HTTP 429 and a real browser gate, PoW 200 at 23:25:41 UTC,
+  completed exact-query `_rr=1` search 200 at 23:25:53, **215,688 network bytes**,
+  returned to the caller in **30.68 seconds**. No MCP or fetchaller proxy was
+  involved.
+- Native headless run: fresh PoW 200 at 23:33:00 UTC, completed `_rr=1` search
+  200 at 23:33:12, **227,317 network bytes**, returned in **30.97 seconds**.
+  Two later native HTTP reads returned search content and consumed their token
+  cookies. Two later gated queries/pages recovered from spare blind tokens in
+  **12.58 / 12.69 seconds**, with **no additional PoW submissions**.
+- A restarted session with **no BrowserSolver configured** loaded an unspent
+  cookie from disk and returned a **219,276-byte HTTP 200** search document.
+  An independent fresh Python process also loaded an unspent cookie and
+  returned the same size successful document without a browser. Both reads
+  consumed their token cookies; repeated reuse is not the protocol.
+- The headless run also established the response/cookie timing race: final
+  network content could arrive before the new search app prepared its next
+  cookie. Recovery no longer depends on the consumed cookie remaining present,
+  and bounded app settling retains a newly prepared cookie when available.
+  Final origin/query, rejection, size, and deadline checks run again after
+  this handoff, before state export.
+- The actual guarded fetchaller **stdio MCP** path recovered a fresh gate and
+  returned **20 attributed Brave results in 31.13 seconds**. Solver audit:
+  `response_status=200 challenge_absent=False`; one browser dispatch;
+  **27 egress connections allowed, zero denied**. It used local wafer source,
+  fetchaller's existing guarded shared solver, and its normal request/provider
+  budgets. No fetchaller implementation change was needed for this fix.
+- The real headless pacing probe completed an awaited two-fetch `evaluate()`
+  and a paced `reload()` without any outer flush loop. Search/reload were real
+  429 gates, and both public key responses were 200. Send gaps were **6.139,
+  6.365, and 6.281 seconds**, with no cleanup errors. This verifies independent
+  route progress/pacing; it is not counted as a PoW solve.
+
+Reproduce the complete native acceptance flow:
+
+```bash
+uv run python tests/live_brave.py --rounds 10 --require-recovery
+uv run python tests/live_brave.py --headless --rounds 10 --require-recovery
+```
+
+The probe requires fresh accepted work and validated recovered content, native
+token replay, subsequent spare-token recovery without new PoW, and an unspent
+cached token accepted after session restart. No-gate or missing-evidence runs
+exit 2; an unresolved response stops live traffic and exits 1. Token/cookie
+values are never logged. Local evidence: `/tmp/wafer-brave-subcalls-before.out`,
+`/tmp/wafer-brave-fixed-recovery.out`, and
+`/tmp/wafer-brave-fixed-headless-final.out`. Guarded integration and pacing:
+`/tmp/fetchaller-wafer-brave-fixed-mcp.out` and
+`/tmp/wafer-brave-pacing-pass.out`.
+
+### Earlier verification
+
+The following records the earlier implementation before the stall and
+cookie-handoff fixes. Its limitations are superseded by the live record above.
 
 - Final lint passed; full suite: **2,832 passed, 25 skipped**, including
   **51 Brave regression cases**. Offline coverage includes the real capture, successful page 1/2,
@@ -118,9 +225,8 @@ untested for PoW solving.
   coverage.
 - Three subsequent guarded runs completed multiple queries, pagination, and a
   session restart with HTTP 200 throughout, but triggered no PoW. They verify
-  ordinary searches only. End-to-end acceptance of the corrected PoW capture,
-  cookie replay, and clearance persistence remain **unverified** until another
-  real gate triggers. Do not describe those as passed based on those clean runs.
+  ordinary searches only. At that stage, end-to-end acceptance of the corrected
+  PoW capture, cookie replay, and clearance persistence were **unverified**.
 - A real headless Chrome search and two concurrent public token-key requests
   returned 200/200/200. The actual send intervals were 6.325 and 6.473 seconds.
   Pending routes were cleaned up without callback/cancellation errors. Reproduce

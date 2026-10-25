@@ -1,11 +1,12 @@
 """Brave's real captured gate, bounded browser protocol and session dispatch."""
 
+import asyncio
 import html
 import re
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -14,6 +15,7 @@ from wafer._brave import BRAVE_ORIGIN, is_brave_challenge
 from wafer._challenge import ChallengeType, detect_challenge
 from wafer._errors import ChallengeDetected, ResponseTooLarge
 from wafer.browser._brave import (
+    _BraveRoutes,
     brave_storage_state,
     capture_brave_response,
     finish_brave,
@@ -156,6 +158,27 @@ def test_network_capture_exact_bytes():
         capture_brave_response(response(), SimpleNamespace(url=URL), URL, 1000)
 
 
+def test_rejection_during_network_body_read_prevents_export():
+    page, solver, _ = browser_page([])
+    evidence = {"accepted": True, "rejected": False}
+    document = response()
+
+    def body():
+        evidence["rejected"] = True
+        return PAGE2
+
+    document.body.side_effect = body
+    assert wait_for_brave(
+        solver,
+        page,
+        URL,
+        [(URL, 200, document)],
+        time.monotonic() + 1,
+        None,
+        evidence,
+    ) == (None, False)
+
+
 @pytest.mark.parametrize(
     "status,body,url,page_url",
     [
@@ -258,6 +281,23 @@ def test_detached_context_then_real_network_document():
     assert not cleared
 
 
+def test_auto_pow_can_finish_before_the_first_dom_poll():
+    page, solver, button = browser_page([])
+    solver._bounded_page_content = MagicMock(side_effect=AssertionError("late DOM"))
+    captured, cleared = wait_for_brave(
+        solver,
+        page,
+        URL,
+        [(URL + "&_rr=1", 200, response(url=URL + "&_rr=1"))],
+        time.monotonic() + 1,
+        None,
+        {"accepted": True, "rejected": False},
+    )
+    assert captured.body == PAGE2 and cleared
+    solver._bounded_page_content.assert_not_called()
+    button.first.click.assert_not_called()
+
+
 def test_challenge_free_navigation_is_passthrough_without_clearance():
     page, solver, button = browser_page([])
     solver._browser_ua = "Chrome"
@@ -278,6 +318,125 @@ def test_challenge_free_navigation_is_passthrough_without_clearance():
     assert result.response.body == PAGE2
     assert result.challenge_absent
     button.first.click.assert_not_called()
+
+
+def test_retained_blind_token_recovery_is_not_an_absent_challenge():
+    from wafer._brave import BRAVE_COOKIES
+
+    page, solver, button = browser_page(["verifying"])
+    solver._browser_ua = "Chrome"
+    solver._browser_version = "155.0.0.0"
+    context = MagicMock()
+    context.cookies.return_value = [{"name": BRAVE_COOKIES[0]}]
+    context.storage_state.return_value = {"origins": []}
+    documents = []
+    with patch(
+        "wafer.browser._brave.idle",
+        side_effect=lambda _: documents.append((URL, 200, response())),
+    ):
+        result = finish_brave(
+            solver,
+            context,
+            page,
+            URL,
+            documents,
+            time.monotonic() + 1,
+            None,
+            ({}, {"accepted": False, "rejected": False}),
+        )
+    assert result.response.body == PAGE2
+    assert not result.challenge_absent
+    button.first.click.assert_not_called()
+
+
+def test_search_app_can_prepare_next_cookie_after_document_capture():
+    from wafer._brave import BRAVE_COOKIES
+
+    page, solver, _ = browser_page([])
+    solver._browser_ua = "Chrome"
+    solver._browser_version = "155.0.0.0"
+    context = MagicMock()
+    context.cookies.side_effect = [[], [{"name": BRAVE_COOKIES[0]}]]
+    context.storage_state.return_value = {"origins": []}
+    with (
+        patch("wafer.browser._brave.wait_for_brave", return_value=(response(), True)),
+        patch("wafer.browser._brave.idle") as pump,
+    ):
+        result = finish_brave(
+            solver,
+            context,
+            page,
+            URL,
+            [],
+            time.monotonic() + 1,
+            None,
+            ({}, {"accepted": True, "rejected": False}),
+        )
+    assert not result.challenge_absent
+    assert result.cookies == [{"name": BRAVE_COOKIES[0]}]
+    pump.assert_called_once()
+
+
+def test_consumed_cookie_cannot_relabel_a_validated_pow_reload_as_absent():
+    page, solver, _ = browser_page([])
+    solver._browser_ua = "Chrome"
+    solver._browser_version = "155.0.0.0"
+    context = MagicMock()
+    context.cookies.return_value = []
+    context.storage_state.return_value = {"origins": []}
+    with (
+        patch("wafer.browser._brave.wait_for_brave", return_value=(response(), True)),
+        patch("wafer.browser._brave.time.monotonic", return_value=10) as clock,
+        patch(
+            "wafer.browser._brave.idle",
+            side_effect=lambda _: setattr(clock, "return_value", 13),
+        ),
+    ):
+        result = finish_brave(
+            solver,
+            context,
+            page,
+            URL,
+            [],
+            15,
+            None,
+            ({}, {"accepted": True, "rejected": False}),
+        )
+    assert not result.challenge_absent
+    assert result.cookies == []
+
+
+@pytest.mark.parametrize("change", ["query", "rejection"])
+def test_cookie_handoff_rechecks_navigation_and_rejection_before_export(change):
+    page, solver, _ = browser_page([])
+    context = MagicMock()
+    context.cookies.return_value = []
+    evidence = {"accepted": False, "rejected": False}
+    state = {}
+
+    def during_handoff():
+        if change == "query":
+            page.url = URL.replace("offset=1", "offset=2")
+        else:
+            evidence["rejected"] = True
+        return {"origins": []}
+
+    context.storage_state.side_effect = during_handoff
+    with patch("wafer.browser._brave.wait_for_brave", return_value=(response(), False)):
+        assert (
+            finish_brave(
+                solver,
+                context,
+                page,
+                URL,
+                [],
+                time.monotonic() + 1,
+                None,
+                (state, evidence),
+            )
+            is None
+        )
+    assert state == {}
 
 
 def test_prepare_state_scope_pacing_and_rejected_state_eviction():
@@ -316,7 +475,7 @@ def test_prepare_state_scope_pacing_and_rejected_state_eviction():
     assert evidence == {"accepted": False, "rejected": True}
 
 
-def test_deadline_aborts_exchange_and_duplicate_pow_is_stopped():
+async def test_deadline_aborts_exchange_and_duplicate_pow_is_stopped():
     for expired in (False, True):
         context, page = MagicMock(), MagicMock()
         _, evidence = prepare_brave(
@@ -325,16 +484,19 @@ def test_deadline_aborts_exchange_and_duplicate_pow_is_stopped():
         route = MagicMock()
         route.request.url = BRAVE_ORIGIN + "/api/captcha/pow?brave=0"
         route.request.is_navigation_request.return_value = False
+        route._impl_obj.abort = AsyncMock()
+        route._impl_obj.continue_ = AsyncMock()
         callback = context.route.call_args.args[1]
         callback(route)
-        page._wafer_brave_flush()
+        await asyncio.sleep(0)
         if expired:
-            route.continue_.assert_not_called()
+            route._impl_obj.continue_.assert_not_awaited()
+            route._impl_obj.abort.assert_awaited_once()
         else:
             callback(route)
             assert evidence["rejected"]
-            route.continue_.assert_called_once()
-        route.abort.assert_called_once()
+            route._impl_obj.continue_.assert_awaited_once()
+            route.abort.assert_called_once()
 
 
 def test_accepted_pow_reload_allows_only_traced_rr_and_original_query():
@@ -623,14 +785,22 @@ def test_query_identity_keeps_duplicate_value_order():
     )
 
 
-def test_queued_browser_exchanges_keep_pump_free_and_share_actual_limiter():
+async def test_queued_browser_exchanges_progress_without_polling_and_share_limiter():
     from wafer._ratelimit import RateLimiter
 
     context, page = MagicMock(), MagicMock()
     limiter = RateLimiter(min_interval=6, jitter=0)
+    real_sleep = asyncio.sleep
+    sent = []
+
+    async def advance(seconds):
+        clock.return_value += seconds
+        await real_sleep(0)
+
     with (
         patch("wafer.browser._brave.time.monotonic", return_value=10) as clock,
         patch("wafer.browser._brave.idle") as pump,
+        patch("wafer.browser._brave.asyncio.sleep", side_effect=advance),
     ):
         prepare_brave(
             context, page, URL, {"_brave": {"limiter": limiter}}, deadline=100
@@ -645,22 +815,26 @@ def test_queued_browser_exchanges_keep_pump_free_and_share_actual_limiter():
         for route in routes:
             route.request.url = BRAVE_ORIGIN + "/api/tokens/keys"
             route.request.is_navigation_request.return_value = False
+            route._impl_obj.continue_ = AsyncMock(
+                side_effect=lambda: sent.append(clock.return_value)
+            )
             callback(route)
-            route.continue_.assert_not_called()
+            route._impl_obj.continue_.assert_not_awaited()
         pump.assert_not_called()  # callbacks queue instead of sleeping
-        page._wafer_brave_flush()
-        routes[0].continue_.assert_not_called()
-        clock.return_value = 16.01
-        page._wafer_brave_flush()
-        routes[0].continue_.assert_called_once()
-        routes[1].continue_.assert_not_called()
-        clock.return_value = 22.02
-        page._wafer_brave_flush()
-        routes[1].continue_.assert_called_once()
-        assert limiter._last_request["search.brave.com"] == 22.02
+        # Waiting on an unrelated protocol operation still runs the dispatcher;
+        # no outer polling/flush call is needed to release either route.
+        for _ in range(100):
+            await real_sleep(0)
+            if len(sent) == 2:
+                break
+        assert len(sent) == 2
+        assert sent[0] - 10 >= 6 and sent[1] - sent[0] >= 6
+        assert limiter._last_request["search.brave.com"] == sent[-1]
+        for route in routes:
+            route._impl_obj.continue_.assert_awaited_once()
 
 
-def test_cancel_drains_pending_routes_and_prevents_new_traffic():
+async def test_cancel_drains_pending_routes_and_prevents_new_traffic():
     context, page = MagicMock(), MagicMock()
     prepare_brave(context, page, URL, {}, time.monotonic() + 10)
     callback = context.route.call_args.args[1]
@@ -676,3 +850,87 @@ def test_cancel_drains_pending_routes_and_prevents_new_traffic():
     callback(later)
     later.abort.assert_called_once()
     later.continue_.assert_not_called()
+    await asyncio.sleep(0)  # Deliver task cancellation before loop shutdown.
+
+
+@pytest.mark.parametrize("stop", ["deadline", "rejection", "cancel"])
+async def test_dispatcher_never_sends_pending_work_after_stop(stop):
+    evidence = {"accepted": False, "rejected": False}
+    limiter = MagicMock()
+    limiter._delay_for.return_value = 10
+    queue = _BraveRoutes(limiter, time.monotonic() + 30, evidence)
+    route = MagicMock()
+    route.request.url = URL + "&_rr=1"
+    route._impl_obj.abort = AsyncMock()
+    route._impl_obj.continue_ = AsyncMock()
+    queue.enqueue(route)
+    task = queue.task
+    await asyncio.sleep(0)  # Dispatcher is now waiting for pacing.
+    if stop == "deadline":
+        queue.deadline = time.monotonic() - 1
+    elif stop == "rejection":
+        evidence["rejected"] = True
+    else:
+        queue.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    route._impl_obj.continue_.assert_not_awaited()
+    limiter.record.assert_not_called()
+    if stop == "cancel":
+        route.abort.assert_called_once()
+    else:
+        route._impl_obj.abort.assert_awaited_once()
+    assert not queue.pending
+
+
+async def test_dispatcher_rejects_and_drains_remaining_work_on_route_failure():
+    evidence = {"accepted": False, "rejected": False}
+    queue = _BraveRoutes(None, time.monotonic() + 5, evidence)
+    first, second = MagicMock(), MagicMock()
+    first.request.url = second.request.url = URL
+    first._impl_obj.continue_ = AsyncMock(side_effect=RuntimeError("detached"))
+    second._impl_obj.abort = AsyncMock()
+    second._impl_obj.continue_ = AsyncMock()
+    queue.enqueue(first)
+    queue.enqueue(second)
+    await queue.task
+    assert evidence["rejected"]
+    second._impl_obj.abort.assert_awaited_once()
+    second._impl_obj.continue_.assert_not_awaited()
+
+
+async def test_protocol_and_reload_do_not_wait_behind_feedback_bursts():
+    evidence = {"accepted": True, "rejected": False}
+    queue = _BraveRoutes(None, time.monotonic() + 5, evidence)
+    sent = []
+    # The real search page emits concurrent feedback while its token requests
+    # and reload are pending. Required exchanges must retain their own FIFO.
+    for index, priority in enumerate([False] * 10 + [True] * 3):
+        route = MagicMock()
+        route.request.url = BRAVE_ORIGIN + (
+            "/api/tokens/keys" if priority else "/api/feedback"
+        )
+        route._impl_obj.continue_ = AsyncMock(
+            side_effect=lambda index=index: sent.append(index)
+        )
+        queue.enqueue(route, priority=priority)
+    await queue.task
+    assert sent == [10, 11, 12, *range(10)]
+
+
+async def test_cancel_allows_an_already_sent_route_to_settle_without_cancellation():
+    evidence = {"accepted": False, "rejected": False}
+    queue = _BraveRoutes(None, time.monotonic() + 5, evidence)
+    released = asyncio.Event()
+    route = MagicMock()
+    route.request.url = URL
+    route._impl_obj.continue_ = AsyncMock(side_effect=released.wait)
+    queue.enqueue(route)
+    task = queue.task
+    await asyncio.sleep(0)
+    assert queue.active is route
+    queue.cancel()
+    assert not task.cancelling()
+    released.set()
+    await task
+    assert not task.cancelled()
+    assert queue.task is None and queue.active is None

@@ -1063,9 +1063,13 @@ session limiter and request deadline. Validated cookies use the normal HTTP
 jar/cache; spare blind tokens remain in origin-scoped, session-local memory,
 not on disk or in a shared BrowserSolver. Direct solver calls have no session
 limiter or retained spare tokens. Use `get()`; `render()` reports this gate
-without solving. Real PoW acceptance has been observed, but corrected capture,
-HTTP cookie replay and clearance persistence still need a fresh live gate to
-verify. See `docs/ref-brave.md` for the verification record.
+without solving. Live recovery, native HTTP replay and loading an unspent cookie
+in a fresh process are verified. Brave consumes/deletes the token cookie after
+an HTTP read; it is not reusable clearance. Later gates can use session-local
+spare tokens through the browser without new PoW. After restart the spare pool
+is gone, so an exhausted cookie can require a fresh solve. An observed gate
+cleared using spare tokens has challenge_absent=False too; it does not mean a
+new PoW was submitted. See `docs/ref-brave.md` for the verification record.
 
 Radware serves its captcha interstitial as a plain HTTP 200 from its own host
 (`validate.perfdrive.com`) after a redirect off the origin, so a Radware block

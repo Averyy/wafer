@@ -754,10 +754,12 @@ spare blind tokens are scoped to the origin and session in memory, never shared
 through BrowserSolver or persisted to disk. `get()` supports this solve path;
 `render()` reports an encountered Brave gate without solving it.
 
-Live Brave work acceptance and the subsequent 200 search document were observed.
-The corrected accepted-reload capture is regression tested; later live probes
-were challenge free. Real HTTP clearance-cookie replay and persistence remain
-unverified. See [Brave protocol, limits, and evidence](docs/ref-brave.md).
+Live verification covers accepted PoW, the completed search response, native
+HTTP token replay, and a fresh process loading an unspent cookie from disk.
+Brave consumes and clears these cookies: later gates use retained spare tokens
+through the browser without repeating PoW. Spare tokens remain in session memory;
+after restart, an exhausted cookie can require new work. See
+[Brave protocol, limits, and evidence](docs/ref-brave.md).
 
 ### Rendering a JavaScript-built page (`session.render`)
 

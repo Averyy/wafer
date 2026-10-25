@@ -1,5 +1,6 @@
 """Bounded Brave Search PoW solving using the site's own verified protocol."""
 
+import asyncio
 import json
 import logging
 import re
@@ -19,6 +20,93 @@ from wafer._errors import ResponseTooLarge
 from wafer.browser._pump import idle
 
 logger = logging.getLogger("wafer")
+
+
+class _BraveRoutes:
+    """Release paced routes even while a synchronous page read is pending.
+
+    Sync Patchright pumps its asyncio loop during protocol calls. A task on
+    that loop can release a navigation while Runtime.evaluate waits for its
+    new execution context. Polling from wait_for_brave cannot: that caller
+    is itself blocked in the read. Route callbacks only enqueue work, so they
+    also leave worker/iframe hardening free to resume paused targets.
+    """
+
+    def __init__(self, limiter, deadline, evidence):
+        self.limiter = limiter
+        self.deadline = deadline
+        self.evidence = evidence
+        self.pending = deque()
+        self.task = None
+        self.active = None
+        self.stopped = False
+
+    def enqueue(self, route, *, priority=False):
+        self.pending.append((route, priority))
+        logger.debug(
+            "Brave route queued path=%s pending=%d",
+            urlparse(route.request.url).path,
+            len(self.pending),
+        )
+        if self.task is None:
+            self.task = asyncio.get_running_loop().create_task(self._drain())
+
+    async def _drain(self):
+        try:
+            while self.pending:
+                remaining = self.deadline - time.monotonic()
+                abort = self.stopped or self.evidence["rejected"] or remaining <= 0
+                if not abort and self.limiter is not None:
+                    delay = self.limiter._delay_for("search.brave.com")
+                    if delay > 0:
+                        await asyncio.sleep(min(delay, 0.2, remaining))
+                        continue
+                # Search pages can enqueue many /api/feedback requests. Keep
+                # their pacing, but do not make a required key, PoW, or final
+                # document wait behind telemetry for most of the solve budget.
+                item = next((item for item in self.pending if item[1]), self.pending[0])
+                self.pending.remove(item)
+                route = item[0]
+                logger.debug(
+                    "Brave route %s path=%s pending=%d",
+                    "abort" if abort else "release",
+                    urlparse(route.request.url).path,
+                    len(self.pending),
+                )
+                # This is the one sync/async bridge: Route's underlying async
+                # implementation belongs to this same driver loop. Calling
+                # the sync wrapper from this task would switch back into the
+                # already-running dispatcher greenlet. Real-driver coverage
+                # in live_brave_pacing.py exercises this bridge.
+                self.active = route
+                try:
+                    if abort:
+                        await route._impl_obj.abort()
+                    else:
+                        if self.limiter is not None:
+                            self.limiter.record("search.brave.com")
+                        await route._impl_obj.continue_()
+                except Exception as exc:
+                    self.evidence["rejected"] = True
+                    logger.debug("Brave route failed (%s)", type(exc).__name__)
+                finally:
+                    self.active = None
+        finally:
+            self.task = None
+
+    def cancel(self):
+        self.stopped = True
+        # Cancelling an in-flight Route.continue_ cancels its bookkeeping
+        # before Patchright can finish handling the route and consume the
+        # protocol result. Let that already-sent operation settle instead;
+        # context close also releases its page-close race. Cancel only pacing.
+        if self.task is not None and self.active is None:
+            self.task.cancel()
+        while self.pending:
+            try:
+                self.pending.popleft()[0].abort()
+            except Exception:
+                pass
 
 
 def brave_storage_state(replay):
@@ -50,43 +138,19 @@ def prepare_brave(context, page, url, replay, deadline):
     limiter = config.get("limiter")
     counts = {"documents": 0, "pow": 0, "keys": 0}
     evidence = {"accepted": False, "rejected": False}
-    pending = deque()
-    stopped = False
+    routes = _BraveRoutes(limiter, deadline, evidence)
 
     def cancel_pending():
-        nonlocal stopped
-        stopped = True
-        while pending:
-            try:
-                pending.popleft().abort()
-            except Exception:
-                pass
+        routes.cancel()
         context.unroute_all(behavior="ignoreErrors")
 
     page._wafer_brave_cancel = cancel_pending
 
-    def flush_pending():
-        # A route callback must return promptly: sleeping there prevents the
-        # CDP worker/iframe hardening callbacks from resuming Brave's workers.
-        # Patchright keeps returned-but-unhandled routes pending until this
-        # worker calls continue_()/abort() (RouteHandler._handle_internal).
-        while pending:
-            if time.monotonic() >= deadline or evidence["rejected"]:
-                pending.popleft().abort()
-                continue
-            if limiter is not None and limiter._delay_for("search.brave.com") > 0:
-                break
-            route = pending.popleft()
-            if limiter is not None:
-                limiter.record("search.brave.com")
-            route.continue_()
-
-    page._wafer_brave_flush = flush_pending
     requested_identity = brave_url_identity(url)
     original_rr = "_rr" in dict(parse_qsl(urlparse(url).query))
 
     def route_request(route):
-        if stopped:
+        if routes.stopped:
             route.abort()
             return
         request = route.request
@@ -134,8 +198,16 @@ def prepare_brave(context, page, url, replay, deadline):
                 if limiter is not None:
                     limiter.record("search.brave.com")
                 route.continue_()
-            elif len(pending) < 32:
-                pending.append(route)
+            elif len(routes.pending) < 32:
+                routes.enqueue(
+                    route,
+                    priority=is_document
+                    or parsed.path
+                    in {
+                        "/api/tokens/keys",
+                        "/api/captcha/pow",
+                    },
+                )
             else:
                 evidence["rejected"] = True
                 route.abort()
@@ -254,13 +326,15 @@ def wait_for_brave(
         return max(1, int(min(500, (deadline - time.monotonic()) * 1000)))
 
     while time.monotonic() < deadline:
-        flush = getattr(page, "_wafer_brave_flush", None)
-        if flush is not None:
-            flush()
         if size_guard and size_guard["exceeded"]:
             raise ResponseTooLarge(url, int(size_guard["size"]), max_size)
         if evidence["rejected"]:
             return None, False
+        # Small sets may finish while goto()/headless verification is still
+        # pumping events. Accepted first-party work is gate evidence even if
+        # the interstitial has disappeared before the first DOM poll. The
+        # completed exact search document is still required below.
+        observed = observed or evidence["accepted"]
         # A redirect can detach the old execution context. Network responses
         # remain authoritative, and polling the new document is safe.
         response = documents[-1][2] if documents else None
@@ -271,10 +345,19 @@ def wait_for_brave(
             max_size,
             allow_pow_reload=observed and evidence["accepted"],
         )
+        # body()/headers can pump route callbacks too. Recheck a rejection
+        # observed during that read before exporting content or cookies.
+        if evidence["rejected"]:
+            return None, False
         if captured is not None:
-            return captured, observed and evidence["accepted"]
+            # A retained, already-verified blind token can clear the gate
+            # without issuing new PoW. That is recovery too, not an absent
+            # challenge. finish_brave exports only cookies still present.
+            return captured, observed
         try:
+            logger.debug("Brave DOM read start")
             html = solver._bounded_page_content(page, max_size)
+            logger.debug("Brave DOM read complete")
             if is_brave_challenge(html, page.url):
                 observed = True
                 tokens = re.search(
@@ -339,8 +422,27 @@ def finish_brave(
     )
     if captured is None or time.monotonic() >= deadline:
         return None
+    # The completed search can arrive before its app has prepared the cookie
+    # for the NEXT navigation. In particular, headless Chrome can expose the
+    # consumed/deleted cookie between response capture and app hydration.
+    # Allow that site-owned handoff to settle, within the original deadline.
+    settle_deadline = min(deadline, time.monotonic() + 3)
+    try:
+        page.wait_for_load_state(
+            "domcontentloaded",
+            timeout=max(1, int((settle_deadline - time.monotonic()) * 1000)),
+        )
+    except Exception:
+        pass
     cookies = context.cookies([BRAVE_ORIGIN])
-    cleared = cleared and any(c.get("name") in BRAVE_COOKIES for c in cookies)
+    while cleared and not any(c.get("name") in BRAVE_COOKIES for c in cookies):
+        if time.monotonic() >= settle_deadline:
+            break
+        idle(min(0.1, max(0, settle_deadline - time.monotonic())))
+        cookies = context.cookies([BRAVE_ORIGIN])
+    # Recovery is established by the observed gate and validated final network
+    # document. A consumed cookie need not remain in the browser afterwards;
+    # it must never relabel an accepted _rr=1 recovery as challenge-absent.
     # Keep ONLY the anonymous spare-token keys from this exact origin. Never
     # share localStorage via BrowserSolver or persist it to the cookie cache.
     storage = context.storage_state()
@@ -356,13 +458,23 @@ def finish_brave(
                     and len(item["value"]) <= 256_000
                 )
             ]
-    if time.monotonic() >= deadline:
+    if time.monotonic() >= deadline or evidence["rejected"]:
+        return None
+    if size_guard and size_guard["exceeded"]:
+        raise ResponseTooLarge(url, int(size_guard["size"]), max_size)
+    if (
+        capture_brave_response(
+            captured, page, url, max_size, allow_pow_reload=evidence["accepted"]
+        )
+        is None
+    ):
         return None
     state["storage"] = entries
     logger.info(
-        "Brave search captured (%d bytes, pow_accepted=%s)",
+        "Brave search captured (%d bytes, cleared=%s, pow_accepted=%s)",
         len(captured.body),
         cleared,
+        evidence["accepted"],
     )
     return SolveResult(
         cookies=cookies,

@@ -409,7 +409,7 @@ Wafer has **no Arkose Labs solver**. Arkose presents 3D puzzle CAPTCHAs (rotate,
 
 | URL | Challenge Type | Status | Notes |
 |---|---|---|---|
-| `search.brave.com/search` | Brave Argon2id + blind-token PoW | browser-passthrough | 2026-10-25: real page-2 HTTP 429 classified as `brave`; browser PoW POST returned 200 and reloaded a 200 search document. Initial capture rejected Brave's `_rr=1` reload; corrected validator has regression coverage. Later paced multi-query/page and session-restart runs passed without challenges. Direct browser solve returned 213,542 network bytes, 200, `challenge_absent=True`. Corrected challenged capture and real HTTP clearance replay/persistence remain unverified because subsequent probes triggered no gate. [Protocol and verification record](ref-brave.md). |
+| `search.brave.com/search` | Brave Argon2id + blind-token PoW | browser-solve | 2026-10-25: fresh headed/headless gates recovered to exact-query search network documents in about 31s. Native HTTP token replay, spare-token recovery without new PoW, and an unspent cached cookie accepted in a fresh process verified. Guarded fetchaller MCP recovered 20 results in 31.13s, egress 27 allowed / 0 denied. Fixed the paced-reload/CDP-read deadlock, feedback starvation, and cookie-handoff race. Cookies are consumable; spare tokens remain session-local. Trigger prevention is not established. [Protocol and verification record](ref-brave.md). |
 
 ### In-House Systems (no generic solver)
 
