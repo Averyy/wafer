@@ -1069,7 +1069,9 @@ an HTTP read; it is not reusable clearance. Later gates can use session-local
 spare tokens through the browser without new PoW. After restart the spare pool
 is gone, so an exhausted cookie can require a fresh solve. An observed gate
 cleared using spare tokens has challenge_absent=False too; it does not mean a
-new PoW was submitted. See `docs/ref-brave.md` for the verification record.
+new PoW was submitted. An earlier validated search challenge counts even when
+spare-token recovery finishes before the first DOM poll; a plain 429 does not.
+See `docs/ref-brave.md` for the verification record.
 
 Radware serves its captcha interstitial as a plain HTTP 200 from its own host
 (`validate.perfdrive.com`) after a redirect off the origin, so a Radware block

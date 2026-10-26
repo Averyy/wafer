@@ -102,6 +102,13 @@ be absent when the response is captured. Wafer allows up to three seconds,
 inside the existing deadline, for the search app to prepare its next cookie;
 it never substitutes a synthetic token when that handoff produces none.
 
+Gate evidence includes earlier main-document **network response bodies** for
+the exact original origin/query/page. A fast spare-token transition can finish
+before the first DOM poll; the earlier structural gate still makes the final
+response a recovery. Each retained response is inspected at most once for gate
+evidence, within the existing response cap and deadline. An arbitrary earlier
+429, a different query/host, or protocol prose does not establish a challenge.
+
 Only validated success exports cookies to the HTTP jar and normal cookie cache.
 Only the exact origin's `app.blindtoken.tokens[.v2]` keys survive into subsequent
 solves, in **session-local memory**, never shared between sessions using the same
@@ -207,6 +214,38 @@ values are never logged. Local evidence: `/tmp/wafer-brave-subcalls-before.out`,
 `/tmp/wafer-brave-fixed-headless-final.out`. Guarded integration and pacing:
 `/tmp/fetchaller-wafer-brave-fixed-mcp.out` and
 `/tmp/wafer-brave-pacing-pass.out`.
+
+### Fast spare-token classification follow-up
+
+Independent verification of `8e9844b` found a remaining metadata race: a
+429-to-200 spare-token transition could finish before the first DOM poll,
+returning correct search content with `challenge_absent=True`. That also skipped
+the recovery-specific HTTP identity alignment and next-cookie wait. The earlier
+live pass did not cover every timing of this transition.
+
+The handler now inspects retained exact-target main-document response bodies
+before declaring the latest successful response challenge-free. This preserves
+structural gate evidence across a completed navigation without relying on new
+PoW, a surviving DOM, or cookie presence. Regression coverage supplies the real
+gate and final document before any DOM poll, including through BrowserSolver's
+normal response listeners; plain 429, wrong-host/page, non-HTML, prose, and
+response-size controls remain enforced. The native acceptance probe is unchanged.
+
+The new headless run accepted fresh PoW and returned **225,115 bytes in 31.31s**.
+Both later spare recoveries were correctly classified (`cleared=True`,
+`pow_accepted=False`, `challenge_absent=False`) in **12.83 / 12.77 seconds**,
+with no new PoW. Native HTTP reads consumed their real token cookies, and the
+browser-free cache restart returned **216,788 bytes, HTTP 200**. Log:
+`/tmp/wafer-brave-history-headless.out`. The original failing independent run
+is `/tmp/wafer-brave-8e9844b-native.out`.
+
+The headed probe also passed, with both spare recoveries correctly classified
+in **12.71 / 12.68 seconds** and a browser-free **216,788-byte HTTP 200** cache
+restart. Every spare recovery in both new runs was `challenge_absent=False`;
+the probes were not satisfied by just one correctly labelled transition.
+Headed log: `/tmp/wafer-brave-history-headed.out`. Final suite: **2,856 passed,
+25 skipped**, including **75 Brave cases**; Ruff, lockfile and diff checks
+passed.
 
 ### Earlier verification
 

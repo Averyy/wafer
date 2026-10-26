@@ -144,6 +144,7 @@ def response(body=PAGE2, status=200, url=URL):
     result = MagicMock()
     result.url = url
     result.status = status
+    result.headers = dict(HEADERS)
     result.body.return_value = body
     result.all_headers.return_value = HEADERS
     result.headers_array.return_value = []
@@ -296,6 +297,76 @@ def test_auto_pow_can_finish_before_the_first_dom_poll():
     assert captured.body == PAGE2 and cleared
     solver._bounded_page_content.assert_not_called()
     button.first.click.assert_not_called()
+
+
+@pytest.mark.parametrize("status", [200, 429])
+def test_spare_token_gate_can_finish_before_the_first_dom_poll(status):
+    page, solver, button = browser_page([])
+    solver._bounded_page_content = MagicMock(side_effect=AssertionError("late DOM"))
+    gate = response(GATE.encode(), status=status)
+    final = response()
+    captured, cleared = wait_for_brave(
+        solver,
+        page,
+        URL,
+        [(URL, status, gate), (URL, 200, final)],
+        time.monotonic() + 1,
+        None,
+        {"accepted": False, "rejected": False},
+    )
+    assert captured.body == PAGE2 and cleared
+    solver._bounded_page_content.assert_not_called()
+    button.first.click.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "body,url,content_type",
+    [
+        (b"Too many requests", URL, "text/html"),
+        (PAGE1, URL, "text/html"),
+        (GATE.encode(), URL.replace("offset=1", "offset=2"), "text/html"),
+        (GATE.encode(), URL.replace("search.brave.com", "example.com"), "text/html"),
+        (
+            GATE.encode(),
+            URL.replace("search.brave.com", "search.brave.com.evil.test"),
+            "text/html",
+        ),
+        (GATE.encode(), URL, "text/plain"),
+        (html.escape(GATE).encode(), URL, "text/html"),
+    ],
+)
+def test_earlier_document_must_prove_a_scoped_structural_gate(body, url, content_type):
+    page, solver, button = browser_page([])
+    solver._bounded_page_content = MagicMock(side_effect=AssertionError("late DOM"))
+    earlier = response(body, status=429, url=url)
+    earlier.headers = {"content-type": content_type}
+    captured, cleared = wait_for_brave(
+        solver,
+        page,
+        URL,
+        [(url, 429, earlier), (URL, 200, response())],
+        time.monotonic() + 1,
+        None,
+        {"accepted": False, "rejected": False},
+    )
+    assert captured.body == PAGE2 and not cleared
+    solver._bounded_page_content.assert_not_called()
+    button.first.click.assert_not_called()
+
+
+def test_retained_gate_body_keeps_the_response_cap():
+    page, solver, _ = browser_page([])
+    oversized = response(GATE.encode() + b" " * len(PAGE2), status=429)
+    with pytest.raises(ResponseTooLarge):
+        wait_for_brave(
+            solver,
+            page,
+            URL,
+            [(URL, 429, oversized), (URL, 200, response())],
+            time.monotonic() + 1,
+            len(PAGE2),
+            {"accepted": False, "rejected": False},
+        )
 
 
 def test_challenge_free_navigation_is_passthrough_without_clearance():
@@ -637,7 +708,8 @@ def test_non_pow_widget_stops_without_click():
     button.first.click.assert_not_called()
 
 
-def test_solver_completes_manual_pow_and_returns_exact_reload_response():
+@pytest.mark.parametrize("early_spare", [False, True])
+def test_solver_returns_exact_response_for_manual_pow_and_early_spare(early_spare):
     from wafer._brave import BRAVE_COOKIES
     from wafer.browser import BrowserSolver
 
@@ -674,7 +746,8 @@ def test_solver_completes_manual_pow_and_returns_exact_reload_response():
     initial = response(GATE.encode(), status=429)
     initial.request.resource_type = "document"
     page.goto.side_effect = lambda *args, **kwargs: emit(initial)
-    completed = response(url=URL + "&_rr=1")
+    completed_url = URL if early_spare else URL + "&_rr=1"
+    completed = response(url=completed_url)
     completed.request.resource_type = "document"
     pow_response = response(status=200, url=BRAVE_ORIGIN + "/api/captcha/pow?brave=0")
     pow_response.request.resource_type = "fetch"
@@ -682,13 +755,18 @@ def test_solver_completes_manual_pow_and_returns_exact_reload_response():
         emit(pow_response),
         emit(completed),
     )
+    if early_spare:
+        page.goto.side_effect = lambda *args, **kwargs: (
+            emit(initial),
+            emit(completed),
+        )[0]
     state = {}
     try:
         with (
             patch.object(solver, "_create_context", return_value=context),
             patch.object(solver, "_setup_headless_patches"),
             patch.object(solver, "_verify_headless_patches"),
-            patch.object(solver, "_bounded_page_content", return_value=GATE),
+            patch.object(solver, "_bounded_page_content", return_value=GATE) as dom,
             patch("wafer.browser._brave.idle"),
         ):
             result = solver._solve_on_worker(
@@ -700,10 +778,14 @@ def test_solver_completes_manual_pow_and_returns_exact_reload_response():
     finally:
         solver.close()
     assert result.response.body == PAGE2
-    assert result.response.url == URL + "&_rr=1"
+    assert result.response.url == completed_url
     assert not result.challenge_absent
     assert state == {"storage": []}
-    button.first.click.assert_called_once()
+    if early_spare:
+        dom.assert_not_called()
+        button.first.click.assert_not_called()
+    else:
+        button.first.click.assert_called_once()
     context.close.assert_called_once()
 
 

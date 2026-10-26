@@ -309,6 +309,37 @@ def capture_brave_response(response, page, url, max_size, *, allow_pow_reload=Fa
     )
 
 
+def _is_brave_challenge_response(response, url, max_size):
+    """Read gate evidence from a retained, exact-target main document.
+
+    A spare token may replace the interstitial before the handler gets a DOM
+    poll. Status alone proves nothing: require the same scoped structural
+    detector used by the transport, on the actual earlier response bytes.
+    """
+    try:
+        if (
+            not is_brave_search_url(url)
+            or not is_brave_search_url(response.url)
+            or brave_url_identity(response.url) != brave_url_identity(url)
+        ):
+            return False
+        headers = response.headers
+        if (
+            headers.get("content-type", "").split(";", 1)[0].lower()
+            not in {"text/html", "application/xhtml+xml"}
+            or "attachment" in headers.get("content-disposition", "").lower()
+        ):
+            return False
+        body = response.body() if callable(response.body) else response.body
+    except Exception:
+        return False
+    if not isinstance(body, bytes):
+        return False
+    if max_size is not None and len(body) > max_size:
+        raise ResponseTooLarge(url, len(body), max_size)
+    return is_brave_challenge(body.decode("utf-8", errors="replace"), response.url)
+
+
 def wait_for_brave(
     solver, page, url, documents, deadline, max_size, evidence, size_guard=None
 ):
@@ -321,6 +352,7 @@ def wait_for_brave(
     observed = False
     manual_start = False
     last_status = None
+    checked_documents = 0
 
     def action_timeout():
         return max(1, int(min(500, (deadline - time.monotonic()) * 1000)))
@@ -335,6 +367,19 @@ def wait_for_brave(
         # the interstitial has disappeared before the first DOM poll. The
         # completed exact search document is still required below.
         observed = observed or evidence["accepted"]
+        # Main-document responses survive a fast spare-token navigation even
+        # when the old DOM is already gone. Inspect each at most once, before
+        # deciding whether the latest successful document was challenge-free.
+        while not observed and checked_documents < len(documents):
+            earlier = documents[checked_documents][2]
+            checked_documents += 1
+            observed = _is_brave_challenge_response(earlier, url, max_size)
+        if time.monotonic() >= deadline:
+            break
+        if size_guard and size_guard["exceeded"]:
+            raise ResponseTooLarge(url, int(size_guard["size"]), max_size)
+        if evidence["rejected"]:
+            return None, False
         # A redirect can detach the old execution context. Network responses
         # remain authoritative, and polling the new document is safe.
         response = documents[-1][2] if documents else None

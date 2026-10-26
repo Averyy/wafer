@@ -761,6 +761,10 @@ through the browser without repeating PoW. Spare tokens remain in session memory
 after restart, an exhausted cookie can require new work. See
 [Brave protocol, limits, and evidence](docs/ref-brave.md).
 
+Fast spare-token recovery retains the earlier network gate as evidence even
+when it finishes before the first DOM poll, so it remains
+`challenge_absent=False`. A genuinely challenge-free navigation stays `True`.
+
 ### Rendering a JavaScript-built page (`session.render`)
 
 Some pages have no content to fetch. The server ships a shell -a `<div id="root">`
