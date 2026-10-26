@@ -1,9 +1,8 @@
 # Brave Search proof of work
 
 Brave Search's first-party Argon2id/blind-token gate is `challenge_type="brave"`.
-It is separate from wafer's inline SHA-256 `pow` gate. The fix is intended for
-**0.7.9** (current published/tagged baseline: 0.7.8); no release is made by
-editing this document.
+It is separate from wafer's inline SHA-256 `pow` gate. Support was added in
+**0.7.9**, including the accepted-reload and fast spare-token recovery fixes.
 
 ## Detection
 
@@ -301,3 +300,78 @@ Fetchaller owns only orchestration and result parsing. Its existing guarded
 BrowserSolver must be passed to the Brave session with a sufficient request and
 provider deadline. Keep its six-second provider gate and `max_retries=0`,
 `max_rotations=0`. Google Docs research-search must remain browser free.
+
+## Independent release approval for 0.7.9
+
+**APPROVED for a new wafer release containing `d01c811a6e9a13adabd232a6693073cfa7c675a5`.**
+
+Independent fetchaller verification completed on 2026-10-25 (EDT). The accepted
+reload stall and fast spare-token classification findings are resolved in the
+tested candidate. No remaining Brave release blocker was observed in this
+matrix. Please publish the intended wafer release with this commit included;
+fetchaller will update its dependency and lockfile after publication and verify
+the released package separately.
+
+No wafer implementation files were changed during this verification.
+
+### Passing verification
+
+- Wafer full suite: **2,856 passed, 25 skipped**, including **75 Brave cases**.
+- Fetchaller full suite against local wafer: **4,603 passed, 5 skipped**.
+- Ruff, lockfile and diff checks passed in both repositories.
+- Native **headless and headed** acceptance probes both passed unchanged:
+  fresh accepted PoW, real exact-query search content, native HTTP token
+  consumption, two subsequent spare-token recoveries without new PoW, and
+  browser-free cache restart.
+- Every observed spare recovery in both runs was correctly classified:
+  `cleared=True`, `pow_accepted=False`, `challenge_absent=False`. The logs were
+  checked for both recoveries in each run, rather than only the probe's final
+  success message. Headless spare timings: **12.56 / 12.66s**; headed:
+  **12.71 / 12.67s**. Fresh solves: **30.89 / 31.01s**.
+- A separate Python process with **no BrowserSolver** loaded an unspent token
+  left by a fresh headless solve, returned a **216,787-byte real search
+  document**, and confirmed that the HTTP read consumed the token.
+- Actual guarded fetchaller **stdio MCP**, macOS: Brave pages 1/2 returned
+  **20 + 20 results, zero overlap**; `all` returned **Google 10 / DDG 10 /
+  Brave 20**. Two recoveries were correctly marked `challenge_absent=False`.
+  Fresh MCP recovery took **31.50s**. Audit: **37 allowed, 0 denied**.
+- The same local candidate source, mounted read-only into the existing Linux
+  amd64 runtime image, passed the same MCP checks: **20 + 20, zero overlap**,
+  all three providers, two correctly classified recoveries. Fresh recovery:
+  **34.02s**. Audit: **36 allowed, 0 denied**. This was local candidate source
+  in that runtime, not a newly published image.
+- The real headless pacing probe completed awaited concurrent key fetches
+  inside `evaluate()` and a paced `reload()` without an outer flush loop.
+  Send gaps: **6.473 / 6.437 / 6.274 seconds**; clean shutdown. This is
+  scheduling/progress evidence, separate from the fresh-PoW recovery evidence.
+- Existing fetchaller budgets and guards were retained: **120s solver / 150s
+  total HTTP / 180s provider**, six-second pacing, no hidden retries/rotation,
+  response caps, exact target checks and guarded browser egress.
+
+### Reproduction and local evidence
+
+```sh
+# From wafer
+uv run --no-sync pytest tests/ -q
+uv run --no-sync python tests/live_brave.py --headless --rounds 10 --require-recovery
+uv run --no-sync python tests/live_brave.py --rounds 10 --require-recovery
+uv run --no-sync python tests/live_brave_pacing.py
+
+# From fetchaller-mcp, with local wafer installed
+uv run --no-sync pytest tests/ -q
+uv run --no-sync python scripts/verify_brave_search.py --wafer-path ../wafer --include-all --rounds 10 --require-recovery
+```
+
+Logs: `/tmp/wafer-brave-d01c811-full.out`,
+`/tmp/fetchaller-brave-d01c811-full.out`,
+`/tmp/wafer-brave-d01c811-headless.out`,
+`/tmp/wafer-brave-d01c811-headed.out`,
+`/tmp/wafer-brave-d01c811-process-prime.out`,
+`/tmp/wafer-brave-d01c811-process-replay.out`,
+`/tmp/wafer-brave-d01c811-pacing.out`,
+`/tmp/fetchaller-brave-d01c811-mcp-all.out`, and
+`/tmp/fetchaller-brave-d01c811-linux-mcp.out`.
+
+The separate-process observation harness is
+`/tmp/verify_wafer_brave_process_replay.py`. The historical findings and wafer's
+regression/implementation record are in `docs/ref-brave.md`.
