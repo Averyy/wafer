@@ -185,7 +185,8 @@ class TokenMintFailed(WaferError):
     flow never silently returns None.
 
     ``stage`` is a short label for where it failed (``"anchor"``,
-    ``"reload"``, or ``"apijs"``). ``status_code`` is the HTTP status of
+    ``"reload"``, or ``"apijs"``; ``"reddit_app"`` when Reddit did not grant
+    the app token a GraphQL request needs). ``status_code`` is the HTTP status of
     the failing response when one was in hand, else None.
     """
 

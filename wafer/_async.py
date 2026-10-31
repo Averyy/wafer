@@ -61,7 +61,6 @@ from wafer._fingerprint import (
 from wafer._native_tls import NATIVE_MAX_RETRIES
 from wafer._profiles import Profile
 from wafer._reddit_app import (
-    REDDIT_APP_OUTCOME_GATE,
     REDDIT_APP_OUTCOME_RATELIMIT,
     REDDIT_APP_OUTCOME_REDIRECT,
     REDDIT_APP_OUTCOME_TOKEN,
@@ -75,7 +74,6 @@ from wafer._reddit_app import (
     is_gate_response,
     mint_backoff,
     reddit_app_redirect,
-    token_request,
     web_url,
 )
 from wafer._response import HistoryEntry, WaferResponse, resolve_charset
@@ -1520,11 +1518,20 @@ class AsyncSession(BaseSession):
         return result
 
     def _reddit_app_http(self):
+        """The app's OkHttp stack: token mints and REST reads."""
         if self._reddit_app_client is None:
             self._reddit_app_client = wreq.Client(
-                **self._reddit_app_client_kwargs()
+                **self._reddit_app_client_kwargs("okhttp")
             )
         return self._reddit_app_client
+
+    def _reddit_app_gql_http(self):
+        """The app's Cronet stack: GraphQL."""
+        if self._reddit_app_gql_client is None:
+            self._reddit_app_gql_client = wreq.Client(
+                **self._reddit_app_client_kwargs("cronet")
+            )
+        return self._reddit_app_gql_client
 
     async def _reddit_app_pace(self, domain: str, deadline: float) -> None:
         if self._rate_limiter:
@@ -1552,6 +1559,10 @@ class AsyncSession(BaseSession):
             token = self._reddit_app_fresh_token()
             if token is not None:
                 return token, None
+            if time.monotonic() < self._reddit_app_backoff_until:
+                # A request queued behind a mint that just failed: the route
+                # is held now, so this one does not ask again.
+                return None, self._reddit_app_last_mint_status
             return await self._reddit_app_mint_locked(
                 domain, deadline, attempt_secs, timeout_secs, url
             )
@@ -1564,7 +1575,7 @@ class AsyncSession(BaseSession):
         timeout_secs: float,
         url: str,
     ):
-        headers, body = token_request(self._reddit_app_install())
+        headers, body = self._reddit_app_token_request()
         await self._reddit_app_pace(domain, deadline)
         limit = self._reddit_app_attempt_limit(
             deadline, attempt_secs, timeout_secs, url
@@ -1599,14 +1610,18 @@ class AsyncSession(BaseSession):
         timeout_secs: float,
         max_response_size: int | None,
         start_time: float,
+        gql_payload: bytes | None = None,
     ) -> WaferResponse | None:
-        """Read a Reddit JSON URL through the Android app API.
+        """Read a Reddit JSON URL, or send a GraphQL POST (``gql_payload``
+        is its body), through the Android app API.
 
-        Returns None to hand the read to the web path (docs/ref-reddit.md has
-        the table): no token, Reddit's edge turning the client away, a
+        Returns None to hand the request to the web path (docs/ref-reddit.md
+        has the table): no token, Reddit's edge turning the client away, a
         transport error, a refused fresh token, a rate-limit window that will
         not reset within the deadline, or a redirect somewhere the app route
-        does not read.
+        does not read. A gate on a request whose gate is final (a read refused
+        to every logged-out client, a GraphQL request) is returned or raised
+        as a block instead (``_reddit_app_refused``).
         """
         domain = extract_domain(url) or url
         current = api_url
@@ -1614,7 +1629,11 @@ class AsyncSession(BaseSession):
         retries = 0
         reminted = False
         try:
-            client = self._reddit_app_http()
+            client = (
+                self._reddit_app_http()
+                if gql_payload is None
+                else self._reddit_app_gql_http()
+            )
         except Exception as e:
             logger.debug("Reddit app client unavailable: %s", type(e).__name__)
             self._reddit_app_fall_back(
@@ -1624,6 +1643,17 @@ class AsyncSession(BaseSession):
             return None
         while True:
             token = self._reddit_app_fresh_token()
+            if token is None and gql_payload is not None and (
+                time.monotonic() < self._reddit_app_backoff_until
+            ):
+                # The route is held after a failed mint: asking again for
+                # every GraphQL request would hammer the token endpoint.
+                self._reddit_app_fall_back(
+                    REDDIT_APP_OUTCOME_TOKEN,
+                    status=self._reddit_app_last_mint_status,
+                    backoff=0,
+                )
+                return None
             if token is None:
                 token, mint_status = await self._reddit_app_mint(
                     domain, deadline, attempt_secs, timeout_secs, url
@@ -1647,11 +1677,21 @@ class AsyncSession(BaseSession):
                 deadline, attempt_secs, timeout_secs, url
             )
             try:
-                resp = await client.get(
-                    current,
-                    headers=self._reddit_app_read_headers(token),
-                    timeout=datetime.timedelta(seconds=limit),
-                )
+                if gql_payload is None:
+                    resp = await client.get(
+                        current,
+                        headers=self._reddit_app_read_headers(token),
+                        timeout=datetime.timedelta(seconds=limit),
+                    )
+                else:
+                    resp = await client.post(
+                        current,
+                        headers=self._reddit_app_gql_headers(
+                            token, gql_payload, retries
+                        ),
+                        body=gql_payload,
+                        timeout=datetime.timedelta(seconds=limit),
+                    )
             except Exception as e:
                 if self._rate_limiter:
                     self._rate_limiter.record(domain)
@@ -1671,7 +1711,7 @@ class AsyncSession(BaseSession):
 
             redirected = 300 <= status < 400 and status != 304
             location = headers.get("location") if redirected else None
-            if location and self.follow_redirects:
+            if location and self.follow_redirects and gql_payload is None:
                 target = reddit_app_redirect(current, location)
                 if target is None:
                     self._reddit_app_fall_back(
@@ -1717,14 +1757,28 @@ class AsyncSession(BaseSession):
                     self._reddit_app_drop_token()
                     continue
                 # A fresh token refused is the API's answer for an endpoint
-                # that needs an account; the web path has the logged-out one.
-                self._reddit_app_fall_back(
-                    REDDIT_APP_OUTCOME_UNAUTHORIZED, status=401, backoff=0
+                # that needs an account. A read tries the web path's
+                # logged-out session; a GraphQL POST has none, so the 401 is
+                # returned.
+                if gql_payload is None:
+                    self._reddit_app_fall_back(
+                        REDDIT_APP_OUTCOME_UNAUTHORIZED, status=401, backoff=0
+                    )
+                    return None
+            elif status != 429 and is_gate_response(status, headers, content):
+                # Reddit's edge refuses this one request: its rules are per
+                # path (r/all and threads are refused while listings are
+                # served), and the web path refuses anonymous JSON too, so
+                # the gate is final for this request and nothing else.
+                return self._reddit_app_refused(
+                    status=status,
+                    content=content,
+                    headers=headers,
+                    url=final_url,
+                    history=history,
+                    start_time=start_time,
+                    retries=retries,
                 )
-                return None
-            if is_gate_response(status, headers, content):
-                self._reddit_app_fall_back(REDDIT_APP_OUTCOME_GATE, status=status)
-                return None
             if (status == 429 or 500 <= status < 600) and retries < self.max_retries:
                 delay = self._reddit_app_retry_delay(status, headers, retries)
                 if time.monotonic() + delay < deadline - REDDIT_APP_READ_MARGIN:
@@ -1878,10 +1932,18 @@ class AsyncSession(BaseSession):
                 raw_set_cookie=set_cookies,
             )
 
-        # Reddit JSON reads go through the Android app API when they can:
-        # logged-out web JSON is gated, and the app reads it without one.
+        # Reddit JSON reads and GraphQL POSTs go through the Android app API
+        # when they can: logged-out web JSON is gated, and the app reads it
+        # with its anonymous token.
         reddit_app_url = self._reddit_app_target(method, url, extra_headers, kwargs)
+        if reddit_app_url is None:
+            unroutable = self._reddit_app_gql_unroutable(
+                method, url, extra_headers, kwargs
+            )
+            if unroutable is not None:
+                raise unroutable
         if reddit_app_url is not None:
+            gql_payload = self._reddit_app_gql_payload(reddit_app_url, kwargs)
             app_resp = await self._try_reddit_app(
                 url,
                 reddit_app_url,
@@ -1890,9 +1952,15 @@ class AsyncSession(BaseSession):
                 timeout_secs=timeout_secs,
                 max_response_size=max_response_size,
                 start_time=start_time,
+                gql_payload=gql_payload,
             )
             if app_resp is not None:
                 return app_resp
+            if gql_payload is not None:
+                # Only the app's token can make it: never the web identity.
+                if time.monotonic() >= deadline:
+                    raise WaferTimeout(url, timeout_secs)
+                raise self._reddit_app_gql_unserved(url)
 
         state = RetryState(self.max_retries, self.max_rotations)
         m = _to_method(method) if isinstance(method, str) else method
@@ -1919,6 +1987,8 @@ class AsyncSession(BaseSession):
         browser_attempted: set[tuple[str, str]] = set()
         critical_ch_retried = False
         reddit_bootstrap_attempted = False
+        # The bootstrap ran and earned the anonymous cookie set this request.
+        reddit_bootstrap_solved = False
         tmd_inline_attempted = False
         # Clearance the last Radware replay rode on, so an identical reissue is
         # not counted as a fresh solve.
@@ -2079,6 +2149,7 @@ class AsyncSession(BaseSession):
                 # detect the gate on the new client and bootstrap it once.
                 reddit_replay_client_generation = None
                 reddit_bootstrap_attempted = False
+                reddit_bootstrap_solved = False
                 continue
             request_client = self._client
             reddit_replay_client_generation = None
@@ -2441,7 +2512,28 @@ class AsyncSession(BaseSession):
             # rotation, or session-health budget. Every one of those would
             # buy another identical denial, and retiring the session would
             # throw away state that was never the reason for the block.
-            if challenge is not None and challenge in TERMINAL_CHALLENGES:
+            # Reddit's 403 gate after a solved bootstrap, or on a request
+            # whose gate is final, is Reddit refusing this read to logged-out
+            # clients: a block, the same answer for any identity or browser.
+            reddit_blocked = (
+                challenge == ChallengeType.REDDIT
+                and status == 403
+                and (
+                    reddit_bootstrap_solved
+                    or self._reddit_web_gate_is_final(current_url, extra_headers)
+                )
+            )
+            if challenge is not None and (
+                challenge in TERMINAL_CHALLENGES or reddit_blocked
+            ):
+                if reddit_blocked:
+                    if reddit_bootstrap_solved:
+                        self._reddit_note_web_json_refused(
+                            current_url, extra_headers
+                        )
+                    self._enforce_final_cap(
+                        raw_content, current_url, max_response_size
+                    )
                 blocked = self._make_response(
                     status_code=status,
                     content=raw_content,
@@ -2627,6 +2719,8 @@ class AsyncSession(BaseSession):
                     )
                 if challenge is not None and inline_solved:
                     state.inline_solves += 1
+                    if challenge == ChallengeType.REDDIT:
+                        reddit_bootstrap_solved = True
                     if isinstance(inline_solved, str):
                         if challenge is ChallengeType.SEARCHGUARD:
                             self._record_url(current_url)

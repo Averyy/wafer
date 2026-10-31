@@ -12,6 +12,7 @@ import subprocess
 import threading
 import time
 from collections import OrderedDict
+from dataclasses import replace
 from html import unescape
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urljoin, urlparse
@@ -48,16 +49,29 @@ from wafer._ratelimit import RateLimiter
 from wafer._reddit_app import (
     REDDIT_APP_API_HOST,
     REDDIT_APP_BACKOFF_SECONDS,
+    REDDIT_APP_GQL_HOST,
     REDDIT_APP_IDENTITY,
+    REDDIT_APP_OUTCOME_RATELIMIT,
+    REDDIT_APP_OUTCOME_REFUSED,
     REDDIT_APP_OUTCOME_SERVED,
+    REDDIT_APP_OUTCOME_TOKEN,
+    REDDIT_APP_SESSION_IDLE_SECONDS,
     REDDIT_APP_TOKEN_URL,
+    RedditAppAnalyticsSession,
     RedditAppDevice,
     RedditAppToken,
+    gql_headers,
+    gql_payload,
     load_state,
     parse_token_response,
     ratelimit_reset,
+    read_headers,
     reddit_app_api_url,
+    reddit_app_gql_url,
+    reddit_gate_is_final,
+    reddit_json_read,
     save_state,
+    token_request,
 )
 from wafer._safari import SafariIdentity
 from wafer._solvers import (
@@ -887,13 +901,25 @@ class BaseSession:
         self._reddit_app_enabled = (
             bool(reddit_app) and profile is not Profile.OPERA_MINI
         )
+        # The app's two network stacks: OkHttp (mint, REST) and Cronet (GraphQL).
         self._reddit_app_client = None
+        self._reddit_app_gql_client = None
         self._reddit_app_device: RedditAppDevice | None = None
         self._reddit_app_token: RedditAppToken | None = None
+        # The app's analytics session (x-reddit-session) and when it last
+        # signed a request (monotonic()).
+        self._reddit_app_analytics: RedditAppAnalyticsSession | None = None
+        self._reddit_app_analytics_used = 0.0
         # monotonic() before which reads skip the app route (it failed), and
         # before which the API's rate-limit window is spent.
         self._reddit_app_backoff_until = 0.0
         self._reddit_app_ratelimit_until = 0.0
+        # HTTP status of the last failed token mint (None: no answer).
+        self._reddit_app_last_mint_status: int | None = None
+        # monotonic() before which a Reddit gate on an anonymous JSON read on
+        # the web path is final: set when a solved bootstrap's replay was
+        # refused, so later reads do not bootstrap (or open a browser) again.
+        self._reddit_web_json_refused_until = 0.0
         # AsyncSession: one token mint at a time (created on first use).
         self._reddit_app_mint_lock = None
 
@@ -3566,44 +3592,91 @@ class BaseSession:
     # -- Reddit app route (no I/O; the sessions send the requests) --------
 
     def _reddit_app_target(self, method, url: str, extra_headers, kwargs) -> str | None:
-        """The app-API URL to read ``url`` from, or None to use the web path.
+        """The app-API URL to send ``url`` to, or None to use the web path.
 
-        Only a plain GET of a Reddit JSON read qualifies. A request that
-        speaks for an account goes out as asked: an ``Authorization`` or
-        ``Cookie`` header (per request or on the session), or a logged-in
-        ``reddit_session`` cookie in the jar. With ``resolve=`` pins, both app
-        hosts must be pinned: the route must not connect anywhere real DNS
-        chose.
+        A plain GET of a Reddit JSON read qualifies, and so does a GraphQL
+        POST to the app's GraphQL host with a ``json=`` or ``body=`` payload.
+        A request that speaks for an account goes out as asked: an
+        ``Authorization`` or ``Cookie`` header (per request or on the
+        session), or a logged-in ``reddit_session`` cookie in the jar. With
+        ``resolve=`` pins, the token host and the request's app host must be
+        pinned: the route must not connect anywhere real DNS chose.
         """
         if not self._reddit_app_enabled:
             return None
         verb = method.upper() if isinstance(method, str) else method
-        if verb not in ("GET", Method.GET):
+        if verb in ("POST", Method.POST):
+            api_url = reddit_app_gql_url(url)
+            if api_url is None or "form" in kwargs:
+                return None
+            api_host = REDDIT_APP_GQL_HOST
+        elif verb in ("GET", Method.GET):
+            if any(key in kwargs for key in ("body", "form", "json")):
+                return None
+            api_url = reddit_app_api_url(url)
+            api_host = REDDIT_APP_API_HOST
+        else:
             return None
-        if any(key in kwargs for key in ("body", "form", "json")):
+        if api_url is None:
             return None
-        if time.monotonic() < self._reddit_app_backoff_until:
+        # The hold sends reads to the web path; GraphQL has none, so it still
+        # goes to the app route, which does not re-mint while held.
+        if (
+            api_host != REDDIT_APP_GQL_HOST
+            and time.monotonic() < self._reddit_app_backoff_until
+        ):
             return None
         if self._resolve and not all(
             _canonical_host(host) in self._resolve
-            for host in (REDDIT_APP_API_HOST, urlparse(REDDIT_APP_TOKEN_URL).hostname)
+            for host in (api_host, urlparse(REDDIT_APP_TOKEN_URL).hostname)
         ):
             return None
-        api_url = reddit_app_api_url(url)
-        if api_url is None:
+        if self._reddit_speaks_for_account(extra_headers):
             return None
+        return api_url
+
+    def _reddit_speaks_for_account(self, extra_headers) -> bool:
+        """Whether a Reddit request carries an account: an ``Authorization`` or
+        ``Cookie`` header (per request or on the session), or a logged-in
+        ``reddit_session`` cookie in the jar."""
         account_headers = ("authorization", "cookie")
         if extra_headers and any(
             str(k).lower() in account_headers for k in extra_headers
         ):
-            return None
+            return True
         if self._user_headers and any(
             str(k).lower() in account_headers and v for k, v in self.headers.items()
         ):
-            return None
-        if "reddit_session" in self._reddit_jar_cookie_names():
-            return None
-        return api_url
+            return True
+        return "reddit_session" in self._reddit_jar_cookie_names()
+
+    def _reddit_web_gate_is_final(self, url: str, extra_headers) -> bool:
+        """Whether Reddit's 403 gate on ``url`` ends a web-path request: a
+        request whose gate is always final (reddit_gate_is_final), or an
+        anonymous JSON read while a refused one is remembered."""
+        if reddit_gate_is_final(url):
+            return True
+        return (
+            time.monotonic() < self._reddit_web_json_refused_until
+            and reddit_json_read(url)
+            and not self._reddit_speaks_for_account(extra_headers)
+        )
+
+    def _reddit_note_web_json_refused(self, url: str, extra_headers) -> None:
+        """A solved bootstrap's replay of an anonymous JSON read was refused:
+        later ones are refused without a bootstrap for a while."""
+        if not reddit_json_read(url) or self._reddit_speaks_for_account(
+            extra_headers
+        ):
+            return
+        self._reddit_web_json_refused_until = (
+            time.monotonic() + REDDIT_APP_BACKOFF_SECONDS
+        )
+        logger.info(
+            "Reddit refuses anonymous JSON on the web path; such reads end"
+            " without a bootstrap for %.0fs",
+            REDDIT_APP_BACKOFF_SECONDS,
+        )
 
     def _reddit_app_cache_dir(self):
         cache = getattr(self, "_cookie_cache", None)
@@ -3647,7 +3720,11 @@ class BaseSession:
             return None
         stats["app_token_mints"] = stats["app_token_mints"] + 1
         self._reddit_app_token = token
-        save_state(self._reddit_app_cache_dir(), self._reddit_app_install(), token)
+        device = self._reddit_app_install()
+        if token.loid and token.loid != device.loid:
+            # The install keeps its logged-out id for later mints.
+            self._reddit_app_device = device = replace(device, loid=token.loid)
+        save_state(self._reddit_app_cache_dir(), device, token)
         return token
 
     def _reddit_app_drop_token(self) -> None:
@@ -3655,8 +3732,45 @@ class BaseSession:
         self._reddit_app_token = None
         save_state(self._reddit_app_cache_dir(), self._reddit_app_install(), None)
 
+    def _reddit_app_session(self) -> RedditAppAnalyticsSession:
+        """The analytics session the next request signs: this session's, or
+        a new one after an idle spell, as the app starts one when it comes
+        back to the foreground."""
+        now = time.monotonic()
+        if (
+            self._reddit_app_analytics is None
+            or now - self._reddit_app_analytics_used > REDDIT_APP_SESSION_IDLE_SECONDS
+        ):
+            self._reddit_app_analytics = RedditAppAnalyticsSession.new()
+        self._reddit_app_analytics_used = now
+        return self._reddit_app_analytics
+
     def _reddit_app_read_headers(self, token: RedditAppToken) -> dict[str, str]:
-        return {**self._reddit_app_install().headers(), **token.headers()}
+        return read_headers(
+            self._reddit_app_install(), token, self._reddit_app_session()
+        )
+
+    def _reddit_app_gql_headers(
+        self, token: RedditAppToken, payload: bytes, attempt: int
+    ) -> dict[str, str]:
+        return gql_headers(
+            self._reddit_app_install(),
+            token,
+            self._reddit_app_session(),
+            payload,
+            attempt,
+        )
+
+    def _reddit_app_token_request(self) -> tuple[dict[str, str], bytes]:
+        return token_request(self._reddit_app_install(), self._reddit_app_session())
+
+    @staticmethod
+    def _reddit_app_gql_payload(api_url: str, kwargs: dict) -> bytes | None:
+        """The bytes a GraphQL POST sends on the app route, or None for a
+        read."""
+        if reddit_app_gql_url(api_url) is None:
+            return None
+        return gql_payload(kwargs)
 
     def _reddit_app_note_ratelimit(self, headers: dict[str, str]) -> None:
         reset = ratelimit_reset(headers)
@@ -3679,6 +3793,8 @@ class BaseSession:
         stats["app_fallbacks"] = stats["app_fallbacks"] + 1
         stats["app_last_outcome"] = outcome
         stats["app_last_status"] = status
+        if outcome == REDDIT_APP_OUTCOME_TOKEN:
+            self._reddit_app_last_mint_status = status
         if backoff > 0:
             self._reddit_app_backoff_until = time.monotonic() + backoff
             logger.info(
@@ -3696,22 +3812,30 @@ class BaseSession:
         stats["app_last_outcome"] = REDDIT_APP_OUTCOME_SERVED
         stats["app_last_status"] = status
 
-    def _reddit_app_client_kwargs(self) -> dict:
-        """kwargs for the app route's own wreq client: the TLS and HTTP/2 of
-        Chromium's network stack on Android and no browser headers, with the
-        session's proxy, trust store, pins and timeouts."""
-        from wreq import Platform
+    def _reddit_app_client_kwargs(self, stack: str = "okhttp") -> dict:
+        """kwargs for one of the app route's own wreq clients, as the app's
+        two network stacks: ``"okhttp"`` (token mint and REST reads: OkHttp
+        on Android's TLS) or ``"cronet"`` (GraphQL: Chromium 143's stack).
+        No browser headers, no cookie jar, and the session's proxy, trust
+        store, pins and timeouts."""
+        from wafer._reddit_app import (
+            cronet_emulation,
+            okhttp_http2_options,
+            okhttp_tls_options,
+        )
 
-        kwargs = {
-            "emulation": Emulation(
-                profile=DEFAULT_EMULATION,
-                platform=Platform.Android,
-                headers=False,
-            ),
-            "connect_timeout": self.connect_timeout,
-            "timeout": self.timeout,
-            "cookie_store": False,
-        }
+        if stack == "cronet":
+            kwargs = {"emulation": cronet_emulation()}
+        else:
+            kwargs = {
+                "tls_options": okhttp_tls_options(),
+                "http2_options": okhttp_http2_options(),
+            }
+        kwargs.update(
+            connect_timeout=self.connect_timeout,
+            timeout=self.timeout,
+            cookie_store=False,
+        )
         store = self._cert_store()
         if store is not None:
             kwargs["tls_verify"] = store
@@ -3780,6 +3904,95 @@ class BaseSession:
             was_retried=retries > 0,
             retries=retries,
             emulation=REDDIT_APP_IDENTITY,
+        )
+
+    def _reddit_app_gql_unserved(self, url: str) -> Exception:
+        """The error for a GraphQL request the app route could not send:
+        without the app's token it cannot be made at all."""
+        from wafer._errors import ConnectionFailed, RateLimited, TokenMintFailed
+
+        stats = self._reddit_stats()
+        outcome, status = stats["app_last_outcome"], stats["app_last_status"]
+        if outcome == REDDIT_APP_OUTCOME_TOKEN:
+            if status is None:
+                return ConnectionFailed(
+                    url, "the Reddit app token endpoint could not be reached"
+                )
+            if status == 429:
+                return RateLimited(url, None)
+            return TokenMintFailed(
+                f"Reddit did not grant the app token (HTTP {status});"
+                f" {url} needs it",
+                stage="reddit_app",
+                status_code=status,
+            )
+        if outcome == REDDIT_APP_OUTCOME_RATELIMIT:
+            return RateLimited(url, self._reddit_app_ratelimit_wait() or None)
+        return ConnectionFailed(url, "the Reddit app route could not reach it")
+
+    def _reddit_app_gql_unroutable(
+        self, method, url: str, extra_headers, kwargs
+    ) -> Exception | None:
+        """The error for an anonymous GraphQL POST the app route will not
+        take because ``resolve=`` leaves a host it needs unpinned: on the web
+        identity, without the app's token, it could only be refused. None for
+        anything else (an account request or ``reddit_app=False`` goes out as
+        asked)."""
+        from wafer._errors import ConnectionFailed
+
+        verb = method.upper() if isinstance(method, str) else method
+        if (
+            not self._reddit_app_enabled
+            or verb not in ("POST", Method.POST)
+            or reddit_app_gql_url(url) is None
+            or "form" in kwargs
+            or self._reddit_speaks_for_account(extra_headers)
+        ):
+            return None
+        return ConnectionFailed(
+            url,
+            "resolve= must pin www.reddit.com and gql-fed.reddit.com for a"
+            " Reddit GraphQL request, which only the app route can send",
+        )
+
+    def _reddit_app_refused(
+        self,
+        *,
+        status: int,
+        content: bytes,
+        headers: dict[str, str],
+        url: str,
+        history: list,
+        start_time: float,
+        retries: int,
+    ):
+        """The edge's gate on a request whose gate is final (see
+        reddit_gate_is_final): returned with ``max_rotations=0``, raised as
+        RequestBlocked otherwise. The route stays on for every other read."""
+        from wafer._challenge import ChallengeType
+        from wafer._errors import RequestBlocked
+        from wafer._response import WaferResponse
+
+        stats = self._reddit_stats()
+        stats["app_last_outcome"] = REDDIT_APP_OUTCOME_REFUSED
+        stats["app_last_status"] = status
+        logger.debug("Reddit refused this read to logged-out clients (HTTP %d)", status)
+        blocked = WaferResponse(
+            status_code=status,
+            content=content,
+            headers=headers,
+            url=url,
+            history=history,
+            elapsed=time.monotonic() - start_time,
+            was_retried=retries > 0,
+            retries=retries,
+            challenge_type=ChallengeType.REDDIT.value,
+            emulation=REDDIT_APP_IDENTITY,
+        )
+        if self.max_rotations == 0:
+            return blocked
+        raise RequestBlocked(
+            ChallengeType.REDDIT.value, url, status, response=blocked
         )
 
     def _reddit_jar_cookie_names(self) -> frozenset[str]:

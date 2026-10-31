@@ -2,11 +2,16 @@
 
 import asyncio
 import base64
+import dataclasses
+import hashlib
+import hmac
 import json
 import logging
 import os
 import stat
 import time
+import uuid
+from dataclasses import replace
 from unittest.mock import patch
 
 import pytest
@@ -20,23 +25,33 @@ from tests.conftest import (
     make_sync_session,
 )
 from wafer._cookies import CookieCache
-from wafer._errors import ResponseTooLarge, TooManyRedirects
+from wafer._errors import RequestBlocked, ResponseTooLarge, TooManyRedirects
 from wafer._reddit_app import (
     _APP_RELEASES,
+    _PHONES,
+    _SESSION_KEY_TAG,
+    _SESSION_SECRET,
     _STATE_FILE,
     REDDIT_APP_BACKOFF_SECONDS,
     REDDIT_APP_CLIENT_ID,
     REDDIT_APP_IDENTITY,
     REDDIT_APP_TOKEN_URL,
     REDDIT_APP_TRANSPORT_BACKOFF_SECONDS,
+    RedditAppAnalyticsSession,
     RedditAppDevice,
     RedditAppToken,
     caller_location,
+    gql_headers,
+    gql_payload,
     is_gate_response,
     load_state,
     parse_token_response,
     ratelimit_reset,
+    read_headers,
+    reddit_anon_refused,
     reddit_app_api_url,
+    reddit_app_gql_url,
+    reddit_gate_is_final,
     save_state,
     token_request,
     web_url,
@@ -49,6 +64,16 @@ _JSON_URL = "https://www.reddit.com/r/Python/.json?limit=1"
 _API_URL = "https://oauth.reddit.com/r/Python/.json?limit=1"
 _LISTING = json.dumps({"kind": "Listing", "data": {"children": []}})
 _JSON = {"content-type": "application/json; charset=UTF-8"}
+_THREAD_URL = "https://www.reddit.com/r/Python/comments/abc123/a_post/.json"
+_GQL_URL = "https://gql-fed.reddit.com/"
+_GQL_HASH = "314f29c2494fd78c7844ef2c6b09acb4bef5b37ab50b4ddc01691d6d5c8433f8"
+_GQL_QUERY = {
+    "operationName": "PostComments",
+    "variables": {"id": "t3_abc123", "sortType": "CONFIDENCE"},
+    "extensions": {"persistedQuery": {"version": 1, "sha256Hash": _GQL_HASH}},
+}
+_GQL_ANSWER = json.dumps({"data": {"postInfoById": {"id": "t3_abc123"}}})
+_GQL_TYPE = {"content-type": "application/graphql-response+json"}
 
 
 def _token_response(cls=MockResponse, expires_in=86399):
@@ -83,7 +108,7 @@ def _store_old_token(cache_dir):
     save_state(
         cache_dir,
         RedditAppDevice.new(),
-        RedditAppToken(_ACCESS, now + 20_000, _LOID, _SESSION, minted_at=now - 3600),
+        RedditAppToken(_ACCESS, now + 20_000, _LOID, minted_at=now - 3600),
     )
 
 
@@ -172,6 +197,86 @@ class TestUrlMapping:
         )
 
 
+class TestRefusedReads:
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://www.reddit.com/comments/abc123.json",
+            "https://www.reddit.com/comments/abc123/.json?limit=3",
+            _THREAD_URL,
+            "https://www.reddit.com/r/Python/comments/abc123/_/.json",
+            "https://www.reddit.com/r/Python/comments/abc123/a_post/def456/.json",
+            "https://www.reddit.com/r/Python/comments.json",
+            "https://www.reddit.com/r/all/comments/.json",
+            "https://oauth.reddit.com/comments/abc123",
+            "https://api.reddit.com/r/Python/comments",
+            "https://oauth.reddit.com/api/info?id=t3_abc123",
+            "https://www.reddit.com/api/info.json?id=t3_abc123",
+            "https://oauth.reddit.com/api/morechildren?link_id=t3_x&children=a",
+            "https://www.reddit.com/user/spez/about.json",
+            "https://oauth.reddit.com/USER/spez/about/",
+            "https://oauth.reddit.com/u/spez/about",
+            "https://www.reddit.com/r/all/hot.json",
+            "https://www.reddit.com/r/all.json",
+            "https://www.reddit.com/r/All/rising.json?limit=100",
+            "https://www.reddit.com/r/all/search.json?q=python",
+            "https://oauth.reddit.com/r/all/about",
+            "https://oauth.reddit.com/by_id/t3_abc123,t3_def456",
+            "https://www.reddit.com/by_id/t3_abc123,t1_def456.json",
+            "https://www.reddit.com/by_id/t3_abc123%2Ct3_def456.json",
+            "https://oauth.reddit.com/by_id/t3_abc123%2ct3_def456",
+        ],
+    )
+    def test_reads_refused_to_logged_out_clients(self, url):
+        assert reddit_anon_refused(url)
+        assert reddit_gate_is_final(url)
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            _JSON_URL,
+            "https://www.reddit.com/r/Python/hot.json",
+            "https://www.reddit.com/r/Python/about.json",
+            "https://www.reddit.com/user/spez/.json",
+            "https://www.reddit.com/user/spez/comments.json",
+            "https://www.reddit.com/user/spez/submitted.json",
+            "https://oauth.reddit.com/by_id/t3_abc123",
+            "https://oauth.reddit.com/duplicates/abc123",
+            "https://oauth.reddit.com/search?q=comments",
+            # HTML threads are served to logged-out web sessions.
+            "https://www.reddit.com/r/Python/comments/abc123/a_post/",
+            "https://www.reddit.com/comments/abc123/",
+            "https://old.reddit.com/comments/abc123.json",
+            "https://www.reddit.com/r/popular/hot.json",
+            "https://www.reddit.com/r/all-funny/hot.json",
+            "https://www.reddit.com/r/allthingsprotoss/hot.json",
+            "https://www.reddit.com/rising.json?limit=100",
+            "https://www.reddit.com/by_id/t3_abc123.json",
+        ],
+    )
+    def test_reads_still_served(self, url):
+        assert not reddit_anon_refused(url)
+        assert not reddit_gate_is_final(url)
+
+    @pytest.mark.parametrize(
+        ("url", "expected"),
+        [
+            (_GQL_URL, _GQL_URL),
+            ("https://gql-fed.reddit.com", _GQL_URL),
+            ("https://GQL-FED.reddit.com./", _GQL_URL),
+            ("https://gql-fed.reddit.com:443/?x=1", "https://gql-fed.reddit.com/?x=1"),
+            ("http://gql-fed.reddit.com/", None),
+            ("https://gql-fed.reddit.com:8443/", None),
+            ("https://u:p@gql-fed.reddit.com/", None),
+            ("https://cf.gql-fed.reddit.com/", None),
+            ("https://gql.reddit.com/", None),
+        ],
+    )
+    def test_graphql_endpoint(self, url, expected):
+        assert reddit_app_gql_url(url) == expected
+        assert reddit_gate_is_final(url) == (expected is not None)
+
+
 class TestIdentity:
     def test_new_install_is_a_real_release_on_a_supported_android(self):
         for _ in range(50):
@@ -184,26 +289,165 @@ class TestIdentity:
                 f"/Android {device.android}"
             )
 
-    def test_headers_carry_one_stable_device_id(self):
+    def test_new_install_is_a_real_phone(self):
+        for _ in range(50):
+            device = RedditAppDevice.new()
+            manufacturer, _, _, _, shipped = _PHONES[device.model]
+            assert shipped <= device.android
+            assert str(uuid.UUID(device.ad_id)) == device.ad_id
+            assert len(device.p_device_id) == 96
+            int(device.p_device_id, 16)
+
+    def test_read_headers_are_the_apps_in_order(self):
         device = RedditAppDevice.new()
-        headers = device.headers()
-        assert headers["client-vendor-id"] == device.device_id
+        token = RedditAppToken(_ACCESS, time.time() + 100, _LOID)
+        headers = read_headers(device, token, RedditAppAnalyticsSession.new())
+        assert list(headers) == [
+            "X-Reddit-Http-QoS",
+            "X-Reddit-Device-Tier",
+            "x-reddit-compression",
+            "X-Reddit-QoS",
+            "X-Reddit-Media-Codecs",
+            "Authorization",
+            "Client-Vendor-ID",
+            "x-reddit-device-id",
+            "User-Agent",
+            "X-Dev-Ad-Id",
+            "Device-Name",
+            "x-reddit-dpr",
+            "x-reddit-width",
+            "x-reddit-loid",
+            "x-reddit-session",
+            "X-Reddit-P-Device-ID",
+            "Accept-Language",
+            "Accept-Encoding",
+        ]
+        assert headers["Client-Vendor-ID"] == device.device_id
         assert headers["x-reddit-device-id"] == device.device_id
-        assert headers == device.headers()
-        assert "Authorization" not in headers
+        assert headers["Authorization"] == f"Bearer {_ACCESS}"
+        assert headers["x-reddit-loid"] == _LOID
+        assert headers["Device-Name"] == f"Google;{device.model}"
+        assert headers["x-reddit-dpr"] == "2.625"
+        assert headers["x-reddit-width"] == "411"
+        assert headers["Accept-Encoding"] == "gzip"
+        assert headers["X-Reddit-Media-Codecs"] == (
+            "available-codecs=video/avc, video/x-vnd.on2.vp9, video/hevc, video/av01"
+        )
+        assert headers["X-Reddit-QoS"].startswith("down-rate-mbps=")
+
+    def test_network_quality_class_matches_the_reported_rate(self):
+        device = RedditAppDevice.new()
+        token = RedditAppToken(_ACCESS, time.time() + 100)
+        for _ in range(50):
+            headers = read_headers(device, token, RedditAppAnalyticsSession.new())
+            mbps = float(headers["X-Reddit-QoS"].split("=")[1])
+            expected = (
+                "EXCELLENT" if mbps >= 20 else "GOOD" if mbps >= 10
+                else "STANDARD" if mbps >= 5 else "LIMITED" if mbps >= 2
+                else "VERY_LIMITED"
+            )
+            assert headers["X-Reddit-Http-QoS"] == expected
+
+    def test_gql_headers_carry_the_operation(self):
+        device = RedditAppDevice.new()
+        token = RedditAppToken(_ACCESS, time.time() + 100, _LOID)
+        payload = gql_payload({"json": _GQL_QUERY})
+        headers = gql_headers(
+            device, token, RedditAppAnalyticsSession.new(), payload, attempt=1
+        )
+        assert list(headers)[:5] == [
+            "Content-Length",
+            "X-Reddit-Retry",
+            "X-APOLLO-OPERATION-NAME",
+            "X-APOLLO-OPERATION-ID",
+            "accept",
+        ]
+        assert headers["Content-Length"] == str(len(payload))
+        assert headers["X-Reddit-Retry"] == "attempt=1, max=3"
+        assert headers["X-APOLLO-OPERATION-NAME"] == "PostComments"
+        assert headers["X-APOLLO-OPERATION-ID"] == _GQL_HASH
+        assert headers["accept"] == (
+            "application/graphql-response+json, application/json"
+        )
+        assert headers["Content-Type"] == "application/json; charset=utf-8"
+        assert headers["Accept-Encoding"] == "gzip, deflate"
+        assert headers["priority"] == "u=1, i"
+        assert list(headers)[-3:] == ["Content-Type", "Accept-Encoding", "priority"]
+
+    @pytest.mark.parametrize(
+        "payload",
+        [b"not json", b"[]", b'{"operationName": "bad name\r\n"}', b"{}"],
+    )
+    def test_gql_headers_without_an_operation_leave_it_out(self, payload):
+        headers = gql_headers(
+            RedditAppDevice.new(),
+            RedditAppToken(_ACCESS, time.time() + 100),
+            RedditAppAnalyticsSession.new(),
+            payload,
+        )
+        assert "X-APOLLO-OPERATION-NAME" not in headers
+        assert "X-APOLLO-OPERATION-ID" not in headers
+
+    def test_gql_payload_is_compact_and_keeps_order(self):
+        assert gql_payload({"json": _GQL_QUERY}) == json.dumps(
+            _GQL_QUERY, separators=(",", ":")
+        ).encode()
+        assert gql_payload({"body": "{}"}) == b"{}"
+        assert gql_payload({"body": b"{}"}) == b"{}"
+        assert gql_payload({"json": {"q": "caf\u00e9"}}) == '{"q":"café"}'.encode()
+
+    def test_session_header_is_the_apps_signed_session(self):
+        session = RedditAppAnalyticsSession.new()
+        header = session.header()
+        signed, signature = header.split(f".{_SESSION_KEY_TAG}-")
+        payload = f"{signed}.{_SESSION_KEY_TAG}"
+        session_id, version, created, tag = payload.split(".")
+        assert len(session_id) == 18 and session_id.isalnum()
+        assert (version, tag) == ("2", _SESSION_KEY_TAG)
+        assert int(created) == session.created_ms
+        mac = hmac.new(_SESSION_SECRET, payload.encode(), hashlib.sha512).digest()
+        assert signature == base64.urlsafe_b64encode(mac).rstrip(b"=").decode()
+        assert header == session.header()
 
     def test_token_request_is_the_anonymous_grant(self):
-        headers, body = token_request(RedditAppDevice.new())
+        device = RedditAppDevice.new()
+        headers, body = token_request(device, RedditAppAnalyticsSession.new())
         expected = base64.b64encode(f"{REDDIT_APP_CLIENT_ID}:".encode()).decode()
         assert headers["Authorization"] == f"Basic {expected}"
         assert headers["Content-Type"] == "application/json; charset=UTF-8"
-        assert json.loads(body) == {"scopes": ["*", "email", "pii"]}
+        assert headers["Accept-Encoding"] == "gzip"
+        assert body == b'{"scopes":["*","email","pii","adsread","adsedit"]}'
+        assert list(headers) == [
+            "Authorization",
+            "X-Reddit-Http-QoS",
+            "X-Reddit-Device-Tier",
+            "User-Agent",
+            "x-reddit-compression",
+            "X-Reddit-QoS",
+            "X-Reddit-Media-Codecs",
+            "Client-Vendor-ID",
+            "X-Reddit-P-Device-ID",
+            "x-reddit-session",
+            "Content-Type",
+            "Content-Length",
+            "Accept-Encoding",
+        ]
+        assert headers["Content-Length"] == str(len(body))
+
+    def test_later_mints_send_the_installs_loid(self):
+        device = replace(RedditAppDevice.new(), loid=_LOID)
+        headers, _ = token_request(device, RedditAppAnalyticsSession.new())
+        assert list(headers)[:2] == ["Authorization", "x-reddit-loid"]
+        assert headers["x-reddit-loid"] == _LOID
 
     def test_token_values_never_appear_in_repr(self):
-        token = RedditAppToken(_ACCESS, time.time() + 100, _LOID, _SESSION)
-        rendered = repr(token)
-        for secret in (_ACCESS, _LOID, _SESSION):
-            assert secret not in rendered
+        token = RedditAppToken(_ACCESS, time.time() + 100, _LOID)
+        device = replace(RedditAppDevice.new(), loid=_LOID)
+        session = RedditAppAnalyticsSession.new()
+        for rendered in (repr(token), repr(device), repr(session)):
+            assert _ACCESS not in rendered
+            assert _LOID not in rendered
+            assert session.session_id not in rendered
 
 
 class TestTokenParsing:
@@ -217,9 +461,9 @@ class TestTokenParsing:
         )
         assert token.access_token == _ACCESS
         assert token.expires_at == 1000.0 + 86399
-        assert token.loid == _LOID and token.session == _SESSION
-        assert token.headers()["Authorization"] == f"Bearer {_ACCESS}"
-        assert token.headers()["x-reddit-loid"] == _LOID
+        # The app signs its own session; the server's value is not kept.
+        assert token.loid == _LOID
+        assert _SESSION not in repr(dataclasses.asdict(token))
 
     @pytest.mark.parametrize(
         ("status", "body"),
@@ -251,8 +495,7 @@ class TestTokenParsing:
             200, {"x-reddit-loid": "bad value\r\n", "x-reddit-session": ""}, body
         )
         assert token is not None
-        assert token.loid == "" and token.session == ""
-        assert "x-reddit-loid" not in token.headers()
+        assert token.loid == ""
 
     def test_freshness_keeps_a_refresh_margin(self):
         token = RedditAppToken(_ACCESS, expires_at=1000.0)
@@ -312,8 +555,8 @@ class TestResponseClassification:
 
 class TestPersistence:
     def test_round_trip_is_owner_only(self, tmp_path):
-        device = RedditAppDevice.new()
-        token = RedditAppToken(_ACCESS, time.time() + 3600, _LOID, _SESSION)
+        device = replace(RedditAppDevice.new(), loid=_LOID)
+        token = RedditAppToken(_ACCESS, time.time() + 3600, _LOID)
         save_state(tmp_path, device, token)
         path = tmp_path / _STATE_FILE
         assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
@@ -368,6 +611,89 @@ class TestPersistence:
         (tmp_path / _STATE_FILE).write_text(content)
         assert load_state(tmp_path) is None
 
+    def test_install_from_before_phones_keeps_its_id(self, tmp_path):
+        """A state file written before the phone fields existed: the install id
+        survives, a phone is picked for it, and its token (which still carries
+        the server's session value) loads."""
+        old = {
+            "device": {
+                "device_id": "11111111-2222-3333-4444-555555555555",
+                "version": "2026.39.0",
+                "build": 2639031,
+                "android": 14,
+                "down_rate": "40.000",
+            },
+            "token": {
+                "access_token": _ACCESS,
+                "expires_at": time.time() + 20_000,
+                "loid": _LOID,
+                "session": _SESSION,
+                "minted_at": time.time(),
+            },
+        }
+        (tmp_path / _STATE_FILE).write_text(json.dumps(old))
+        device, token = load_state(tmp_path)
+        assert device.device_id == old["device"]["device_id"]
+        assert device.down_rate == "40.000"
+        assert device.version in {r[0] for r in _APP_RELEASES}
+        assert device.model in _PHONES
+        assert _PHONES[device.model][4] <= device.android
+        assert device.ad_id and device.p_device_id
+        assert token is not None and token.loid == _LOID
+        # The install took the token's loid, and the update is kept on disk.
+        assert device.loid == _LOID
+        assert load_state(tmp_path) == (device, token)
+
+    def test_old_install_keeps_its_loid_when_its_token_expired(self, tmp_path):
+        old = {
+            "device": {
+                "device_id": "11111111-2222-3333-4444-555555555555",
+                "version": "2026.39.0",
+                "build": 2639031,
+                "android": 14,
+                "down_rate": "40.000",
+            },
+            "token": {
+                "access_token": _ACCESS,
+                "expires_at": time.time() - 10,
+                "loid": _LOID,
+                "session": _SESSION,
+                "minted_at": time.time() - 90_000,
+            },
+        }
+        (tmp_path / _STATE_FILE).write_text(json.dumps(old))
+        device, token = load_state(tmp_path)
+        assert token is None
+        assert device.loid == _LOID
+        again, _ = load_state(tmp_path)
+        assert again == device
+        headers, _ = token_request(again, RedditAppAnalyticsSession.new())
+        assert headers["x-reddit-loid"] == _LOID
+
+    @pytest.mark.parametrize(
+        "field",
+        [{"version": []}, {"model": ["Pixel 8"]}, {"android": "fourteen"}],
+    )
+    def test_malformed_install_starts_a_new_one(self, tmp_path, field):
+        save_state(tmp_path, RedditAppDevice.new(), None)
+        path = tmp_path / _STATE_FILE
+        data = json.loads(path.read_text())
+        data["device"].update(field)
+        path.write_text(json.dumps(data))
+        assert load_state(tmp_path) is None
+
+    def test_current_install_is_not_rewritten_on_load(self, tmp_path):
+        save_state(tmp_path, RedditAppDevice.new(), None)
+        before = (tmp_path / _STATE_FILE).stat().st_mtime_ns
+        load_state(tmp_path)
+        assert (tmp_path / _STATE_FILE).stat().st_mtime_ns == before
+
+    def test_loid_round_trips_with_the_install(self, tmp_path):
+        device = replace(RedditAppDevice.new(), loid=_LOID)
+        save_state(tmp_path, device, None)
+        loaded, _ = load_state(tmp_path)
+        assert loaded == device
+
     def test_state_file_is_not_read_as_a_cookie_domain(self, tmp_path):
         save_state(tmp_path, RedditAppDevice.new(), None)
         assert list(CookieCache(tmp_path).list_domains()) == []
@@ -392,9 +718,12 @@ class TestSyncRoute:
         headers = read_kw["headers"]
         assert headers["Authorization"] == f"Bearer {_ACCESS}"
         assert headers["x-reddit-loid"] == _LOID
-        assert headers["x-reddit-session"] == _SESSION
+        # The app's own signed session, the same on the mint and the read.
+        assert headers["x-reddit-session"] != _SESSION
+        assert headers["x-reddit-session"] == mint_kw["headers"]["x-reddit-session"]
         assert headers["User-Agent"].startswith("Reddit/Version ")
-        assert headers["client-vendor-id"] == mint_kw["headers"]["client-vendor-id"]
+        assert headers["Client-Vendor-ID"] == mint_kw["headers"]["Client-Vendor-ID"]
+        assert "x-reddit-loid" not in mint_kw["headers"]
         state = session.reddit_bootstrap_state()
         assert state["app_reads"] == 1
         assert state["app_token_mints"] == 1
@@ -418,7 +747,8 @@ class TestSyncRoute:
         assert [m for m, _, _ in app2.request_log] == ["GET"]
         first = app.request_log[1][2]["headers"]
         second = app2.request_log[0][2]["headers"]
-        assert first["client-vendor-id"] == second["client-vendor-id"]
+        assert first["Client-Vendor-ID"] == second["Client-Vendor-ID"]
+        assert first["Device-Name"] == second["Device-Name"]
         assert again.reddit_bootstrap_state()["app_token_mints"] == 0
 
     def test_refused_older_token_is_reminted_once(self, tmp_path):
@@ -450,22 +780,22 @@ class TestSyncRoute:
         session.get(_JSON_URL)
         assert [m for m, _, _ in app.request_log] == ["POST", "GET", "GET"]
 
-    def test_edge_gate_falls_back_and_backs_off(self):
-        session, app, web = _session([_token_response(), _gate()])
-        first = session.get(_JSON_URL)
-        assert first.emulation != REDDIT_APP_IDENTITY
-        assert web.request_count == 1
-        assert session._reddit_app_backoff_until - time.monotonic() > (
-            REDDIT_APP_BACKOFF_SECONDS - 60
-        )
+    def test_any_gate_ends_that_read_and_nothing_else(self):
+        """Reddit's rules are per path (r/all is refused, r/popular served):
+        a gate on one read neither holds the route nor goes to the web path,
+        which refuses anonymous JSON too."""
+        session, app, web = _session([_token_response(), _gate(), _listing()])
+        with pytest.raises(RequestBlocked):
+            session.get("https://www.reddit.com/r/all/hot.json")
+        assert web.request_count == 0
+        assert session._reddit_app_backoff_until == 0.0
         state = session.reddit_bootstrap_state()
-        assert state["app_fallbacks"] == 1
-        assert state["app_last_outcome"] == "gate"
+        assert state["app_fallbacks"] == 0
+        assert state["app_last_outcome"] == "refused"
         assert state["app_last_status"] == 403
-
-        session.get(_JSON_URL)
-        assert app.request_count == 2  # the backoff kept the route idle
-        assert web.request_count == 2
+        resp = session.get(_JSON_URL)
+        assert resp.emulation == REDDIT_APP_IDENTITY
+        assert web.request_count == 0
 
     def test_refused_mint_falls_back_for_the_long_backoff(self):
         session, app, web = _session([_gate()])
@@ -521,15 +851,24 @@ class TestSyncRoute:
                 {"content-type": "text/html"},
                 "<title>Reddit - Prove your humanity</title>",
             ),
-            MockResponse(429, {"content-type": "text/html"}, "<html>slow</html>"),
         ],
     )
     def test_html_from_the_api_is_the_edge_not_content(self, answer):
-        session, app, web = _session([_token_response(), answer])
+        session, app, web = _session([_token_response(), answer], max_rotations=0)
         resp = session.get(_JSON_URL)
-        assert resp.emulation != REDDIT_APP_IDENTITY
-        assert web.request_count == 1
-        assert session.reddit_bootstrap_state()["app_last_outcome"] == "gate"
+        assert resp.challenge_type == "reddit"
+        assert resp.emulation == REDDIT_APP_IDENTITY
+        assert web.request_count == 0
+        assert session.reddit_bootstrap_state()["app_last_outcome"] == "refused"
+
+    @patch("wafer._sync.time.sleep")
+    def test_an_html_429_is_rate_limiting_not_a_block(self, mock_sleep):
+        slow = MockResponse(429, {"content-type": "text/html"}, "<html>slow</html>")
+        session, app, web = _session([_token_response(), slow, _listing()])
+        resp = session.get(_JSON_URL)
+        assert resp.status_code == 200
+        assert resp.emulation == REDDIT_APP_IDENTITY
+        assert [m for m, _, _ in app.request_log] == ["POST", "GET", "GET"]
 
     def test_api_json_error_is_returned_as_is(self):
         private = '{"reason": "private", "message": "Forbidden", "error": 403}'
@@ -709,6 +1048,262 @@ class TestSyncRoute:
         session.get("https://www.reddit.com/r/Python/")
         assert app.request_count == 0
 
+    def test_refused_read_is_a_block_and_the_route_stays_on(self):
+        session, app, web = _session([_token_response(), _gate(), _listing()])
+
+        with pytest.raises(RequestBlocked) as exc:
+            session.get(_THREAD_URL)
+
+        assert exc.value.challenge_type == "reddit"
+        assert exc.value.status_code == 403
+        assert exc.value.url == _THREAD_URL
+        assert exc.value.response.emulation == REDDIT_APP_IDENTITY
+        assert web.request_count == 0
+        state = session.reddit_bootstrap_state()
+        assert state["app_last_outcome"] == "refused"
+        assert state["app_fallbacks"] == 0
+        # No backoff: the next listing is still read as the app.
+        resp = session.get(_JSON_URL)
+        assert resp.emulation == REDDIT_APP_IDENTITY
+        assert [m for m, _, _ in app.request_log] == ["POST", "GET", "GET"]
+        assert web.request_count == 0
+
+    def test_refused_read_is_returned_without_rotations(self):
+        session, app, web = _session(
+            [_token_response(), _gate()], max_rotations=0
+        )
+        resp = session.get(_THREAD_URL)
+        assert resp.status_code == 403
+        assert resp.challenge_type == "reddit"
+        assert resp.emulation == REDDIT_APP_IDENTITY
+        assert resp.url == _THREAD_URL
+        assert web.request_count == 0
+
+    def test_refused_read_still_tries_the_app(self):
+        """If Reddit serves the read again, it is returned as content."""
+        session, app, web = _session([_token_response(), _listing()])
+        resp = session.get(_THREAD_URL)
+        assert resp.status_code == 200
+        assert resp.emulation == REDDIT_APP_IDENTITY
+        assert app.request_log[1][1] == (
+            "https://oauth.reddit.com/r/Python/comments/abc123/a_post/.json"
+        )
+
+    def test_refused_mint_still_holds_the_route_for_reads(self):
+        session, app, web = _session([MockResponse(403, {}, "denied")])
+        session.get(_JSON_URL)
+        assert session.reddit_bootstrap_state()["app_last_outcome"] == "token"
+        assert web.request_count == 1
+        session.get(_JSON_URL)
+        assert app.request_count == 1
+
+    def test_graphql_post_is_sent_as_the_app(self):
+        session, app, web = _session(
+            [_token_response(), MockResponse(200, _GQL_TYPE, _GQL_ANSWER)]
+        )
+
+        resp = session.post(_GQL_URL, json=_GQL_QUERY)
+
+        assert resp.status_code == 200
+        assert resp.json()["data"]["postInfoById"]["id"] == "t3_abc123"
+        assert resp.emulation == REDDIT_APP_IDENTITY
+        assert resp.url == _GQL_URL
+        assert web.request_count == 0
+        method, url, kw = app.request_log[1]
+        assert (method, url) == ("POST", _GQL_URL)
+        assert kw["body"] == json.dumps(_GQL_QUERY, separators=(",", ":")).encode()
+        assert "json" not in kw
+        headers = kw["headers"]
+        assert headers["Authorization"] == f"Bearer {_ACCESS}"
+        assert headers["X-APOLLO-OPERATION-NAME"] == "PostComments"
+        assert headers["X-APOLLO-OPERATION-ID"] == _GQL_HASH
+        assert headers["X-Reddit-Retry"] == "attempt=0, max=3"
+        assert headers["Content-Type"] == "application/json; charset=utf-8"
+        assert session.reddit_bootstrap_state()["app_last_outcome"] == "served"
+
+    def test_graphql_body_bytes_are_sent_as_given(self):
+        raw = json.dumps(_GQL_QUERY).encode()
+        session, app, _ = _session(
+            [_token_response(), MockResponse(200, _GQL_TYPE, _GQL_ANSWER)]
+        )
+        session.post(_GQL_URL, body=raw)
+        kw = app.request_log[1][2]
+        assert kw["body"] == raw
+        assert kw["headers"]["X-APOLLO-OPERATION-NAME"] == "PostComments"
+
+    @patch("wafer._sync.time.sleep")
+    def test_graphql_retry_counts_the_attempt(self, mock_sleep):
+        session, app, _ = _session(
+            [
+                _token_response(),
+                MockResponse(502, _JSON, "{}"),
+                MockResponse(200, _GQL_TYPE, _GQL_ANSWER),
+            ]
+        )
+        session.post(_GQL_URL, json=_GQL_QUERY)
+        retries = [kw["headers"]["X-Reddit-Retry"] for _, _, kw in app.request_log[1:]]
+        assert retries == ["attempt=0, max=3", "attempt=1, max=3"]
+
+    def test_graphql_gate_is_a_block(self):
+        session, app, web = _session([_token_response(), _gate(), _listing()])
+        with pytest.raises(RequestBlocked):
+            session.post(_GQL_URL, json=_GQL_QUERY)
+        assert web.request_count == 0
+        session.get(_JSON_URL)
+        assert app.request_log[-1][0] == "GET"
+
+    def test_graphql_redirect_is_its_answer(self):
+        moved = MockResponse(302, {"location": "https://www.reddit.com/"}, "")
+        session, app, web = _session([_token_response(), moved])
+        resp = session.post(_GQL_URL, json=_GQL_QUERY)
+        assert resp.status_code == 302
+        assert resp.emulation == REDDIT_APP_IDENTITY
+        assert app.request_count == 2
+        assert web.request_count == 0
+
+    def test_graphql_401_from_a_fresh_token_is_its_answer(self):
+        refused = MockResponse(401, _JSON, '{"message": "Unauthorized"}')
+        session, app, web = _session([_token_response(), refused])
+        resp = session.post(_GQL_URL, json=_GQL_QUERY)
+        assert resp.status_code == 401
+        assert resp.emulation == REDDIT_APP_IDENTITY
+        assert web.request_count == 0
+
+    def test_graphql_while_the_route_is_held_does_not_go_out_as_the_web(self):
+        from wafer._errors import TokenMintFailed
+
+        session, app, web = _session([MockResponse(403, {}, "denied")])
+        session.get(_JSON_URL)  # a refused mint holds the route
+        assert session._reddit_app_backoff_until > time.monotonic()
+        with pytest.raises(TokenMintFailed) as exc:
+            session.post(_GQL_URL, json=_GQL_QUERY)
+        assert exc.value.status_code == 403
+        assert exc.value.stage == "reddit_app"
+        # No second mint while held, and nothing on the web identity.
+        assert app.request_count == 1
+        assert [u for _, u, _ in web.request_log if "gql-fed" in u] == []
+
+    def test_graphql_with_a_held_route_and_a_token_is_still_sent(self, tmp_path):
+        _store_old_token(tmp_path)
+        session, app, web = _session(
+            [MockResponse(200, _GQL_TYPE, _GQL_ANSWER)],
+            cookie_cache=CookieCache(tmp_path),
+        )
+        session._reddit_app_backoff_until = time.monotonic() + 600
+        resp = session.post(_GQL_URL, json=_GQL_QUERY)
+        assert resp.emulation == REDDIT_APP_IDENTITY
+        assert web.request_count == 0
+
+    @pytest.mark.parametrize(
+        ("mint", "expected"),
+        [
+            (ConnectionError("reset"), "ConnectionFailed"),
+            (MockResponse(429, {}, "slow"), "RateLimited"),
+            (MockResponse(503, {}, "down"), "TokenMintFailed"),
+            (MockResponse(403, {}, "denied"), "TokenMintFailed"),
+        ],
+    )
+    def test_graphql_mint_failure_raises_by_its_cause(self, mint, expected):
+        from wafer import _errors
+
+        session, app, web = _session([mint])
+        with pytest.raises(getattr(_errors, expected)):
+            session.post(_GQL_URL, json=_GQL_QUERY)
+        assert web.request_count == 0
+
+    def test_graphql_with_unpinned_www_raises_instead_of_the_web(self):
+        from wafer._errors import ConnectionFailed
+
+        session, app, web = _session(
+            [_token_response()],
+            resolve={"gql-fed.reddit.com": ["151.101.1.140"]},
+        )
+        with pytest.raises(ConnectionFailed, match="resolve="):
+            session.post(_GQL_URL, json=_GQL_QUERY)
+        assert app.request_count == 0
+        assert web.request_count == 0
+
+    def test_account_graphql_with_unpinned_hosts_goes_out_as_asked(self):
+        session, app, web = _session(
+            [_token_response()],
+            resolve={"gql-fed.reddit.com": ["151.101.1.140"]},
+        )
+        session.post(
+            _GQL_URL, json=_GQL_QUERY, headers={"Authorization": "Bearer user"}
+        )
+        assert app.request_count == 0
+        assert web.request_count == 1
+
+    def test_graphql_transport_error_raises_instead_of_the_web(self):
+        from wafer._errors import ConnectionFailed
+
+        session, app, web = _session([_token_response(), ConnectionError("reset")])
+        with pytest.raises(ConnectionFailed):
+            session.post(_GQL_URL, json=_GQL_QUERY)
+        assert web.request_count == 0
+
+    @pytest.mark.parametrize(
+        ("url", "kwargs"),
+        [
+            (_GQL_URL, {"form": {"a": "b"}}),
+            (_GQL_URL, {"json": _GQL_QUERY, "headers": {"Authorization": "Bearer u"}}),
+            ("https://www.reddit.com/api/comment", {"json": {}}),
+            ("https://oauth.reddit.com/api/vote", {"json": {}}),
+        ],
+    )
+    def test_other_posts_stay_on_the_web(self, url, kwargs):
+        session, app, web = _session([_token_response()])
+        session.post(url, **kwargs)
+        assert app.request_count == 0
+        assert web.request_count == 1
+
+    def test_resolve_pins_must_cover_the_graphql_host(self):
+        pins = {
+            "www.reddit.com": ["151.101.1.140"],
+            "oauth.reddit.com": ["151.101.1.140"],
+        }
+        from wafer._errors import ConnectionFailed
+
+        session, app, web = _session([_token_response()], resolve=pins)
+        with pytest.raises(ConnectionFailed):
+            session.post(_GQL_URL, json=_GQL_QUERY)
+        assert app.request_count == 0
+        assert web.request_count == 0
+        pinned, app2, _ = _session(
+            [_token_response(), MockResponse(200, _GQL_TYPE, _GQL_ANSWER)],
+            resolve={**pins, "gql-fed.reddit.com": ["151.101.1.140"]},
+        )
+        pinned.post(_GQL_URL, json=_GQL_QUERY)
+        assert app2.request_count == 2
+
+    def test_mint_after_a_refused_token_sends_the_installs_loid(self, tmp_path):
+        _store_old_token(tmp_path)
+        session, app, _ = _session(
+            [
+                _listing(status=401, body='{"message": "Unauthorized", "error": 401}'),
+                _token_response(),
+                _listing(),
+            ],
+            cookie_cache=CookieCache(tmp_path),
+        )
+        session.get(_JSON_URL)
+        # The first mint stored the loid on the install; later mints send it.
+        device, _ = load_state(tmp_path)
+        assert device.loid == _LOID
+        again, app2, _ = _session(
+            [
+                _listing(status=401, body='{"message": "Unauthorized", "error": 401}'),
+                _token_response(),
+                _listing(),
+            ],
+            cookie_cache=CookieCache(tmp_path),
+        )
+        state = json.loads((tmp_path / _STATE_FILE).read_text())
+        state["token"]["minted_at"] = time.time() - 3600
+        (tmp_path / _STATE_FILE).write_text(json.dumps(state))
+        again.get(_JSON_URL)
+        assert app2.request_log[1][2]["headers"]["x-reddit-loid"] == _LOID
+
     def test_resolve_pins_must_cover_the_app_hosts(self):
         session, app, web = _session(
             [_token_response(), _listing()],
@@ -748,14 +1343,40 @@ class TestAsyncRoute:
         assert all(r.status_code == 200 for r in results)
         assert [m for m, _, _ in app.request_log].count("POST") == 1
 
-    async def test_edge_gate_falls_back(self):
+    async def test_any_gate_ends_that_read_and_nothing_else(self):
         session, app, web = _async_session(
-            [_token_response(AsyncMockResponse), _gate(AsyncMockResponse)]
+            [
+                _token_response(AsyncMockResponse),
+                _gate(AsyncMockResponse),
+                _listing(AsyncMockResponse),
+            ]
         )
+        with pytest.raises(RequestBlocked):
+            await session.get(_JSON_URL)
+        assert web.request_count == 0
         resp = await session.get(_JSON_URL)
-        assert resp.emulation != REDDIT_APP_IDENTITY
-        assert web.request_count == 1
-        assert session.reddit_bootstrap_state()["app_last_outcome"] == "gate"
+        assert resp.emulation == REDDIT_APP_IDENTITY
+
+    async def test_requests_queued_behind_a_refused_mint_do_not_mint(self):
+        from wafer._errors import TokenMintFailed
+
+        session, app, web = _async_session([AsyncMockResponse(403, {}, "denied")])
+        results = await asyncio.gather(
+            *(session.post(_GQL_URL, json=_GQL_QUERY) for _ in range(4)),
+            return_exceptions=True,
+        )
+        assert all(isinstance(r, TokenMintFailed) for r in results)
+        assert app.request_count == 1
+        assert web.request_count == 0
+
+    async def test_graphql_while_the_route_is_held_raises(self):
+        from wafer._errors import TokenMintFailed
+
+        session, app, web = _async_session([AsyncMockResponse(403, {}, "denied")])
+        await session.get(_JSON_URL)
+        with pytest.raises(TokenMintFailed):
+            await session.post(_GQL_URL, json=_GQL_QUERY)
+        assert app.request_count == 1
 
     async def test_refused_older_token_is_reminted_once(self, tmp_path):
         _store_old_token(tmp_path)
@@ -811,11 +1432,36 @@ class TestAsyncRoute:
 
     async def test_html_from_the_api_is_the_edge(self):
         page = AsyncMockResponse(200, {"content-type": "text/html"}, "<html>x</html>")
-        session, app, web = _async_session([_token_response(AsyncMockResponse), page])
+        session, app, web = _async_session(
+            [_token_response(AsyncMockResponse), page], max_rotations=0
+        )
         resp = await session.get(_JSON_URL)
-        assert resp.emulation != REDDIT_APP_IDENTITY
-        assert web.request_count == 1
+        assert resp.challenge_type == "reddit"
+        assert web.request_count == 0
 
+    async def test_refused_read_is_a_block(self):
+        session, app, web = _async_session(
+            [_token_response(AsyncMockResponse), _gate(AsyncMockResponse)]
+        )
+        with pytest.raises(RequestBlocked):
+            await session.get(_THREAD_URL)
+        assert web.request_count == 0
+        assert session.reddit_bootstrap_state()["app_last_outcome"] == "refused"
+        assert session._reddit_app_backoff_until == 0.0
+
+    async def test_graphql_post_is_sent_as_the_app(self):
+        session, app, web = _async_session(
+            [
+                _token_response(AsyncMockResponse),
+                AsyncMockResponse(200, _GQL_TYPE, _GQL_ANSWER),
+            ]
+        )
+        resp = await session.post(_GQL_URL, json=_GQL_QUERY)
+        assert resp.emulation == REDDIT_APP_IDENTITY
+        assert web.request_count == 0
+        method, url, kw = app.request_log[1]
+        assert (method, url) == ("POST", _GQL_URL)
+        assert kw["headers"]["X-APOLLO-OPERATION-ID"] == _GQL_HASH
 
 class TestConstruction:
     def test_on_by_default_and_opt_out(self):
@@ -840,15 +1486,42 @@ class TestConstruction:
             assert "headers" not in kwargs
             assert "orig_headers" not in kwargs
 
-    def test_app_client_emulation(self):
-        from wreq import Platform
-
+    def test_okhttp_stack_is_androids_tls_and_okhttps_http2(self):
         from wafer import SyncSession
-        from wafer._base import DEFAULT_EMULATION
 
         with SyncSession() as session:
-            with patch("wafer._base.Emulation") as emulation:
-                session._reddit_app_client_kwargs()
+            kwargs = session._reddit_app_client_kwargs("okhttp")
+        assert "emulation" not in kwargs
+        assert kwargs["tls_options"] is not None
+        assert kwargs["http2_options"] is not None
+        assert kwargs["cookie_store"] is False
+
+    def test_cronet_stack_is_chrome_143_on_android(self):
+        from wreq import Platform, Profile
+
+        from wafer import SyncSession
+
+        with SyncSession() as session:
+            with patch("wafer._reddit_app.Emulation") as emulation:
+                kwargs = session._reddit_app_client_kwargs("cronet")
         emulation.assert_called_once_with(
-            profile=DEFAULT_EMULATION, platform=Platform.Android, headers=False
+            profile=Profile.Chrome143, platform=Platform.Android, headers=False
         )
+        assert "tls_options" not in kwargs
+
+    def test_graphql_uses_the_cronet_client_and_reads_the_okhttp_one(self):
+        from tests.conftest import MockClient
+
+        okhttp = MockClient([_token_response(), _listing()])
+        cronet = MockClient([MockResponse(200, _GQL_TYPE, _GQL_ANSWER)])
+        session, _, web = _session([])
+        session._reddit_app_client = okhttp
+        session._reddit_app_gql_client = cronet
+        session.get(_JSON_URL)
+        session.post(_GQL_URL, json=_GQL_QUERY)
+        assert [(m, u) for m, u, _ in okhttp.request_log] == [
+            ("POST", REDDIT_APP_TOKEN_URL),
+            ("GET", _API_URL),
+        ]
+        assert [(m, u) for m, u, _ in cronet.request_log] == [("POST", _GQL_URL)]
+        assert web.request_count == 0

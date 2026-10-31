@@ -18,11 +18,12 @@ from tests.conftest import (
     make_sync_session,
 )
 from wafer._cookies import CookieCache
-from wafer._errors import ResponseTooLarge, WaferTimeout
+from wafer._errors import RequestBlocked, ResponseTooLarge, WaferTimeout
 from wafer._solvers import (
     REDDIT_CACHE_DOMAIN,
     REDDIT_SOLVE_ORIGIN,
     REDDIT_VERIFICATION_MAX_BYTES,
+    is_reddit_captcha_gate,
     is_reddit_verification,
     parse_reddit_verification,
     reddit_cookie_names,
@@ -978,6 +979,179 @@ class TestRedditBootstrapSync:
         assert mock.request_log[0][1] == "https://old.reddit.com/"
 
 
+class TestRedditRefusedJson:
+    """Reddit refuses anonymous JSON to logged-out web sessions even after the
+    bootstrap establishes the anonymous cookie set (measured 2026-10-31; a
+    fresh real Chrome gets the same 403). A gate that survives a solved
+    bootstrap, or one on a read refused to every logged-out client, is a
+    block: no rotation or browser can change it."""
+
+    _THREAD = "https://www.reddit.com/comments/abc123.json?limit=3"
+    _GQL = "https://gql-fed.reddit.com/"
+
+    @patch("wafer._sync.time.sleep")
+    def test_gate_after_a_solved_bootstrap_is_a_block(self, mock_sleep):
+        responses = [
+            _gate_response(),
+            MockResponse(200, {}, _verification_html()),
+            _solved_response(),
+            _gate_response(),
+        ]
+        session, mock = make_sync_session(responses, max_rotations=2)
+
+        with pytest.raises(RequestBlocked) as exc:
+            session.get(_OLD_JSON_URL)
+
+        assert exc.value.challenge_type == "reddit"
+        assert exc.value.status_code == 403
+        assert exc.value.response.rotations == 0
+        assert mock.request_count == 4
+        assert session.reddit_bootstrap_state()["successes"] == 1
+
+    @patch("wafer._sync.time.sleep")
+    def test_gate_after_a_solved_bootstrap_is_returned_without_rotations(
+        self, mock_sleep
+    ):
+        responses = [
+            _gate_response(),
+            MockResponse(200, {}, _verification_html()),
+            _solved_response(),
+            _gate_response(),
+        ]
+        session, mock = make_sync_session(responses, max_rotations=0)
+        resp = session.get(_OLD_JSON_URL)
+        assert resp.status_code == 403
+        assert resp.challenge_type == "reddit"
+        assert mock.request_count == 4
+
+    @pytest.mark.parametrize(
+        ("method", "url", "kwargs"),
+        [
+            ("GET", _THREAD, {}),
+            ("GET", "https://www.reddit.com/user/spez/about.json", {}),
+            ("POST", _GQL, {"json": {"operationName": "PostComments"}}),
+        ],
+    )
+    def test_final_gate_skips_the_bootstrap(self, method, url, kwargs):
+        session, mock = make_sync_session([_gate_response()], max_rotations=2)
+        with pytest.raises(RequestBlocked):
+            session.request(method, url, **kwargs)
+        assert mock.request_count == 1
+        assert session.reddit_bootstrap_state()["attempts"] == 0
+
+    def test_blocked_gate_still_fits_the_response_cap(self):
+        session, _ = make_sync_session([_gate_response()], max_rotations=0)
+        with pytest.raises(ResponseTooLarge):
+            session.get(self._THREAD, max_response_size=16)
+
+    def test_html_thread_still_bootstraps(self):
+        """A 403 on a thread page (not a JSON read) is still a challenge."""
+        html_thread = "https://www.reddit.com/r/Python/comments/abc123/a_post/"
+        responses = [
+            _gate_response(),
+            MockResponse(200, {}, _verification_html()),
+            _solved_response(),
+            MockResponse(200, {"content-type": "text/html"}, "<html>post</html>"),
+        ]
+        session, mock = make_sync_session(responses, max_rotations=0)
+        with patch("wafer._sync.time.sleep"):
+            resp = session.get(html_thread)
+        assert resp.status_code == 200
+        assert session.reddit_bootstrap_state()["successes"] == 1
+
+    @patch("wafer._sync.time.sleep")
+    def test_later_json_reads_do_not_bootstrap_again(self, mock_sleep):
+        """One solved bootstrap whose replay was refused is enough: later
+        anonymous JSON reads end at their gate, with no bootstrap and no
+        browser, so a held route never becomes a bootstrap per read."""
+        responses = [
+            _gate_response(),
+            MockResponse(200, {}, _verification_html()),
+            _solved_response(),
+            _gate_response(),
+            _gate_response(),
+            _gate_response(),
+        ]
+        session, mock = make_sync_session(responses, max_rotations=2)
+        with pytest.raises(RequestBlocked):
+            session.get(_OLD_JSON_URL)
+        assert mock.request_count == 4
+        for other in (_JSON_URL, "https://www.reddit.com/r/homelab/new.json"):
+            with pytest.raises(RequestBlocked):
+                session.get(other)
+        assert mock.request_count == 6
+        assert session.reddit_bootstrap_state()["attempts"] == 1
+
+    @patch("wafer._sync.time.sleep")
+    def test_html_still_bootstraps_after_a_refused_json_read(self, mock_sleep):
+        responses = [
+            _gate_response(),
+            MockResponse(200, {}, _verification_html()),
+            _solved_response(),
+            _gate_response(),
+            _gate_response(),
+            MockResponse(200, {}, _verification_html()),
+            _solved_response(),
+            MockResponse(200, {"content-type": "text/html"}, "<html>page</html>"),
+        ]
+        session, mock = make_sync_session(responses, max_rotations=0)
+        session.get(_OLD_JSON_URL)
+        resp = session.get(_HTML_URL)
+        assert resp.status_code == 200
+        assert session.reddit_bootstrap_state()["attempts"] == 2
+
+    @patch("wafer._sync.time.sleep")
+    def test_account_reads_are_not_held_by_an_anonymous_refusal(self, mock_sleep):
+        responses = [
+            _gate_response(),
+            MockResponse(200, {}, _verification_html()),
+            _solved_response(),
+            _gate_response(),
+            MockResponse(200, {"content-type": "application/json"}, '{"kind":"t2"}'),
+        ]
+        session, mock = make_sync_session(responses, max_rotations=0)
+        session.get(_OLD_JSON_URL)
+        resp = session.get(_JSON_URL, headers={"Authorization": "Bearer user"})
+        assert resp.status_code == 200
+
+    async def test_async_later_json_reads_do_not_bootstrap_again(self):
+        responses = [
+            _async_gate_response(),
+            AsyncMockResponse(200, {}, _verification_html()),
+            _async_solved_response(),
+            _async_gate_response(),
+            _async_gate_response(),
+        ]
+        session, mock = make_async_session(responses, max_rotations=2)
+        with patch("wafer._async.asyncio.sleep"):
+            with pytest.raises(RequestBlocked):
+                await session.get(_OLD_JSON_URL)
+            with pytest.raises(RequestBlocked):
+                await session.get(_JSON_URL)
+        assert mock.request_count == 5
+
+    @patch("wafer._async.asyncio.sleep")
+    async def test_async_gate_after_a_solved_bootstrap_is_a_block(self, mock_sleep):
+        responses = [
+            _async_gate_response(),
+            AsyncMockResponse(200, {}, _verification_html()),
+            _async_solved_response(),
+            _async_gate_response(),
+        ]
+        session, mock = make_async_session(responses, max_rotations=2)
+        with pytest.raises(RequestBlocked):
+            await session.get(_OLD_JSON_URL)
+        assert mock.request_count == 4
+
+    async def test_async_final_gate_skips_the_bootstrap(self):
+        session, mock = make_async_session(
+            [_async_gate_response()], max_rotations=2
+        )
+        with pytest.raises(RequestBlocked):
+            await session.get(self._THREAD)
+        assert mock.request_count == 1
+
+
 class TestRedditLiveShape:
     """The page Reddit serves since 2026-09-27 (title "Reddit", jsc_token),
     solved inline without a browser."""
@@ -1067,6 +1241,59 @@ class TestRedditCaptchaGate:
 
     def _gate(self, cls=MockResponse):
         return cls(200, {"content-type": "text/html"}, self._GATE)
+
+    _PARTIAL_GATE = (
+        _FIXTURES / "reddit_captcha_gate_partial_2026-10-31.html"
+    ).read_text()
+    _PARTIAL = (
+        "https://www.reddit.com/svc/shreddit/pdp-right-rail/related/worldnews/"
+        "t3_1xjs1vh?render-mode=partial"
+    )
+
+    @pytest.mark.parametrize(
+        "action",
+        [
+            "/r/Python/?captcha=1",
+            "/svc/x?render-mode=partial&amp;captcha=1",
+            "/svc/x?render-mode=partial&#38;captcha=1",
+            "/svc/x?render-mode=partial&#x26;captcha=1",
+            "/svc/x?render-mode=partial&captcha=1",
+        ],
+    )
+    def test_gate_form_is_recognized_with_or_without_a_query(self, action):
+        page = self._GATE.replace('action="/r/Python/?captcha=1"', f'action="{action}"')
+        assert is_reddit_captcha_gate(page)
+
+    @pytest.mark.parametrize(
+        "action",
+        ["/r/Python/?notcaptcha=1", "/svc/x?render-mode=partial&amp;xcaptcha=1"],
+    )
+    def test_other_forms_are_not_the_gate(self, action):
+        page = self._GATE.replace('action="/r/Python/?captcha=1"', f'action="{action}"')
+        assert not is_reddit_captcha_gate(page)
+
+    @patch("wafer._sync.time.sleep")
+    def test_bootstrap_clears_a_cold_partial_captcha(self, mock_sleep):
+        """A cold session's first read of a /svc/shreddit/ partial gets the
+        gate (its form action keeps the partial's query, so "&" arrives as
+        "&amp;"): the bootstrap runs and the partial is replayed."""
+        partial = "<faceplate-tracker>46 related posts</faceplate-tracker>"
+        session, mock = make_sync_session(
+            [
+                MockResponse(200, {"content-type": "text/html"}, self._PARTIAL_GATE),
+                MockResponse(200, {}, self._PAGE),
+                _solved_response(),
+                MockResponse(200, {"content-type": "text/html"}, partial),
+            ],
+            max_rotations=0,
+        )
+        resp = session.get(self._PARTIAL)
+        assert resp.text == partial
+        assert resp.challenge_type is None
+        state = session.reddit_bootstrap_state()
+        assert state["attempts"] == 1 and state["successes"] == 1
+        assert state["browser_attempts"] == 0
+        assert mock.request_log[-1][1] == self._PARTIAL
 
     @patch("wafer._sync.time.sleep")
     def test_bootstrap_clears_a_cold_captcha(self, mock_sleep):

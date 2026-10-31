@@ -91,7 +91,7 @@ from wafer import (
     ConnectionFailed,  # network/TLS error after all retries
     EmptyResponse,     # 200 with empty body after all retries
     TooManyRedirects,  # redirect loop exceeded max_redirects
-    TokenMintFailed,   # mint_recaptcha_v3() could not extract a token
+    TokenMintFailed,   # mint_recaptcha_v3() / Reddit app token not granted
     ResponseTooLarge,  # body exceeded max_response_size cap
 )
 
@@ -206,8 +206,10 @@ SyncSession(
     # Socket connects to these IPs; TLS SNI + cert still key on the hostname.
     # Construction-only (no per-request form); an empty IP list raises;
     # combining with proxy= raises (a proxy resolves the host, voiding the pin).
-    # Reddit's app route (reddit_app=) needs both oauth.reddit.com and
-    # www.reddit.com pinned; otherwise Reddit JSON uses the web path.
+    # Reddit's app route (reddit_app=) needs www.reddit.com pinned, plus
+    # oauth.reddit.com for JSON reads and gql-fed.reddit.com for GraphQL;
+    # otherwise a JSON read uses the web path and an anonymous GraphQL POST
+    # raises ConnectionFailed.
     resolve: dict[str, list[str]] | None = None,
 
     # Reddit JSON reads via Reddit's app API (see "Reddit" under Challenge
@@ -405,10 +407,13 @@ session.reddit_bootstrap_state() -> dict
 #   "app_reads": int         - JSON reads the Android app route served
 #   "app_token_mints": int   - app tokens minted (0 when cache_dir had one)
 #   "app_fallbacks": int     - reads the app route handed to the web path
-#   "app_last_outcome": str|None - "served", or why the read went to the web
-#                              path: "token", "gate" (Reddit refused the app
-#                              client), "unauthorized" (endpoint needs an
-#                              account), "ratelimit", "transport", "redirect"
+#   "app_last_outcome": str|None - "served"; "refused" (Reddit refuses this
+#                              read to logged-out clients: returned or raised
+#                              as a block, see "Reddit"); or why the read went
+#                              to the web path: "token", "gate" (Reddit
+#                              refused the app client), "unauthorized"
+#                              (endpoint needs an account), "ratelimit",
+#                              "transport", "redirect"
 #   "app_last_status": int|None - HTTP status behind app_last_outcome
 # Names, counts, and labels only - never cookie values, the app token, the
 # verification token, or the solved submission query. Counters are per session
@@ -496,7 +501,7 @@ resp.emulation      # str | None - the identity that SERVED this response, for
                     # / "Profile.Firefox152"; for non-Emulation profiles it's the
                     # profile name ("safari", "ios_safari", "dart",
                     # "opera_mini"), and "reddit_app" for a Reddit JSON read
-                    # the Android app route served. Reflects the
+                    # or GraphQL request the Android app route served. Reflects the
                     # CURRENT identity, so after a rotation it shows the one that
                     # actually served (not the session's original). This is the TLS
                     # profile only; after a browser solve it may report a lower
@@ -645,7 +650,7 @@ WaferError (base)
   +- ConnectionFailed     .url: str, .reason: str
   +- EmptyResponse        .url: str, .status_code: int, .response: WaferResponse | None
   +- TooManyRedirects     .url: str, .max_redirects: int
-  +- TokenMintFailed      .stage: str | None ("anchor"|"reload"|"apijs"), .status_code: int | None
+  +- TokenMintFailed      .stage: str | None ("anchor"|"reload"|"apijs"|"reddit_app"), .status_code: int | None
   +- ResponseTooLarge     .url: str, .size: int (bytes seen when cap hit), .limit: int (the cap)
   +- WaferTimeout         .url: str, .timeout_secs: float  (also inherits TimeoutError)
   +- WaferHTTPError       .status_code: int, .url: str, .response: WaferResponse | None  (raised by raise_for_status())
@@ -658,13 +663,14 @@ client to prove it is a browser, so retrying, rotating identity, or solving in
 a browser can change the outcome. A block means the request matched a WAF rule,
 and every one of those returns the same denial - so wafer raises immediately,
 spending no retry or rotation budget, with `.challenge_type` set to the
-terminal type (`cloudflare_block`). What can change the outcome is changing the
-request: a different path, origin, or egress address. It subclasses
+terminal type (`cloudflare_block`, or `reddit` for a Reddit JSON read Reddit
+refuses to logged-out clients - see "Reddit"). What can change the outcome is
+changing the request: a different path, origin, or egress address. It subclasses
 `ChallengeDetected`, so existing handlers still catch it; catch it separately to
 tell "try again later" from "this will never work as-is". Under
 `max_rotations=0` (including `.bulk()`) the block is returned as a response with
-`challenge_type="cloudflare_block"` instead of raised, like every other
-challenge.
+`challenge_type` set (`"cloudflare_block"` / `"reddit"`) instead of raised,
+like every other challenge.
 
 `ChallengeDetected`, `RateLimited`, `EmptyResponse`, and `WaferHTTPError`
 carry the final `WaferResponse` as `e.response` (body, headers, status of the
@@ -683,6 +689,7 @@ cookie jar) and continues retrying. It does not raise.
 Default mode (`max_rotations > 0`):
 - 403 + challenge detected -> raises `ChallengeDetected` after exhausting rotations
 - 403 + terminal WAF block detected -> raises `RequestBlocked` immediately, before any retry or rotation
+- Reddit JSON read Reddit refuses to logged-out clients (threads, comments, `/api/info`, `/user/<name>/about`; see "Reddit") -> raises `RequestBlocked` (`challenge_type="reddit"`) at once
 - 429 without challenge -> raises `RateLimited` after exhausting rotations
 - 200 with empty body -> retries; if the host already served a real body this session, also rotates to a fresh identity (within `max_rotations`); raises `EmptyResponse` once retries+rotations are exhausted (see "Stateful request replay")
 - Connection error (refused/reset/TLS failure) -> raises `ConnectionFailed` after exhausting retries. When the host resolved only to `0.0.0.0` / `::`, `.reason` says so: the resolver refused the name (sinkhole, blocklist, filtered DNS) rather than the host being unreachable. Pin the address with `resolve=` or use another resolver.
@@ -1139,15 +1146,76 @@ the session's own identity.
   separately, but they share the budget). When it is spent, a read waits for
   the reset if that fits `timeout=`, else goes through the web path. It never
   raises for this.
-- Always on the web path: HTML pages, `old.reddit.com`, a body or non-GET
-  method, and account requests (`Authorization` / `Cookie` per request or in
-  the session's `headers=`, or a logged-in `reddit_session` cookie). Your
-  per-request `headers=` are not sent on the app route.
+- Always on the web path: HTML pages, `old.reddit.com`, any other body or
+  non-GET request, and account requests (`Authorization` / `Cookie` per
+  request or in the session's `headers=`, or a logged-in `reddit_session`
+  cookie). Your per-request `headers=` are not sent on the app route.
 - Falls back to the web path for one read when an endpoint needs an account or
-  a redirect leaves the API; for 15 minutes when Reddit turns the app client
-  away; for 1 minute after a transport error.
+  a redirect leaves the API; for 15 minutes when Reddit refuses the app token;
+  for 1 minute after a transport error.
   `reddit_bootstrap_state()["app_last_outcome"]` says why. `reddit_app=False`
   turns the route off.
+- Reddit's gate (its HTML network-security page) on any app-route read is
+  that read's answer: `RequestBlocked` at once (see below), never a fallback
+  and never a pause for other reads, because Reddit's rules are per path and
+  the web path refuses anonymous JSON too.
+
+**Reads Reddit refuses to logged-out clients.** Since 2026-10-20 Reddit
+answers these JSON reads with its network-security page for every logged-out
+client - the app's anonymous token and an anonymous web session alike - while
+listings, search, `/by_id` and `/duplicates` are still served: a thread or its
+comments (`/comments/<id>`, `/r/<sub>/comments/<id>/...`), the comment streams
+(`/r/<sub>/comments`), `/api/info`, `/api/morechildren`, `/user/<name>/about`,
+r/all in any form (`/r/all/hot.json`, `/r/all/rising.json`, ...;
+`/r/popular` and `/rising.json` are served), and `/by_id` with more than one
+id (one id is served; read post batches with the app's `PostsByIds`
+operation). Wafer still tries the read once on the app route (so it
+works again if Reddit reopens it), then raises `RequestBlocked`
+(`challenge_type="reddit"`, `e.response` holds the 403 page), or returns that
+response under `max_rotations=0`. It takes well under a second: no web
+fallback, no rotation, and other reads keep using the app route. On the web
+path (`reddit_app=False`), the same reads and any JSON gate that survives a
+solved bootstrap are reported the same way, and after one such refusal the
+session's later anonymous Reddit JSON reads end at their gate for 15 minutes
+without a bootstrap or a browser. Threads, comments and profiles are
+available over GraphQL:
+
+**GraphQL.** `POST https://gql-fed.reddit.com/` with `json=` (or a JSON
+`body=`) goes out as the app: its token, device headers, and the
+`X-APOLLO-OPERATION-NAME` / `-ID` headers taken from your payload's
+`operationName` and `extensions.persistedQuery.sha256Hash`. Send the app's
+persisted operations: `{"operationName": ..., "variables": {...},
+"extensions": {"persistedQuery": {"version": 1, "sha256Hash": ...}}}`; the app
+never sends query text. The response is Reddit's GraphQL JSON, returned as is
+(`errors` arrive with HTTP 200), with `resp.emulation == "reddit_app"`; wafer
+does not translate it into REST listings. Two Reddit answers to plan for:
+`PostComments` returns at most 200 comments per read whatever `count` says
+(follow the `more` stubs' cursors with `after` for the rest), and a deleted
+comment's `node` is a `DeletedComment` with no `id` (place it by the tree's
+`depth` and `parentId`). A gate there is a `RequestBlocked`
+as above; a redirect or a 401 is returned as Reddit's answer. A GraphQL POST
+is never sent without the app's token: when the route cannot carry it, it
+raises `TokenMintFailed` (`stage="reddit_app"`, `.status_code` = the token
+endpoint's answer; wafer does not ask again while the route is held),
+`ConnectionFailed` (no answer, or `resolve=` pins that leave
+`www.reddit.com` / `gql-fed.reddit.com` unpinned), `RateLimited`, or
+`WaferTimeout`. `json=` is sent compactly in your key order. A form body, an
+account request (`Authorization` / `Cookie`), `reddit_app=False`, or a POST
+anywhere else on Reddit goes out as asked on the session's own identity.
+
+```python
+async with wafer.AsyncSession(cache_dir="./cache") as s:
+    resp = await s.post("https://gql-fed.reddit.com/", json={
+        "operationName": "PostComments",
+        "variables": {"id": "t3_1xk4n1t", "sortType": "CONFIDENCE",
+                      "count": 200, "maxDepth": 10,
+                      "includeConsistencyToken": False,
+                      "includePremiumAvatarTreatment": False},
+        "extensions": {"persistedQuery": {"version": 1,
+            "sha256Hash": "314f29c2494fd78c7844ef2c6b09acb4bef5b37ab50b4ddc01691d6d5c8433f8"}},
+    })
+    trees = resp.json()["data"]["postInfoById"]["commentForest"]["trees"]
+```
 
 On the web path, wafer solves Reddit's JS verification inline at
 `https://www.reddit.com/` and retries the original request. That also clears the "Prove your

@@ -914,8 +914,12 @@ def is_reddit_verification(body: str) -> bool:
 # Reddit's reCAPTCHA gate ("Prove your humanity", first seen 2026-09-27): a
 # 200 whose form posts the widget's token back to the page with ?captcha=1.
 # Reddit's login page loads reCAPTCHA too, but never posts to ?captcha=1.
+# The form posts back to the page with captcha=1 added to its query: "?" on a
+# page without one, an HTML-escaped "&" (&amp;, &#38;, &#x26;) on one that has
+# one, such as a /svc/shreddit/ partial (?render-mode=partial&amp;captcha=1).
 _CAPTCHA_FORM_RE = re.compile(
-    r"""<form\b[^>]{0,512}?\baction\s*+=\s*+["']?[^"'\s>]{0,1024}?[?&]captcha=1\b""",
+    r"""<form\b[^>]{0,512}?\baction\s*+=\s*+["']?[^"'\s>]{0,1024}?"""
+    r"""(?:[?&]|&amp;|&\#0*38;|&\#x0*26;)captcha=1\b""",
     re.IGNORECASE,
 )
 
