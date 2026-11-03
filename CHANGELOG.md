@@ -4,6 +4,39 @@ All notable changes to wafer. Versions come from git tags (`hatch-vcs`); each
 release is on [PyPI](https://pypi.org/project/wafer-py/) and
 [GitHub Releases](https://github.com/Averyy/wafer/releases).
 
+## 0.7.11 - 2026-11-02
+
+### Fixed
+
+- **Cookies set with `add_cookie()` now reach the browser.** `render()`,
+  `browser_prime()`, `browser_solve_challenge()` and automatic browser solves
+  each run in a fresh browser context, and that context never saw the
+  caller's cookies. A page loaded with the site's defaults for the egress IP,
+  and the site's value then replaced the caller's in the jar. With an
+  AliExpress currency pin to GBP on a Canadian IP, `get()` was priced in GBP,
+  `render()` in CAD, and every `get()` after the render in CAD. Now the
+  browser starts with the session's `add_cookie()` cookies for the site being
+  navigated, at their current jar value and scope. The same run stays in GBP
+  throughout. Only cookies the caller added are carried; cookies the session
+  earned from responses or solves are not, so a solve's context is otherwise
+  as fresh as before. WAF clearance and sensor cookies (`cf_clearance`,
+  `datadome`, `_abck`, `aws-waf-token`, `_px*`, `reese84`, `x5sec`, ...) are
+  never carried in, even when the caller added them. Several solvers take one
+  of those cookies being present as a finished solve.
+- A seeded cookie the browser hands back unchanged is no longer counted as
+  earned state. It is not written to `cache_dir` as solver state, and a
+  `browser_prime()` that got nothing else returns False. A value the page
+  changed still replaces the jar's, as a `Set-Cookie` on `get()` would.
+- `BrowserSolver.solve()`, `asolve()`, `render()` and `arender()` take an
+  optional `cookies=` (Playwright `add_cookies` entries) to seed the context.
+  A custom `browser_solver` without it keeps working and is not passed any.
+- Completing a certificate chain through AIA, an AIA intermediate expiring,
+  and `mint_recaptcha_v3()` in an embed session no longer empty the session's
+  cookie jar. Each rebuilt the client with a fresh jar, which dropped every
+  in-memory cookie, the caller's included, and kept only what `cache_dir`
+  held. Fingerprint rotation, `rotate_every` and session retirement still
+  start an empty jar, as before.
+
 ## 0.7.10 - 2026-10-31
 
 Reddit changed what it serves to logged-out clients on 2026-10-20. These

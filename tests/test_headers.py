@@ -1191,3 +1191,25 @@ class TestClientHintsAndRevalidation:
             {"profile": Profile.SAFARI},
         ):
             SyncSession(embed="xhr", embed_origin="https://www.site.example", **kwargs)
+
+
+class TestEmbedSuspendKeepsTheJar:
+    """Suspending embed mode (reCAPTCHA v3 mint) rebuilds twice on one jar.
+
+    Both rebuilds started an empty jar, so minting a token in an embed session
+    dropped every in-memory cookie for the site it was minted for.
+    """
+
+    def test_cookies_survive_suspend_and_restore(self):
+        from wafer import SyncSession
+
+        session = SyncSession(
+            cache_dir=None, embed="xhr", embed_origin="https://www.shop.test"
+        )
+        session.add_cookie("sid=abc; Path=/", "https://www.shop.test/")
+        with session._embed_suspended():
+            assert session.get_cookie("sid", "https://www.shop.test/") == "abc"
+            session.add_cookie("NID=g; Domain=.google.com; Path=/", "https://www.google.com/")
+        assert session._embed == "xhr"
+        assert session.get_cookie("sid", "https://www.shop.test/") == "abc"
+        assert session.get_cookie("NID", "https://www.google.com/") == "g"

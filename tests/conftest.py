@@ -446,6 +446,7 @@ def make_sync_session(responses, **session_kwargs):
     session._pool_strikes = {}
     session._cookie_cache = session_kwargs.get("cookie_cache", None)
     session._cookie_scopes = {}
+    session._caller_cookies = {}
     session._accept_ch = {}
     session._reddit_bootstrap_stats = _new_reddit_bootstrap_stats()
     # The Reddit app route is off unless a test opts in with reddit_app=True
@@ -570,6 +571,7 @@ def make_async_session(responses, **session_kwargs):
     session._pool_strikes = {}
     session._cookie_cache = session_kwargs.get("cookie_cache", None)
     session._cookie_scopes = {}
+    session._caller_cookies = {}
     session._accept_ch = {}
     session._reddit_bootstrap_stats = _new_reddit_bootstrap_stats()
     # The Reddit app route is off unless a test opts in with reddit_app=True

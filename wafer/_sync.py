@@ -798,6 +798,16 @@ class SyncSession(BaseSession):
             "max_size",
         ):
             solve_kwargs["max_size"] = max_size
+        # The browser starts with the caller's own cookies for the site, as
+        # the session's requests carry them (see _browser_seed_cookies).
+        seeded = self._browser_seed_cookies(url, embedder)
+        if seeded and not _callable_accepts_keyword(
+            self._browser_solver.render if render else self._browser_solver.solve,
+            "cookies",
+        ):
+            seeded = []
+        if seeded and not render:
+            solve_kwargs["cookies"] = seeded
         browser_attempts = 1
         if challenge is ChallengeType.TMD and deadline is not None:
             # Classify from the issued punishment URL when one is available:
@@ -825,6 +835,8 @@ class SyncSession(BaseSession):
                 "challenge_budget",
             ):
                 render_kwargs["challenge_budget"] = render_challenge_budget
+            if seeded:
+                render_kwargs["cookies"] = seeded
             result = self._browser_solver.render(url, **render_kwargs)
             browser_attempts = 0
         for browser_attempt in range(browser_attempts):
@@ -881,7 +893,7 @@ class SyncSession(BaseSession):
         reg = registrable_domain(domain)
         target_cookies = [
             c
-            for c in result.cookies
+            for c in self._without_seeded_cookies(result.cookies, seeded)
             if browser_cookie_matches_host(c.get("domain", ""), domain)
         ]
         if challenge == ChallengeType.REDDIT and not reddit_has_cookie_evidence(
@@ -2887,12 +2899,18 @@ class SyncSession(BaseSession):
         return self.request("PATCH", url, **kwargs)
 
     def add_cookie(self, raw_set_cookie: str, url: str) -> None:
-        """Inject a Set-Cookie header value into the session's cookie jar."""
+        """Inject a Set-Cookie header value into the session's cookie jar.
+
+        The cookie is the caller's: a browser render or solve on its site
+        starts with its current value (WAF clearance cookies excepted), so the
+        page loads with it as the session's own requests do.
+        """
         if self._profile is Profile.OPERA_MINI:
             raise NotImplementedError(
                 "add_cookie() is not supported with Opera Mini profile"
             )
         self._record_cookie_scope(raw_set_cookie, url)
+        self._remember_caller_cookie(raw_set_cookie, url)
         self._client.cookie_jar.add(raw_set_cookie, url)
 
     def mint_recaptcha_v3(

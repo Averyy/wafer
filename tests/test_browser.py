@@ -77,6 +77,7 @@ class MockBrowserSolver:
         embedder=None,
         replay=None,
         max_size=None,
+        cookies=None,
     ):
         self.solve_calls.append((url, challenge_type))
         self.solve_kwargs.append(
@@ -87,6 +88,7 @@ class MockBrowserSolver:
                 "embedder": embedder,
                 "replay": replay,
                 "max_size": max_size,
+                "cookies": cookies,
             }
         )
         if self._results is not None:
@@ -12218,7 +12220,10 @@ class TestRenderChallengeBudget:
     def _solver_whose_worker_extends(self, extend: bool, work: float):
         solver = BrowserSolver(solve_timeout=300)
 
-        def worker(url, timeout=None, max_size=None, *, _deadline=None, _budget=None):
+        def worker(
+            url, timeout=None, max_size=None, *, _deadline=None, _budget=None,
+            cookies=None,
+        ):
             if extend:
                 _budget["deadline"] = _budget["challenge_deadline"]
             time.sleep(work)

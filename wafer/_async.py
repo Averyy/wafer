@@ -25,6 +25,7 @@ from wafer._base import (
     _extract_location,
     _is_binary_content_type,
     _is_challengeable_content_type,
+    _solver_takes_cookies,
     _tmd_browser_attempt_count,
     _tmd_browser_attempt_timeout,
     _tmd_punish_url_from_body,
@@ -820,13 +821,16 @@ class AsyncSession(BaseSession):
         timeout: float | None,
         max_size: int | None,
         challenge_budget: float | None = None,
+        cookies: list[dict] | None = None,
     ):
-        """Await the solver's render, preferring its native async entry point."""
+        """Await the solver's render, preferring its native async entry point.
 
-        async_render = getattr(self._browser_solver, "arender", None)
-        render_callable = (
-            async_render if callable(async_render) else self._browser_solver.render
-        )
+        ``cookies`` (the caller's, to start the browser with) is passed only
+        when non-empty; ``_try_browser_solve`` empties it first for a solver
+        whose render cannot take it.
+        """
+
+        render_callable, is_async = self._render_callable()
         kwargs = {"timeout": timeout}
         if max_size is not None and _callable_accepts_keyword(
             render_callable,
@@ -838,9 +842,19 @@ class AsyncSession(BaseSession):
             "challenge_budget",
         ):
             kwargs["challenge_budget"] = challenge_budget
-        if callable(async_render):
-            return await async_render(url, **kwargs)
+        if cookies:
+            kwargs["cookies"] = cookies
+        if is_async:
+            return await render_callable(url, **kwargs)
         return await asyncio.to_thread(render_callable, url, **kwargs)
+
+    def _render_callable(self):
+        """The solver's render entry point, and whether it is ``arender``."""
+
+        async_render = getattr(self._browser_solver, "arender", None)
+        if callable(async_render):
+            return async_render, True
+        return self._browser_solver.render, False
 
     async def _try_browser_solve(
         self,
@@ -946,6 +960,17 @@ class AsyncSession(BaseSession):
             "max_size",
         ):
             solve_kwargs["max_size"] = max_size
+        # The browser starts with the caller's own cookies for the site, as
+        # the session's requests carry them (see _browser_seed_cookies).
+        seeded = self._browser_seed_cookies(url, embedder)
+        if seeded and not _solver_takes_cookies(
+            self._browser_solver,
+            self._render_callable()[0] if render else solve_callable,
+            "render" if render else "solve",
+        ):
+            seeded = []
+        if seeded and not render:
+            solve_kwargs["cookies"] = seeded
         browser_attempts = 1
         if challenge is ChallengeType.TMD and deadline is not None:
             # Classify from the issued punishment URL when one is available:
@@ -963,7 +988,7 @@ class AsyncSession(BaseSession):
         result = None
         if render:
             result = await self._arender_via_solver(
-                url, solve_timeout, max_size, render_challenge_budget
+                url, solve_timeout, max_size, render_challenge_budget, seeded
             )
             browser_attempts = 0
         for browser_attempt in range(browser_attempts):
@@ -1028,7 +1053,7 @@ class AsyncSession(BaseSession):
         reg = registrable_domain(domain)
         target_cookies = [
             c
-            for c in result.cookies
+            for c in self._without_seeded_cookies(result.cookies, seeded)
             if browser_cookie_matches_host(c.get("domain", ""), domain)
         ]
         if challenge == ChallengeType.REDDIT and not reddit_has_cookie_evidence(
@@ -3111,12 +3136,18 @@ class AsyncSession(BaseSession):
         return await self.request("PATCH", url, **kwargs)
 
     def add_cookie(self, raw_set_cookie: str, url: str) -> None:
-        """Inject a Set-Cookie header value into the session's cookie jar."""
+        """Inject a Set-Cookie header value into the session's cookie jar.
+
+        The cookie is the caller's: a browser render or solve on its site
+        starts with its current value (WAF clearance cookies excepted), so the
+        page loads with it as the session's own requests do.
+        """
         if self._profile is Profile.OPERA_MINI:
             raise NotImplementedError(
                 "add_cookie() is not supported with Opera Mini profile"
             )
         self._record_cookie_scope(raw_set_cookie, url)
+        self._remember_caller_cookie(raw_set_cookie, url)
         self._client.cookie_jar.add(raw_set_cookie, url)
 
     async def mint_recaptcha_v3(

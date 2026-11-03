@@ -255,6 +255,23 @@ session.request(method: str, url: str, **kwargs) -> WaferResponse
 session.add_cookie(raw_set_cookie: str, url: str) -> None
 # raw_set_cookie is a Set-Cookie header string, e.g. "name=value; Path=/; Secure"
 # Raises NotImplementedError for Opera Mini profile.
+# A cookie added here also rides into the browser: render(), browser_prime(),
+# browser_solve_challenge() and every automatic browser solve start their
+# fresh browser context with the session's added cookies for the site being
+# navigated (its registrable domain, plus solve_origin's), at their current
+# jar value and scope. So a display preference (currency, ship-to region,
+# language) holds in the rendered or solved page as it does on get(). Only
+# cookies added with add_cookie() are carried; cookies the session earned from
+# responses or earlier solves are not. WAF clearance and sensor cookies
+# (cf_clearance, __cf_bm, datadome, _abck, bm_*, aws-waf-token, _px*, reese84,
+# incap_ses_*, x5sec, __uzm*, KP_UID*, Reddit's loid/token_v2/csv, ...) are
+# never carried in, even when you added them: a solve exists to replace them.
+# They still go out on the session's own requests. If the page then sets a
+# carried cookie to a different value, the site's value replaces yours in the
+# jar, as a Set-Cookie on get() would. An added cookie is lost when the session
+# changes identity: a fingerprint rotation, a rotate_every rotation and session
+# retirement all start an empty jar. Add it again before each request if it
+# must hold across those.
 
 # Cookie read access (sync on both SyncSession and AsyncSession - not a coroutine):
 session.get_cookie(name: str, url: str) -> str | None
@@ -290,7 +307,10 @@ session.browser_solve_challenge(url: str, challenge_type: str, *,
 # the result. timeout defaults to the session timeout; <= 0 returns False.
 # A solve adds the browser's cookies to the session's jar and keeps the ones
 # the session already held (an MTop _m_h5_tk survives a TMD solve); a browser
-# cookie replaces the session's cookie of the same name.
+# cookie replaces the session's cookie of the same name. The browser starts
+# with your add_cookie() cookies (see add_cookie above); one it hands back
+# unchanged is not counted as earned state, so browser_prime() returns False
+# when that is all it got.
 # A response whose Content-Type is JSON, XML, plain text or CSV is never
 # checked for challenges, so a punishment returned inside an API's JSON body
 # reaches you as an ordinary response. AliExpress MTop is the common case: a
@@ -332,8 +352,10 @@ session.render(url: str, *, timeout=None, max_response_size=None) -> WaferRespon
 # a client-side redirect: a page that sets location.href reports the
 # destination's status, not the first navigation's.
 # The browser follows redirects regardless of follow_redirects, so resp.url is
-# the final URL and resp.history is empty. Cookies the page set are merged into
-# the session jar, so a following get() reuses them.
+# the final URL and resp.history is empty. The browser starts with the cookies
+# you added with add_cookie() for the site (not WAF clearance cookies; see
+# add_cookie above). Cookies the page set are merged into the session jar, so a
+# following get() reuses them.
 # A render that ends on a WAF challenge raises ChallengeDetected (the document
 # is on .response, with .challenge_type set) and keeps none of its cookies: not
 # in the jar, not in cache_dir, no identity pin. The exception is a site gate
@@ -1461,6 +1483,14 @@ resp = session.get("https://protected-site.com")  # auto-solves challenges
 
 # Manual solve:
 result: SolveResult | None = solver.solve(url, challenge_type)
+# Optional keyword cookies=[{"name", "value", "domain", "path", ...}] (the
+# Playwright add_cookies shape; also accepted by asolve, render and arender)
+# seeds the fresh context before it navigates. "domain" with a leading dot is
+# a Domain cookie, without one a host-only cookie; "url"-only entries are
+# skipped, and so is any cookie Chrome refuses, without failing the solve.
+# result.cookies still lists every context cookie, seeded ones included.
+# Sessions pass their add_cookie() cookies here. A custom browser_solver whose
+# solve/render does not accept cookies= is simply not given them.
 # result.cookies: list[dict] - browser cookies
 # result.user_agent: str - browser's User-Agent (version-reduced, e.g.
 #   "...Chrome/154.0.0.0...")

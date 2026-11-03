@@ -2852,14 +2852,18 @@ class TestAnchorExpiry:
 
     def _short_lived_ca(self):
         key = _key()
+        # From the clock now, not the module's _NOW: a CA 30s past import has
+        # already expired once the suite takes that long to reach this class,
+        # and the chase then rejects it as expired.
+        now = datetime.datetime.now(datetime.timezone.utc)
         return (
             x509.CertificateBuilder()
             .subject_name(_name("Short CA"))
             .issuer_name(_name("Short Root"))
             .public_key(key.public_key())
             .serial_number(x509.random_serial_number())
-            .not_valid_before(_NOW - datetime.timedelta(days=1))
-            .not_valid_after(_NOW + datetime.timedelta(seconds=30))
+            .not_valid_before(now - datetime.timedelta(days=1))
+            .not_valid_after(now + datetime.timedelta(seconds=30))
             .add_extension(x509.BasicConstraints(ca=True, path_length=None), True)
             .sign(key, hashes.SHA256())
         )
@@ -2963,3 +2967,60 @@ def test_ip_helper_matches_stdlib_classification():
     # 203.0.113.0/24 is TEST-NET-3, which stdlib reports as private; a
     # genuinely routable address is the right positive control.
     assert not ipaddress.ip_address("93.184.216.34").is_private
+
+
+class TestChainCompletionKeepsTheJar:
+    """Completing a chain changes the trust store, not the session's identity.
+
+    The rebuild after a chase started an empty jar, so the first host that
+    needed AIA dropped every in-memory cookie: add_cookie() pins, logins, app
+    tokens. Real sessions and wreq's real jar: the mocked client would hide it.
+    """
+
+    def test_a_completed_chain_keeps_the_sessions_cookies(self, pki):
+        from wafer import SyncSession
+
+        session = SyncSession(cache_dir=None)
+        session.add_cookie("cur=GBP; Domain=.shop.test; Path=/", "https://www.shop.test/")
+        client = session._client
+        with patch.object(
+            _aia,
+            "resolve_missing_intermediates",
+            return_value=[_pem(pki["intermediate"])],
+        ):
+            assert session._complete_chain_via_aia("https://incomplete.test/")
+        assert session._client is not client
+        assert session.get_cookie("cur", "https://www.shop.test/") == "GBP"
+
+    def test_expiring_an_anchor_keeps_the_sessions_cookies(self):
+        from wafer import SyncSession
+
+        session = SyncSession(cache_dir=None)
+        key = _key()
+        # From the clock now, not the module's _NOW: by the time a full run
+        # reaches this test, an anchor 30s past import has already expired.
+        now = datetime.datetime.now(datetime.timezone.utc)
+        short = (
+            x509.CertificateBuilder()
+            .subject_name(_name("Short CA"))
+            .issuer_name(_name("Short Root"))
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - datetime.timedelta(days=1))
+            .not_valid_after(now + datetime.timedelta(minutes=30))
+            .add_extension(x509.BasicConstraints(ca=True, path_length=None), True)
+            .sign(key, hashes.SHA256())
+        )
+        with patch.object(
+            _aia, "resolve_missing_intermediates", return_value=[_pem(short)]
+        ):
+            assert session._complete_chain_via_aia("https://short.test/")
+        session.add_cookie("cur=GBP; Domain=.shop.test; Path=/", "https://www.shop.test/")
+        client = session._client
+        later = session._aia_expires_at + 1
+        with patch.object(_aia.time, "time", lambda: later), patch.object(
+            _base.time, "time", lambda: later
+        ):
+            assert session._expire_aia_anchors_if_due() is True
+        assert session._client is not client
+        assert session.get_cookie("cur", "https://www.shop.test/") == "GBP"

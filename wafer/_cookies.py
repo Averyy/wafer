@@ -49,6 +49,69 @@ def cookie_domain_matches(cookie_domain: str, registrable: str) -> bool:
     )
 
 
+# Cookies a WAF issues as clearance or sensor state. They are never seeded into
+# a browser context (see BaseSession._browser_seed_cookies), even when the
+# caller set them: a solve exists to replace them, and several handlers take a
+# cookie's mere presence as a finished solve (cf_clearance, aws-waf-token,
+# _px3/_pxhd, reese84, the Brave tokens), so a seeded copy would fake one, or
+# hand the browser the very token the WAF just rejected.
+WAF_COOKIE_NAMES = frozenset(
+    {
+        # Cloudflare
+        "cf_clearance",
+        "__cf_bm",
+        "_cfuvid",
+        # DataDome
+        "datadome",
+        # Akamai Bot Manager
+        "_abck",
+        "ak_bmsc",
+        "sec_cpt",
+        # AWS WAF
+        "aws-waf-token",
+        # PerimeterX / HUMAN
+        "pxcts",
+        # Imperva
+        "reese84",
+        "___utmvc",
+        # Alibaba Cloud WAF and TMD
+        "acw_sc__v2",
+        "acw_tc",
+        # Brave Search's proof-of-work tokens (wafer._brave.BRAVE_COOKIES)
+        "__Secure-token#brave-search-captcha-v2",
+        "__Secure-token#brave-search-captcha",
+        # wafer's PoW gate (wafer._solvers.POW_COOKIE_NAME)
+        "pow_bypass",
+    }
+)
+WAF_COOKIE_PREFIXES = (
+    "cf_chl",  # Cloudflare challenge state
+    "bm_",  # Akamai bm_sz, bm_sv, bm_mi, ...
+    "sbsd",  # Akamai sbsd, sbsd_o
+    "_px",  # PerimeterX _px2, _px3, _pxhd, _pxvid, ...
+    "incap_ses_",  # Imperva classic
+    "visid_incap_",
+    "nlbi_",
+    "__uzm",  # Radware __uzma ... __uzmf
+    "KP_UID",  # Kasada
+    "x5sec",  # Alibaba TMD clearance
+)
+# Reddit's anonymous session is what its browser bootstrap establishes, and the
+# bootstrap takes these names as proof it did (wafer._solvers
+# .reddit_has_cookie_evidence). Scoped to Reddit: ``csv`` is a common name.
+_REDDIT_STATE_COOKIES = frozenset({"loid", "token_v2", "csv"})
+
+
+def is_waf_cookie(name: str, domain: str = "") -> bool:
+    """Whether ``name`` (on ``domain``) is WAF or challenge state, not app state."""
+    if name in WAF_COOKIE_NAMES or name.startswith(WAF_COOKIE_PREFIXES):
+        return True
+    host = (domain or "").lstrip(".").rstrip(".").lower()
+    return name in _REDDIT_STATE_COOKIES and (
+        host == "reddit.com" or host.endswith(".reddit.com")
+    )
+
+
 def browser_cookie_matches_host(cookie_domain: str, host: str) -> bool:
     """Whether a Playwright cookie is allowed on ``host``.
 

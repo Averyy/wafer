@@ -21,7 +21,12 @@ from wreq import CertStore, Emulation, Method
 
 from wafer import _psl
 from wafer._bytes import as_text, is_binary
-from wafer._cookies import CookieCache, _default_cookie_path, registrable_domain
+from wafer._cookies import (
+    CookieCache,
+    _default_cookie_path,
+    is_waf_cookie,
+    registrable_domain,
+)
 from wafer._dart import DartIdentity
 from wafer._fingerprint import (
     HIGH_ENTROPY_HINTS,
@@ -136,6 +141,12 @@ _MISSING = object()
 # Upper bound on remembered Set-Cookie host-only bits (see _record_cookie_scope).
 # Generous enough that ordinary sessions never evict.
 _MAX_COOKIE_SCOPES = 16384
+# Upper bound on remembered caller cookies (see _remember_caller_cookie).
+_MAX_CALLER_COOKIES = 1024
+# Chrome caps a cookie's lifetime at 400 days from when it is set, so a seeded
+# cookie that outlives that comes back with an earlier expiry the page never
+# set (see _seed_expiry_unchanged).
+_CHROME_COOKIE_MAX_AGE = 400 * 86400
 
 _TMD_PUNISH_SUFFIX = "/_____tmd_____/punish"
 
@@ -291,6 +302,34 @@ def _callable_accepts_keyword(callable_obj, keyword: str) -> bool:
     return any(
         item.kind is inspect.Parameter.VAR_KEYWORD for item in parameters.values()
     )
+
+
+def _solver_takes_cookies(solver, entry, sync_name: str) -> bool:
+    """Whether calling ``entry`` with ``cookies=`` seeds the browser.
+
+    ``BrowserSolver.asolve``/``arender`` accept ``cookies=``, but in a subclass
+    that overrides ``solve``/``render`` they dispatch to the override and pass
+    the cookies on only if it takes them. Probing the async entry alone would
+    report cookies seeded that never reached the browser, and the session
+    would then discard returned cookies as unchanged seeds.
+    """
+
+    if not _callable_accepts_keyword(entry, "cookies"):
+        return False
+    try:
+        from wafer.browser._solver import BrowserSolver
+    except Exception:
+        return True
+    func = getattr(entry, "__func__", None)
+    name = getattr(func, "__name__", "")
+    if func is None or func is not getattr(BrowserSolver, name, None):
+        return True
+    sync = getattr(solver, sync_name, None)
+    if sync is None or getattr(sync, "__func__", None) is getattr(
+        BrowserSolver, sync_name, None
+    ):
+        return True
+    return _callable_accepts_keyword(sync, "cookies")
 
 
 def _to_method(method: str) -> Method:
@@ -891,6 +930,15 @@ class BaseSession:
         # parent-domain cookies without leaking host-only cookies to siblings.
         # Keyed by the RFC cookie identity (name, normalized domain, path).
         self._cookie_scopes: dict[tuple[str, str, str], bool] = {}
+        # The cookies the caller set with add_cookie(), by the same identity:
+        # (host-only bit, the value added with an explicit SameSite=None or
+        # None). A browser render or solve starts in a fresh context, so their
+        # current jar values are seeded into it (_browser_seed_cookies): the
+        # page then loads with the caller's preferences, as the session's own
+        # requests do.
+        self._caller_cookies: dict[
+            tuple[str, str, str], tuple[bool, str | None]
+        ] = {}
         # High-entropy Client Hints each origin asked for with Accept-CH.
         self._accept_ch: dict[str, frozenset[str]] = {}
 
@@ -2441,7 +2489,8 @@ class BaseSession:
             dropped = len(self._aia_extra_pems) != before
         if dropped:
             logger.debug("AIA anchors expired; rebuilding without them")
-            self._rebuild_client()
+            # A trust-store change, not a new identity: keep the jar.
+            self._rebuild_client(keep_cookies=True)
         return dropped
 
     def _publish_under_generation(self, build):
@@ -2706,13 +2755,16 @@ class BaseSession:
             # intermediates. Keeping the old one would leave the Imperva
             # fallback failing on a chain the wreq path can now complete.
             self._native_tls = None
-        # Rebuilt outside the lock on purpose. _rebuild_client re-hydrates the
-        # cookie jar from the on-disk cache -- up to max_entries file reads and
-        # JSON parses -- and holding _aia_lock across that would block every
-        # concurrent caller on disk I/O. The store it reads is already current,
-        # so the worst case is a client published a moment before another
-        # origin's certificate lands, which the next rebuild picks up.
-        self._rebuild_client()
+        # Rebuilt outside the lock on purpose: building a client is not cheap,
+        # and holding _aia_lock across it would stall every concurrent caller.
+        # The store it reads is already current, so the worst case is a client
+        # published a moment before another origin's certificate lands, which
+        # the next rebuild picks up.
+        # Only the trust store changed, so the jar is kept. A fresh one dropped
+        # every in-memory cookie (add_cookie() pins, logins, app tokens) the
+        # first time any host needed its chain completed, and only what
+        # cache_dir held came back.
+        self._rebuild_client(keep_cookies=True)
         return True
 
     def _build_client_kwargs(self) -> dict:
@@ -2818,8 +2870,8 @@ class BaseSession:
         *client* level (``_compute_client_headers``), so a per-request delta
         cannot remove them - the client must be rebuilt without embed.
 
-        This saves the embed config, clears it, rebuilds the client (cookies
-        rehydrate from cache, fingerprint stays put), yields, then restores
+        This saves the embed config, clears it, rebuilds the client on the
+        same jar (fingerprint and cookies stay put), yields, then restores
         the embed config and rebuilds again. Not concurrency-safe within a
         single session - same as the rotation path, which also mutates the
         client - so don't share one session across threads mid-mint.
@@ -2834,14 +2886,14 @@ class BaseSession:
         self._embed = None
         self._embed_origin = None
         self._embed_referers = []
-        self._rebuild_client()
+        self._rebuild_client(keep_cookies=True)
         try:
             yield
         finally:
             self._embed = saved_embed
             self._embed_origin = saved_origin
             self._embed_referers = saved_referers
-            self._rebuild_client()
+            self._rebuild_client(keep_cookies=True)
 
     # ------------------------------------------------------------------
     # Native-TLS fallback (urllib / system OpenSSL)
@@ -3114,23 +3166,30 @@ class BaseSession:
             return False
         return path.endswith("/") or request_path[len(path) :].startswith("/")
 
-    def _record_cookie_scope(
-        self,
+    @staticmethod
+    def _cookie_scope_key(
         raw_set_cookie: str,
         url: str,
         *,
         domain: str | None = None,
         path: str | None = None,
         host_only: bool | None = None,
-    ) -> None:
-        """Remember the host-only bit that wreq omits from Cookie objects."""
+    ) -> tuple[tuple[str, str, str], bool] | None:
+        """The ``(name, domain, path)`` identity and host-only bit of a cookie.
+
+        Read from a Set-Cookie value as RFC 6265 stores it: no Domain means
+        the request host and host-only, a missing or relative Path means the
+        URL's default path. ``domain``/``path``/``host_only`` override what the
+        header says (a browser cookie arrives with them already resolved).
+        None for a value with no cookie name.
+        """
 
         if not isinstance(raw_set_cookie, str):
-            return
+            return None
         first, *parts = raw_set_cookie.split(";")
         name, separator, _value = first.strip().partition("=")
         if not separator or not name:
-            return
+            return None
         attributes: dict[str, str] = {}
         for part in parts:
             key, has_value, value = part.strip().partition("=")
@@ -3144,7 +3203,7 @@ class BaseSession:
         normalized_domain = (raw_domain or request_host).lstrip(".").lower()
         normalized_domain = normalized_domain.rstrip(".")
         if not normalized_domain:
-            return
+            return None
 
         raw_path = path if path is not None else attributes.get("path")
         normalized_path = raw_path or ""
@@ -3153,17 +3212,273 @@ class BaseSession:
 
         if host_only is None:
             host_only = domain is None and "domain" not in attributes
-        key = (name, normalized_domain, normalized_path)
+        return (name, normalized_domain, normalized_path), bool(host_only)
+
+    def _record_cookie_scope(
+        self,
+        raw_set_cookie: str,
+        url: str,
+        *,
+        domain: str | None = None,
+        path: str | None = None,
+        host_only: bool | None = None,
+    ) -> None:
+        """Remember the host-only bit that wreq omits from Cookie objects."""
+
+        scope = self._cookie_scope_key(
+            raw_set_cookie, url, domain=domain, path=path, host_only=host_only
+        )
+        if scope is None:
+            return
+        key, host_only = scope
         # Refresh recency: re-assigning an existing dict key keeps its original
         # insertion position, so without the pop a cookie that is rewritten on
         # every response would still age out ahead of one-shot entries.
         self._cookie_scopes.pop(key, None)
-        self._cookie_scopes[key] = bool(host_only)
+        self._cookie_scopes[key] = host_only
         # A session that walks many hosts would otherwise grow this map for
         # its whole lifetime. Evict oldest-first; a dropped entry only costs
         # get_cookie() its parent-domain lookup for that cookie.
         while len(self._cookie_scopes) > _MAX_COOKIE_SCOPES:
             self._cookie_scopes.pop(next(iter(self._cookie_scopes)), None)
+
+    def _remember_caller_cookie(self, raw_set_cookie: str, url: str) -> None:
+        """Mark a cookie set with ``add_cookie()`` as the caller's own.
+
+        Only the identity is kept: what a browser context is seeded with is
+        the jar's value when it starts, so a later Set-Cookie on the same
+        name, domain and path is carried as the session's own requests would
+        carry it. The one attribute recorded is an explicit ``SameSite=None``,
+        which wreq's Cookie cannot report (it has only Lax and Strict flags).
+        Bounded like ``_cookie_scopes``; an evicted entry is simply no longer
+        seeded.
+        """
+
+        scope = self._cookie_scope_key(raw_set_cookie, url)
+        if scope is None:
+            return
+        key, host_only = scope
+        first, *parts = raw_set_cookie.split(";")
+        same_site_none = None
+        for part in parts:
+            attribute, _sep, attribute_value = part.strip().partition("=")
+            if attribute.strip().lower() == "samesite":
+                same_site_none = (
+                    first.strip().partition("=")[2].strip()
+                    if attribute_value.strip().lower() == "none"
+                    else None
+                )
+        self._caller_cookies.pop(key, None)
+        self._caller_cookies[key] = (host_only, same_site_none)
+        while len(self._caller_cookies) > _MAX_CALLER_COOKIES:
+            self._caller_cookies.pop(next(iter(self._caller_cookies)), None)
+
+    def _browser_seed_cookies(self, *urls: str | None) -> list[dict]:
+        """The caller's cookies to seed a browser context navigating ``urls``.
+
+        Every render and solve runs in a fresh context, so without this the
+        browser never saw a cookie the caller set with ``add_cookie()``: the
+        page loaded with the site's defaults for the IP (an AliExpress
+        currency pin came back priced in the egress country's currency), and
+        the site's default then replaced the caller's value in the jar.
+
+        Seeds only caller cookies, at their current jar value and scope, on
+        the registrable domain of a URL the browser will navigate. Nothing the
+        session earned itself is seeded, so a solve's context is as fresh as
+        before for every other cookie. WAF clearance and sensor cookies are
+        never seeded, even the caller's (``is_waf_cookie``). Returns
+        Playwright ``add_cookies`` entries; Domain cookies carry a leading
+        dot, host-only cookies their exact host. Never raises.
+        """
+
+        caller_cookies = self._caller_cookies
+        if not caller_cookies:
+            return []
+        registrables = set()
+        for target in urls:
+            if not target:
+                continue
+            try:
+                host = (urlparse(target).hostname or "").lower().rstrip(".")
+            except ValueError:
+                continue
+            if host:
+                registrables.add(registrable_domain(host))
+        if not registrables:
+            return []
+        jar = getattr(getattr(self, "_client", None), "cookie_jar", None)
+        if jar is None:
+            return []
+        try:
+            cookies = jar.get_all()
+        except Exception:
+            logger.debug("Cookie jar read failed for browser seeding", exc_info=True)
+            return []
+        host_only_hosts: dict[tuple[str, str], list[str]] = {}
+        for (name, domain, path), (host_only, _none) in caller_cookies.items():
+            if host_only:
+                host_only_hosts.setdefault((name, path), []).append(domain)
+
+        now = time.time()
+        seeds: list[dict] = []
+        # Host-only owners already given to a jar entry. Two hosts can hold
+        # the same name, path and value; each entry takes a different one.
+        claimed: set[tuple[str, str, str]] = set()
+        for cookie in cookies:
+            try:
+                name = cookie.name or ""
+                value = cookie.value
+                path = cookie.path or "/"
+                stored = (cookie.domain or "").lstrip(".").lower().rstrip(".")
+                if stored:
+                    # A Domain cookie: wreq reports the attribute's domain.
+                    record = caller_cookies.get((name, stored, path))
+                    if record is None or record[0]:
+                        continue
+                    domain, browser_domain = stored, "." + stored
+                else:
+                    # Host-only: wreq reports no domain, so find the host the
+                    # caller set it on.
+                    domain = ""
+                    for host in host_only_hosts.get((name, path), ()):
+                        if (name, path, host) in claimed:
+                            continue
+                        if self._jar_host_only_copy(jar, cookie, host):
+                            domain = host
+                            claimed.add((name, path, host))
+                            break
+                    if not domain:
+                        continue
+                    record = caller_cookies[(name, domain, path)]
+                    browser_domain = domain
+                if not isinstance(value, str) or registrable_domain(
+                    domain
+                ) not in registrables:
+                    continue
+                if is_waf_cookie(name, domain):
+                    logger.debug(
+                        "Not seeding WAF cookie %s into the browser", name
+                    )
+                    continue
+                expires = None
+                max_age = getattr(cookie, "max_age", None)
+                cookie_expires = getattr(cookie, "expires", None)
+                if max_age is not None:
+                    expires = now + max_age.total_seconds()
+                elif cookie_expires is not None:
+                    expires = cookie_expires.timestamp()
+                if expires is not None and expires <= now:
+                    continue
+                seed = {
+                    "name": name,
+                    "value": value,
+                    "domain": browser_domain,
+                    "path": path,
+                    "secure": bool(getattr(cookie, "secure", False)),
+                    "httpOnly": bool(getattr(cookie, "http_only", False)),
+                }
+                if expires is not None:
+                    seed["expires"] = float(expires)
+                if getattr(cookie, "same_site_strict", False):
+                    seed["sameSite"] = "Strict"
+                elif getattr(cookie, "same_site_lax", False):
+                    seed["sameSite"] = "Lax"
+                elif record[1] is not None and record[1] == value:
+                    # Still the value the caller added with SameSite=None.
+                    seed["sameSite"] = "None"
+                seeds.append(seed)
+            except Exception:
+                logger.debug("Skipping unreadable jar cookie for seeding")
+        return seeds
+
+    @staticmethod
+    def _jar_host_only_copy(jar, cookie, host: str) -> bool:
+        """Whether ``cookie`` is the host-only cookie the jar holds on ``host``.
+
+        ``_jar_host_only_owner`` with every attribute wreq reports compared
+        too, so same-valued cookies on sibling hosts that differ in Secure,
+        HttpOnly, SameSite or lifetime are not swapped.
+        """
+        netloc = f"[{host}]" if ":" in host else host
+        try:
+            match = jar.get(cookie.name, f"https://{netloc}{cookie.path or '/'}")
+        except Exception:
+            return False
+        if match is None or match.domain is not None:
+            return False
+        attributes = (
+            "value",
+            "secure",
+            "http_only",
+            "same_site_lax",
+            "same_site_strict",
+            "expires",
+            "max_age",
+        )
+        return all(
+            getattr(match, attribute, None) == getattr(cookie, attribute, None)
+            for attribute in attributes
+        )
+
+    @staticmethod
+    def _seed_expiry_unchanged(sent, got, now: float) -> bool:
+        """Whether a returned cookie's expiry is the one it was seeded with.
+
+        A session cookie comes back as ``-1``. A persistent one comes back
+        with the same instant, or at Chrome's 400-day cap when it was seeded
+        with a later one (a day's slack covers the time the solve took).
+        """
+        got = float(got) if isinstance(got, (int, float)) and got > 0 else None
+        if sent is None:
+            return got is None
+        if got is None:
+            return False
+        if abs(got - sent) <= 2:
+            return True
+        return got < sent and got >= now + _CHROME_COOKIE_MAX_AGE - 86400
+
+    @classmethod
+    def _without_seeded_cookies(cls, cookies, seeded: list[dict]) -> list:
+        """Browser cookies minus the seeded ones it handed back unchanged.
+
+        A seeded cookie is already in the jar. Coming back exactly as it went
+        in, it was not earned: it proves no solve (a Reddit bootstrap, a
+        ``browser_prime``), and adopting it would only write the caller's
+        cookie to ``cache_dir`` as solver state. One the page reissued with
+        any difference (its value, Secure, HttpOnly, SameSite or lifetime) is
+        the site's answer and is kept, so it replaces the jar's copy as a
+        transport Set-Cookie would. Chrome reports an unspecified SameSite as
+        Lax.
+        """
+
+        cookies = list(cookies or [])
+        if not seeded:
+            return cookies
+        sent = {(c["name"], c["domain"].lower(), c["path"]): c for c in seeded}
+        now = time.time()
+
+        def unchanged(cookie) -> bool:
+            if not isinstance(cookie, dict):
+                return False
+            seed = sent.get(
+                (
+                    cookie.get("name"),
+                    str(cookie.get("domain") or "").lower(),
+                    cookie.get("path") or "/",
+                )
+            )
+            return (
+                seed is not None
+                and cookie.get("value") == seed["value"]
+                and bool(cookie.get("secure")) == seed["secure"]
+                and bool(cookie.get("httpOnly")) == seed["httpOnly"]
+                and (cookie.get("sameSite") or "Lax") == seed.get("sameSite", "Lax")
+                and cls._seed_expiry_unchanged(
+                    seed.get("expires"), cookie.get("expires"), now
+                )
+            )
+
+        return [cookie for cookie in cookies if not unchanged(cookie)]
 
     @staticmethod
     def _radware_fingerprint(entries: list[dict]) -> str:

@@ -229,6 +229,63 @@ def _valid_browser_url(value: str) -> bool:
     )
 
 
+_SEED_COOKIE_FIELDS = (
+    "name",
+    "value",
+    "domain",
+    "path",
+    "expires",
+    "httpOnly",
+    "secure",
+    "sameSite",
+)
+
+
+def _seed_context_cookies(context, cookies) -> int:
+    """Add ``cookies`` to a fresh context, one at a time; return how many took.
+
+    Chrome refuses a cookie it considers invalid (a ``__Host-`` cookie with a
+    domain, a ``__Secure-`` one without Secure), and Playwright then fails the
+    whole batch, so each goes in alone and a refused one is skipped. Only the
+    Playwright cookie fields are passed, and an entry must name its domain and
+    path: a bare ``url`` entry would let a custom caller scope a cookie to
+    whatever host it names without saying so.
+    """
+
+    added = 0
+    for cookie in cookies or ():
+        if not isinstance(cookie, dict):
+            continue
+        name = cookie.get("name")
+        value = cookie.get("value")
+        domain = cookie.get("domain")
+        path = cookie.get("path")
+        if not (
+            isinstance(name, str)
+            and name
+            and isinstance(value, str)
+            and isinstance(domain, str)
+            and domain.strip(".")
+            and isinstance(path, str)
+            and path.startswith("/")
+        ):
+            logger.debug("Skipping malformed seed cookie")
+            continue
+        entry = {
+            key: cookie[key] for key in _SEED_COOKIE_FIELDS if key in cookie
+        }
+        try:
+            context.add_cookies([entry])
+            added += 1
+        except Exception as exc:
+            logger.debug(
+                "Browser refused seed cookie %s (%s)", name, type(exc).__name__
+            )
+    if added:
+        logger.debug("Seeded %d cookie(s) into the browser context", added)
+    return added
+
+
 def _cookie_structure(cookies: list[dict]) -> list[dict[str, object]]:
     """Return a bounded, value-free cookie diagnostic summary."""
 
@@ -3960,8 +4017,17 @@ class BrowserSolver:
             )
         return self._viewport
 
-    def _create_context(self, *, storage_state: dict | None = None):
-        """Create a new browser context with realistic settings."""
+    def _create_context(
+        self,
+        *,
+        storage_state: dict | None = None,
+        cookies: list[dict] | None = None,
+    ):
+        """Create a new browser context with realistic settings.
+
+        ``cookies`` (Playwright ``add_cookies`` entries) are added before any
+        page opens, so the first navigation already carries them.
+        """
         kwargs: dict = {}
         if storage_state is not None:
             kwargs["storage_state"] = storage_state
@@ -3996,7 +4062,10 @@ class BrowserSolver:
         # A context-level one only adds Playwright's own metadata, which
         # reports architecture x86 and platformVersion 10.15.7 in every
         # cross-site iframe whatever the host.
-        return self._browser.new_context(**kwargs)
+        context = self._browser.new_context(**kwargs)
+        if cookies:
+            _seed_context_cookies(context, cookies)
+        return context
 
     @staticmethod
     def _bounded_page_content(page, max_size: int | None) -> str:
@@ -5060,8 +5129,15 @@ class BrowserSolver:
         embedder: str | None = None,
         replay: dict | None = None,
         max_size: int | None = None,
+        *,
+        cookies: list[dict] | None = None,
     ) -> SolveResult | None:
-        """Solve on the dedicated worker within one end-to-end deadline."""
+        """Solve on the dedicated worker within one end-to-end deadline.
+
+        ``cookies``: Playwright ``add_cookies`` entries the fresh context
+        starts with (a session passes the caller's own cookies for the site).
+        A cookie Chrome refuses is skipped.
+        """
 
         if threading.get_ident() == self._worker_ident:
             return self._solve_on_worker(
@@ -5071,6 +5147,7 @@ class BrowserSolver:
                 embedder,
                 replay,
                 max_size,
+                cookies=cookies,
             )
         if self._worker_lost("solve"):
             return None
@@ -5092,6 +5169,7 @@ class BrowserSolver:
             replay,
             max_size,
             _deadline=deadline,
+            cookies=cookies,
         )
         try:
             return future.result(timeout=solve_timeout)
@@ -5116,6 +5194,7 @@ class BrowserSolver:
         max_size: int | None = None,
         *,
         _deadline: float | None = None,
+        cookies: list[dict] | None = None,
     ) -> SolveResult | None:
         """Solve a WAF challenge by navigating in a real browser.
 
@@ -5197,10 +5276,11 @@ class BrowserSolver:
                     from wafer.browser._brave import brave_storage_state
 
                     context = self._create_context(
-                        storage_state=brave_storage_state(replay)
+                        storage_state=brave_storage_state(replay),
+                        cookies=cookies,
                     )
                 else:
-                    context = self._create_context()
+                    context = self._create_context(cookies=cookies)
                 page = context.new_page()
                 self._setup_headless_patches(
                     page,
@@ -5777,6 +5857,7 @@ class BrowserSolver:
         max_size: int | None = None,
         *,
         challenge_budget: float | None = None,
+        cookies: list[dict] | None = None,
     ) -> SolveResult | None:
         """Navigate ``url`` and return the settled document as a passthrough.
 
@@ -5802,10 +5883,13 @@ class BrowserSolver:
         on a challenge whose solve can outrun ``timeout`` (a reCAPTCHA that
         escalates to image grids) run that long instead; it never shortens
         ``timeout``.
+
+        ``cookies``: Playwright ``add_cookies`` entries the fresh context
+        starts with, as for :meth:`solve`.
         """
 
         if threading.get_ident() == self._worker_ident:
-            return self._render_on_worker(url, timeout, max_size)
+            return self._render_on_worker(url, timeout, max_size, cookies=cookies)
         if self._worker_lost("render"):
             return None
         if not _valid_browser_url(url):
@@ -5823,6 +5907,7 @@ class BrowserSolver:
             max_size,
             _deadline=budget["deadline"],
             _budget=budget,
+            cookies=cookies,
         )
         while True:
             # The worker moves the deadline when it lands on a slow challenge.
@@ -5851,6 +5936,7 @@ class BrowserSolver:
         *,
         _deadline: float | None = None,
         _budget: dict | None = None,
+        cookies: list[dict] | None = None,
     ) -> SolveResult | None:
         """Render ``url`` on the dedicated worker and capture the DOM."""
 
@@ -5888,7 +5974,7 @@ class BrowserSolver:
 
             context = None
             try:
-                context = self._create_context()
+                context = self._create_context(cookies=cookies)
                 page = context.new_page()
                 self._setup_headless_patches(page, challenge_type=None)
                 size_guard = self._install_navigation_size_limit(page, max_size)
@@ -6709,6 +6795,8 @@ class BrowserSolver:
         embedder: str | None = None,
         replay: dict | None = None,
         max_size: int | None = None,
+        *,
+        cookies: list[dict] | None = None,
     ) -> "SolveResult | None":
         """Async wrapper around :meth:`solve` - identical args and result.
 
@@ -6742,16 +6830,20 @@ class BrowserSolver:
                     replay,
                     max_size,
                     _deadline=deadline,
+                    cookies=cookies,
                 )
             args = (url, challenge_type, solve_timeout, embedder, replay)
             from wafer._base import _callable_accepts_keyword
 
-            if max_size is None or not _callable_accepts_keyword(
+            extra = {}
+            if max_size is not None and _callable_accepts_keyword(
                 solve_callable,
                 "max_size",
             ):
-                return solve_callable(*args)
-            return solve_callable(*args, max_size=max_size)
+                extra["max_size"] = max_size
+            if cookies and _callable_accepts_keyword(solve_callable, "cookies"):
+                extra["cookies"] = cookies
+            return solve_callable(*args, **extra)
 
         future = self._submit_on_worker(invoke_solve)
         try:
@@ -6792,6 +6884,7 @@ class BrowserSolver:
         max_size: int | None = None,
         *,
         challenge_budget: float | None = None,
+        cookies: list[dict] | None = None,
     ) -> "SolveResult | None":
         """Async wrapper around :meth:`render` - identical args and result.
 
@@ -6823,15 +6916,19 @@ class BrowserSolver:
                     max_size,
                     _deadline=deadline,
                     _budget=budget,
+                    cookies=cookies,
                 )
             from wafer._base import _callable_accepts_keyword
 
-            if max_size is None or not _callable_accepts_keyword(
+            extra = {}
+            if max_size is not None and _callable_accepts_keyword(
                 render_callable,
                 "max_size",
             ):
-                return render_callable(url, render_timeout)
-            return render_callable(url, render_timeout, max_size=max_size)
+                extra["max_size"] = max_size
+            if cookies and _callable_accepts_keyword(render_callable, "cookies"):
+                extra["cookies"] = cookies
+            return render_callable(url, render_timeout, **extra)
 
         future = self._submit_on_worker(invoke_render)
         wrapped = asyncio.wrap_future(future)
