@@ -204,7 +204,9 @@ class TestPageCommands:
         # Without metadata Chrome drops sec-ch-ua, or fills it from the binary.
         params = _ua_override_params(_UA, "154.0.8037.98")
         assert params["userAgent"] == _UA
-        assert params["acceptLanguage"] == "en-US,en"
+        # The languages come from --accept-lang: an acceptLanguage here moves
+        # Accept-Language up behind User-Agent, which Akamai refuses.
+        assert "acceptLanguage" not in params
         metadata = params["userAgentMetadata"]
         assert metadata["fullVersion"] == "154.0.8037.98"
         assert any(b["brand"] == "Google Chrome" for b in metadata["brands"])

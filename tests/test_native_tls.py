@@ -885,7 +885,22 @@ def test_browser_replay_descriptor():
     session, _ = make_sync_session([])
     # GET: no body.
     r = session._browser_replay("GET", {})
-    assert r == {"method": "GET", "body": None, "content_type": None}
+    assert r == {
+        "method": "GET", "body": None, "body_b64": None, "content_type": None,
+        "body_unavailable": False, "headers": {}, "follow_redirects": True,
+        "max_redirects": 10, "redirects_left": 10,
+    }
+    # Redirects the session already followed come off the budget.
+    assert session._browser_replay("GET", {}, None, 4)["redirects_left"] == 6
+    assert session._browser_replay("GET", {}, None, 12)["redirects_left"] == 0
+    # A multipart= body is wreq's own object and cannot be remade in a page.
+    assert session._browser_replay("POST", {"multipart": object()})[
+        "body_unavailable"
+    ] is True
+    # The caller's own request headers ride along (a Kasada signed replay
+    # sends them).
+    r = session._browser_replay("GET", {}, {"client_id": "USBC"})
+    assert r["headers"] == {"client_id": "USBC"}
     # POST form: urlencoded body + content type, method upper-cased.
     r = session._browser_replay("post", {"form": {"Area": "Ottawa"}})
     assert r["method"] == "POST"

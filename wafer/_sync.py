@@ -1,6 +1,7 @@
 """SyncSession -- synchronous HTTP client wrapping wreq.blocking.Client."""
 
 import datetime
+import json
 import logging
 import time
 
@@ -37,6 +38,7 @@ from wafer._challenge import (
     TERMINAL_CHALLENGES,
     ChallengeType,
     detect_challenge,
+    is_kasada_api_refusal,
 )
 from wafer._cookies import (
     browser_cookie_matches_host,
@@ -94,8 +96,10 @@ from wafer._solvers import (
     REDDIT_OUTCOME_VERIFICATION_STRUCTURE,
     REDDIT_OUTCOME_VERIFICATION_TOO_LARGE,
     REDDIT_VERIFICATION_MAX_BYTES,
+    akamai_interstitial_next,
     format_reddit_cookie_names,
     is_reddit_captcha_gate,
+    parse_akamai_interstitial,
     parse_amazon_captcha,
     parse_reddit_verification,
     reddit_cookie_names,
@@ -606,6 +610,41 @@ class SyncSession(BaseSession):
                     ", ".join(c.name for c in gate_cookies),
                 )
                 return True
+
+        elif challenge == ChallengeType.AKAMAI:
+            # Akamai's bm-verify interstitial: make the page's own POST over
+            # the transport and replay (see parse_akamai_interstitial). Every
+            # other Akamai challenge is the browser's.
+            target = parse_akamai_interstitial(body, url)
+            if target:
+                try:
+                    sub_kw = {"timeout": sub_timeout} if sub_timeout is not None else {}
+                    # The script's synchronous XHR from the page, its body as
+                    # JSON.stringify writes it.
+                    xhr_headers, xhr_kw = self._page_xhr_headers(
+                        target["url"], url, {"Content-Type": "application/json"}
+                    )
+                    verify = self._client.post(
+                        target["url"],
+                        body=json.dumps(target["json"], separators=(",", ":")),
+                        headers=xhr_headers,
+                        **xhr_kw,
+                        **sub_kw,
+                    )
+                    status = verify.status.as_int()
+                    answer = (_read_body_capped(verify, 64_000)).decode(
+                        "utf-8", errors="replace"
+                    )
+                    if 200 <= status < 300:
+                        self._cache_response_cookies(target["url"], verify)
+                        logger.info("Akamai interstitial answered inline")
+                        following = akamai_interstitial_next(answer, url)
+                        return True if following == url else following
+                    logger.debug(
+                        "Akamai interstitial verify answered HTTP %d", status
+                    )
+                except Exception:
+                    logger.debug("Akamai interstitial inline answer failed")
 
         elif challenge == ChallengeType.AMAZON:
             target = parse_amazon_captcha(body, url)
@@ -2264,6 +2303,20 @@ class SyncSession(BaseSession):
                 and _is_challengeable_content_type(content_type)
                 else None
             )
+            if (
+                challenge is None
+                and self._profile not in (Profile.OPERA_MINI, Profile.DART)
+                and is_kasada_api_refusal(status, headers, content_type)
+            ):
+                # A signed Kasada API refuses an unsigned call with a bare
+                # 403/429 in its own content type (costco.com: empty
+                # text/plain). The x-kpsdk headers are Kasada's, never an
+                # origin API's, so the content-type exemption does not apply.
+                logger.info(
+                    "Challenge detected (header): kasada API refusal (%s)",
+                    content_type or "no content type",
+                )
+                challenge = ChallengeType.KASADA
             if challenge == ChallengeType.REDDIT and not reddit_response:
                 challenge = None
             # A cold Reddit page can get the reCAPTCHA gate (a fresh real
@@ -2605,10 +2658,13 @@ class SyncSession(BaseSession):
                         challenge,
                         current_url,
                         deadline,
-                        embedder=self._imperva_embedder(
-                            challenge, current_url, extra_headers, kwargs, body
+                        embedder=self._solve_embedder(
+                            challenge, current_url, extra_headers, kwargs, body,
+                            method, content_type,
                         ),
-                        replay=self._browser_replay(method, kwargs),
+                        replay=self._browser_replay(
+                            method, kwargs, extra_headers, redirects_followed
+                        ),
                         max_size=max_response_size,
                         challenge_url=(
                             _tmd_punish_url_from_body(body, current_url)
@@ -2684,10 +2740,18 @@ class SyncSession(BaseSession):
                             challenge,
                             current_url,
                             deadline,
-                            embedder=self._imperva_embedder(
-                                challenge, current_url, extra_headers, kwargs, body
+                            embedder=self._solve_embedder(
+                                challenge,
+                                current_url,
+                                extra_headers,
+                                kwargs,
+                                body,
+                                method,
+                                content_type,
                             ),
-                            replay=self._browser_replay(method, kwargs),
+                            replay=self._browser_replay(
+                                method, kwargs, extra_headers, redirects_followed
+                            ),
                             max_size=max_response_size,
                             defer_cache=pending_browser_cookies,
                         )

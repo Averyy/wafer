@@ -15,7 +15,7 @@ from collections import OrderedDict
 from dataclasses import replace
 from html import unescape
 from typing import Any
-from urllib.parse import parse_qs, urlencode, urljoin, urlparse
+from urllib.parse import parse_qs, urlencode, urljoin, urlparse, urlsplit, urlunsplit
 
 from wreq import CertStore, Emulation, Method
 
@@ -29,10 +29,12 @@ from wafer._cookies import (
 )
 from wafer._dart import DartIdentity
 from wafer._fingerprint import (
+    CHROME_NAVIGATION_ACCEPTS,
     HIGH_ENTROPY_HINTS,
     ROTATION_LADDER,
     FingerprintManager,
     build_fingerprint_envelope,
+    chrome_navigation_accept,
     chrome_version_from_ua,
     chromium_navigation_order,
     embed_header_family,
@@ -44,6 +46,7 @@ from wafer._fingerprint import (
     emulation_major_version,
     emulation_user_agent,
     family_headers,
+    presented_chrome_version,
     wreq_emulation,
 )
 from wafer._ios import IOSSafariIdentity
@@ -468,11 +471,10 @@ else:
 DEFAULT_EMULATION = Emulation.Chrome154
 
 DEFAULT_HEADERS = {
-    "Accept": (
-        "text/html,application/xhtml+xml,application/xml;q=0.9,"
-        "image/avif,image/webp,image/apng,*/*;q=0.8,"
-        "application/signed-exchange;v=b3;q=0.7"
-    ),
+    # The presented default Chrome's (see _fingerprint._WIRE_IDENTICAL_RELEASES):
+    # 156+ names image/jxl. A session presenting an older Chrome sends that
+    # version's form instead (_compute_client_headers).
+    "Accept": chrome_navigation_accept(presented_chrome_version(DEFAULT_EMULATION)),
     "Accept-Language": "en-US,en;q=0.9",
     "Accept-Encoding": "gzip, deflate, br, zstd",
     "Upgrade-Insecure-Requests": "1",
@@ -1608,6 +1610,22 @@ class BaseSession:
             # Low-entropy only; the high-entropy hints go per request to the
             # origins that asked for them (_build_headers).
             headers.update(self._fingerprint.sec_ch_ua_headers(high_entropy=False))
+            # Chrome's navigation Accept depends on its version (156+ names
+            # image/jxl): match the version on the wire, a rotated profile's
+            # or a solving browser's. Only wafer's own envelope is touched; a
+            # caller's headers= Accept is theirs, whatever its value.
+            if (
+                not self._user_headers
+                and emulation_family(self._fingerprint.current) == "chrome"
+            ):
+                for key in list(headers):
+                    if (
+                        key.lower() == "accept"
+                        and headers[key] in CHROME_NAVIGATION_ACCEPTS
+                    ):
+                        headers[key] = chrome_navigation_accept(
+                            self._fingerprint.presented_version
+                        )
 
         if self._embed:
             # Strip Sec-Fetch-* from client level. _build_headers sets
@@ -1646,6 +1664,10 @@ class BaseSession:
             if "user-agent" not in present:
                 headers["User-Agent"] = emulation_user_agent(current)
             fallback = family_headers(emulation_family(current)) or {}
+            if emulation_family(current) == "chrome" and "Accept" in fallback:
+                fallback["Accept"] = chrome_navigation_accept(
+                    self._fingerprint.presented_version
+                )
             for name in ("Accept", "Accept-Language", "Accept-Encoding"):
                 if name.lower() not in present and name in fallback:
                     headers[name] = fallback[name]
@@ -2023,6 +2045,56 @@ class BaseSession:
         )
         return {k: v for k, v in headers.items() if v != ""}, {
             "default_headers": False
+        }
+
+    def _page_xhr_headers(
+        self, url: str, page_url: str, extra: dict[str, str]
+    ) -> tuple[dict[str, str], dict]:
+        """Headers (and extra wreq kwargs) for an XHR a page's script sends to
+        its own origin (Akamai's interstitial verify POST).
+
+        A Chromium navigation client carries navigation-only headers
+        (Upgrade-Insecure-Requests, Sec-Fetch-User) that a per-request header
+        cannot remove, so the full set goes with wreq's defaults off, as for
+        a Reddit bootstrap leg. *extra* (Content-Type and the like) is added.
+        """
+        page = urlparse(page_url)
+        fetch = {
+            "Accept": "*/*",
+            "Origin": f"{page.scheme}://{page.netloc}",
+            "Referer": page_url,
+            "Sec-Fetch-Site": self._sec_fetch_relation(page_url, url),
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Dest": "empty",
+            **extra,
+        }
+        # Any desktop Chrome/Edge session, embed modes included: an iframe
+        # session's client headers are an iframe navigation's, and its order.
+        if not self._is_chromium_navigation() and not (
+            self._embed and self._embed_header_kind() == "chromium"
+        ):
+            return self._build_headers(url, fetch), {}
+        headers = {
+            k: v
+            for k, v in self._client_headers.items()
+            if k.lower()
+            not in (
+                "upgrade-insecure-requests", "sec-fetch-user", "cache-control",
+                "x-requested-with",
+            )
+        }
+        requested = self._accept_ch.get(self._hint_origin(url) or "")
+        if requested:
+            for name, value in self._fingerprint.sec_ch_ua_headers().items():
+                if name in requested:
+                    headers[name] = value
+        headers.update(fetch)
+        headers["Priority"] = "u=1, i"
+        # Chrome's captured fetch()/XHR order (docs/ref-sec-fetch.md); the
+        # script sets only Content-Type, as a fetch() with a JSON body does.
+        return {k: v for k, v in headers.items() if v != ""}, {
+            "default_headers": False,
+            "orig_headers": embed_header_order("chromium", "xhr"),
         }
 
     def _script_navigation_headers(
@@ -2944,6 +3016,66 @@ class BaseSession:
             merged.update(hdrs)
         return imperva_embedder(url, merged, body)
 
+    def _solve_embedder(
+        self, challenge, url, extra_headers, kwargs, body=None,
+        method="GET", content_type="",
+    ):
+        """Origin page a browser solve should navigate instead of *url*, or None.
+
+        Imperva's API hosts (see ``_imperva_embedder``) and Kasada's signed
+        APIs (see ``_kasada_embedder``) both have to be reached from a page on
+        the site; every other challenge is solved on *url* itself.
+        """
+        embedder = self._imperva_embedder(
+            challenge, url, extra_headers, kwargs, body
+        )
+        # A signed Kasada call is the caller's request remade in the page, so
+        # one whose body cannot be remade (see _browser_replay) is not made
+        # there: the usual solve leaves the retry to wreq, which still has it.
+        if embedder is None and kwargs.get("multipart") is None:
+            embedder = self._kasada_embedder(
+                challenge, url, extra_headers, method, content_type
+            )
+        return embedder
+
+    def _kasada_embedder(self, challenge, url, extra_headers, method, content_type):
+        """The page a Kasada-signed API call is made from, or None.
+
+        A Kasada API answers an unsigned call with a bare 403/429 (not the
+        HTML interstitial a page navigation gets), and only the site's own
+        SDK can sign the retry, from a page on the site. That page is the one
+        the caller says the call comes from: its ``Referer``, else its
+        ``Origin``, else the session's ``embed_origin``. A navigation (a GET
+        answered with HTML) keeps the usual solve on *url*.
+        """
+        from wafer._challenge import ChallengeType
+
+        if challenge != ChallengeType.KASADA or self._browser_solver is None:
+            return None
+        html = (content_type or "").lower().split(";")[0].strip() in (
+            "", "text/html", "application/xhtml+xml",
+        )
+        if str(method).upper() == "GET" and html:
+            return None
+        headers = {
+            str(k).lower(): str(v)
+            for k, v in self._caller_headers(extra_headers).items()
+        }
+        for candidate in (
+            headers.get("referer"),
+            headers.get("origin"),
+            self._embed_origin,
+        ):
+            if not candidate:
+                continue
+            parsed = urlsplit(candidate)
+            if parsed.scheme not in ("http", "https") or not parsed.hostname:
+                continue
+            # A bare origin gets the root path; its query, if any, stays the
+            # query (appending "/" to the string would put it in the query).
+            return urlunsplit(parsed._replace(path=parsed.path or "/"))
+        return None
+
     def _brave_browser_replay(self, replay: dict | None) -> dict:
         """Private browser exchange context: per-session state and pacing."""
         from wafer._brave import BRAVE_COOKIES, BRAVE_ORIGIN
@@ -2965,18 +3097,52 @@ class BaseSession:
             },
         }
 
-    def _browser_replay(self, method, kwargs) -> dict:
+    def _caller_headers(self, extra_headers=None) -> dict[str, str]:
+        """The headers the caller set for a request: its session ``headers=``
+        (when it passed any) under its per-request ones, matched by name
+        without regard to case. wafer's own defaults are not included."""
+        merged: dict[str, tuple[str, str]] = {}
+        if self._user_headers:
+            for name, value in (self.headers or {}).items():
+                merged[str(name).lower()] = (str(name), str(value))
+        for name, value in (extra_headers or {}).items():
+            merged[str(name).lower()] = (str(name), str(value))
+        return dict(merged.values())
+
+    def _browser_replay(
+        self, method, kwargs, headers=None, redirects_followed: int = 0
+    ) -> dict:
         """Replay descriptor (method/body/content-type) for an in-page XHR.
 
-        Lets the Imperva embedder solve re-issue the *original* request -
-        GET or POST with its form/json/body - as a same-site fetch from the
-        origin page, so the caller gets the real response directly.
+        Lets an embedder solve re-issue the *original* request - GET or POST
+        with its form/json/body - as a fetch from the origin page, so the
+        caller gets the real response directly. ``headers`` are the caller's
+        per-request headers, sent with its session ``headers=`` (see
+        ``_caller_headers``): a Kasada API reads its parameters from them
+        (costco.com's ``client_id``, ``locale``), so its signed replay sends
+        them; the Imperva replay does not. ``body_b64`` is the exact body
+        bytes, which the signed replay sends; ``body`` is its text for the
+        Imperva replay.
+
+        ``body_unavailable`` marks a request whose body cannot be remade: a
+        ``multipart=`` body is wreq's own object, which cannot be read back,
+        so an in-page replay would send the request without its upload and
+        could hand back the API's answer to an empty one. ``redirects_left``
+        is what the request may still follow after *redirects_followed*.
         """
+        import base64
+
         body, content_type = self._extract_native_body(kwargs)
         return {
             "method": (method if isinstance(method, str) else "GET").upper(),
             "body": body.decode("utf-8", errors="replace") if body else None,
+            "body_b64": base64.b64encode(body).decode("ascii") if body else None,
             "content_type": content_type,
+            "body_unavailable": kwargs.get("multipart") is not None,
+            "headers": self._caller_headers(headers),
+            "follow_redirects": bool(self.follow_redirects),
+            "max_redirects": self.max_redirects,
+            "redirects_left": max(0, self.max_redirects - redirects_followed),
         }
 
     def _native_transport(self):
@@ -3018,13 +3184,15 @@ class BaseSession:
         for k, v in self.headers.items():
             if k.lower() == "user-agent" and v:
                 return v
-        from wafer._fingerprint import chrome_version, host_user_agent
+        from wafer._fingerprint import host_user_agent
 
+        if self._fingerprint is not None and self._fingerprint.ua_override:
+            return self._fingerprint.ua_override
         major = None
         if self._fingerprint is not None:
-            major = chrome_version(self._fingerprint.current)
+            major = presented_chrome_version(self._fingerprint.current)
         if major is None:
-            major = chrome_version(DEFAULT_EMULATION) or 154
+            major = presented_chrome_version(DEFAULT_EMULATION) or 157
         return host_user_agent(major)
 
     def _native_prepare(

@@ -9,6 +9,7 @@ differently gets recorded as a fact about the site.
 import json
 import os
 import subprocess
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -60,6 +61,20 @@ class TestHeadlessMode:
     def test_linux_headless_does_not_start_maximized(self):
         config = hardened_launch_config(headless=True, platform="linux")
         assert "--start-maximized" not in config.args
+
+
+class TestLanguages:
+    def test_accept_lang_set_natively_on_every_platform(self):
+        # Through the launch, not the CDP UA override: an override's
+        # acceptLanguage sends Accept-Language right after User-Agent instead
+        # of last, and homedepot.com's Akamai denied every such Linux or
+        # Windows navigation outright (2026-11-03).
+        for platform in ("darwin", "linux", "win32"):
+            for headless in (True, False):
+                config = hardened_launch_config(
+                    headless=headless, platform=platform
+                )
+                assert "--accept-lang=en-US,en" in config.args
 
 
 class TestAutomationSignals:
@@ -334,8 +349,8 @@ class TestSolverUsesTheSharedConfig:
     against a configuration wafer itself no longer uses.
     """
 
-    def _launch(self, *, headless, browsers, known_ua=None):
-        solver = BrowserSolver(headless=headless)
+    def _launch(self, *, headless, browsers, known_ua=None, timezone=None):
+        solver = BrowserSolver(headless=headless, timezone=timezone)
         solver._browser_ua = known_ua
         playwright = MagicMock()
         playwright.chromium.launch.side_effect = browsers
@@ -448,11 +463,43 @@ class TestSolverUsesTheSharedConfig:
             solver.close()
 
     def test_no_timezone_leaves_the_environment_alone(self):
-        solver, launches = self._launch(
-            headless=False, browsers=[_browser_reporting(_SCRUBBED_UA)]
-        )
+        # On a host whose clock is not UTC (pinned: a CI runner's is).
+        with patch("wafer.browser._solver._clock_is_utc", return_value=False):
+            solver, launches = self._launch(
+                headless=False, browsers=[_browser_reporting(_SCRUBBED_UA)]
+            )
         try:
             assert "env" not in launches[0].kwargs
+        finally:
+            solver.close()
+
+    def test_an_inherited_utc_clock_becomes_london(self, monkeypatch, caplog):
+        # Kasada refused every signed call from a UTC browser in a container
+        # and accepted every named zone tried (costco.com, 2026-11-03).
+        monkeypatch.delenv("TZ", raising=False)
+        with patch("wafer.browser._solver._clock_is_utc", return_value=True):
+            with caplog.at_level("INFO", logger="wafer"):
+                solver, launches = self._launch(
+                    headless=False, browsers=[_browser_reporting(_SCRUBBED_UA)]
+                )
+        try:
+            assert launches[0].kwargs["env"]["TZ"] == "Europe/London"
+            assert not [r for r in caplog.records if r.levelname == "WARNING"
+                        and "UTC" in r.message]
+            assert any("runs on Europe/London" in r.message for r in caplog.records)
+        finally:
+            solver.close()
+
+    def test_an_explicit_timezone_beats_the_utc_replacement(self, monkeypatch):
+        monkeypatch.delenv("TZ", raising=False)
+        with patch("wafer.browser._solver._clock_is_utc", return_value=True):
+            solver, launches = self._launch(
+                headless=False,
+                browsers=[_browser_reporting(_SCRUBBED_UA)],
+                timezone="America/Toronto",
+            )
+        try:
+            assert launches[0].kwargs["env"]["TZ"] == "America/Toronto"
         finally:
             solver.close()
 
@@ -463,15 +510,18 @@ class TestSolverUsesTheSharedConfig:
             BrowserSolver(timezone=" ")
 
     @pytest.mark.parametrize("utc", [True, False])
-    def test_utc_clock_warns_once(self, utc, caplog):
+    def test_a_tz_naming_utc_is_kept_and_warns_once(self, utc, monkeypatch, caplog):
+        # TZ=UTC is the caller's own choice: kept as it is, and surfaced.
+        monkeypatch.setenv("TZ", "UTC" if utc else "America/Toronto")
         with patch("wafer.browser._solver._clock_is_utc", return_value=utc):
             with caplog.at_level("WARNING", logger="wafer"):
-                solver, _ = self._launch(
+                solver, launches = self._launch(
                     headless=False, browsers=[_browser_reporting(_SCRUBBED_UA)]
                 )
         try:
             warned = [r for r in caplog.records if "Browser clock is UTC" in r.message]
             assert len(warned) == (1 if utc else 0)
+            assert "env" not in launches[0].kwargs
         finally:
             solver.close()
 
@@ -901,6 +951,68 @@ class TestHardenedDriverEnv:
         assert by_session["C"][1][1] == {"userAgent": "CTX"}
         assert by_session["W"] == [("Runtime.runIfWaitingForDebugger", None)]
 
+    def test_input_chrome_never_answers_does_not_hang_the_driver(self):
+        # A mouseMoved in flight when its frame was torn down was never
+        # answered, and Playwright waited for it forever: mouser.com's
+        # DataDome solve sat in mouse.move to its timeout (2026-11-04). Input
+        # is now taken as given after a bound; anything else still waits.
+        pytest.importorskip("patchright")
+        from patchright._impl._driver import compute_driver_executable
+
+        node, cli = compute_driver_executable()
+        connection = os.path.join(
+            os.path.dirname(cli), "lib", "server", "chromium", "crConnection.js"
+        )
+        if not (os.path.isfile(node) and os.path.isfile(connection)):
+            pytest.skip("Patchright driver files not found")
+        script = (
+            "const {CRSession} = require(%s);"
+            "const conn = {_lastId: 0, _closed: false, _sessions: new Map(),"
+            " _rawSend() { return ++this._lastId; }};"
+            "const s = Object.create(CRSession.prototype);"
+            "Object.assign(s, {_connection: conn, _sessionId: 'P',"
+            " _callbacks: new Map(), _crashed: false, _closed: false});"
+            "const keepAlive = setTimeout(() => {}, 30000);"
+            "const t0 = Date.now();"
+            "const settle = (p) => p.then((r) => ['ok', r, Date.now() - t0],"
+            " (e) => ['error', String(e.message), Date.now() - t0]);"
+            "const move = {type: 'mouseMoved'};"
+            "const lost = settle(s.send('Input.dispatchMouseEvent', move));"
+            "const answered = settle(s.send('Input.dispatchMouseEvent', move));"
+            "const refused = settle("
+            " s.send('Input.dispatchKeyEvent', {type: 'keyDown'}));"
+            "let other = 'pending';"
+            "s.send('Runtime.evaluate', {expression: '1'})"
+            " .then(() => { other = 'settled'; });"
+            "s._onMessage({id: 2, result: {chrome: true}});"
+            "s._onMessage({id: 3, error: {message: 'No target'}});"
+            "Promise.all([lost, answered, refused]).then((out) => {"
+            " setTimeout(() => {"
+            "  process.stdout.write(JSON.stringify({out, other}));"
+            "  clearTimeout(keepAlive);"
+            " }, 200);"
+            "});"
+        ) % json.dumps(connection)
+        result = subprocess.run(
+            [node, "--require", _DRIVER_PRELOAD, "-e", script],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert result.returncode == 0, result.stderr
+        report = json.loads(result.stdout)
+        lost, answered, refused = report["out"]
+        # Never answered: taken as given once the bound passes.
+        assert lost[:2] == ["ok", {}]
+        assert 2500 <= lost[2] < 10000
+        # Chrome's own answer, and its errors, still come through at once.
+        assert answered[:2] == ["ok", {"chrome": True}]
+        assert answered[2] < 1000
+        assert refused[0] == "error" and "No target" in refused[1]
+        assert refused[2] < 1000
+        # Only input is bounded.
+        assert report["other"] == "pending"
+
 
 class TestRealDisplay:
     """Headless macOS describes the Mac's real display to Chrome natively."""
@@ -1074,6 +1186,127 @@ class TestDriverLoss:
             assert solver._driver_lost is False
             process.terminate.assert_called_once()
         finally:
+            solver._playwright = None
+            solver.close()
+
+    @staticmethod
+    def _relaunch(solver):
+        """Run _ensure_browser with a fresh driver; return (start, launch) mocks."""
+        playwright = MagicMock()
+        playwright.chromium.launch.return_value = _browser_reporting(_RAW_UA)
+        with (
+            patch("patchright.sync_api.sync_playwright") as sync_playwright,
+            patch.object(solver, "_ensure_browser_installed"),
+            patch.object(
+                solver, "_expected_browser_version", return_value="149.0.7827.201"
+            ),
+            patch.object(solver, "_browser_executable", return_value="/bin/chrome"),
+        ):
+            sync_playwright.return_value.start.return_value = playwright
+            solver._ensure_browser()
+        return sync_playwright.return_value.start, playwright.chromium.launch
+
+    def test_an_interrupted_browser_is_relaunched_though_it_reports_connected(self):
+        # fetchaller, 2026-11-04: a Kasada signed call cut off in its SDK wait
+        # left is_connected() True (the disconnect was never pumped), and the
+        # next solve failed at once with TargetClosedError.
+        solver, process = self._solver_with_driver(None)
+        stale_driver = solver._playwright
+        stale = MagicMock()
+        stale.is_connected.return_value = True
+        solver._browser = stale
+        solver._last_used = time.monotonic()
+        busy = MagicMock()
+        busy.done.return_value = False
+        try:
+            solver._recover_timed_out_worker(busy)
+            process.terminate.assert_called_once()
+            start, launch = self._relaunch(solver)
+            stale.close.assert_called_once()
+            stale_driver.stop.assert_called_once()
+            start.assert_called_once()
+            launch.assert_called_once()
+            assert solver._browser is launch.return_value
+            assert solver._browser_interrupted is False
+        finally:
+            solver._browser = None
+            solver._playwright = None
+            solver.close()
+
+    def test_a_connected_browser_is_reused_when_nothing_was_interrupted(self):
+        solver, _process = self._solver_with_driver(None)
+        browser = MagicMock()
+        browser.is_connected.return_value = True
+        solver._browser = browser
+        solver._last_used = time.monotonic()
+        try:
+            start, launch = self._relaunch(solver)
+            start.assert_not_called()
+            launch.assert_not_called()
+            browser.close.assert_not_called()
+            assert solver._browser is browser
+        finally:
+            solver._browser = None
+            solver._playwright = None
+            solver.close()
+
+    def test_a_failed_interrupt_does_not_condemn_the_browser(self):
+        solver, _process = self._solver_with_driver(None)
+        busy = MagicMock()
+        busy.done.return_value = False
+        try:
+            with patch.object(
+                solver, "_interrupt_playwright_transport", return_value=False
+            ):
+                solver._recover_timed_out_worker(busy)
+            assert solver._browser_interrupted is False
+        finally:
+            solver._playwright = None
+            solver.close()
+
+    def test_an_interrupted_browser_is_not_reported_ready(self):
+        from concurrent.futures import Future
+
+        solver, _process = self._solver_with_driver(None)
+        browser = MagicMock()
+        browser.is_connected.return_value = True
+        solver._browser = browser
+        busy = Future()
+        try:
+            solver._recover_timed_out_worker(busy)
+            busy.set_result(None)
+            assert solver.runtime_ready is False
+        finally:
+            solver._browser = None
+            solver._playwright = None
+            solver.close()
+
+    def test_an_operation_finishing_during_recovery_leaves_it_unready(self):
+        # The readiness callback runs the moment the operation finishes; if
+        # that is before the browser is flagged, it saw a connected browser
+        # and marked the solver ready just before the interrupt closed it.
+        from concurrent.futures import Future
+
+        solver, _process = self._solver_with_driver(None)
+        browser = MagicMock()
+        browser.is_connected.return_value = True
+        solver._browser = browser
+        busy = Future()
+        mark = solver._mark_worker_recovering
+
+        def mark_then_finish(future):
+            mark(future)
+            future.set_result(None)
+
+        try:
+            with patch.object(
+                solver, "_mark_worker_recovering", side_effect=mark_then_finish
+            ):
+                solver._recover_timed_out_worker(busy)
+            assert solver.runtime_ready is False
+            assert solver._browser_interrupted is True
+        finally:
+            solver._browser = None
             solver._playwright = None
             solver.close()
 

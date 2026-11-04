@@ -10,6 +10,8 @@
 
 **Integration**: Done. Session cache with 30-min TTL, cookie-based auth for simple deployments. Passthrough mode for dual-WAF sites (browser captures post-solve page content when cookie replay fails due to TLS-bound tokens). CT+CD header injection disabled pending x-kpsdk-h HMAC generation.
 
+**Signed APIs (in-page replay)**: Done (2026-11-03). A deployment that signs each API call refuses an unsigned one with a bare 403/429 in the API's own content type, and the browser makes the call instead, through the SDK's fetch hook. See "Signed API calls" below.
+
 **Validated against real sites**:
 - `realestate.com.au` -server-side 429, browser-solve PASS, cookie auth 5/5 durability (Feb 2026)
 - `hyatt.com` -server-side 429 (also Akamai CDN), browser-solve PASS, cookie auth 5/5, 43 cookies (Feb 2026)
@@ -44,6 +46,29 @@ This is confirmed by multiple commercial Kasada solver APIs (EzCaptcha, Hyper So
 **Other candidates**:
 - `draftkings.com` -2026-02-21: TLS passes Cloudflare on homepage. Kasada presence unverified on deeper pages.
 - Any Kasada site that rejects cookie-only auth with a 429
+
+## Signed API calls
+
+Some deployments sign every call to a protected API rather than a page load. The SDK (`p.js`) wraps the page's `fetch`/`XMLHttpRequest` and adds `x-kpsdk-ct`, `x-kpsdk-cd`, `x-kpsdk-h` and `x-kpsdk-v` to each request to an endpoint its `KPSDK.configure([...])` list names. The server refuses a call without them, cookies or not.
+
+**Measured on `gdx-api.costco.com/catalog/search/api/v1/search` (2026-11-03):**
+
+| Request | Result |
+|---|---|
+| wreq POST, no cookies | 429, empty body, `text/plain;charset=UTF-8`, `x-kpsdk-ct` + `x-kpsdk-r: 1-AA` |
+| wreq POST with every cookie a browser page load earned (`KP_UIDz`, `KP_UIDz-ssn`, ...) | 429, same |
+| The page's own search POST (`www.costco.com/s?keyword=laptop`) | 200, carries all four `x-kpsdk-*` |
+| `fetch()` evaluated in the page's **main world**, `credentials: 'same-origin'` (the site's own mode) | 200, 166KB JSON, all four headers added by the SDK |
+| Same, `credentials: 'include'` | `TypeError: Failed to fetch` (the API's CORS does not allow credentials) |
+| `fetch()` in Patchright's **isolated world** | not signed (the isolated world's `fetch` is the native one) |
+
+So the per-request `x-kpsdk-h` (an HMAC over SDK state wafer cannot reproduce) is the whole gate: CT alone, cookies alone, or CT + a Python CD do not pass.
+
+**What wafer does.** A 403/429 carrying `x-kpsdk-*` headers is classified `kasada` whatever its Content-Type (`is_kasada_api_refusal`; JSON/text responses are otherwise exempt from detection, but no origin API sends those headers). When the refused request is not a plain HTML navigation (it is not a GET, or the refusal is not HTML), the browser solve navigates the page the call comes from instead of the API URL: the caller's `Referer`, else its `Origin`, else the session's `embed_origin`; `solve_origin` overrides all three. It waits for `KPSDK.isReady()` and issues the caller's request (method, body, content type, and the caller's own headers less the ones a page may not set) from the main world through CDP `Runtime.evaluate`, so the SDK's hook signs it. The response comes back as a passthrough. It earns nothing reusable, since each signature is single-use, so every refused call goes through the browser again (about 4-6s each on costco.com, page load included). A request that names no page to come from keeps the old solve on its own URL, and so does a `multipart=` request: wreq's multipart object cannot be read back, and remade without its upload the call could hand back the API's answer to an empty request (the Imperva XHR replay skips it for the same reason). The fetch gets one deadline for both its attempts (credentialed, then same-origin when CORS refuses credentials). It follows redirects itself, and fetch cannot be told how many, so the hops are counted from the page's requests (`redirected_from` chains) and checked against what the session's `max_redirects` still allows; past it, or on any redirect with none left, it raises `TooManyRedirects` as the session's own loop does.
+
+**The signing browser is scored.** In fetchaller's Linux image (Chrome for Testing 154, Xvfb, emulated amd64, Canadian IP) the page's own search POST was signed with all four headers and still answered 429 while the browser's clock was UTC, on wafer 0.7.11 and on this change alike (0 of 2). Every named zone tried passed from the same IP: America/Toronto 2 of 2, America/Vancouver, Europe/London (UTC's own offset in November) and Asia/Tokyo 1 of 1 each, both calls per run 200. So Kasada refuses the UTC zone itself, which is what servers, containers and fingerprint-resisting browsers report, not a mismatch between the clock and the IP's region. A browser that would inherit UTC (no `timezone=`, no `TZ`, system clock UTC) is therefore launched on Europe/London (`_INHERITED_UTC_ZONE` in `wafer/browser/_solver.py`), logged once at INFO; an explicit `TZ=UTC` is kept and warned about. In the image the signed call took about 24-28s, mostly page load, so the 30s default timeout was not enough.
+
+**No page cookies come back.** The signed call's result carries none of the page's cookies. The site's own page calls `gdx-api` and `ecom-api` cross-origin with no cookies (captured by fetchaller on a real page load), so they played no part in the response. Handing them back put costco.com's consent cookie `tcm` (`Domain=.costco.com`, expiring 2027) into the session's jar and `cache_dir`, and `ecom-api.costco.com` answers any request carrying it with a bare 403: one signed search broke every later location read, in that session and any sharing the cache. Measured after the fix in the image (no `TZ`, so London): locator 200, signed search 200 with 0 cookies injected, locator again 200, a fresh session on the same `cache_dir` 200.
 
 ## Headless Detection
 
@@ -194,6 +219,7 @@ Does NOT need:
 | `footlocker.co.uk` | tls-pass | 2026-02-21: 200 even with naked client. Kasada SDK present but no enforcement. |
 | `wizzair.com` | tls-pass | 2026-02-21: no Kasada markers found. |
 | `gql.twitch.tv/integrity` | untested | API-style Kasada (POST). Returns x-kpsdk-ct directly. May have ST. |
+| `gdx-api.costco.com` (search POST) | **Validated** | 2026-11-03: signed API (CT+CD+H+V per call). Unsigned POST and cookie-only replay 429; in-page signed replay from the caller's Referer page 200 JSON, 4 of 4, 4-6s each. |
 | `draftkings.com` | unverified | Aggressive behavioral scoring. May use full CT+CD enforcement. |
 | `bet365.com` | unverified | Kasada + in-house (hardest known deployment). |
 

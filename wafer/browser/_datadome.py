@@ -17,7 +17,9 @@ rejected.  See ``docs/ref-datadome.md`` for details.
 import logging
 import random
 import time
+from urllib.parse import urlparse
 
+from wafer._cookies import browser_cookie_matches_host
 from wafer.browser._pump import idle
 
 logger = logging.getLogger("wafer")
@@ -111,6 +113,41 @@ def _click_element(solver, page, state, locator):
     return True
 
 
+def _let_through(page) -> bool:
+    """Whether DataDome let the browser through on its first request.
+
+    DataDome answers a request it trusts with the page itself and sets its
+    ``datadome`` cookie on that response, with no challenge to watch for a
+    cookie change. On mouser.com the browser was served the 200 page and the
+    cookie from its first navigation while the plain client drew the 403
+    (1 of 16 solves, 2026-11-04); treated as a failed solve, it threw both
+    away and the request failed with the challenge.
+
+    The status is the displayed document's own (its navigation timing entry),
+    not the newest response seen: a 200 still on its way in is not what the
+    page shows.
+    """
+    from wafer.browser._solver import _quiet_read
+
+    try:
+        host = urlparse(page.url).hostname or ""
+        status = _quiet_read(
+            page,
+            "(performance.getEntriesByType('navigation')[0] || {}).responseStatus",
+        )
+        cookies = page.context.cookies()
+    except Exception:
+        return False
+    if not host or not isinstance(status, int) or not 200 <= status < 300:
+        return False
+    return any(
+        c.get("name") == "datadome"
+        and c.get("value")
+        and browser_cookie_matches_host(c.get("domain", ""), host)
+        for c in cookies
+    )
+
+
 def wait_for_datadome(solver, page, timeout_ms: int) -> bool:
     """Wait for DataDome challenge to resolve.
 
@@ -118,7 +155,9 @@ def wait_for_datadome(solver, page, timeout_ms: int) -> bool:
     indicates a "blocked visitor" verdict that cannot be solved.
 
     Early bail-out: if no captcha-delivery iframe appears within 8
-    seconds, returns False (browser passed through without challenge).
+    seconds, the browser met no challenge. That is a pass when DataDome let it
+    through (the displayed document is a 2xx and a ``datadome`` cookie is set
+    for the page's host), and a failure otherwise.
     """
     # t=bv = blocked visitor, unsolvable
     try:
@@ -225,6 +264,12 @@ def wait_for_datadome(solver, page, timeout_ms: int) -> bool:
 
         # Early bail-out: no DD iframe after grace period
         if not iframe_seen and time.monotonic() > grace_deadline:
+            if _let_through(page):
+                logger.info(
+                    "No DataDome challenge after 8s: the browser was let "
+                    "through with DataDome's cookie"
+                )
+                return True
             logger.info(
                 "No DataDome challenge iframe after 8s, "
                 "browser likely passed through"

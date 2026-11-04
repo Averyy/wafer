@@ -312,8 +312,10 @@ session.browser_solve_challenge(url: str, challenge_type: str, *,
 # unchanged is not counted as earned state, so browser_prime() returns False
 # when that is all it got.
 # A response whose Content-Type is JSON, XML, plain text or CSV is never
-# checked for challenges, so a punishment returned inside an API's JSON body
-# reaches you as an ordinary response. AliExpress MTop is the common case: a
+# checked for challenges (one exception: a 403/429 carrying x-kpsdk-* headers
+# is "kasada", see "Kasada-signed APIs"), so a punishment returned inside an
+# API's JSON body reaches you as an ordinary response. AliExpress MTop is the
+# common case: a
 # call answered with resp.json()["ret"][0] == "FAIL_SYS_USER_VALIDATE" carries
 # the issued punishment URL in resp.json()["data"]["url"]. Pass that URL with
 # challenge_type="tmd", then reissue the MTop call; its token bootstrap
@@ -641,6 +643,8 @@ wafer.full_version(major: int) -> str
 wafer.chrome_full_version(emulation) -> str | None
 # Exact four-part Chrome version wafer emits for that Emulation's
 # high-entropy client hints. Returns None for non-Chrome profiles.
+# Chrome154 -> "157.0.8103.38" (the version presented over it, see Chrome
+# below); an older profile -> its own build ("153.0.8010.53").
 
 wafer.emulation_family(emulation) -> str | None
 # Classify a wreq.Emulation: "chrome" | "edge" | "firefox" | "opera" | "safari" | None.
@@ -901,7 +905,17 @@ capabilities and trade-offs.
 
 ### Chrome (default, no profile= needed)
 
-- Default wreq TLS + HTTP/2 profile is `Emulation.Chrome154`
+- Default wreq TLS + HTTP/2 profile is `Emulation.Chrome154`, presented as
+  Chrome **157**, the current stable release: `Chrome/157.0.0.0` UA,
+  `sec-ch-ua` 157, full version `157.0.8103.38` in the high-entropy hints, and
+  Chrome 157's navigation `Accept` (it names `image/jxl`). Real Chrome 154
+  through 157 send the same TLS ClientHello and HTTP/2 settings (measured), so
+  wafer claims the current release over the newest profile wreq ships. Some
+  WAFs weigh an outdated Chrome: in one measured window eBay's Akamai refused
+  cold requests claiming Chrome 154 from Linux and served the same requests
+  claiming 157 (at other times it treated both alike). A rotation to an older Chrome profile (Chrome153 ...) presents that
+  profile's own version and Accept, and a session pinned to a solving browser
+  presents the browser's.
 - The User-Agent and `sec-ch-ua-platform` describe the host OS: a session on a
   Linux server sends a Linux Chrome UA, on Windows a Windows one (the same holds
   for the Edge and Firefox families)
@@ -917,6 +931,8 @@ capabilities and trade-offs.
 - On 403/challenge: rotates across families (Chrome -> Firefox -> Safari -> Edge -> Chrome versions), swapping the header envelope each switch (see "Rotation escalation")
 - All features enabled: challenge detection, retry, rotation, browser solving
 - Pass `emulation=wreq.Emulation.Chrome154` to select that specific profile
+  (it is still presented as Chrome 157; an older profile presents its own
+  version)
 
 ### Safari (`profile=Profile.SAFARI`)
 
@@ -1022,7 +1038,9 @@ one of these strings:
 
 ```
 "cloudflare"   - Cloudflare managed challenge / Turnstile
-"akamai"       - Akamai Bot Manager
+"akamai"       - Akamai Bot Manager (its bm-verify interstitial, a 200 page
+                 that posts a token and a trivial proof of work, is answered
+                 inline with no browser; the rest need a BrowserSolver)
 "datadome"     - DataDome
 "perimeterx"   - PerimeterX / HUMAN Security
 "imperva"      - Imperva / Incapsula
@@ -1308,6 +1326,10 @@ config: HardenedLaunch = hardened_launch_config(
                         # GPU, Mesa's renderer is llvmpipe, which Akamai refuses
                         # outright; SwiftShader passes.
 )
+# The timezone is not part of the launch config. BrowserSolver launches a
+# browser that would inherit UTC on Europe/London (see timezone= below); a
+# browser you launch yourself runs on your process's TZ, so in a container
+# set TZ (or pass env={..., "TZ": "<zone>"} to chromium.launch) yourself.
 # Headless on macOS the launch describes the Mac's main display (read once per
 # process) to Chrome, so with new_context(no_viewport=True) every frame reports
 # the same screen, color depth, scale and window size as headed Chrome. A
@@ -1332,6 +1354,10 @@ with hardened_driver_env():
 #   another thread starts during the block inherits them. A lock serializes
 #   concurrent starts, so `with hardened_driver_env(), sync_playwright() as p:`
 #   holds it for the whole block and delays any BrowserSolver starting then.
+# - A page.mouse / page.keyboard call (any Playwright input) whose event
+#   Chrome never acknowledges returns after 3s instead of waiting forever.
+#   Chrome drops the answer when the frame the event went to is torn down
+#   mid-dispatch, e.g. a page that reloads itself while you move the mouse.
 
 # The headless recipe. Read the UA from a first launch (Chrome builds
 # "HeadlessChrome" into its default UA, and workers read that default before
@@ -1423,10 +1449,19 @@ solver = BrowserSolver(
                           # a matching Session(proxy=).
     executable_path=None, # optional str/os.PathLike Chrome executable override
     timezone=None,        # IANA zone for the browser process (TZ), e.g.
-                          # "America/Toronto"; None keeps the process's own.
-                          # Unknown names raise ValueError. An inherited UTC
-                          # clock logs a one-time WARNING at launch. Timezone
-                          # selection does not guarantee avoiding challenges.
+                          # "America/Toronto"; None keeps the process's own,
+                          # except that a browser that would inherit UTC (no
+                          # TZ set, system clock UTC: the container default)
+                          # runs on "Europe/London" instead, logged once at
+                          # INFO. Kasada refused every signed call from a UTC
+                          # browser and accepted every named zone tried from
+                          # the same Canadian IP (Toronto, Vancouver, London,
+                          # Tokyo): UTC is what servers report, not people.
+                          # London is a guess for an egress IP elsewhere, as
+                          # UTC was; set TZ or timezone= to the egress region.
+                          # An explicit TZ=UTC is kept and logs a one-time
+                          # WARNING. Unknown names raise ValueError. A zone
+                          # does not guarantee avoiding challenges.
 )
 # Linux (Docker, Xvfb): with no GPU the solver renders WebGL on SwiftShader,
 # chosen automatically (no /dev/dri render node, or Mesa fell back to llvmpipe).
@@ -1451,7 +1486,9 @@ assert solver.runtime_ready is False
 # returns None at once and preflight() raises RuntimeError. Create a new
 # BrowserSolver (or restart the process).
 # Startup checks the browser's four-part version against
-# chrome_full_version(DEFAULT_EMULATION). A difference is logged and accepted,
+# chrome_full_version(DEFAULT_EMULATION). A browser of a release wafer
+# presents over the same TLS (154-157 today) is logged at DEBUG; any other
+# version logs a WARNING. Either way the difference is accepted,
 # not rejected: Chrome auto-updates ahead of the newest available emulation, so
 # the installed browser is authoritative for browser-bound clearance replay.
 # Those solve paths align the session's User-Agent and client hints to it.
@@ -1493,16 +1530,18 @@ result: SolveResult | None = solver.solve(url, challenge_type)
 # solve/render does not accept cookies= is simply not given them.
 # result.cookies: list[dict] - browser cookies
 # result.user_agent: str - browser's User-Agent (version-reduced, e.g.
-#   "...Chrome/154.0.0.0...")
+#   "...Chrome/157.0.0.0...")
 # result.browser_version: str | None - browser's full build (e.g.
-#   "154.0.8037.93"); the version-reduced user_agent hides it
+#   "157.0.8103.38"); the version-reduced user_agent hides it
 # result.extras: dict | None - WAF-specific data
 # result.response: CapturedResponse | None - passthrough content (see below)
 # result.challenge_absent: bool - no transferable clearance identity was
 #   earned. True for a validated Cloudflare main-document response when no
 #   challenge iframe appeared, a challenge-free TMD GET returned as
 #   browser-only passthrough without x5sec, a challenge-free Brave navigation,
-#   and a render that met no challenge.
+#   a Kasada-signed API response, and a render that met no challenge (a render
+#   whose page cleared a Cloudflare challenge while it loaded did meet one:
+#   False, and the session pins to the browser).
 #   Automatic session handling returns those without pinning the fingerprint
 #   or rebuilding the wreq client; False means clearance WAS earned and the
 #   session pins.
@@ -1641,7 +1680,56 @@ resp = session.get("https://api.example.com/v1/data")  # JSON API
 - Where to earn the token is WAF mechanics (wafer's job); the per-site **value**
   of `solve_origin` (which page mints it) is yours to supply.
 - Without `solve_origin`, the auto-solve navigates the request URL itself
-  (correct for normal HTML pages, wrong for JSON APIs).
+  (correct for normal HTML pages, wrong for JSON APIs). Kasada-signed APIs are
+  the exception: see below.
+
+### Kasada-signed APIs
+
+Some Kasada deployments sign every API call (`x-kpsdk-ct/-cd/-h/-v`, added by
+the site's own script) and refuse an unsigned one with a bare 403/429 in the
+API's content type (costco.com's search API: 429, empty `text/plain`). Cookies
+do not help, and the signature can only be made inside the site's page.
+
+- The refusal is classified `"kasada"` despite its content type. Without a
+  `browser_solver` it raises `ChallengeDetected("kasada")` at once (no retries,
+  no `RateLimited`); with `max_rotations=0` it is returned with
+  `resp.challenge_type == "kasada"`.
+- With a `browser_solver`, the browser opens the page the call comes from and
+  makes your request (method, body, content type and your own headers) through
+  the site's script, and `post()`/`get()` returns that response
+  (`WaferResponse`, real status and JSON body). The page is your `Referer`
+  header, else your `Origin` + `/`, else the session's `embed_origin`;
+  `solve_origin` overrides all three. Pass the page the site itself calls the
+  API from. A request naming none of them is solved on its own URL, which
+  cannot work for an API.
+- Headers a page cannot set (Origin, Referer, Cookie, User-Agent,
+  Accept-Encoding, `Sec-*`, ...) are the browser's own; any `x-kpsdk-*` you
+  pass is dropped. Session `headers=` you set go too, under the per-request
+  ones. The browser's cookies for the API host (your `add_cookie()` ones
+  included) go when the API's CORS allows credentials; otherwise it is called
+  without, as the site's own page calls it.
+- The browser follows redirects itself, and they count against
+  `max_redirects` with the ones the request already followed (past it:
+  `TooManyRedirects`). With `follow_redirects=False` a redirected signed call
+  fails (`ChallengeDetected("kasada")`): the browser cannot report the
+  redirect's status or Location.
+- A `multipart=` request is not made in the page: wafer cannot read a wreq
+  multipart body back, and the call would go without its upload. It gets the
+  usual solve on its own URL, which cannot sign it. Send a body the page can
+  remake (`body=`, `json=`, `form=`) to have it signed.
+- Nothing carries over: every refused call goes through the browser again
+  (seconds per call, page load included), serialized on the solver's lock.
+  Size the request `timeout=` for it: the 30s default can be spent on the
+  page load alone on a slow host.
+- Kasada scores the browser that signs. A browser whose clock was UTC had
+  every signed call refused (403/429 again, raised as
+  `ChallengeDetected("kasada")`), and any named zone was accepted; a browser
+  that would inherit UTC now runs on Europe/London (see `timezone=` on
+  BrowserSolver). An explicit `TZ=UTC` is kept.
+- The signed response comes back alone: none of the page's cookies go into
+  the session's jar or `cache_dir`. The site's own page calls these APIs
+  without cookies, and costco.com's consent cookie got its location API
+  refused (403) on every later request that carried it.
 
 ---
 

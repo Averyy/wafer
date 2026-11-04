@@ -260,7 +260,7 @@ from wreq import Emulation
 wafer.sec_ch_ua(147)                          # '"Google Chrome";v="147", ...'
 wafer.sec_ch_ua(147, brand="Microsoft Edge")  # Edge brand
 wafer.full_version(147)                       # "147.0.7727.24"
-wafer.chrome_full_version(Emulation.Chrome154)  # "154.0.8037.93"
+wafer.chrome_full_version(Emulation.Chrome154)  # "157.0.8103.38" (presented over Chrome154's TLS)
 wafer.emulation_family(Emulation.Edge148)     # "edge"
 wafer.emulation_is_mobile(Emulation.SafariIos26_2)  # True
 wafer.build_fingerprint_envelope(Emulation.Chrome154, user_agent="...")  # full dict
@@ -364,11 +364,11 @@ solver - you must handle it yourself).
 | WAF | Detection | Solved by |
 |-----|-----------|-----------|
 | Cloudflare | `cf-mitigated` header, managed challenge HTML | browser |
-| Akamai | `_abck` cookie patterns, sensor script references | browser |
+| Akamai | `_abck` cookie patterns, sensor script references, a refusal page setting `bm_so`, the bm-verify interstitial (`/_sec/verify?provider=interstitial`) | browser; the interstitial inline |
 | DataDome | `datadome` cookie, challenge page markers | browser |
 | PerimeterX / HUMAN | `_px` cookies, captcha div, press-and-hold | browser |
 | Imperva / Incapsula | `reese84`/`___utmvc` cookie, `_Incapsula_Resource` script, 200 "Pardon Our Interruption" interstitial | inline (native-TLS) + browser under load |
-| Kasada | `429` with Kasada script markers | browser |
+| Kasada | `429` with Kasada script markers; a signed API's bare 403/429 with `x-kpsdk-*` headers, whatever its content type | browser (a signed API call is made from the site's page) |
 | F5 Shape | `istlWasHere` interstitial page | browser |
 | Radware Bot Manager | Radware sensor plus a captcha-template marker (`captcha.perfdrive.com`, `SSJSInternal`); served as a plain 200 | inline (clearance replay) |
 | AWS WAF | `aws-waf-token` cookie, `AwsWafIntegration` script | browser |

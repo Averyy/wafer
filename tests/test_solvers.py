@@ -1,5 +1,6 @@
 """Tests for inline challenge solvers (ACW, PoW, Amazon, TMD, Radware)."""
 
+import json
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -18,7 +19,10 @@ from wafer._cookies import CookieCache
 from wafer._errors import ChallengeDetected
 from wafer._solvers import (
     _is_amazon_domain,
+    akamai_interstitial_next,
+    is_akamai_interstitial,
     is_pow_challenge,
+    parse_akamai_interstitial,
     parse_amazon_captcha,
     parse_pow_challenge,
     solve_acw,
@@ -1642,3 +1646,147 @@ class TestRadwareClearanceScoping:
         assert session._radware_clearance_cookies(
             "http://www.gojobs.gov.on.ca/x"
         ) == []
+
+
+# ---------------------------------------------------------------------------
+# Akamai bm-verify interstitial (www.amazon.co.uk, 2026-11-03)
+# ---------------------------------------------------------------------------
+
+_AKAMAI_FIXTURE = (
+    Path(__file__).parent / "fixtures" / "amazon_akamai_interstitial_2026-11-03.html"
+)
+_AKAMAI_URL = "https://www.amazon.co.uk/s?k=usb+c+cable"
+_AKAMAI_HEADERS = {
+    "server": "AkamaiGHost",
+    "content-type": "text/html",
+    "set-cookie": "ak_bmsc=abc; Domain=.amazon.co.uk; Path=/; Max-Age=7200; HttpOnly",
+}
+
+
+class TestAkamaiInterstitial:
+    def _body(self):
+        return _AKAMAI_FIXTURE.read_text()
+
+    def test_detected_as_akamai(self):
+        # It is a 200 and was returned as the search page.
+        from wafer._challenge import ChallengeType, detect_challenge
+
+        assert detect_challenge(
+            200, _AKAMAI_HEADERS, self._body(), url=_AKAMAI_URL
+        ) == ChallengeType.AKAMAI
+        assert is_akamai_interstitial(self._body())
+
+    def test_a_page_quoting_it_is_not_one(self):
+        # A large page that merely mentions the endpoint (docs, a forum post).
+        quoted = "<html>" + "x" * 30_000 + self._body() + "</html>"
+        assert not is_akamai_interstitial(quoted)
+        assert not is_akamai_interstitial(
+            "<p>POST /_sec/verify?provider=interstitial with bm-verify</p>"
+        )
+
+    def test_the_post_is_the_scripts(self):
+        body = self._body()
+        target = parse_akamai_interstitial(body, _AKAMAI_URL)
+        assert target["url"] == (
+            "https://www.amazon.co.uk/_sec/verify?provider=interstitial"
+        )
+        # var j = i + Number("1251" + "02029"): the digit strings concatenate.
+        assert target["json"]["pow"] == 1793762341 + 125102029
+        assert target["json"]["bm-verify"].startswith("AAQAAAAO")
+
+    def test_where_the_page_goes_next(self):
+        url = "https://www.amazon.co.uk/s?k=x&bm-verify=AAQ"
+        assert akamai_interstitial_next('{"reload": true}', url) == (
+            "https://www.amazon.co.uk/s?k=x"
+        )
+        assert akamai_interstitial_next(
+            '{"location": "/s?k=y"}', url
+        ) == "https://www.amazon.co.uk/s?k=y"
+        # Never off the page's origin.
+        assert akamai_interstitial_next(
+            '{"location": "https://evil.example/"}', url
+        ) == "https://www.amazon.co.uk/s?k=x"
+        assert akamai_interstitial_next("not json", url) == (
+            "https://www.amazon.co.uk/s?k=x"
+        )
+        # The same origin however it is spelled.
+        assert akamai_interstitial_next(
+            '{"location": "https://WWW.amazon.co.uk:443/s?k=y"}', url
+        ) == "https://WWW.amazon.co.uk:443/s?k=y"
+        # First in the query, with more after it: the rest stays the query.
+        assert akamai_interstitial_next(
+            '{"reload": true}', "https://www.amazon.co.uk/s?bm-verify=AAQ&k=usb+c"
+        ) == "https://www.amazon.co.uk/s?k=usb+c"
+        assert akamai_interstitial_next(
+            '{"reload": true}', "https://www.amazon.co.uk/s?bm-verify=AAQ"
+        ) == "https://www.amazon.co.uk/s"
+
+    @patch("wafer._sync.time.sleep")
+    def test_answered_inline_then_the_page(self, mock_sleep):
+        responses = [
+            MockResponse(200, dict(_AKAMAI_HEADERS), self._body()),
+            MockResponse(200, {"content-type": "application/json"}, '{"reload": true}'),
+            MockResponse(200, {"content-type": "text/html"}, "<html>results</html>"),
+        ]
+        session, mock = make_sync_session(responses, use_cookie_jar=True)
+        resp = session.request("GET", _AKAMAI_URL)
+        assert resp.text == "<html>results</html>"
+        method, url, kwargs = mock.request_log[1]
+        assert (method, url) == (
+            "POST", "https://www.amazon.co.uk/_sec/verify?provider=interstitial"
+        )
+        # The body JSON.stringify writes: no spaces.
+        assert kwargs["body"].startswith('{"bm-verify":"AAQAAAAO')
+        assert json.loads(kwargs["body"])["pow"] == 1793762341 + 125102029
+        headers = kwargs["headers"]
+        assert headers["Sec-Fetch-Mode"] == "cors"
+        assert headers["Sec-Fetch-Dest"] == "empty"
+        assert headers["Sec-Fetch-Site"] == "same-origin"
+        assert headers["Origin"] == "https://www.amazon.co.uk"
+        assert headers["Content-Type"] == "application/json"
+        assert headers["Accept"] == "*/*"
+        # The page's XHR carries no navigation-only headers, and those ride a
+        # navigation client unless its defaults are off.
+        lower = {k.lower() for k in headers}
+        assert "upgrade-insecure-requests" not in lower
+        assert "sec-fetch-user" not in lower
+        assert kwargs["default_headers"] is False
+        # Chrome's captured fetch()/XHR order, not the navigation one.
+        assert [n.lower() for n in kwargs["orig_headers"]][:4] == [
+            "content-length", "sec-ch-ua-platform", "user-agent", "sec-ch-ua",
+        ]
+        assert "image/jxl" not in headers["Accept"]
+        assert mock.request_log[2][1] == _AKAMAI_URL
+
+    @pytest.mark.asyncio
+    @patch("wafer._async.asyncio.sleep")
+    async def test_answered_inline_async(self, mock_sleep):
+        responses = [
+            MockResponse(200, dict(_AKAMAI_HEADERS), self._body()),
+            MockResponse(200, {"content-type": "application/json"}, '{"reload": true}'),
+            MockResponse(200, {"content-type": "text/html"}, "<html>results</html>"),
+        ]
+        session, mock = make_async_session(responses, use_cookie_jar=True)
+        resp = await session.request("GET", _AKAMAI_URL)
+        assert resp.text == "<html>results</html>"
+        assert mock.request_log[1][0] == "POST"
+
+    def test_an_iframe_embed_session_still_sends_the_xhr_shape(self):
+        # Its client headers are an iframe navigation's (Upgrade-Insecure-
+        # Requests, iframe order); the page's XHR carries neither.
+        session, _ = make_sync_session(
+            [], embed="iframe", embed_origin="https://www.example.com"
+        )
+        headers, kw = session._page_xhr_headers(
+            "https://www.amazon.co.uk/_sec/verify?provider=interstitial",
+            _AKAMAI_URL,
+            {"Content-Type": "application/json"},
+        )
+        lower = {k.lower(): v for k, v in headers.items()}
+        assert "upgrade-insecure-requests" not in lower
+        assert lower["sec-fetch-mode"] == "cors"
+        assert lower["sec-fetch-dest"] == "empty"
+        assert kw["default_headers"] is False
+        assert [n.lower() for n in kw["orig_headers"]][:2] == [
+            "content-length", "sec-ch-ua-platform",
+        ]

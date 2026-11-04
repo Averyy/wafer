@@ -5187,7 +5187,11 @@ class TestBrowserSolverThreadOwnership:
 
         assert calls == 2
         driver.terminate.assert_called_once_with()
-        assert solver.runtime_ready is True
+        # The interrupt made the driver close Chrome, though the browser
+        # still reports itself connected: not ready until _ensure_browser
+        # relaunches it (fetchaller, 2026-11-04).
+        assert solver.runtime_ready is False
+        assert solver._browser_interrupted is True
         assert solver.close(timeout=1) is True
 
     def test_timed_out_intercept_recovers_the_serial_worker(self):
@@ -5249,7 +5253,10 @@ class TestBrowserSolverThreadOwnership:
 
         assert calls == 2
         driver.terminate.assert_called_once_with()
-        assert solver.runtime_ready is True
+        # Not ready until _ensure_browser relaunches the browser the
+        # interrupt closed.
+        assert solver.runtime_ready is False
+        assert solver._browser_interrupted is True
         assert solver.close(timeout=1) is True
 
     def test_close_timeout_does_not_wait_for_busy_browser_worker(self):
@@ -7152,6 +7159,45 @@ class TestWaitForDataDome:
 
         assert wait_for_datadome(solver, page, 10000) is False
 
+    @staticmethod
+    def _met_no_challenge(cookies, displayed_status):
+        """Run the handler on a page that never shows DataDome's iframe."""
+        from wafer.browser._datadome import wait_for_datadome
+
+        page = MagicMock()
+        page.url = "https://www.mouser.com/"
+        page.frames = []
+        page.context.cookies.return_value = cookies
+        # The displayed document's own status (its navigation timing entry).
+        page.evaluate.return_value = displayed_status
+        # deadline, grace, then one pass of the loop past the 8s grace.
+        with patch("time.monotonic", side_effect=[0.0, 0.0, 9.0, 9.0]):
+            return wait_for_datadome(MagicMock(), page, 30000)
+
+    _DD_COOKIE = {"name": "datadome", "value": "tok", "domain": ".mouser.com"}
+
+    def test_a_browser_datadome_let_through_is_a_pass(self):
+        # mouser.com served the browser its page and DataDome's cookie on the
+        # first navigation; with no challenge there was no cookie change to
+        # see, and the solve was thrown away (2026-11-04).
+        assert self._met_no_challenge([self._DD_COOKIE], 200) is True
+
+    def test_no_challenge_without_datadomes_cookie_still_fails(self):
+        other = {"name": "session", "value": "x", "domain": ".mouser.com"}
+        assert self._met_no_challenge([other], 200) is False
+
+    def test_a_displayed_refusal_still_fails(self):
+        # The status is the shown document's, so a 200 still on its way in
+        # behind a displayed 403 is no pass.
+        assert self._met_no_challenge([self._DD_COOKIE], 403) is False
+
+    def test_another_sites_datadome_cookie_does_not_count(self):
+        cookie = dict(self._DD_COOKIE, domain=".example.com")
+        assert self._met_no_challenge([cookie], 200) is False
+
+    def test_an_unreadable_status_still_fails(self):
+        assert self._met_no_challenge([self._DD_COOKIE], None) is False
+
 
 # ---------------------------------------------------------------------------
 # Imperva solver
@@ -7500,6 +7546,21 @@ class TestImpervaXhrReplay:
         }
         imperva_xhr_replay(page, "https://api2.realtor.ca/x", {}, 10000)
         assert page.evaluate.call_args[0][1]["method"] == "GET"
+
+    def test_a_body_that_cannot_be_remade_is_not_replayed(self):
+        # A multipart= upload sent without its body: a 2xx would answer a
+        # different request. None falls back to cookie replay over wreq.
+        from wafer.browser._imperva import imperva_xhr_replay
+
+        page = MagicMock()
+        res = imperva_xhr_replay(
+            page,
+            "https://api2.realtor.ca/x",
+            {"method": "POST", "body_unavailable": True},
+            10000,
+        )
+        assert res is None
+        page.evaluate.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -12500,6 +12561,191 @@ class TestRenderOnWorker:
             self._run(solver, context, timeout=5, max_size=64)
         assert excinfo.value.limit == 64
 
+    @staticmethod
+    def _load_waits(page):
+        return [
+            c for c in page.wait_for_load_state.call_args_list
+            if c.args and c.args[0] == "domcontentloaded"
+        ]
+
+    def test_a_document_replaced_mid_read_is_read_again(self):
+        """eBay's splash moves itself on to the search right after settling.
+
+        The DOM read raced that commit and render reported "no document"
+        (fetchaller's Linux image, 2026-11-04, 10 of 22 eBay renders).
+        """
+        results = "<html><body>" + "search results " * 50 + "</body></html>"
+        moved_to = _fake_document_response("https://spa.example.com/", 200)
+        solver, context, page = self._setup(
+            dom=results,
+            url="https://spa.example.com/",
+        )
+        handlers = {}
+        page.on.side_effect = lambda event, fn: handlers.__setitem__(event, fn)
+        reads = {"n": 0}
+
+        def content():
+            reads["n"] += 1
+            if reads["n"] == 1:
+                handlers["response"](moved_to)
+                raise RuntimeError("Execution context was destroyed")
+            return results
+
+        page.content.side_effect = content
+        result = self._run(solver, context, timeout=5)
+        assert result is not None
+        assert b"search results" in result.response.body
+        assert result.response.status == 200
+        assert len(self._load_waits(page)) == 1
+
+    def _solve_landing_on(
+        self, landed_url, landed_status, landed_dom, *, guard=None, **render
+    ):
+        """Render a 403 interstitial whose solve leaves *landed_dom* in place.
+
+        *guard* stands in for the navigation size guard; the solve marks it
+        exceeded, as a handler navigation past ``max_size`` would.
+        """
+        interstitial = (
+            "<html><body><script>window._cf_chl_opt={};</script>"
+            "Just a moment...</body></html>"
+        )
+        solver, context, page = self._setup(dom=interstitial, nav_status=403)
+        handlers = {}
+        page.on.side_effect = lambda event, fn: handlers.__setitem__(event, fn)
+        replayed = "<html><body>" + "replayed page " * 1000 + "</body></html>"
+
+        def solve(*_args, **_kwargs):
+            if guard is not None:
+                guard.update(exceeded=True, size=20 * 1024 * 1024)
+            handlers["response"](
+                _fake_document_response(landed_url, landed_status)
+            )
+            page.url = landed_url
+            page.content.side_effect = None
+            page.content.return_value = landed_dom
+            return True
+
+        goto = page.goto.side_effect
+
+        def goto_again(*args, **kwargs):
+            if page.goto.call_count > 1:
+                page.url = "https://spa.example.com/"
+                page.content.return_value = replayed
+            return goto(*args, **kwargs)
+
+        page.goto.side_effect = goto_again
+        with (
+            patch.object(solver, "_dispatch_challenge", side_effect=solve),
+            patch.object(
+                solver,
+                "_install_navigation_size_limit",
+                return_value=guard if guard is not None else {"exceeded": False},
+            ),
+        ):
+            result = self._run(solver, context, timeout=30, **render)
+        return result, page
+
+    def test_the_page_a_solve_left_in_place_is_kept(self):
+        """www.ebay.com, 2026-11-04: Akamai's retried refusal went on to the
+        results, and the replayed navigation was refused (403) again."""
+        results = "<html><body>" + "search results " * 1000 + "</body></html>"
+        result, page = self._solve_landing_on(
+            "https://spa.example.com/", 200, results
+        )
+        assert page.goto.call_count == 1
+        assert b"search results" in result.response.body
+        assert result.response.status == 200
+        assert result.challenge_absent is False
+
+    def test_a_page_left_in_place_past_the_size_cap_raises(self):
+        # The guard stopped the solve's own navigation past max_size; the
+        # DOM left behind is truncated, not the page.
+        results = "<html><body>" + "search results " * 1000 + "</body></html>"
+        guard = {"exceeded": False, "size": 0}
+        with pytest.raises(ResponseTooLarge):
+            self._solve_landing_on(
+                "https://spa.example.com/", 200, results,
+                guard=guard, max_size=10 * 1024 * 1024,
+            )
+
+    def test_a_small_page_left_in_place_is_replayed(self):
+        # TMD's slider leaves a small same-URL transition shell.
+        result, page = self._solve_landing_on(
+            "https://spa.example.com/", 200, "<html><body>loading</body></html>"
+        )
+        assert page.goto.call_count == 2
+        assert b"replayed page" in result.response.body
+
+    def test_another_url_left_in_place_is_replayed(self):
+        elsewhere = "<html><body>" + "home page " * 2000 + "</body></html>"
+        result, page = self._solve_landing_on(
+            "https://spa.example.com/home", 200, elsewhere
+        )
+        assert page.goto.call_count == 2
+        assert b"replayed page" in result.response.body
+
+    def test_a_challenge_left_in_place_is_replayed(self):
+        still = (
+            "<html><body><script>window._cf_chl_opt={};</script>"
+            + "x" * 20_000 + "</body></html>"
+        )
+        result, page = self._solve_landing_on(
+            "https://spa.example.com/", 403, still
+        )
+        assert page.goto.call_count == 2
+
+    @pytest.mark.parametrize(
+        "a, b, same",
+        [
+            ("https://example.com:443/", "https://example.com/", True),
+            ("HTTPS://Example.COM/a?b=1#top", "https://example.com/a?b=1", True),
+            ("https://example.com", "https://example.com/", True),
+            ("http://example.com:80/x", "http://example.com/x", True),
+            ("https://example.com:8443/", "https://example.com/", False),
+            ("https://example.com/a?b=1", "https://example.com/a?b=2", False),
+            ("https://example.com/a", "https://example.com/b", False),
+            ("http://example.com/", "https://example.com/", False),
+        ],
+    )
+    def test_page_urls_compare_as_chrome_normalizes_them(self, a, b, same):
+        from wafer.browser._solver import _same_page_url
+
+        assert _same_page_url(a, b) is same
+
+    def test_the_current_documents_headers_reach_the_classifier(self):
+        refusal = (
+            Path(__file__).parent / "fixtures" / "ebay_akamai_refusal_2026-11-03.html"
+        ).read_text()
+        refused = _fake_document_response("https://spa.example.com/", 403)
+        refused.all_headers.return_value = {
+            "content-type": "text/html",
+            "set-cookie": "bm_so=abc; Path=/",
+        }
+        refused.headers_array.return_value = [
+            {"name": "set-cookie", "value": "bm_so=abc; Path=/"}
+        ]
+        solver, context, page = self._setup(dom=refusal, extra_responses=[refused])
+        with patch.object(
+            solver, "_dispatch_challenge", return_value=False
+        ) as dispatch:
+            self._run(solver, context, timeout=5)
+        assert dispatch.call_args[0][1] == "akamai"
+
+    def test_a_document_that_never_comes_is_still_no_document(self):
+        from wafer.browser._solver import _RENDER_REREADS
+
+        solver, context, page = self._setup()
+        page.content.side_effect = RuntimeError("Execution context was destroyed")
+        assert self._run(solver, context, timeout=5) is None
+        assert page.content.call_count == 1 + _RENDER_REREADS
+
+    def test_an_oversize_document_is_not_waited_for(self):
+        solver, context, page = self._setup()
+        with pytest.raises(ResponseTooLarge):
+            self._run(solver, context, timeout=5, max_size=64)
+        assert self._load_waits(page) == []
+
     def test_no_budget_returns_none_without_touching_the_browser(self):
         solver, context, page = self._setup()
         assert self._run(solver, context, timeout=0) is None
@@ -13022,6 +13268,23 @@ class TestInPlaceChallengeClassification:
             solver.close()
         assert d.call_args[0][1] == "cloudflare"
 
+    def test_render_documents_reach_the_handler(self):
+        # The Cloudflare handler reads them to tell a solved stage from a
+        # new one (stackoverflow.com, 2026-11-03); render passed none.
+        solver = self._solver()
+        html = "<html><body><script>window._cf_chl_opt={};</script></body></html>"
+        documents = [("https://example.com/", 429, None)]
+        try:
+            with patch.object(solver, "_dispatch_challenge", return_value=True) as d:
+                solver._solve_challenge_in_place(
+                    MagicMock(), "https://example.com/", html,
+                    time.monotonic() + 30, 429, documents=documents,
+                )
+        finally:
+            solver.close()
+        assert d.call_args[0][1] == "cloudflare"
+        assert d.call_args.kwargs["documents"] is documents
+
     def test_unclassifiable_body_dispatches_nothing(self):
         solver = self._solver()
         try:
@@ -13076,6 +13339,64 @@ class TestInPlaceChallengeClassification:
         assert self._generic_in_place(
             ["<html>challenge</html>", "<html>real page</html>"], [cookies, cookies]
         ) is True
+
+    @staticmethod
+    def _document_setting(url, status, set_cookie):
+        response = _fake_document_response(url, status)
+        response.all_headers.return_value = {
+            "content-type": "text/html",
+            "set-cookie": "\n".join(set_cookie),
+        }
+        response.headers_array.return_value = [
+            {"name": "set-cookie", "value": value} for value in set_cookie
+        ]
+        return response
+
+    def test_the_documents_headers_classify_akamais_refusal(self):
+        """www.ebay.com, 2026-11-04: classified without headers, the 403
+        refusal read as generic_js, whose wait re-navigated it and then polled
+        it through the 30s post-solve window."""
+        solver = self._solver()
+        refusal = (
+            Path(__file__).parent / "fixtures" / "ebay_akamai_refusal_2026-11-03.html"
+        ).read_text()
+        url = "https://www.ebay.com/sch/i.html?_nkw=hdmi+cable"
+        response = self._document_setting(
+            url, 403, ["bm_so=abc; Domain=.ebay.com; Path=/", "bm_s=def; Path=/"]
+        )
+        try:
+            with patch.object(solver, "_dispatch_challenge", return_value=False) as d:
+                solver._solve_challenge_in_place(
+                    MagicMock(), url, refusal, time.monotonic() + 30, 403,
+                )
+                without_headers = d.call_args[0][1]
+                d.reset_mock()
+                solver._solve_challenge_in_place(
+                    MagicMock(), url, refusal, time.monotonic() + 30, 403,
+                    response=response,
+                )
+        finally:
+            solver.close()
+        assert without_headers == "generic_js"
+        assert d.call_args[0][1] == "akamai"
+
+    def test_a_200_pages_cookies_stay_out_of_the_blocking_status_fallback(self):
+        # Akamai sets _abck on every page; at a 403 the server never sent,
+        # that cookie would turn a Cloudflare page into an Akamai solve.
+        solver = self._solver()
+        html = "<html><body><script>window._cf_chl_opt={};</script></body></html>"
+        response = self._document_setting(
+            "https://example.com/", 200, ["_abck=x; Path=/", "ak_bmsc=y; Path=/"]
+        )
+        try:
+            with patch.object(solver, "_dispatch_challenge", return_value=True) as d:
+                solver._solve_challenge_in_place(
+                    MagicMock(), "https://example.com/", html,
+                    time.monotonic() + 30, 200, response=response,
+                )
+        finally:
+            solver.close()
+        assert d.call_args[0][1] == "cloudflare"
 
     def test_legitimate_ips_script_does_not_use_blocking_status_fallback(self):
         solver = self._solver()

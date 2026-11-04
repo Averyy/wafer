@@ -67,6 +67,41 @@ function waferOverride(browserUserAgent) {
   }
 }
 
+// Input Chrome never acknowledges. An Input.dispatch* command answers once the
+// renderer has handled the event, and one in flight when the frame it went to
+// is torn down is never answered: DataDome's full-page iframe on mouser.com
+// was removed as the cleared page committed its reload, 4-14 ms after a
+// mouseMoved, and that move never returned (macOS, 2 of 16 solves, on 0.7.11
+// too). Playwright waits for the answer with no deadline, so the solve sat in
+// mouse.move to its own timeout and the browser was then killed (see
+// docs/ref-headless.md). An answer
+// that has not come within INPUT_ACK_MS is taken as given; the event is
+// Chrome's either way, and it keeps queued input in order. Measured acks:
+// median 11 ms, slowest 354 ms of 1,467 (2026-11-04).
+const INPUT_ACK_MS = 3000;
+const INPUT_METHODS = new Set([
+  'Input.dispatchMouseEvent',
+  'Input.dispatchKeyEvent',
+  'Input.dispatchTouchEvent',
+  'Input.dispatchDragEvent',
+  'Input.insertText',
+]);
+
+function boundedInput(result) {
+  if (!result || typeof result.then !== 'function') {
+    return result;
+  }
+  let timer;
+  const unanswered = new Promise((resolve) => {
+    timer = setTimeout(() => resolve({}), INPUT_ACK_MS);
+    if (timer.unref) {
+      timer.unref();
+    }
+  });
+  result.then(() => clearTimeout(timer), () => clearTimeout(timer));
+  return Promise.race([result, unanswered]);
+}
+
 function patchSession(exports) {
   const session = exports && exports.CRSession;
   const proto = session && session.prototype;
@@ -92,6 +127,9 @@ function patchSession(exports) {
       }
     }
     const result = send.call(this, method, params);
+    if (INPUT_METHODS.has(method)) {
+      return boundedInput(result);
+    }
     if (method === 'Browser.getVersion' && connection && result && result.then) {
       // The browser's own user agent: what wafer keys its override by.
       result.then((version) => {

@@ -431,6 +431,110 @@ def solve_cookie_gate(body: str, url: str) -> list[GateCookie] | None:
     return cookies
 
 
+# ── Akamai Bot Manager interstitial ──────────────────────────────────────────
+# A 200 page (2.2 KB on www.amazon.co.uk, 2026-11-03, server AkamaiGHost,
+# setting ak_bmsc) with a meta refresh and a script that computes
+#   var i = <int>; var j = i + Number("<digits>" + "<digits>");
+# and synchronously POSTs {"bm-verify": <token>, "pow": j} as JSON to
+# /_sec/verify?provider=interstitial, then follows the JSON answer:
+# {"reload": true} reloads the URL without its bm-verify parameter,
+# {"location": ...} goes there. No sensor script runs. Measured inline from
+# the plain client: the POST answered 200 {"reload": true} with a fresh
+# ak_bmsc in 0.07 s, and the replayed search returned the results page.
+
+AKAMAI_INTERSTITIAL_MAX_PAGE_BYTES = 20_000
+_AKAMAI_VERIFY_PATH = "/_sec/verify?provider=interstitial"
+_AKAMAI_POW_RE = re.compile(
+    r"var\s+i\s*=\s*(\d{1,15})\s*;\s*var\s+j\s*=\s*i\s*\+\s*"
+    r'Number\(\s*"(\d{1,15})"\s*\+\s*"(\d{1,15})"\s*\)'
+)
+# The real token is base64 (with "/" and "+"), a few hundred characters.
+_AKAMAI_TOKEN_RE = re.compile(r'"bm-verify"\s*:\s*"([A-Za-z0-9+/=_-]{16,4096})"')
+_AKAMAI_POST_RE = re.compile(r'\.open\(\s*"POST"\s*,\s*"(/_sec/verify\?[^"]{0,200})"')
+
+
+def is_akamai_interstitial(body: str) -> bool:
+    """True for Akamai Bot Manager's bm-verify interstitial page.
+
+    Structural: small, POSTs to ``/_sec/verify?provider=interstitial`` with a
+    ``bm-verify`` token, and computes its proof of work in the page.
+    """
+    if len(body) > AKAMAI_INTERSTITIAL_MAX_PAGE_BYTES:
+        return False
+    if _AKAMAI_VERIFY_PATH not in body or "bm-verify" not in body:
+        return False
+    return _AKAMAI_POW_RE.search(body) is not None
+
+
+def parse_akamai_interstitial(body: str, url: str) -> dict | None:
+    """What the interstitial's script POSTs, for answering it from *url*.
+
+    Returns ``{"url", "json"}`` (the verify endpoint on the page's own origin
+    and the body the script sends), or ``None`` when any part is missing or
+    not the shape the real page has.
+    """
+    if not is_akamai_interstitial(body):
+        return None
+    work = _AKAMAI_POW_RE.search(body)
+    token = _AKAMAI_TOKEN_RE.search(body)
+    post = _AKAMAI_POST_RE.search(body)
+    if work is None or token is None or post is None:
+        return None
+    if not post.group(1).startswith(_AKAMAI_VERIFY_PATH):
+        return None
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return None
+    # The script's arithmetic: Number(a + b) concatenates the digit strings.
+    proof = int(work.group(1)) + int(work.group(2) + work.group(3))
+    return {
+        "url": urljoin(url, post.group(1)),
+        "json": {"bm-verify": token.group(1), "pow": proof},
+    }
+
+
+def _origin_of(url: str) -> tuple:
+    """(scheme, host, effective port): equal for equivalent spellings."""
+    parts = urlparse(url)
+    scheme = (parts.scheme or "").lower()
+    try:
+        port = parts.port
+    except ValueError:
+        return (scheme, None, None)
+    return (
+        scheme,
+        (parts.hostname or "").lower().rstrip("."),
+        port or {"http": 80, "https": 443}.get(scheme),
+    )
+
+
+def akamai_interstitial_next(answer: str, url: str) -> str | None:
+    """Where the page goes after the verify POST answered *answer*.
+
+    ``{"reload": true}`` (and anything the script falls back to reloading on)
+    is *url* without its ``bm-verify`` parameter. A ``location`` is followed
+    only on the same origin; elsewhere the replay stays on *url*.
+    """
+    import json
+
+    # The script strips the parameter from its href; drop it from the query,
+    # keeping every other parameter as it was.
+    parts = urlparse(url)
+    kept = [p for p in parts.query.split("&") if p and not p.startswith("bm-verify=")]
+    reload_url = parts._replace(query="&".join(kept)).geturl()
+    try:
+        data = json.loads(answer)
+    except ValueError:
+        return reload_url
+    if isinstance(data, dict) and "reload" not in data and isinstance(
+        data.get("location"), str
+    ):
+        target = urljoin(url, data["location"])
+        if _origin_of(target) == _origin_of(url):
+            return target
+    return reload_url
+
+
 # ── Amazon Captcha Parser ─────────────────────────────────────────────────────
 # Amazon's rate-limit interstitial has a "Continue shopping" link or form.
 # No JS challenge, no image CAPTCHA -- just parse and follow.

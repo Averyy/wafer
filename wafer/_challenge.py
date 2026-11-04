@@ -16,6 +16,7 @@ from urllib.parse import urlparse
 
 from wafer._brave import is_brave_challenge
 from wafer._solvers import (
+    is_akamai_interstitial,
     is_cookie_gate,
     is_pow_challenge,
     is_reddit_captcha_gate,
@@ -230,6 +231,43 @@ def _has_cookie(set_cookie: str, name: str) -> bool:
     return f"{name}=" in set_cookie
 
 
+def is_ebay_splash_challenge(body: str) -> bool:
+    """eBay's own JS challenge page ("Pardon Our Interruption", splashui).
+
+    eBay redirects a request it wants to check (307) to
+    ``/splashui/challenge``, which answers **200** with a small page whose
+    script posts to ``/splashui/challengesvc/answer`` and then navigates back
+    to the original URL; a browser clears it in about a second
+    (www.ebay.ca, 2026-11-03). Served as a 200 it read as content. Keyed on
+    the page's structure, never its copy: the splashui service named in its
+    logger payload and eBay's challenge script bundle, both in its first
+    6 KB. The bare token, because a browser's serialized DOM escapes the
+    payload's quotes (``&quot;serviceName&quot;``).
+    """
+    lower = body[:60_000].lower()
+    return "splashui" in lower and "/rs/c/challenge-" in lower
+
+
+def is_kasada_api_refusal(
+    status_code: int, headers: dict[str, str], content_type: str = ""
+) -> bool:
+    """A Kasada refusal of an API call, whatever its Content-Type.
+
+    Responses that are not HTML skip challenge detection, so an API's own
+    JSON error is never taken for a challenge. Kasada's refusal of an
+    unsigned API call is the exception: a bare 403/429 in the API's content
+    type (gdx-api.costco.com answers 429 with an empty ``text/plain`` body)
+    carrying ``x-kpsdk-*`` headers, which no origin API sends. HTML responses
+    are left to :func:`detect_challenge`, which already classifies them.
+    """
+    if status_code not in (403, 429):
+        return False
+    ct = (content_type or "").lower().split(";")[0].strip()
+    if ct in ("", "text/html", "application/xhtml+xml"):
+        return False
+    return any(str(key).lower().startswith("x-kpsdk") for key in headers)
+
+
 def _header_fast_path(
     status_code: int, headers: dict[str, str], set_cookie: str
 ) -> ChallengeType | None:
@@ -289,6 +327,18 @@ def _header_fast_path(
     if status_code == 403:
         if _has_cookie(set_cookie, "_abck") or _has_cookie(set_cookie, "ak_bmsc"):
             return ChallengeType.AKAMAI
+
+    # Akamai -the script interstitial's own cookies on a refusal. A cold
+    # navigation it distrusts gets a small 403 "Error Page" that loads
+    # Akamai's script (``/<random path>?v=<uuid>``) and sets bm_so/bm_s
+    # rather than _abck; once that script has posted, the same navigation
+    # goes through (www.ebay.ca from Linux Chrome, stock Chrome for Testing
+    # included, 2026-11-03). It read as generic_js, whose wait never retries
+    # the navigation.
+    if status_code in (403, 429) and (
+        _has_cookie(set_cookie, "bm_so") or _has_cookie(set_cookie, "sbsd_o")
+    ):
+        return ChallengeType.AKAMAI
 
     # F5 Shape — sensor response headers on block status.
     #
@@ -534,8 +584,12 @@ def detect_challenge(
     # --- Browser-solvable challenges ---
 
     # Cloudflare — body markers (fallback without cf-mitigated header)
-    # CF challenges come on 403 and 503 (older configs omit cf-mitigated).
-    if status_code in (403, 503) and (
+    # CF challenges come on 403 and 503 (older configs omit cf-mitigated), and
+    # on 429 when Cloudflare escalates a solved first stage to a second one
+    # (stackoverflow.com, 2026-11-03). A browser render classifies its DOM
+    # without the real headers, so without 429 here that stage read as
+    # generic_js and never got the Turnstile handler.
+    if status_code in (403, 429, 503) and (
         "window._cf_chl_opt" in body
         or "_cf_chl_ctx" in body
         or "challenge-form" in body
@@ -588,6 +642,14 @@ def detect_challenge(
         logger.info("Challenge detected (body): akamai behavioral")
         return ChallengeType.AKAMAI
 
+    # Akamai Bot Manager's bm-verify interstitial (www.amazon.co.uk,
+    # 2026-11-03): a 200 page that posts a token and a trivial proof of work,
+    # then reloads (see is_akamai_interstitial). Returned as content before;
+    # the session answers it inline, and a browser clears it by loading it.
+    if is_akamai_interstitial(body):
+        logger.info("Challenge detected (body): akamai interstitial")
+        return ChallengeType.AKAMAI
+
     # Compute body_lower once for all remaining case-insensitive checks
     body_lower = body.lower()
 
@@ -596,6 +658,12 @@ def detect_challenge(
     if "istlwashere" in body_lower or "_imp_apg_r_" in body:
         logger.info("Challenge detected (body): shape")
         return ChallengeType.SHAPE
+
+    # eBay's splash challenge, served as a 200 after a 307 (see
+    # is_ebay_splash_challenge). A browser clears it on its own.
+    if is_ebay_splash_challenge(body):
+        logger.info("Challenge detected (body): ebay splash")
+        return ChallengeType.GENERIC_JS
 
     # Radware Bot Manager — checked on any status code, and ahead of the
     # 403/429 block below so the generic-JS fallback can never swallow a

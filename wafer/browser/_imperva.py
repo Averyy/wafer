@@ -226,8 +226,12 @@ def imperva_xhr_replay(
     the real ``Origin``/``Referer``/cookies and the WAF treats it exactly like
     the consuming app's own fetch. Returns ``{status, body, content_type}`` or
     ``None`` on a transport error - the caller turns a 2xx into a passthrough
-    response and otherwise falls back to cookie replay.
+    response and otherwise falls back to cookie replay. A request whose body
+    cannot be remade here (``multipart=``) is not replayed: sent without its
+    upload, its 2xx would be the answer to a different request.
     """
+    if replay.get("body_unavailable"):
+        return None
     arg = {
         "url": url,
         "method": (replay.get("method") or "GET").upper(),

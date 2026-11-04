@@ -1624,3 +1624,60 @@ class TestRadwareRedirectScheme:
         # ...and the converse is a genuine Radware host, so it does match.
         real = "https://evil.example@validate.perfdrive.com/"
         assert detect_challenge(302, _h(location=real), "") == ChallengeType.RADWARE
+
+
+# ---------------------------------------------------------------------------
+# eBay (www.ebay.ca, 2026-11-03)
+# ---------------------------------------------------------------------------
+
+_FIXTURES = pathlib.Path(__file__).parent / "fixtures"
+_EBAY_SPLASH = (_FIXTURES / "ebay_splash_challenge_2026-11-03.html").read_text()
+_EBAY_REFUSAL = (_FIXTURES / "ebay_akamai_refusal_2026-11-03.html").read_text()
+
+
+class TestEbay:
+    def test_splash_challenge_served_as_200(self):
+        # Reached through a 307 to /splashui/challenge; it read as content.
+        from wafer._challenge import is_ebay_splash_challenge
+
+        assert is_ebay_splash_challenge(_EBAY_SPLASH)
+        assert (
+            detect_challenge(200, {"content-type": "text/html"}, _EBAY_SPLASH)
+            == ChallengeType.GENERIC_JS
+        )
+
+    def test_splash_survives_dom_serialization(self):
+        # A browser's DOM escapes the logger payload's quotes.
+        from wafer._challenge import is_ebay_splash_challenge
+
+        serialized = _EBAY_SPLASH.replace('"', "&quot;")
+        assert is_ebay_splash_challenge(serialized)
+
+    def test_splash_markers_absent_from_a_results_page(self):
+        from wafer._challenge import is_ebay_splash_challenge
+
+        page = (
+            "<html><head><title>USB C Cable for sale | eBay</title></head>"
+            "<body>" + "<li class=s-item>cable</li>" * 500 + "</body></html>"
+        )
+        assert not is_ebay_splash_challenge(page)
+        assert detect_challenge(200, {"content-type": "text/html"}, page) is None
+
+    def test_akamai_refusal_names_akamai_by_its_cookies(self):
+        headers = {
+            "content-type": "text/html",
+            "server": "AkamaiGHost",
+            "set-cookie": "bm_s=YAAQ; bm_so=AE89~YAAQ",
+        }
+        assert detect_challenge(403, headers, _EBAY_REFUSAL) == ChallengeType.AKAMAI
+
+    def test_refusal_without_its_cookies_stays_generic(self):
+        assert (
+            detect_challenge(403, {"content-type": "text/html"}, _EBAY_REFUSAL)
+            == ChallengeType.GENERIC_JS
+        )
+
+    def test_splash_is_never_a_browser_passthrough(self):
+        from wafer.browser._solver import _is_passthrough_challenge_html
+
+        assert _is_passthrough_challenge_html(_EBAY_SPLASH)

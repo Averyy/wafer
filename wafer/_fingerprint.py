@@ -150,7 +150,7 @@ def emulation_user_agent(emulation: Emulation) -> str | None:
     Linux/Windows), so it has to be the real browser's.
     """
     family = emulation_family(emulation)
-    ver = emulation_major_version(emulation)
+    ver = presented_major_version(emulation)
     if ver is None:
         return None
     if family == "chrome":
@@ -253,6 +253,13 @@ _CHROME_BUILDS: dict[int, tuple[int, int]] = {
     # 154.0.8037.93 is the build the Chrome154 profile was wire-verified
     # against (2026-10-05, Google Chrome on macOS).
     154: (8037, 93),
+    # 155-157 are presented over the Chrome154 profile (see
+    # _WIRE_IDENTICAL_RELEASES). 155 and 156 are macOS's last stable builds;
+    # 157.0.8103.38 is in the stable history of macOS, Linux and Windows, and
+    # is what Linux stable reported in its client hints (2026-11-03).
+    155: (8059, 86),
+    156: (8078, 81),
+    157: (8103, 38),
 }
 
 # Fallback for versions outside the lookup table.
@@ -595,6 +602,25 @@ _CHROME_ACCEPT = (
     "image/avif,image/webp,image/apng,*/*;q=0.8,"
     "application/signed-exchange;v=b3;q=0.7"
 )
+# Chrome's navigation Accept names image/jxl once JPEG XL decoding is on by
+# default. Measured 2026-11-03 at tls.peet.ws: Chrome for Testing 154 sends
+# _CHROME_ACCEPT; Google Chrome 156 (macOS) and 157 (Linux) send this. 155 was
+# not captured; it gets the older form.
+_CHROME_ACCEPT_JXL = (
+    "text/html,application/xhtml+xml,application/xml;q=0.9,image/jxl,"
+    "image/avif,image/webp,image/apng,*/*;q=0.8,"
+    "application/signed-exchange;v=b3;q=0.7"
+)
+_CHROME_JXL_ACCEPT_FROM = 156
+CHROME_NAVIGATION_ACCEPTS = frozenset({_CHROME_ACCEPT, _CHROME_ACCEPT_JXL})
+
+
+def chrome_navigation_accept(major: int | None) -> str:
+    """Chrome's top-level navigation ``Accept`` for a Chrome *major*."""
+    if major is not None and major >= _CHROME_JXL_ACCEPT_FROM:
+        return _CHROME_ACCEPT_JXL
+    return _CHROME_ACCEPT
+
 _FIREFOX_ACCEPT = (
     "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
 )
@@ -616,8 +642,10 @@ _SAFARI_ACCEPT = (
 # max-age=0 only on a reload or a form POST, which the session adds per
 # request (see _build_headers).
 _FAMILY_HEADERS: dict[str, dict[str, str]] = {
+    # The presented default Chrome's (see _WIRE_IDENTICAL_RELEASES); the
+    # session swaps in the older form for a version that predates it.
     "chrome": {
-        "Accept": _CHROME_ACCEPT,
+        "Accept": _CHROME_ACCEPT_JXL,
         "Accept-Language": "en-US,en;q=0.9",
         "Accept-Encoding": "gzip, deflate, br, zstd",
         "Upgrade-Insecure-Requests": "1",
@@ -852,9 +880,71 @@ _EMULATION_BY_VERSION: dict[int, Emulation] = {
 }
 
 
+# Chrome releases newer than a wreq Chrome profile whose navigation wire is
+# that profile's: the same ClientHello (JA4, peetprint) and the same HTTP/2
+# SETTINGS, WINDOW_UPDATE and pseudo-header order. wafer presents the newest
+# of them over the profile's TLS (UA, client hints and the version-dependent
+# Accept), as pin_to_browser does for a solving browser. Chrome's stable
+# channel moves every four weeks and wreq ships profiles later, and an old
+# version is something a WAF can see: in one window, www.ebay.ca's Akamai
+# refused alternating cold navigations claiming Chrome 154 from Linux (403
+# "Error Page", 3 of 3) and served the same ones claiming 157, then current
+# stable, over the same TLS (200, 3 of 3; 2026-11-03). Its verdict also
+# moved with other state later that day, for both versions.
+#
+# Only add a release after capturing real Chrome of that version at
+# tls.peet.ws: Chrome changed its ClientHello at 150 and again at 152 (see
+# pin_to_browser), and presenting a version over a ClientHello it never sent
+# is the skew a JA4-aware WAF looks for. Measured 2026-11-03: Google Chrome
+# 156.0.8078.80 (macOS) and 157.0.8103.38 (Linux) both send JA4
+# t13d1517h2_8daaf6152771_cb7bf5808d99 and Akamai HTTP/2
+# 1:65536;2:0;4:6291456;6:262144|15663105|0|m,a,s,p, exactly Chrome154's.
+# 155 was not captured; it lies between two identical releases.
+_WIRE_IDENTICAL_RELEASES: dict[int, tuple[int, ...]] = {
+    154: (155, 156, 157),
+}
+_PROFILE_FOR_RELEASE: dict[int, int] = {
+    release: profile
+    for profile, releases in _WIRE_IDENTICAL_RELEASES.items()
+    for release in releases
+}
+
+
 def chrome_version(emulation: Emulation) -> int | None:
     """Extract Chrome major version from an Emulation profile, or None."""
     return _VERSION_BY_REPR.get(repr(emulation))
+
+
+def presented_chrome_version(emulation: Emulation) -> int | None:
+    """The Chrome major wafer presents for a Chrome profile, or None.
+
+    The newest release whose wire is identical to the profile's (see
+    ``_WIRE_IDENTICAL_RELEASES``), else the profile's own version.
+    """
+    ver = chrome_version(emulation)
+    if ver is None:
+        return None
+    newer = _WIRE_IDENTICAL_RELEASES.get(ver)
+    return max(newer) if newer else ver
+
+
+def presented_major_version(emulation: Emulation) -> int | None:
+    """The major version wafer presents for any family's profile, or None.
+
+    Chrome profiles present their newest wire-identical release; every other
+    family presents the profile's own version.
+    """
+    return presented_chrome_version(emulation) or emulation_major_version(
+        emulation
+    )
+
+
+def wire_identical_chrome(major: int, emulation: Emulation) -> bool:
+    """Whether Chrome *major* sends exactly *emulation*'s navigation wire."""
+    ver = chrome_version(emulation)
+    return ver is not None and (
+        major == ver or _PROFILE_FOR_RELEASE.get(major) == ver
+    )
 
 
 def chrome_full_version(emulation: Emulation) -> str | None:
@@ -863,13 +953,21 @@ def chrome_full_version(emulation: Emulation) -> str | None:
     The returned four-part version is the same value wafer emits in
     high-entropy Chrome client hints. Non-Chrome profiles return ``None``.
     """
-    major = chrome_version(emulation)
+    major = presented_chrome_version(emulation)
     return _full_version(major) if major is not None else None
 
 
 def emulation_for_version(version: int) -> Emulation | None:
-    """Find the Emulation profile matching a Chrome major version, or None."""
-    return _EMULATION_BY_VERSION.get(version)
+    """The Emulation profile whose wire Chrome *version* sends, or None.
+
+    The profile of that version, or the older one it is wire-identical to
+    (see ``_WIRE_IDENTICAL_RELEASES``).
+    """
+    exact = _EMULATION_BY_VERSION.get(version)
+    if exact is not None:
+        return exact
+    profile = _PROFILE_FOR_RELEASE.get(version)
+    return _EMULATION_BY_VERSION.get(profile) if profile is not None else None
 
 
 # ---------------------------------------------------------------------------
@@ -980,6 +1078,15 @@ class FingerprintManager:
     def ch_full_version_override(self) -> str | None:
         """Client-hint full build to present, or None for the Emulation's."""
         return self._ch_full_version_override
+
+    @property
+    def presented_version(self) -> int | None:
+        """The major version on the wire: a solving browser's after
+        :meth:`pin_to_browser`, else the profile's presented one (a Chrome
+        profile presents its newest wire-identical release)."""
+        if self._ch_version_override is not None:
+            return self._ch_version_override
+        return presented_major_version(self._current)
 
     def pin(self) -> None:
         """Pin current fingerprint (cookies are bound to this TLS identity)."""
@@ -1098,11 +1205,7 @@ class FingerprintManager:
         brand = _FAMILY_BRAND.get(family) if family else None
         # After a browser solve the client-hint version follows the solving
         # browser (pin_to_browser), which may be newer than any wreq profile.
-        ver = (
-            self._ch_version_override
-            if self._ch_version_override is not None
-            else emulation_major_version(self._current)
-        )
+        ver = self.presented_version
         # Firefox/Safari (brand None) and unknown profiles send no hints.
         if brand is None or ver is None:
             return {}
@@ -1212,7 +1315,7 @@ def build_fingerprint_envelope(
     ver = (
         ch_major_version
         if ch_major_version is not None
-        else emulation_major_version(emulation)
+        else presented_major_version(emulation)
     )
     is_mobile = emulation_is_mobile(emulation)
 

@@ -48,11 +48,12 @@ from concurrent.futures import (
     TimeoutError as FutureTimeoutError,
 )
 from dataclasses import dataclass, field
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse, urlsplit
 
 from wafer._brave import is_brave_challenge
+from wafer._challenge import is_ebay_splash_challenge
 from wafer._cookies import browser_cookie_matches_host, registrable_domain
-from wafer._errors import ResponseTooLarge
+from wafer._errors import ResponseTooLarge, TooManyRedirects
 from wafer._fingerprint import chrome_full_version
 from wafer._solvers import (
     is_cookie_gate,
@@ -455,6 +456,7 @@ def _is_passthrough_challenge_html(html: str) -> bool:
         # solves it inline on the replay, so it is never content.
         or is_cookie_gate(html)
         or is_brave_challenge(html)
+        or is_ebay_splash_challenge(html)
     )
 
 
@@ -622,6 +624,12 @@ def _read_response_headers(response) -> tuple[dict[str, str], list[str]]:
 _RENDER_POLL_INTERVAL = 0.25
 _RENDER_STABLE_POLLS = 3
 _RENDER_SETTLE_CAP = 10.0
+# A page a solve left in place is kept as the render only past this size
+# (Akamai's stub bound): TMD leaves a small transition shell on the same URL.
+_RENDER_IN_PLACE_MIN_CHARS = 10_000
+# How many times render reads the DOM again after a read came back empty
+# because the page replaced its document under it (_reread_moved_document).
+_RENDER_REREADS = 3
 # Post-solve phase bound: how long the capture may spend re-navigating
 # and settling after a challenge clears, clamped to the caller deadline.
 _RENDER_POST_SOLVE_SECONDS = 30.0
@@ -1621,6 +1629,23 @@ _UTC_ZONES = frozenset(
 )
 
 
+# The zone a browser that would inherit UTC is launched on instead. Kasada
+# refused every signed call from a UTC browser in a container (costco.com,
+# 2026-11-03: the page's own call, 0 of 2) and accepted every named zone
+# tried from the same Canadian IP: America/Toronto, America/Vancouver,
+# Europe/London, even Asia/Tokyo. UTC is what servers, containers and
+# fingerprint-resisting browsers report, not what a person's browser does.
+# London keeps UTC's offset in winter. It is a guess for an egress IP
+# anywhere else, as UTC already was; timezone= or TZ choose the real one.
+_INHERITED_UTC_ZONE = "Europe/London"
+
+
+def _inherits_utc() -> bool:
+    """Whether a browser would run on UTC by inheriting the system zone, with
+    no ``TZ`` set (an explicit ``TZ``, UTC included, is the caller's)."""
+    return "TZ" not in os.environ and _clock_is_utc()
+
+
 def _clock_is_utc() -> bool:
     """Whether a browser launched by this process will run on UTC.
 
@@ -1751,6 +1776,9 @@ def hardened_launch_config(
         # after that point took 17-26s on macOS (Chromium issue 481087595).
         # Browser-process only: nothing about it is visible to a page.
         "--disable-updater-scheduler",
+        # en-US whatever the host locale, set natively so Accept-Language
+        # keeps stock Chrome's position (see _ACCEPT_LANGUAGE).
+        f"--accept-lang={_ACCEPT_LANGUAGE}",
     ]
     if host == "linux":
         # Pin ANGLE's backend either way. Its automatic Linux selection can
@@ -1872,14 +1900,33 @@ def scrub_headless_ua(user_agent: str) -> str:
 # configured proxy with that UA (measured 2026-10-06). It never needs the
 # network, so it gets none: a proxy nothing listens on, and no background
 # services.
+def _wire_matches_default(version: str | None) -> bool:
+    """Whether Chrome *version* sends the navigation wire of wafer's default
+    profile: that profile's own major, or a release measured identical to it
+    (see ``_fingerprint._WIRE_IDENTICAL_RELEASES``)."""
+    from wafer._base import DEFAULT_EMULATION
+    from wafer._fingerprint import wire_identical_chrome
+
+    try:
+        major = int(str(version or "").split(".")[0])
+    except ValueError:
+        return False
+    return wire_identical_chrome(major, DEFAULT_EMULATION)
+
+
 _OFFLINE_ARGS = [
     "--proxy-server=http://127.0.0.1:9",
     "--proxy-bypass-list=<-loopback>",
     "--disable-background-networking",
 ]
 
-# navigator.languages is ["en-US"] without this, where a real en-US Chrome
-# reports ["en-US", "en"].
+# The browser's languages: navigator.languages ["en-US", "en"] in every frame
+# and worker, and Accept-Language "en-US,en;q=0.9", the plain client's. Given
+# to Chrome as --accept-lang (see hardened_launch_config), never through the
+# CDP user-agent override: an override's acceptLanguage makes Chrome send
+# Accept-Language right after User-Agent instead of last, a header order no
+# stock Chrome has, and Akamai refuses it from Linux and Windows
+# (homedepot.com denied every such navigation outright, 2026-11-03).
 _ACCEPT_LANGUAGE = "en-US,en"
 
 # Child targets are attached unflattened and paused until their overrides
@@ -1921,9 +1968,9 @@ def _ua_override_params(user_agent: str, browser_version: str | None) -> dict:
     """
     from wafer._fingerprint import cdp_ua_metadata
 
-    params = cdp_ua_metadata(user_agent, browser_version=browser_version)
-    params["acceptLanguage"] = _ACCEPT_LANGUAGE
-    return params
+    # No acceptLanguage: the launch's --accept-lang sets the languages, and
+    # Chrome then places the header itself (see _ACCEPT_LANGUAGE).
+    return cdp_ua_metadata(user_agent, browser_version=browser_version)
 
 
 def _color_gamut_command(headless: bool, host: str) -> list[tuple[str, dict]]:
@@ -3290,6 +3337,31 @@ def _current_document(document_responses: list, navigation_response):
     return document_responses[-1] if document_responses else navigation_response
 
 
+def _same_page_url(a: str, b: str) -> bool:
+    """The same scheme, host, port, path and query; the fragment ignored.
+
+    Chrome reports a URL normalized (``https://host:443/`` as
+    ``https://host/``, the host lowercased), so the default port and the
+    host's case do not tell two spellings of one page apart.
+    """
+
+    def parts(value: str):
+        split = urlsplit(value)
+        scheme = split.scheme.lower()
+        host = (split.hostname or "").rstrip(".")
+        try:
+            host = host.encode("idna").decode("ascii")
+        except UnicodeError:
+            pass
+        port = split.port or {"http": 80, "https": 443}.get(scheme)
+        return scheme, host.lower(), port, split.path or "/", split.query
+
+    try:
+        return parts(a) == parts(b)
+    except ValueError:
+        return False
+
+
 def _response_status(response) -> int:
     if response is None:
         return 200
@@ -3422,6 +3494,12 @@ class BrowserSolver:
         # Set when the driver process died under a busy worker, which can
         # never return (see _recover_timed_out_worker).
         self._driver_lost = False
+        # Set when a timed-out operation's driver was interrupted, which
+        # closes Chrome (see _recover_timed_out_worker). The browser's
+        # "disconnected" event only arrives when a later call pumps the
+        # connection, so is_connected() keeps answering True until then;
+        # _ensure_browser relaunches on this instead.
+        self._browser_interrupted = False
         # Patchright's synchronous Playwright objects are greenlet-bound to
         # the thread that created them. Every public browser operation,
         # including preflight and close, must therefore use one dedicated
@@ -3606,9 +3684,7 @@ class BrowserSolver:
             # the installed browser's exact UA/client hints.
             actual = _browser_executable_version(chrome, timeout)
             if actual != expected:
-                actual_major = actual.split(".")[0] if actual else ""
-                expected_major = expected.split(".")[0] if expected else ""
-                if actual_major != expected_major:
+                if not _wire_matches_default(actual):
                     logger.warning(
                         "Installed Chrome %s differs from wafer's default "
                         "emulation Chrome %s; the TLS shape may diverge "
@@ -3619,8 +3695,8 @@ class BrowserSolver:
                     )
                 else:
                     logger.debug(
-                        "Installed Chrome %s (wafer emulation is %s, "
-                        "same major)",
+                        "Installed Chrome %s (wafer presents %s over the same "
+                        "TLS)",
                         actual,
                         expected,
                     )
@@ -3636,7 +3712,19 @@ class BrowserSolver:
         """Launch browser if not running or if idle too long."""
         now = time.monotonic()
 
-        if self._browser is not None:
+        if self._browser_interrupted:
+            # The driver closed Chrome when a timed-out operation was
+            # interrupted, but is_connected() still answers True: the
+            # disconnect has not been pumped yet. Reusing the browser failed
+            # the next solve at once with TargetClosedError, even with a
+            # minute to spare (a Kasada signed call cut off in its SDK wait,
+            # fetchaller, 2026-11-04).
+            self._browser_interrupted = False
+            logger.debug(
+                "Browser was interrupted by a timed-out operation, relaunching"
+            )
+            self._close_browser(preserve_identity=True)
+        elif self._browser is not None:
             if self._last_used > 0 and (now - self._last_used) > self._idle_timeout:
                 logger.debug(
                     "Browser idle timeout (%.0fs), closing",
@@ -3729,9 +3817,7 @@ class BrowserSolver:
             launched_version = self._browser.version
             expected_version = self._expected_browser_version()
             if launched_version != expected_version:
-                launched_major = launched_version.split(".")[0]
-                expected_major = expected_version.split(".")[0]
-                if launched_major != expected_major:
+                if not _wire_matches_default(launched_version):
                     logger.warning(
                         "Launched Chrome %s differs from wafer's default "
                         "emulation Chrome %s; the TLS shape may diverge",
@@ -3740,8 +3826,8 @@ class BrowserSolver:
                     )
                 else:
                     logger.debug(
-                        "Launched Chrome %s (wafer emulation is %s, "
-                        "same major)",
+                        "Launched Chrome %s (wafer presents %s over the same "
+                        "TLS)",
                         launched_version,
                         expected_version,
                     )
@@ -3776,15 +3862,26 @@ class BrowserSolver:
         self._publish_browser_identity()
         self._runtime_ready.set()
 
-        if not self._timezone and not self._utc_clock_warned and _clock_is_utc():
-            # Surface a commonly unintended container default. A clock alone
-            # does not determine whether an application accepts browser state.
-            self._utc_clock_warned = True
-            logger.warning(
-                "Browser clock is UTC; if unintended, pass "
-                "BrowserSolver(timezone=...) or set TZ. Changing the "
-                "timezone does not guarantee challenge-free requests"
-            )
+        if not self._timezone and not self._utc_clock_warned:
+            if _inherits_utc():
+                self._utc_clock_warned = True
+                logger.info(
+                    "System clock is UTC; the browser runs on %s instead "
+                    "(pass BrowserSolver(timezone=...) or set TZ to the "
+                    "egress region)",
+                    _INHERITED_UTC_ZONE,
+                )
+            elif _clock_is_utc():
+                # TZ names UTC itself: the caller's choice, kept, and worth
+                # surfacing. A clock alone does not determine whether an
+                # application accepts browser state.
+                self._utc_clock_warned = True
+                logger.warning(
+                    "Browser clock is UTC (TZ=%s); if unintended, pass "
+                    "BrowserSolver(timezone=...) or set TZ. Changing the "
+                    "timezone does not guarantee challenge-free requests",
+                    os.environ.get("TZ", ""),
+                )
 
         self._last_used = time.monotonic()
         logger.info("Browser launched (headless=%s)", self._headless)
@@ -3816,8 +3913,11 @@ class BrowserSolver:
         browser_proxy = self._egress_guard_proxy or self._proxy_server
         if browser_proxy and not offline:
             launch_kwargs["proxy"] = _playwright_proxy(browser_proxy)
-        if self._timezone:
-            launch_kwargs["env"] = {**os.environ, "TZ": self._timezone}
+        timezone = self._timezone
+        if timezone is None and _inherits_utc():
+            timezone = _INHERITED_UTC_ZONE
+        if timezone:
+            launch_kwargs["env"] = {**os.environ, "TZ": timezone}
         browser = self._playwright.chromium.launch(**launch_kwargs)
         self._browser = browser
 
@@ -4084,6 +4184,7 @@ class BrowserSolver:
                 return ""
             return html
         except Exception:
+            logger.debug("DOM read failed", exc_info=True)
             return ""
 
     @staticmethod
@@ -4273,8 +4374,9 @@ class BrowserSolver:
         :func:`harden_page` uses; only the script set is the solver's own.
 
         **All modes** (headed + headless):
-        - ``Emulation.setUserAgentOverride`` with ``userAgentMetadata`` and
-          ``acceptLanguage``, so ``sec-ch-ua``, ``navigator.userAgentData``
+        - ``Emulation.setUserAgentOverride`` with ``userAgentMetadata`` (the
+          languages come from the launch's ``--accept-lang``), so ``sec-ch-ua``,
+          ``navigator.userAgentData``
           and ``navigator.languages`` agree with the user agent.
         - The screenX/screenY fix for the CDP mouse event bug
           (Chromium #40280325), when the real-input probe proved it.
@@ -5037,7 +5139,11 @@ class BrowserSolver:
                 if self._executor_closed:
                     return
             try:
-                connected = self._browser is not None and self._browser.is_connected()
+                connected = (
+                    self._browser is not None
+                    and self._browser.is_connected()
+                    and not self._browser_interrupted
+                )
             except Exception:
                 connected = False
             if connected:
@@ -5082,6 +5188,10 @@ class BrowserSolver:
     def _recover_timed_out_worker(self, future) -> None:
         if future.done():
             return
+        # Flagged before anything else: the readiness callback registered
+        # below runs the moment the operation finishes, and the worker may
+        # start its next operation as soon as the driver closes Chrome.
+        self._browser_interrupted = True
         self._mark_worker_recovering(future)
         exit_code = self._driver_exit_code()
         if exit_code is not None and not self._driver_lost:
@@ -5100,6 +5210,10 @@ class BrowserSolver:
             )
             return
         interrupted = self._interrupt_playwright_transport()
+        if interrupted:
+            self._runtime_ready.clear()
+        else:
+            self._browser_interrupted = False
         logger.warning(
             "Browser worker recovery requested (driver_interrupted=%s)",
             interrupted,
@@ -5389,6 +5503,17 @@ class BrowserSolver:
                         extras=None,
                         response=captured,
                         browser_version=self._browser_version,
+                    )
+
+                # Kasada on a signed API: the server wants the SDK's
+                # per-request headers, which only the origin page's own fetch
+                # hook can add, so the caller's request is made from there and
+                # its response handed back. Nothing earned here replays over
+                # wreq (see kasada_api_replay).
+                if challenge_type == "kasada" and embedder and replay:
+                    return self._solve_kasada_api(
+                        context, page, url, embedder, replay,
+                        overall_deadline, max_size, size_guard,
                     )
 
                 # No JS stealth injection needed.  The launch flag
@@ -5820,7 +5945,9 @@ class BrowserSolver:
                     ),
                 )
 
-            except ResponseTooLarge:
+            except (ResponseTooLarge, TooManyRedirects):
+                # Limits the caller set, hit inside the solve (a passthrough
+                # body past max_size, a signed request past its redirects).
                 raise
             except Exception as exc:
                 logger.warning(
@@ -5993,6 +6120,9 @@ class BrowserSolver:
                 # history.pushState route change issues no document response,
                 # so the last recorded one stays correct there too.
                 document_responses = []
+                # The same documents as (url, status, response), the shape the
+                # per-WAF handlers read when one solves in place.
+                handler_documents: list[tuple[str, int, object]] = []
 
                 def _record_document(response) -> None:
                     try:
@@ -6004,6 +6134,12 @@ class BrowserSolver:
                     except Exception:
                         return
                     document_responses.append(response)
+                    try:
+                        handler_documents.append(
+                            (str(response.url), int(response.status), response)
+                        )
+                    except Exception:
+                        return
 
                 page.on("response", _record_document)
                 navigation_response = None
@@ -6027,6 +6163,12 @@ class BrowserSolver:
                     raise ResponseTooLarge(url, int(size_guard["size"]), max_size)
 
                 html = self._bounded_page_content(page, max_size)
+                if not html:
+                    html = self._reread_moved_document(
+                        page, max_size, overall_deadline
+                    )
+                if size_guard["exceeded"]:
+                    raise ResponseTooLarge(url, int(size_guard["size"]), max_size)
                 # A protected page answers the navigation with an interstitial,
                 # so the settled DOM is the challenge rather than the content.
                 # The browser that would solve it is already on that page: run
@@ -6041,6 +6183,7 @@ class BrowserSolver:
                 # a WAF the transport path clears routinely. Solving in place
                 # is a no-op when the classifier finds nothing.
                 solved_challenge = False
+                in_place = ""
                 if html:
                     # Classified by the status of the document the DOM came
                     # from, as the session will classify the result. Google's
@@ -6048,9 +6191,10 @@ class BrowserSolver:
                     # /sorry/, which answered 429: classified at the goto()
                     # status, its reCAPTCHA was not a challenge, and render
                     # handed it back unsolved (2026-10-06).
-                    nav_status = _response_status(
-                        _current_document(document_responses, navigation_response)
+                    current_document = _current_document(
+                        document_responses, navigation_response
                     )
+                    nav_status = _response_status(current_document)
                     def extend_for(challenge_value: str) -> float:
                         nonlocal overall_deadline
                         overall_deadline = _extend_render_budget(
@@ -6065,11 +6209,42 @@ class BrowserSolver:
                         overall_deadline,
                         nav_status,
                         extend=extend_for,
+                        documents=handler_documents,
+                        response=current_document,
                     )
                     if solved:
                         solved_challenge = True
                         from wafer._challenge import detect_challenge
 
+                        settle_deadline = min(
+                            overall_deadline,
+                            time.monotonic() + _RENDER_POST_SOLVE_SECONDS,
+                        )
+                        # The handler may have left the requested page itself
+                        # in place: Akamai's refusal, retried, went on through
+                        # eBay's splash to the 2.4 MB results. Navigating again
+                        # only asked for a fresh verdict, and eBay refused it
+                        # (403), so render polled the refusal and returned it
+                        # (www.ebay.com, Linux image, 2026-11-04).
+                        in_place = self._content_left_in_place(
+                            page,
+                            url,
+                            max_size,
+                            lambda: _current_document(
+                                document_responses, navigation_response
+                            ),
+                            settle_deadline,
+                        )
+                        if size_guard["exceeded"]:
+                            raise ResponseTooLarge(
+                                url, int(size_guard["size"]), max_size
+                            )
+                        if in_place:
+                            html = in_place
+                            logger.info(
+                                "Render kept the page the solve left in place"
+                            )
+                    if solved and not in_place:
                         # Replay the original navigation with the clearance
                         # state the solve just earned. The solve's own target
                         # navigation can leave a same-URL transition document
@@ -6087,10 +6262,6 @@ class BrowserSolver:
                         # document, turning an informative ChallengeDetected at
                         # 44s into a ConnectionFailed at 155s. Worst case is
                         # now solve time plus this window.
-                        settle_deadline = min(
-                            overall_deadline,
-                            time.monotonic() + _RENDER_POST_SOLVE_SECONDS,
-                        )
                         try:
                             refreshed_response = page.goto(
                                 url,
@@ -6132,6 +6303,22 @@ class BrowserSolver:
                                     break
                             if not _sleep_before_deadline(settle_deadline, 0.5):
                                 break
+                if not solved_challenge:
+                    from wafer.browser._cloudflare import cleared_in_passing
+
+                    # Cloudflare's interstitial can clear while the page
+                    # settles, before the DOM is first read: no solve runs, yet
+                    # the clearance it earned is bound to this browser's UA and
+                    # client hints like any other. Reported as challenge-absent,
+                    # the session merged the cookies without pinning, and its
+                    # next request was challenged under its own identity
+                    # (stackoverflow.com, 2026-11-03).
+                    if cleared_in_passing(handler_documents):
+                        solved_challenge = True
+                        logger.info(
+                            "Render cleared a Cloudflare challenge while the "
+                            "page settled"
+                        )
                 if not html and max_size is not None:
                     # _bounded_page_content returns "" for both an absent
                     # document and one over the cap. Ask which it was, so a DOM
@@ -6271,6 +6458,8 @@ class BrowserSolver:
         deadline: float,
         status: int = 200,
         extend=None,
+        documents: list | None = None,
+        response=None,
     ) -> bool:
         """Run the per-WAF handler on the interstitial a render landed on.
 
@@ -6278,6 +6467,11 @@ class BrowserSolver:
         transport path agree on what a body is. Returns whether a solve was
         attempted and reported success - a False leaves the interstitial in
         place for the caller to classify and report as a challenge.
+
+        *documents* is the render's live list of main-frame
+        ``(url, status, response)``, handed to the handler as the solve path
+        hands it its own. *response* is the one the DOM came from; its
+        headers take part in the classification at its real status.
         """
 
         from wafer._challenge import detect_challenge
@@ -6290,8 +6484,25 @@ class BrowserSolver:
         # generic JS wait that never ran the drag. Then 403 as a fallback,
         # because other WAFs gate their body markers on a blocking status and
         # would hide from a challenge served in place as 200.
+        # The real status goes with the document's real headers, as the
+        # transport path classifies it. Without them, Akamai's refusal page
+        # (a 403 whose Set-Cookie names bm_so) read as generic_js, whose wait
+        # re-navigated it and then polled it for the 30s post-solve window
+        # (www.ebay.com, 2026-11-04). The 403 fallback stays body-only: a
+        # 200 page's own cookies (Akamai sets _abck on every page) say
+        # nothing at a status the server never sent.
         headers = {"content-type": "text/html"}
-        challenge = detect_challenge(status, headers, html, url=url)
+        served = dict(headers)
+        if response is not None:
+            try:
+                served_headers, served_cookies = _response_headers(response)
+            except Exception:
+                served_headers, served_cookies = {}, []
+            served = {**served_headers}
+            served.setdefault("content-type", "text/html")
+            if served_cookies:
+                served["set-cookie"] = "\n".join(served_cookies)
+        challenge = detect_challenge(status, served, html, url=url)
         if (
             challenge is None
             and status != 403
@@ -6315,6 +6526,7 @@ class BrowserSolver:
                 challenge.value,
                 remaining_ms,
                 challenge_url=url,
+                documents=documents,
             )
         except Exception as exc:
             logger.warning(
@@ -6383,6 +6595,160 @@ class BrowserSolver:
             if not _sleep_before_deadline(settle_deadline, _RENDER_POLL_INTERVAL):
                 return
 
+    def _content_left_in_place(
+        self,
+        page,
+        url: str,
+        max_size: int | None,
+        current_document,
+        deadline: float,
+    ) -> str:
+        """The requested page, when a solve left it in the page; else "".
+
+        A solve can end on the destination itself (Akamai's handler returns
+        once the real page has replaced the refusal) or on something that only
+        leads there (TMD's slider leaves a small same-URL transition shell),
+        for which render replays the navigation. Kept only when it is plainly
+        the page: the requested URL, a 2xx document, past a challenge stub's
+        size, and no challenge to the classifier, checked again once the page
+        has settled. *current_document* returns the main-frame response the
+        page holds now.
+        """
+        from wafer._challenge import detect_challenge
+
+        def is_destination() -> bool:
+            document = current_document()
+            if document is None:
+                return False
+            status = _response_status(document)
+            return 200 <= status < 300 and _same_page_url(str(page.url), url)
+
+        if not is_destination():
+            return ""
+        self._wait_for_hydration(page, deadline)
+        html = self._bounded_page_content(page, max_size)
+        if len(html) <= _RENDER_IN_PLACE_MIN_CHARS or not is_destination():
+            return ""
+        status = _response_status(current_document())
+        if detect_challenge(status, {"content-type": "text/html"}, html, url=url):
+            return ""
+        return html
+
+    def _reread_moved_document(
+        self, page, max_size: int | None, deadline: float
+    ) -> str:
+        """Read the DOM again when the first read came back empty.
+
+        A page can replace its own document after it has settled. eBay's
+        splash (``/splashui/challenge``) clears itself and moves on to the
+        search a second or so after it goes quiet. A DOM read that raced the
+        commit failed, and render reported "no document" with the results
+        page arriving and most of the budget left (fetchaller's Linux image,
+        2026-11-04: 10 of 22 eBay renders on 0.7.11 and the working tree).
+        So wait for the new document, let it settle, and read it; a document
+        past *max_size* is left for the caller to report as too large.
+        """
+
+        for _ in range(_RENDER_REREADS):
+            if max_size is not None:
+                try:
+                    length = _quiet_read(page, _DOCUMENT_LENGTH)
+                except Exception:
+                    length = None
+                if isinstance(length, (int, float)) and length > max_size:
+                    return ""
+            if not _sleep_before_deadline(deadline, _RENDER_POLL_INTERVAL):
+                return ""
+            try:
+                page.wait_for_load_state(
+                    "domcontentloaded", timeout=_navigation_budget_ms(deadline)
+                )
+            except Exception as exc:
+                logger.debug(
+                    "Render re-read: no loaded document (%s)", type(exc).__name__
+                )
+            self._wait_for_hydration(page, deadline)
+            html = self._bounded_page_content(page, max_size)
+            if html:
+                logger.info(
+                    "Render read the document the page moved to (%s)",
+                    str(page.url) or "?",
+                )
+                return html
+        return ""
+
+    def _solve_kasada_api(
+        self,
+        context,
+        page,
+        url: str,
+        embedder: str,
+        replay: dict,
+        overall_deadline: float,
+        max_size: int | None,
+        size_guard: dict,
+    ) -> "SolveResult | None":
+        """Make a Kasada-signed API call from the *embedder* page.
+
+        Navigates the site page that calls the API, waits for its Kasada SDK,
+        then issues the caller's request through the SDK's fetch hook. The
+        response is a passthrough: it reports no transferable clearance,
+        because each signature is single-use and bound to the SDK's state.
+        """
+        from wafer.browser._kasada import kasada_api_replay, wait_for_kasada_sdk
+
+        try:
+            page.goto(
+                embedder,
+                wait_until="domcontentloaded",
+                timeout=_navigation_budget_ms(overall_deadline),
+            )
+        except Exception as exc:
+            logger.debug(
+                "Kasada embedder navigation timeout/error (%s)",
+                type(exc).__name__,
+            )
+        if size_guard["exceeded"]:
+            raise ResponseTooLarge(url, int(size_guard["size"]), max_size)
+        if not wait_for_kasada_sdk(page, overall_deadline):
+            logger.warning(
+                "Kasada SDK never became ready on %s; cannot sign the request",
+                embedder,
+            )
+            return None
+        remaining_ms = int((overall_deadline - time.monotonic()) * 1000)
+        if remaining_ms <= 0:
+            return None
+        res = kasada_api_replay(page, url, replay, remaining_ms, max_size)
+        if res is None:
+            return None
+        self._last_used = time.monotonic()
+        logger.info(
+            "Kasada signed request from %s (HTTP %d, %d bytes)",
+            embedder,
+            res["status"],
+            len(res["body"]),
+        )
+        return SolveResult(
+            # None of the page's cookies took part in this response, and they
+            # are not the API's to carry: the site's own page calls these
+            # APIs cross-origin without credentials, and one of costco.com's
+            # (its consent cookie, tcm) gets its location API refused outright
+            # (403) on every later request that carries it. Handing them back
+            # would put them in the session's jar and its cache_dir.
+            cookies=[],
+            user_agent=self._browser_ua or "",
+            extras=None,
+            response=CapturedResponse(
+                url=res["url"],
+                status=res["status"],
+                headers=res["headers"],
+                body=res["body"],
+            ),
+            browser_version=self._browser_version,
+            challenge_absent=True,
+        )
+
     def _dispatch_challenge(
         self,
         page,
@@ -6402,7 +6768,9 @@ class BrowserSolver:
                 wait_for_cloudflare,
             )
 
-            return wait_for_cloudflare(self, page, timeout_ms)
+            return wait_for_cloudflare(
+                self, page, timeout_ms, documents=documents
+            )
         elif challenge_type == "akamai":
             from wafer.browser._akamai import wait_for_akamai
 

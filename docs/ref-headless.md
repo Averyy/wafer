@@ -137,6 +137,25 @@ Where each came from, and what fixes it:
   `ProtocolError`s (a target or context that is gone) and re-throws anything
   else. If a driver still dies under a busy worker, `BrowserSolver` logs one
   ERROR and refuses later work at once instead of queuing it.
+- **The preload bounds input Chrome never answers.** An `Input.dispatch*`
+  command answers once the renderer has handled the event, and one in flight
+  when the frame it went to is torn down is never answered. On mouser.com,
+  DataDome's interstitial is a full-page iframe; when it clears, the page
+  reloads and the iframe is removed at the commit, and a `mouseMoved` sent
+  4-14 ms before that commit never returned (2 of 16 capped solves on macOS,
+  0.7.11 and the working tree alike, 2026-11-04). Playwright waits for the
+  answer with no deadline, so the solve sat in `mouse.move` until its own
+  timeout and the browser was killed to recover the worker. The preload's
+  `CRSession.send` wrapper takes an input command (`Input.dispatchMouseEvent`,
+  `dispatchKeyEvent`, `dispatchTouchEvent`, `dispatchDragEvent`,
+  `insertText`) as answered after 3s; Chrome's own answer or error still
+  comes through when it arrives first, and nothing else is bounded. Measured
+  acks over 1,467 events: median 11 ms, 99.9th percentile 303 ms, slowest
+  354 ms. A slower renderer only means the next event is sent before the last
+  was acknowledged, which Chrome queues in order, as it does a real mouse's.
+  The hangs came only with a `max_response_size` set (0 of 19 solves
+  uncapped, 5 of 29 capped); why the cap's extra `Network.enable` session
+  moves the odds is not known.
 - **Which solver sites use shared workers** (headless, 2026-10-06).
   realtor.com started one and chewy.com two, all from `blob:` URLs;
   Cloudflare, DataDome (allegro.pl, idealista.com), Imperva, AWS WAF and
@@ -416,6 +435,7 @@ any click.
 | `--disable-blink-features=AutomationControlled` | Makes `navigator.webdriver` return `false` via native getter. | Both |
 | `--enable-gpu` | Forces real GPU where there is one. Without it, WebGL exposes `"SwiftShader"` as renderer even on a GPU host. | Both |
 | `--disable-updater-scheduler` | Stops branded Chrome waking Google Updater 19s after launch. The updater inherits the stdio pipes Playwright waits on, so every close after that point took 17-26s on macOS (Chromium issue 481087595; measured 2026-10-05 on Chrome 154: 17.1s without, 0.2s with). Browser-process only, invisible to pages. Honored from about M148 (commit #1605857); older builds ignore it. | Both |
+| `--accept-lang=en-US,en` | The browser's languages, natively: `navigator.languages` `["en-US", "en"]` in every frame and worker and `Accept-Language: en-US,en;q=0.9`, the plain client's, whatever the host's language: a French-locale Linux image measured `fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7` without it and exactly `en-US,en;q=0.9` with it, and so did a Mac whose preferred languages were French (Chrome started with `-AppleLanguages "(fr-FR, fr)"`, 2026-11-03). It does not change Chrome's UI locale, which on macOS comes only from the system (`--lang` is ignored there), so a non-English host keeps its own `Intl` default locale, as a real Chrome whose user put English first does. Never through the CDP UA override's `acceptLanguage`: Chrome then sends Accept-Language right after User-Agent instead of last, an order no stock Chrome has. homedepot.com's Akamai denied that order outright (403 "Error Page" on the first request) from Linux 3 of 3 and Windows 1 of 1, macOS was let through, and natural order got the solvable behavioral page on all three (2026-11-03). That was why every solve in fetchaller's Linux image failed. | Both |
 | `--use-gl=angle` | Uses ANGLE for GPU rendering (pairs with `--enable-gpu`). | Both |
 | `--use-angle=gl` + `--ignore-gpu-blocklist` | Linux with a GPU (`gpu=True`, or by default when the process can open a `/dev/dri/renderD*` node): selects Mesa OpenGL explicitly; automatic ANGLE selection can yield `gl=none` and remove WebGL. | Linux |
 | `--use-angle=swiftshader` + `--enable-unsafe-swiftshader` | Linux without a GPU (`gpu=False`, or by default with no usable render node, e.g. a container without GPU passthrough). Mesa's OpenGL driver there is its `llvmpipe` software rasterizer, and Akamai refuses that renderer outright: homedepot.com under Xvfb (fetchaller's image, Chrome for Testing 154) answered every llvmpipe launch's sensor with a 403 block page within 3s (6 of 6), with or without mouse replay, and passed every SwiftShader launch (4 of 4; then `get()` 200 897KB and `render()` 200 919KB end to end, 2026-10-08). No WebGL at all (`gl=none`, `--disable-3d-apis`) was refused too. `--enable-unsafe-swiftshader` because Chrome no longer falls back to SwiftShader for WebGL on its own. `BrowserSolver` also reads the launched renderer and relaunches on SwiftShader when a render node still led to llvmpipe. | Linux |
@@ -522,7 +542,7 @@ Applied in both headed and headless, to the page and, through auto-attach on the
 | Field | Value | Purpose |
 |---|---|---|
 | `userAgent` | Native (headed) or HeadlessChrome replaced (headless) | Remove headless identifier |
-| `acceptLanguage` | `"en-US,en"` | Fix `navigator.languages` from `["en-US"]` to `["en-US", "en"]` |
+| `acceptLanguage` | not sent | The launch's `--accept-lang=en-US,en` sets the languages instead. Sent here (until 2026-11-03), it moved Accept-Language up behind User-Agent, which Akamai refuses from Linux and Windows (see the launch-args table). |
 | `brands` | Generated from sec-ch-ua algorithm | Ensure brand shuffling matches HTTP headers |
 | `fullVersionList` | Real version from `browser.version` | See version consistency below |
 | `fullVersion` | Real version from `browser.version` | Sets `getHighEntropyValues().uaFullVersion` |

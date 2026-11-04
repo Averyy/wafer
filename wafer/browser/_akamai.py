@@ -28,6 +28,7 @@ def _document_head(page) -> tuple[int, str]:
         length, head = json.loads(_quiet_read(page, _DOCUMENT_HEAD))
         return int(length), str(head)
     except Exception:
+        logger.debug("Akamai document read failed", exc_info=True)
         return 0, ""
 
 
@@ -47,6 +48,35 @@ def _challenge_then_document(documents) -> bool:
 
 
 _BEHAVIORAL_GRACE = 15.0
+
+# A refusal document: a small 403/429 that is not the behavioral stub. Akamai
+# answers a cold navigation it distrusts with one (an "Error Page" loading its
+# script at ``/<random path>?v=<uuid>``), and once that script has posted, the
+# same navigation goes through: stock Chrome for Testing on Linux was refused
+# by www.ebay.ca, and after 8s and one reload landed on eBay's splash
+# challenge and then the results page (2026-11-03). Nothing else moves it, so
+# polling it ran the whole solve budget (142s on homedepot.com). The
+# navigation is retried once, after the script's POST or _DENY_SENSOR_WAIT,
+# and a refusal that survives the retry for _DENY_RETRY_GRACE is final. A
+# second retry was refused again, so there is only one.
+_DENY_SENSOR_WAIT = 8.0
+_DENY_RETRY_GRACE = 15.0
+
+
+def _latest_status(documents) -> int | None:
+    entries = list(documents or ())
+    return entries[-1][1] if entries else None
+
+
+def _is_real_content(length: int, head: str) -> bool:
+    """A document past Akamai's stub that is not itself a challenge page."""
+    from wafer._challenge import is_ebay_splash_challenge
+
+    return (
+        length > _STUB_SIZE
+        and "sec-if-cpt" not in head[:5000]
+        and not is_ebay_splash_challenge(head)
+    )
 
 
 def wait_for_akamai(solver, page, timeout_ms: int, documents=None) -> bool:
@@ -87,6 +117,26 @@ def wait_for_akamai(solver, page, timeout_ms: int, documents=None) -> bool:
     # the full timeout.
     behavioral_deadline = None
 
+    # A refusal document (see _DENY_SENSOR_WAIT).
+    refused = (
+        not is_behavioral
+        and _latest_status(documents) in _CHALLENGE_STATUSES
+        and initial_length < _STUB_SIZE
+    )
+    refused_at = time.monotonic()
+    retried_at: float | None = None
+    script_posted: dict = {}
+    if refused:
+
+        def _on_post(response) -> None:
+            try:
+                if response.request.method == "POST":
+                    script_posted.setdefault("at", time.monotonic())
+            except Exception:
+                return
+
+        page.on("response", _on_post)
+
     while time.monotonic() < deadline:
         if behavioral_deadline and time.monotonic() >= behavioral_deadline:
             logger.info(
@@ -95,24 +145,64 @@ def wait_for_akamai(solver, page, timeout_ms: int, documents=None) -> bool:
             )
             return False
 
+        status = _latest_status(documents)
+        if refused and status in _CHALLENGE_STATUSES:
+            # Still on a refusal: an _abck change here is the script's own
+            # bookkeeping, not clearance.
+            now = time.monotonic()
+            if retried_at is None:
+                posted = script_posted.get("at")
+                if (
+                    posted is not None and now - posted >= 1.0
+                ) or now - refused_at >= _DENY_SENSOR_WAIT:
+                    logger.info(
+                        "Akamai refused the navigation (HTTP %s); retrying it "
+                        "after its script ran",
+                        status,
+                    )
+                    retried_at = now
+                    try:
+                        page.reload(
+                            wait_until="domcontentloaded",
+                            timeout=max(1, int((deadline - now) * 1000)),
+                        )
+                    except Exception as exc:
+                        logger.debug(
+                            "Akamai retry navigation error (%s)",
+                            type(exc).__name__,
+                        )
+                    continue
+            elif now - retried_at >= _DENY_RETRY_GRACE:
+                logger.info(
+                    "Akamai refused the retried navigation too (HTTP %s); "
+                    "giving up",
+                    status,
+                )
+                return False
+            solver._replay_browse_chunk(page, state, 0.5)
+            continue
+
         cookies = page.context.cookies()
         for cookie in cookies:
             if cookie["name"] == "_abck":
                 if cookie["value"] != initial_abck:
-                    if not is_behavioral:
+                    if not is_behavioral and not refused:
                         solver._replay_browse_chunk(page, state, 1)
                         return True
-                    if behavioral_deadline is None:
+                    if is_behavioral and behavioral_deadline is None:
                         behavioral_deadline = min(
                             deadline,
                             time.monotonic() + _BEHAVIORAL_GRACE,
                         )
                 break
 
-        if is_behavioral or _challenge_then_document(documents):
+        if is_behavioral or refused or _challenge_then_document(documents):
             length, head = _document_head(page)
-            if length > _STUB_SIZE and "sec-if-cpt" not in head[:5000]:
-                logger.info("Akamai behavioral challenge auto-resolved")
+            if _is_real_content(length, head):
+                logger.info(
+                    "Akamai %s challenge auto-resolved",
+                    "refusal" if refused else "behavioral",
+                )
                 return True
 
         solver._replay_browse_chunk(page, state, 0.5)

@@ -36,8 +36,13 @@ The solver (`wafer/browser/_datadome.py`) does:
 3. If confirm button visible, click it with mousse replay
 4. If WASM PoW runs, detect `datadome` cookie change + iframe disappearing
 5. If DD escalates to interactive challenge (audio/slider), bail out immediately (saves 15-30s of wasted time)
+6. If no `captcha-delivery` iframe appears within 8s, the browser met no challenge. When the displayed document is a 2xx (its own navigation timing status, not the newest response seen) and a `datadome` cookie is set for the page's host, DD let it through on the first request (that response sets the cookie, so there is no change to see); this counts as solved, the page is passed through and the session pins to the browser, as after any DD solve. Without both, it fails as before.
 
 The bail-out was added March 2026. Previously the solver spent 15-30s on audio transcription or slider solving that always got rejected.
+
+**Let through on the first request** (mouser.com, macOS, 2026-11-04, 1 of 16 solves): the plain client drew the 403 and the browser's navigation got the 200 page with DD's cookie. The handler reported it as a failed solve, so the page and cookie were dropped, the rotations were refused, and the request failed in 14s. The solver's return-cookies-anyway fallback for a failed handler went in July 2026, which turned this case from a replay into a failure.
+
+**A mouse move Chrome never answers** (mouser.com): DD's interstitial is a full-page iframe, removed when the cleared page reloads; a `mouseMoved` in flight at that commit was never answered, and the solve waited in `mouse.move` until its timeout. The driver preload now bounds input (see `docs/ref-headless.md`).
 
 ## Cookie Replay
 
@@ -55,6 +60,7 @@ Sites where WASM PoW auto-resolve works:
 - `allegro.pl` - auto-resolve, 1.3MB (Feb 2026)
 - `tripadvisor.com` - auto-resolve (intermittent, sometimes TLS-only)
 - `idealista.com` - auto-resolve, 89KB (Feb 2026)
+- `mouser.com` - auto-resolve, 172KB, about 6s on macOS (Nov 2026); now and then lets the browser through with no challenge
 
 Sites where DD escalates to interactive challenge (unsolvable):
 - `neimanmarcus.com` - escalates to audio captcha, always rejected (Mar 2026)
