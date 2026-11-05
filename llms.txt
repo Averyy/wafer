@@ -628,6 +628,14 @@ as returned. After a browser solve, `emulation` (the TLS profile) may be a lower
 Chrome major than `user_agent` / `sec_ch_ua` / `full_version_list` (which follow
 the solving browser's version); do not reconcile them to a single version.
 
+`platform_version` is what Chrome itself reports for the host OS, quoted as a
+header value; `user_agent_data["platformVersion"]` is the same value unquoted.
+On macOS it is the marketing version (`'"26.2.0"'`). On Linux it is empty,
+`'""'` and `""`, because Chrome reports no version there. That is a real value,
+not a missing one: do not substitute the kernel's version, which no Linux
+Chrome sends. On Windows it is the `Windows.Foundation.UniversalApiContract`
+version (e.g. `'"15.0.0"'` on Windows 11 23H2), not the OS build.
+
 ### Module-level fingerprint helpers
 
 ```python

@@ -204,19 +204,55 @@ def _detect_platform_version() -> str:
         patch = parts[2] if len(parts) > 2 else "0"
         return f'"{major}.{minor}.{patch}"'
     if system == "Linux":
-        try:
-            release = platform.release()  # e.g. "6.5.0-44-generic"
-            parts = release.split(".")
-            return f'"{parts[0]}.{parts[1] if len(parts) > 1 else "0"}.0"'
-        except Exception:
-            return '"6.0.0"'
+        # Chrome reports no version on Linux, whatever the kernel:
+        # GetPlatformVersion() returns an empty string under IS_LINUX
+        # (components/embedder_support/user_agent_utils.cc). wafer sent the
+        # kernel's (7.0.0 in a container), which no Linux Chrome sends; stock
+        # Google Chrome 157 in the same container reported "" (2026-11-04).
+        return '""'
     if system == "Windows":
-        ver = platform.version()  # e.g. "10.0.22631"
-        parts = ver.split(".")
-        if len(parts) >= 3:
-            return f'"{parts[0]}.{parts[1]}.{parts[2]}"'
-        return '"10.0.0"'
+        return f'"{_windows_platform_version()}"'
     return '"10.0.0"'
+
+
+# Chrome's Sec-CH-UA-Platform-Version on Windows is the
+# Windows.Foundation.UniversalApiContract version, not the Windows build
+# (GetUniversalApiContractVersion in user_agent_utils.cc): Windows 11 23H2
+# reports "15.0.0", 24H2 "19.0.0". Builds before RS5 (17763) have no registry
+# value and map by build, RS4 covering 17134-17762 (base/win/
+# windows_version.cc); from RS5 on, a failed read reports the highest version
+# Chrome knows.
+_PRE_RS5_CONTRACTS = {10240: 1, 10586: 2, 14393: 3, 15063: 4, 16299: 5, 17134: 6}
+_RS5_BUILD = 17763
+_HIGHEST_KNOWN_CONTRACT = 19
+
+
+def _windows_platform_version() -> str:
+    try:
+        build = int(platform.version().split(".")[2])
+    except (IndexError, ValueError):
+        build = 0
+    if build and build < _RS5_BUILD:
+        major = max(
+            (v for b, v in _PRE_RS5_CONTRACTS.items() if b <= build), default=1
+        )
+        return f"{major}.0.0"
+    try:
+        import winreg
+
+        with winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SOFTWARE\Microsoft\WindowsRuntime\WellKnownContracts",
+            0,
+            winreg.KEY_QUERY_VALUE | winreg.KEY_WOW64_64KEY,
+        ) as key:
+            value, _kind = winreg.QueryValueEx(
+                key, "Windows.Foundation.UniversalApiContract"
+            )
+        value = int(value)
+        return f"{(value >> 16) & 0xFFFF}.{value & 0xFFFF}.0"
+    except Exception:
+        return f"{_HIGHEST_KNOWN_CONTRACT}.0.0"
 
 
 # Chrome full version format: MAJOR.0.BUILD.PATCH

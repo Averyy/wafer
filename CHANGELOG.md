@@ -4,6 +4,24 @@ All notable changes to wafer. Versions come from git tags (`hatch-vcs`); each
 release is on [PyPI](https://pypi.org/project/wafer-py/) and
 [GitHub Releases](https://github.com/Averyy/wafer/releases).
 
+## 0.7.13 - 2026-11-05
+
+### Fixed
+
+- **`Sec-CH-UA-Platform-Version` and `navigator.userAgentData`'s
+  `platformVersion` are what Chrome reports on Linux and Windows.** On Linux
+  wafer sent the kernel's version (`"7.0.0"` in a container), and Chrome
+  reports none there: `GetPlatformVersion()` returns an empty string on Linux
+  (Chromium's `user_agent_utils.cc`), and stock Google Chrome 157 in the same
+  container reported `""`. On Windows it sent the build (`"10.0.22631"`),
+  where Chrome reports the `Windows.Foundation.UniversalApiContract` version
+  (`"15.0.0"` on Windows 11 23H2), read from the same registry value. Both the
+  plain client and the browser's client-hint override carry it. With the fix,
+  wafer's browser in a Linux container reads the same as stock Google Chrome
+  157 there on every surface measured (user agent, client hints, WebGL,
+  canvas, audio, fonts, screen, time zone, header order) except the window
+  size.
+
 ## 0.7.12 - 2026-11-04
 
 ### Changed

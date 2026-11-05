@@ -142,6 +142,113 @@ class TestSecChUaGeneration:
         )
 
 
+class TestPlatformVersion:
+    """Sec-CH-UA-Platform-Version as Chrome computes it on each platform
+    (GetPlatformVersion, components/embedder_support/user_agent_utils.cc)."""
+
+    @staticmethod
+    def _detect(monkeypatch, system, **platform_attrs):
+        import platform as platform_module
+
+        from wafer import _fingerprint
+
+        monkeypatch.setattr(platform_module, "system", lambda: system)
+        for name, value in platform_attrs.items():
+            monkeypatch.setattr(platform_module, name, value)
+        return _fingerprint._detect_platform_version()
+
+    @staticmethod
+    def _registry(monkeypatch, value=None, error=None):
+        import sys
+        import types
+
+        def query(_key, name):
+            assert name == "Windows.Foundation.UniversalApiContract"
+            if error is not None:
+                raise error
+            return value, 4
+
+        class Key:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        fake = types.SimpleNamespace(
+            HKEY_LOCAL_MACHINE=object(),
+            KEY_QUERY_VALUE=1,
+            KEY_WOW64_64KEY=256,
+            OpenKey=lambda *a: Key(),
+            QueryValueEx=query,
+        )
+        monkeypatch.setitem(sys.modules, "winreg", fake)
+
+    def test_macos_reports_its_marketing_version(self, monkeypatch):
+        version = self._detect(
+            monkeypatch, "Darwin", mac_ver=lambda: ("26.2", ("", "", ""), "")
+        )
+        assert version == '"26.2.0"'
+
+    def test_linux_reports_none_whatever_the_kernel(self, monkeypatch):
+        # wafer sent the kernel's (7.0.0 in a container), which no Linux
+        # Chrome sends; stock Chrome 157 there reported "" (2026-11-04).
+        version = self._detect(monkeypatch, "Linux", release=lambda: "7.0.0-linuxkit")
+        assert version == '""'
+
+    def test_windows_reports_the_api_contract_not_the_build(self, monkeypatch):
+        self._registry(monkeypatch, value=(15 << 16) | 0)
+        version = self._detect(monkeypatch, "Windows", version=lambda: "10.0.22631")
+        assert version == '"15.0.0"'
+
+    def test_windows_keeps_the_contracts_minor(self, monkeypatch):
+        self._registry(monkeypatch, value=(19 << 16) | 1)
+        version = self._detect(monkeypatch, "Windows", version=lambda: "10.0.26100")
+        assert version == '"19.1.0"'
+
+    def test_windows_without_the_registry_value_reports_the_highest_known(
+        self, monkeypatch
+    ):
+        self._registry(monkeypatch, error=OSError("no value"))
+        version = self._detect(monkeypatch, "Windows", version=lambda: "10.0.26200")
+        assert version == '"19.0.0"'
+
+    @pytest.mark.parametrize(
+        ("build", "expected"),
+        [("16299", '"5.0.0"'), ("17134", '"6.0.0"'), ("17692", '"6.0.0"')],
+    )
+    def test_windows_before_rs5_maps_its_build(self, monkeypatch, build, expected):
+        # RS4 runs from 17134 to 17762 (base/win/windows_version.cc); a
+        # read of the registry there would raise and report "19.0.0".
+        self._registry(monkeypatch, error=AssertionError("not read"))
+        version = self._detect(monkeypatch, "Windows", version=lambda: f"10.0.{build}")
+        assert version == expected
+
+    def test_windows_from_rs5_reads_the_registry(self, monkeypatch):
+        self._registry(monkeypatch, value=7 << 16)
+        version = self._detect(monkeypatch, "Windows", version=lambda: "10.0.17763")
+        assert version == '"7.0.0"'
+
+    def test_linux_empty_version_reaches_every_surface(self, monkeypatch):
+        # The header and the envelope carry Chrome's quoted '""'; the CDP
+        # metadata and userAgentData carry the bare empty string.
+        from wafer import _fingerprint
+
+        linux = self._detect(monkeypatch, "Linux", release=lambda: "7.0.0-linuxkit")
+        monkeypatch.setattr(_fingerprint, "_HOST_PLATFORM_VERSION", linux)
+        ua = (
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36"
+        )
+        metadata = _fingerprint.cdp_ua_metadata(ua)["userAgentMetadata"]
+        assert metadata["platformVersion"] == ""
+        headers = FingerprintManager(initial=Emulation.Chrome154).sec_ch_ua_headers()
+        assert headers["sec-ch-ua-platform-version"] == '""'
+        envelope = _fingerprint.build_fingerprint_envelope(Emulation.Chrome154)
+        assert envelope["platform_version"] == '""'
+        assert envelope["user_agent_data"]["platformVersion"] == ""
+
+
 class TestChromeVersion:
     def test_known_profile(self):
         assert chrome_version(Emulation.Chrome145) == 145

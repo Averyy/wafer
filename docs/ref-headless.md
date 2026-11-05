@@ -547,7 +547,7 @@ Applied in both headed and headless, to the page and, through auto-attach on the
 | `fullVersionList` | Real version from `browser.version` | See version consistency below |
 | `fullVersion` | Real version from `browser.version` | Sets `getHighEntropyValues().uaFullVersion` |
 | `architecture` | Real arch (e.g. `"arm"`) | High-entropy Client Hints |
-| `platformVersion` | Real macOS version (e.g. `"26.3.0"`) | Frozen `10.15.7` is a headless tell |
+| `platformVersion` | What Chrome itself reports: the macOS marketing version (e.g. `"26.3.0"`), an empty string on Linux, and on Windows the `Windows.Foundation.UniversalApiContract` version from the registry (e.g. `"15.0.0"` on Windows 11 23H2), not the build (`GetPlatformVersion` in Chromium's `user_agent_utils.cc`) | Frozen `10.15.7` is a headless tell. On Linux wafer sent the kernel's version (`7.0.0` in a container) until 2026-11-04, which no Linux Chrome sends; stock Google Chrome 157 in the same container reported `""` |
 
 ### `Emulation.setEmulatedMedia` (headless macOS)
 
