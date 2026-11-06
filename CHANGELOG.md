@@ -4,6 +4,19 @@ All notable changes to wafer. Versions come from git tags (`hatch-vcs`); each
 release is on [PyPI](https://pypi.org/project/wafer-py/) and
 [GitHub Releases](https://github.com/Averyy/wafer/releases).
 
+## 0.7.14 - 2026-11-06
+
+### Fixed
+
+- Recognize Akamai's HTTP 206 JSON API refusal (`AkamaiGHost`,
+  `data.GenericError`, `error` list) as an `akamai` challenge instead of an
+  empty success. A browser solver visits the caller's page (Referer, Origin,
+  or `embed_origin`; explicit `solve_origin` takes precedence), then retries
+  the original request with its cookies. A failed solve or refused replay
+  stops without fingerprint rotations. Without a browser, raise
+  `ChallengeDetected` immediately. As elsewhere, `max_rotations=0` returns
+  the response marked `challenge_type="akamai"` instead of raising.
+
 ## 0.7.13 - 2026-11-05
 
 ### Fixed

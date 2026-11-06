@@ -40,6 +40,7 @@ from wafer._challenge import (
     TERMINAL_CHALLENGES,
     ChallengeType,
     detect_challenge,
+    is_akamai_api_refusal,
     is_kasada_api_refusal,
 )
 from wafer._cookies import (
@@ -2520,8 +2521,8 @@ class AsyncSession(BaseSession):
                 await asyncio.sleep(self._clamp_delay(delay, deadline))
                 continue
 
-            # Challenge detection (HTML responses only — WAF challenges
-            # are always HTML pages). Skip for:
+            # General challenge detection is limited to HTML. API refusal
+            # shapes are checked separately below. Skip the general path for:
             # - Binary content (images, PDFs, etc.)
             # - Non-HTML text (JSON, XML) — API endpoints may have
             #   challenge markers in cookies/headers but browser-solving
@@ -2548,6 +2549,22 @@ class AsyncSession(BaseSession):
                     content_type or "no content type",
                 )
                 challenge = ChallengeType.KASADA
+            # Akamai's edge refusing an API call answers 206 JSON (the
+            # homedepot.com gateway), which content-type exemption would
+            # hand back as a success with nothing in it. Like Kasada's API
+            # refusal it is cleared in the browser, on the page the call
+            # comes from, not by rotating into the refusal again.
+            akamai_api_refusal = (
+                challenge is None
+                and self._profile not in (Profile.OPERA_MINI, Profile.DART)
+                and is_akamai_api_refusal(status, headers, body)
+            )
+            if akamai_api_refusal:
+                logger.info(
+                    "Challenge detected (body): akamai API refusal (HTTP %d)",
+                    status,
+                )
+                challenge = ChallengeType.AKAMAI
             if challenge == ChallengeType.REDDIT and not reddit_response:
                 challenge = None
             # A cold Reddit page can get the reCAPTCHA gate (a fresh real
@@ -2881,7 +2898,7 @@ class AsyncSession(BaseSession):
                 # can't help — these require JS execution)
                 if (
                     challenge is not None
-                    and challenge in JS_ONLY_CHALLENGES
+                    and (challenge in JS_ONLY_CHALLENGES or akamai_api_refusal)
                     and _browser_attempt_key(challenge, current_url)
                     not in browser_attempted
                     and self._browser_solver is not None
@@ -2894,6 +2911,7 @@ class AsyncSession(BaseSession):
                         embedder=self._solve_embedder(
                             challenge, current_url, extra_headers, kwargs, body,
                             method, content_type,
+                            api_refusal=akamai_api_refusal,
                         ),
                         replay=self._browser_replay(
                             method, kwargs, extra_headers, redirects_followed
@@ -2918,10 +2936,12 @@ class AsyncSession(BaseSession):
                         self._record_success(domain)
                         continue
 
-                # No browser solver — rotation can't help JS-only challenges
+                # Akamai API refusal is final after the single browser attempt
+                # (or immediately without a browser). Rotating here discards
+                # the clearance identity and repeats the refused API call.
                 if (
                     self._browser_solver is None and challenge in JS_ONLY_CHALLENGES
-                ) or challenge is ChallengeType.BRAVE:
+                ) or akamai_api_refusal or challenge is ChallengeType.BRAVE:
                     self._enforce_final_cap(raw_content, current_url, max_response_size)
                     if self.max_rotations == 0:
                         return self._make_response(
@@ -2981,6 +3001,7 @@ class AsyncSession(BaseSession):
                                 body,
                                 method,
                                 content_type,
+                                api_refusal=akamai_api_refusal,
                             ),
                             replay=self._browser_replay(
                                 method, kwargs, extra_headers, redirects_followed

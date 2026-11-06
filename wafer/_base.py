@@ -3018,13 +3018,15 @@ class BaseSession:
 
     def _solve_embedder(
         self, challenge, url, extra_headers, kwargs, body=None,
-        method="GET", content_type="",
+        method="GET", content_type="", api_refusal=False,
     ):
         """Origin page a browser solve should navigate instead of *url*, or None.
 
-        Imperva's API hosts (see ``_imperva_embedder``) and Kasada's signed
-        APIs (see ``_kasada_embedder``) both have to be reached from a page on
-        the site; every other challenge is solved on *url* itself.
+        Imperva's API hosts (see ``_imperva_embedder``), Kasada's signed
+        APIs (see ``_kasada_embedder``) and an API call Akamai's edge refused
+        (*api_refusal*, see ``is_akamai_api_refusal``) all have to be reached
+        from a page on the site; every other challenge is solved on *url*
+        itself.
         """
         embedder = self._imperva_embedder(
             challenge, url, extra_headers, kwargs, body
@@ -3036,7 +3038,43 @@ class BaseSession:
             embedder = self._kasada_embedder(
                 challenge, url, extra_headers, method, content_type
             )
+        # Akamai's refusal of an API call is cleared on the page the call
+        # comes from, and the call itself is then retried over wreq with the
+        # cookies the page earned; the API URL is not a page a browser can
+        # load. Nothing is remade in the page, so any body qualifies.
+        from wafer._challenge import ChallengeType
+
+        if (
+            embedder is None
+            and api_refusal
+            and challenge == ChallengeType.AKAMAI
+            and self._browser_solver is not None
+        ):
+            embedder = self._caller_page(extra_headers)
         return embedder
+
+    def _caller_page(self, extra_headers):
+        """The page the caller says a request comes from, or None: its
+        ``Referer``, else its ``Origin``, else the session's ``embed_origin``.
+        """
+        headers = {
+            str(k).lower(): str(v)
+            for k, v in self._caller_headers(extra_headers).items()
+        }
+        for candidate in (
+            headers.get("referer"),
+            headers.get("origin"),
+            self._embed_origin,
+        ):
+            if not candidate:
+                continue
+            parsed = urlsplit(candidate)
+            if parsed.scheme not in ("http", "https") or not parsed.hostname:
+                continue
+            # A bare origin gets the root path; its query, if any, stays the
+            # query (appending "/" to the string would put it in the query).
+            return urlunsplit(parsed._replace(path=parsed.path or "/"))
+        return None
 
     def _kasada_embedder(self, challenge, url, extra_headers, method, content_type):
         """The page a Kasada-signed API call is made from, or None.
@@ -3057,24 +3095,7 @@ class BaseSession:
         )
         if str(method).upper() == "GET" and html:
             return None
-        headers = {
-            str(k).lower(): str(v)
-            for k, v in self._caller_headers(extra_headers).items()
-        }
-        for candidate in (
-            headers.get("referer"),
-            headers.get("origin"),
-            self._embed_origin,
-        ):
-            if not candidate:
-                continue
-            parsed = urlsplit(candidate)
-            if parsed.scheme not in ("http", "https") or not parsed.hostname:
-                continue
-            # A bare origin gets the root path; its query, if any, stays the
-            # query (appending "/" to the string would put it in the query).
-            return urlunsplit(parsed._replace(path=parsed.path or "/"))
-        return None
+        return self._caller_page(extra_headers)
 
     def _brave_browser_replay(self, replay: dict | None) -> dict:
         """Private browser exchange context: per-session state and pacing."""

@@ -1688,8 +1688,27 @@ resp = session.get("https://api.example.com/v1/data")  # JSON API
 - Where to earn the token is WAF mechanics (wafer's job); the per-site **value**
   of `solve_origin` (which page mints it) is yours to supply.
 - Without `solve_origin`, the auto-solve navigates the request URL itself
-  (correct for normal HTML pages, wrong for JSON APIs). Kasada-signed APIs are
-  the exception: see below.
+  (correct for normal HTML pages, wrong for JSON APIs). Akamai API refusals
+  and Kasada-signed APIs can derive the calling page: see below.
+
+### Akamai API refusals
+
+Akamai can refuse a JSON API with HTTP **206**, `Server: AkamaiGHost`, and
+`{"data":{"GenericError":null},"error":[{"message":"Generic errors"}]}`.
+Wafer recognizes this as `akamai`, not successful partial content. Ordinary
+206 range responses and application GraphQL errors are unaffected.
+
+- Without `browser_solver`, raises `ChallengeDetected` immediately, with the
+  original 206 in `.response`. With `max_rotations=0`, returns that response
+  with `challenge_type == "akamai"` instead.
+- With a browser solver, visits the page named by `Referer`, else `Origin`,
+  else `embed_origin`. Explicit `solve_origin` overrides these. Supply the
+  actual product/content page: the homepage may not earn the same clearance.
+- Retries the original API request over HTTP with the browser's cookies;
+  does not return the page HTML as the API response. One browser attempt per
+  request; failed solving or another refusal stops without rotating identities.
+- Use the API hostname observed in the site's own browser requests. Wafer
+  does not rewrite API URLs or discover site-specific endpoints.
 
 ### Kasada-signed APIs
 

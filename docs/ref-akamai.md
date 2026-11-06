@@ -13,6 +13,73 @@ inline over the transport, the rest go to the browser (`wafer/browser/_akamai.py
 | Script refusal: small 403/429 "Error Page" that sets `bm_s`/`bm_so` and loads `/<random>?v=<uuid>` | www.ebay.ca, homedepot.com | Set-Cookie `bm_so`/`sbsd_o` on a 403/429 (header fast path) | Browser: one retried navigation after the script posts |
 | Behavioral challenge (`sec-if-cpt`, `behavioral-content`) | homedepot.com, chewy.com | Body markers, with or without `_abck` | Browser |
 | Sensor challenge (`_abck` + `bmSz` / `sensor_data`) | various | Set-Cookie + body markers on a non-200 | Browser |
+| API refusal: 206 JSON, `Server: AkamaiGHost`, `data.GenericError` and `error` list | homedepot.com federation gateway | `is_akamai_api_refusal`, before accepting JSON | Browser on caller's page, then cookie replay; no rotations |
+
+## API refusal
+
+The API refusal bypasses the normal JSON exemption in both session paths.
+Without a browser it raises `ChallengeDetected`; `max_rotations=0` preserves
+the library's inspection mode and returns the marked response. With a
+browser it solves once on Referer, Origin or `embed_origin` (explicit
+`solve_origin` wins), then retries the original request with the earned
+cookies. Failed solving or a refused replay ends there: rotating would
+discard the solving identity and send more requests into the same refusal.
+
+**2026-11-06 browser comparison, macOS:** fresh headed system Chrome
+156.0.8078.80 loaded `/p/204279858`, reached the DEWALT DCD771C2 product page,
+and its own `productClientOnlyProduct` POST returned 200 with the product.
+The browser calls **apionline.homedepot.com**, whereas fetchaller's failing
+request targets **www.homedepot.com**. Those endpoints are not interchangeable
+evidence. The browser sent domain cookies, `Accept: */*`, JSON content type,
+Origin `https://www.homedepot.com`, root Referer (cross-origin referrer policy),
+and the full product path in `x-current-url`. This comparison alone proves
+neither that cookies are required nor that wafer's recovery succeeds.
+
+At 08:22 EST, ten minutes after that browser visit, fetchaller's original
+query/headers against the **www** gateway returned 200 / the DCD771C2 product
+from a fresh macOS wafer session, with no cookies or cache. A solver was
+available but never invoked. Thus the hostname difference alone does not
+establish the cause, and this run does **not** validate automatic recovery.
+
+At 08:32 EST the same cold request from the existing `fetchaller-mcp:test`
+Linux/amd64 image, with the wafer working tree mounted, also returned
+**200 envoy / the product in 0.45 s**. No browser was invoked. The image's
+installed browser was Chrome for Testing 157.0.8103.38. Both environments
+passed the original endpoint; those cold passes did not exercise recovery.
+They do not establish that changing the API hostname is necessary.
+
+**Live recovery verified at 08:35 EST, same Linux image.** A bounded
+challenge-triggering test used only state issued by the site:
+
+1. A fresh wafer session (`max_rotations=0`, no browser yet) fetched
+   `/p/204279858`: **403**, 2,416 bytes, classified `akamai`. Its cookie jar
+   retained the response's `_abck`, `bm_s`, `bm_so`, `bm_sz` and other cookies.
+2. After five seconds, the diagnostic attached the real `BrowserSolver` to
+   that same session and sent fetchaller's original www gateway POST.
+   **HTTP 206** was detected by `is_akamai_api_refusal`; no fabricated response
+   or cookie was used.
+3. The automatic solve followed the product Referer. Chrome got **403**, ran
+   its script, and the existing Akamai handler retried the navigation once:
+   **301 → 200**, the canonical product page.
+4. The solver returned **17 cookies**, which wafer imported. The original
+   gateway POST retried over wreq and returned **200 envoy**, with
+   `data.product.itemId == "204279858"` and model `DCD771C2`. No API hostname,
+   query or header change, and no fingerprint rotation was needed.
+
+The complete page→five-second pause→API recovery took **17.56 s**; the API
+recovery itself took about **12 s**. This verifies the real 206 detection,
+caller-page browser solve and cookie replay together. The returned `_abck`
+**did not contain `~0~`**: do not impose that marker as a success requirement.
+The application response is the decisive evidence.
+
+Raw logs/probe scripts: `/tmp/wafer-hd-20261106/page-gate.log` and
+`page_gate.py` (ephemeral). The diagnostic attached `_browser_solver` after
+its intentionally unsolved navigation solely to trigger the API path;
+normal applications pass `browser_solver=solver` at session construction.
+The cold, cookieless failures reported on November 5 are not causally
+explained by this test. Their API refusal shape now has a live-verified
+recovery, and a no-browser caller gets an explicit challenge instead of an
+empty success.
 
 ## bm-verify interstitial
 

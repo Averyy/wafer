@@ -10,6 +10,7 @@ Detection order is intentional:
 """
 
 import enum
+import json
 import logging
 import re
 from urllib.parse import urlparse
@@ -266,6 +267,42 @@ def is_kasada_api_refusal(
     if ct in ("", "text/html", "application/xhtml+xml"):
         return False
     return any(str(key).lower().startswith("x-kpsdk") for key in headers)
+
+
+def is_akamai_api_refusal(
+    status_code: int, headers: dict[str, str], body: str | None
+) -> bool:
+    """Akamai's edge refusing an API call, answered as a 206 JSON error.
+
+    homedepot.com's federation gateway answers a POST its Akamai edge will
+    not pass with HTTP 206 from ``Server: AkamaiGHost`` and the body
+    ``{"data":{"GenericError":null},"error":[{"message":"Generic errors"}]}``
+    in about 0.3s (2026-10-07, 2026-11-05); the gateway itself, which
+    answers as ``server: envoy``, never sees it. Read as a response, it is a
+    "success" with nothing in it. A real 206 is a range response and has
+    neither that server nor that JSON. Keyed on the structure, the
+    ``GenericError`` data key beside an ``error`` list, not on the message's
+    copy.
+    """
+    if status_code != 206 or not body or len(body) > 4096:
+        return False
+    server = next(
+        (str(v) for k, v in headers.items() if str(k).lower() == "server"), ""
+    )
+    if not server.lower().startswith("akamaighost"):
+        return False
+    try:
+        payload = json.loads(body)
+    except ValueError:
+        return False
+    if not isinstance(payload, dict):
+        return False
+    data = payload.get("data")
+    return (
+        isinstance(data, dict)
+        and "GenericError" in data
+        and isinstance(payload.get("error"), list)
+    )
 
 
 def _header_fast_path(
