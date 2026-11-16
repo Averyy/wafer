@@ -229,7 +229,15 @@ def _tmd_punish_url_from_body(body: str, base_url: str) -> str | None:
 
 
 def _tmd_is_recaptcha_challenge(challenge_url: str) -> bool:
-    """Return whether an immutable issued TMD URL selects reCAPTCHA."""
+    """Return whether an immutable issued TMD URL selects reCAPTCHA.
+
+    The action is matched without regard to case. Every issuance measured live
+    is lowercase, but a report of this flow spelled it ``captchaRecaptcha``,
+    and misreading it sends the punishment to the slider solver, which waits
+    out the whole budget for a widget that never exists. Which solver runs is
+    all this decides; the host and path are validated elsewhere. A repeated
+    ``action`` still selects nothing.
+    """
 
     try:
         action = parse_qs(
@@ -238,7 +246,7 @@ def _tmd_is_recaptcha_challenge(challenge_url: str) -> bool:
         ).get("action")
     except (TypeError, ValueError):
         return False
-    return action == ["captcharecaptcha"]
+    return [value.lower() for value in action or ()] == ["captcharecaptcha"]
 
 
 def _tmd_browser_attempt_count(

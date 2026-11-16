@@ -7738,6 +7738,8 @@ class TestDispatchChallenge:
         [
             "action=captcharecaptcha&action=",
             "action=&action=captcharecaptcha",
+            # Matching without case must not make a repeated action count.
+            "action=captchaRecaptcha&action=captcharecaptcha",
         ],
     )
     @patch("wafer.browser._drag.solve_baxia", return_value=True)
@@ -7891,6 +7893,53 @@ class TestDispatchChallenge:
             10_000,
             protocol_completion_is_intermediate=True,
         )
+        mock_baxia.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "action", ["captchaRecaptcha", "captchaRECAPTCHA", "CAPTCHARECAPTCHA"]
+    )
+    @patch("wafer.browser._drag.solve_baxia")
+    @patch("wafer.browser._recaptcha.wait_for_recaptcha", return_value=True)
+    def test_tmd_recaptcha_action_is_matched_without_case(
+        self, mock_recaptcha, mock_baxia, action
+    ):
+        """Every live issuance is lowercase, but a report of this flow spelled
+        the action ``captchaRecaptcha``. Read case-sensitively, that sent the
+        punishment to the slider solver, which waits out the whole budget for
+        a widget that never exists. All three readers must agree: the attempt
+        budget, the issued URL, and an issued dialog frame on a rendered page.
+        """
+        from wafer._base import (
+            _tmd_browser_attempt_count,
+            _tmd_punish_url_from_body,
+        )
+
+        issued_url = (
+            "https://acs.aliexpress.com/h5/mtop.relation.x/1.0/_____tmd_____/"
+            f"punish?x5secdata=issued&x5step=2&action={action}&pureCaptcha="
+        )
+        body = '{"data":{"url":"' + issued_url + '"}}'
+        issued = _tmd_punish_url_from_body(
+            body, "https://acs.aliexpress.com/h5/mtop.relation.x/1.0/"
+        )
+        assert issued == issued_url
+        assert _tmd_browser_attempt_count(180.0, issued) == 1
+
+        solver = self._make_solver_with_mock_browser()
+        wrapper = MagicMock()
+        wrapper.url = "https://acs.aliexpress.com/_____tmd_____/punish?iframe=1"
+        assert solver._dispatch_challenge(
+            wrapper, "tmd", 10_000, challenge_url=issued_url
+        )
+
+        rendered = self._item_page(
+            self._DIALOG_FRAME_URL.replace("captcharecaptcha", action)
+        )
+        assert solver._dispatch_challenge(
+            rendered, "tmd", 10_000, challenge_url=self._ITEM_URL
+        )
+
+        assert mock_recaptcha.call_count == 2
         mock_baxia.assert_not_called()
 
     @pytest.mark.parametrize(
