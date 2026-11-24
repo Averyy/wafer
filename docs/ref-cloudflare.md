@@ -161,6 +161,20 @@ Live, 2026-11-24, macOS, wafer working tree, against the zone described above:
   subdomain's cookie): no Referer, a plain 403 after the usual 403 handling, no browser;
   widget page as Referer, JSON in 5.0 s.
 
+Linux, 2026-11-24, fetchaller's linux/amd64 image (Chrome for Testing 158 under Xvfb,
+amd64 emulated on Apple Silicon), the same request:
+- On a quiet host (load about 3), 4 of 4 passed: the candidate at 16.0, 20.3 and 21.5 s,
+  and published 0.7.16 at 22.4 s. Each time the widget came up as the 1x1 interaction-only
+  frame about 3 s after the solve started, and the session cookie followed about 6 s later,
+  with no click.
+- Two earlier image runs that timed out at about 115 s (one on 0.7.16) were made while the
+  host was saturated (load average up to 116). With the image's 6 vCPUs deliberately
+  saturated (24 busy loops), the solve failed the same way: widget up, no session cookie,
+  `RequestBlocked` at 85 s. The page itself had given up on its verification within the first
+  seconds and offered a retry, so a browser on that starved host fails too. Emulated amd64
+  Chrome is several times slower than native, so a timing verdict from the image needs a
+  quiet host (check `uptime` first).
+
 ### Not done
 
 - No page is guessed for a request that names none. Which page carries the widget is the

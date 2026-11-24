@@ -4,6 +4,105 @@ All notable changes to wafer. Versions come from git tags (`hatch-vcs`); each
 release is on [PyPI](https://pypi.org/project/wafer-py/) and
 [GitHub Releases](https://github.com/Averyy/wafer/releases).
 
+## 0.7.17 - 2026-11-24
+
+### Fixed
+
+- A `Referer` that does not parse as a URL (an unclosed `[` host such as
+  `http://[bad/x`, a port that is not a number or is out of range) no longer
+  makes the request raise `ValueError` before anything is sent. It is sent as
+  given, with `Sec-Fetch-Site: cross-site` (what a Referer naming no host
+  already got) and a WARNING that quotes at most 200 characters of it.
+- The page an Akamai or Kasada API refusal is solved on skips a `Referer` or
+  `Origin` the browser would refuse: one that does not parse, or one with
+  whitespace (a raw space in a query), userinfo or port 0. The next of
+  `Referer`, `Origin` and `embed_origin` is used instead of a solve that could
+  not navigate. The Imperva embedder skips one whose host does not parse; it
+  uses only the host, so a bad port does not matter there.
+- An `embed_origin` that does not parse, or that contains a control character
+  (CR, LF, NUL) and so cannot be sent as a header, used to make every request
+  of the session fail. It now raises `ValueError` when the session is built.
+  An opaque one such as `"null"` is still allowed.
+- `solve_origin` is checked at construction against the same rule the browser
+  applies before it navigates: http(s), a host, and no userinfo, port 0 or
+  whitespace. Before, a bad one only made every solve of the session fail.
+  `""` is still unset.
+- `resolve=` is validated before a shared `browser_solver` is touched. A
+  session refused for `resolve=` with `proxy=`, or for a bad pin, no longer
+  leaves the solver's proxy changed.
+- A 3xx whose `Location` is not a URL (`http://[bad/x`, a port out of range)
+  raised a bare `ValueError`, even with `follow_redirects=False`. Following
+  it now raises `ConnectionFailed` at once, which is how Fetch treats it; with
+  `follow_redirects=False` the 3xx is returned.
+- An Amazon captcha page whose "Continue shopping" link or form action does
+  not parse no longer raises; that target is skipped.
+- `mint_recaptcha_v3` raises `TokenMintFailed` (`stage="anchor"`), not
+  `ValueError`, for an `origin` or `referer` that does not parse. It now also
+  checks `referer` when `origin` is given: such a referer was sent to Google as
+  it was.
+- Akamai's explicit 403 denial page (`Server: AkamaiGHost`,
+  `x-reference-error`, "Access to this page has been denied.", served by
+  www.mouser.com) is now `akamai_denied`, not `generic_js`.
+  - With a browser, the solve still gets the real page when the browser is let
+    through. A browser left on the denial no longer counts as solved, so its
+    cookies are not replayed.
+  - Without a browser, or after the one solve fails, the session does not
+    rotate. It raises `ChallengeDetected` (or returns the 403 under
+    `max_rotations=0`).
+  - A PerimeterX page with the same title is still `perimeterx`.
+  - Live, 2026-11-24: the denial on request 41 of a product crawl was passed
+    through from the browser, 192 KB in 10.8 s.
+
+- After the cross-family ladder (Firefox, Safari, Edge), Chrome version
+  cycling skipped Chrome 153: it went 154, then 152. It now steps 154, 153,
+  152, ... in order.
+- On the native-TLS fallback (Imperva), a desktop Edge or Firefox session sent
+  a Chrome User-Agent. It now sends its own browser's, the one its cookies were
+  earned under.
+- A POST or HEAD that met a challenge could get the browser's GET page back as
+  its response: the browser loads the URL with a GET, and that page was passed
+  through. Only a GET gets the browser's page now; anything else is retried
+  over HTTP with the earned cookies.
+- A browser solve that saw no document response took the page's status from
+  `goto()` only for `akamai_denied`. It now does so for every challenge type.
+  A page with no status at all is no longer passed through as a made-up 200.
+
+- A session created with a preflighted `browser_solver` never rotated to
+  another browser family. The preflight aligns the first request to the
+  browser's UA and client hints with a pin, and rotation kept every pinned
+  identity. So `max_rotations=2` went Chrome, Chrome, retire, browser, and
+  never reached Firefox. On www.ebay.ca from fetchaller's Linux image, Chrome
+  (stock Google Chrome too) was refused and Firefox served: the search failed
+  in 43.8 s and now returns in 5.7 s. Only a browser solve's own pin, whose
+  cookies are bound to the identity, stops rotation now. Rotation 1, which
+  keeps the identity, still keeps the cookies a shared `cache_dir` holds for
+  it. A caller who set the browser's exact User-Agent asserted that identity,
+  and it is still kept.
+- A session started on another family (`emulation=Firefox152`, `Edge148`) with
+  a preflighted solver was pinned to the browser's Chrome identity. It sent
+  Chrome TLS, UA and client hints with Firefox's Accept-Language. It now keeps
+  the family its caller chose.
+- When the identity went back to Chrome, the Firefox header set stayed. That
+  happened on retirement after the Firefox rung (reachable with the defaults:
+  `max_rotations=2`, `max_failures=3`) and on a browser solve's pin. Chrome's
+  TLS, UA and client hints then went out with Firefox's Accept and
+  `Accept-Language: ...;q=0.5`. The headers now follow the identity.
+- A session refused for an explicit User-Agent that doesn't match the
+  preflighted browser no longer leaves a shared solver's proxy configured.
+- A request URL that does not parse at all (`https://[bad/x`) raises
+  `ValueError` ("... is not a URL") before anything is sent. It used to fail
+  wherever its host was first read. One that parses but has a port out of
+  range goes to the transport, which refuses it with `ConnectionFailed`.
+- A browser page whose path changed in place after a non-2xx document was
+  passed through as a 200. It is now replayed over HTTP for the real status.
+
+### Changed
+
+- The default identity presents Chrome 158 (`158.0.8127.88`), the current
+  stable release, over the Chrome154 profile. Google Chrome 158 on macOS sends
+  the same ClientHello (JA4, peetprint), HTTP/2 settings and frames,
+  navigation header order and `Accept` as 154-157 (measured 2026-11-24).
+
 ## 0.7.16 - 2026-11-24
 
 ### Fixed

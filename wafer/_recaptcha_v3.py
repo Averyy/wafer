@@ -63,18 +63,27 @@ def compute_co(origin: str) -> str:
     """
     # Accept a bare host (no scheme) by assuming https.
     src = origin if "://" in origin else "https://" + origin.strip().rstrip("/")
-    parsed = urllib.parse.urlsplit(src)
-    scheme = (parsed.scheme or "https").lower()
-    host = (parsed.hostname or "").lower()
+    try:
+        parsed = urllib.parse.urlsplit(src)
+        explicit_port = parsed.port
+    except ValueError:
+        parsed, explicit_port = None, None
+    host = (parsed.hostname or "").lower() if parsed is not None else ""
     if not host:
         raise TokenMintFailed(
             f"cannot parse reCAPTCHA origin {origin!r}", stage="anchor"
         )
+    scheme = (parsed.scheme or "https").lower()
     # Google encodes scheme://host:port using the origin's ACTUAL port
     # (explicit if given, else the scheme default) -- not unconditionally
     # :443, which would double a non-default port or mislabel http.
-    port = parsed.port or (443 if scheme == "https" else 80)
-    raw = f"{scheme}://{host}:{port}".encode("utf-8")
+    port = explicit_port or (443 if scheme == "https" else 80)
+    try:
+        raw = f"{scheme}://{host}:{port}".encode("utf-8")
+    except UnicodeEncodeError:  # a lone surrogate, as json.loads can return
+        raise TokenMintFailed(
+            f"cannot parse reCAPTCHA origin {origin!r}", stage="anchor"
+        ) from None
     return base64.urlsafe_b64encode(raw).decode("ascii").replace("=", ".")
 
 
@@ -93,8 +102,12 @@ def generate_cb(seed: bytes | None = None) -> str:
 
 def origin_from_referer(referer: str) -> str:
     """Derive ``scheme://host[:port]`` origin from a referer URL."""
-    parsed = urllib.parse.urlsplit(referer)
-    if not parsed.scheme or not parsed.netloc:
+    try:
+        parsed = urllib.parse.urlsplit(referer)
+        parsed.port  # noqa: B018 - raises for a malformed port
+    except ValueError:
+        parsed = None
+    if parsed is None or not parsed.scheme or not parsed.netloc:
         raise TokenMintFailed(
             f"cannot derive origin from referer {referer!r}",
             stage="anchor",
@@ -232,6 +245,10 @@ def _resolve_origin_referer(
         )
     if origin is None:
         origin = origin_from_referer(referer)  # type: ignore[arg-type]
+    elif referer is not None:
+        # Sent as the Referer of every leg: refused here like one that would
+        # have derived the origin, not sent to Google as it is.
+        origin_from_referer(referer)
     if referer is None:
         referer = origin
     return origin, referer

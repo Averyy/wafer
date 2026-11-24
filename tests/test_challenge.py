@@ -210,6 +210,65 @@ class TestCloudflareBlock:
 
 
 class TestAkamai:
+    def test_mouser_access_denial(self):
+        body = (
+            pathlib.Path(__file__).parent / "fixtures"
+            / "mouser_akamai_denial_2026-11-20.html"
+        ).read_text()
+        headers = _h(server="AkamaiGHost", x_reference_error="redacted")
+        assert detect_challenge(403, headers, body) is ChallengeType.AKAMAI_DENIED
+        assert ChallengeType.AKAMAI_DENIED in JS_ONLY_CHALLENGES
+        assert ChallengeType.AKAMAI_DENIED not in TERMINAL_CHALLENGES
+        assert detect_challenge(200, headers, body) is None
+        assert detect_challenge(403, {}, body) is ChallengeType.GENERIC_JS
+        assert detect_challenge(403, headers, "") is None
+        edge_only = _h(server="AkamaiGHost")
+        assert detect_challenge(403, edge_only, body) is ChallengeType.GENERIC_JS
+
+    def test_mouser_denial_wins_over_its_own_edge_cookies(self):
+        # The denial sets ordinary Akamai cookies (bm_s); one with _abck or
+        # a DataDome cookie must not turn it into a solvable challenge.
+        body = (
+            pathlib.Path(__file__).parent / "fixtures"
+            / "mouser_akamai_denial_2026-11-20.html"
+        ).read_text()
+        for cookie in ("_abck=abc; Path=/", "bm_s=abc; Path=/", "datadome=abc; Path=/"):
+            headers = _h(
+                server="AkamaiGHost", x_reference_error="ref", set_cookie=cookie
+            )
+            assert detect_challenge(403, headers, body) is ChallengeType.AKAMAI_DENIED
+
+    def test_mouser_denial_needs_the_akamai_edge(self):
+        body = (
+            pathlib.Path(__file__).parent / "fixtures"
+            / "mouser_akamai_denial_2026-11-20.html"
+        ).read_text()
+        assert detect_challenge(403, _h(x_reference_error="ref"), body) is not (
+            ChallengeType.AKAMAI_DENIED
+        )
+        blank = _h(server="AkamaiGHost", x_reference_error="  ")
+        assert detect_challenge(403, blank, body) is not ChallengeType.AKAMAI_DENIED
+        # Case of the title and of the server value does not matter.
+        upper = body.replace(
+            "Access to this page has been denied.",
+            "ACCESS TO THIS PAGE HAS BEEN DENIED.",
+        )
+        edge = _h(server="akamaighost", x_reference_error="ref")
+        assert detect_challenge(403, edge, upper) is ChallengeType.AKAMAI_DENIED
+
+    def test_perimeterx_page_through_akamai_is_not_a_denial(self):
+        # PerimeterX's block page has the same title; through Akamai's edge
+        # it can carry the same headers. Its cookies or markup keep it PX,
+        # which wafer can solve.
+        title = "<title>Access to this page has been denied.</title>"
+        edge = {"server": "AkamaiGHost", "x-reference-error": "ref"}
+        by_cookie = {**edge, "set-cookie": "_px3=abc; Path=/"}
+        assert detect_challenge(403, by_cookie, title) is ChallengeType.PERIMETERX
+        markup = title + '<div id="px-captcha"></div>'
+        assert detect_challenge(403, _h(**{
+            "server": "AkamaiGHost", "x_reference_error": "ref",
+        }), markup) is ChallengeType.PERIMETERX
+
     def test_abck_cookie_403(self):
         headers = _h(set_cookie="_abck=abc123; Path=/")
         assert detect_challenge(403, headers, "") == ChallengeType.AKAMAI

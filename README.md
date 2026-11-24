@@ -260,7 +260,7 @@ from wreq import Emulation
 wafer.sec_ch_ua(147)                          # '"Google Chrome";v="147", ...'
 wafer.sec_ch_ua(147, brand="Microsoft Edge")  # Edge brand
 wafer.full_version(147)                       # "147.0.7727.24"
-wafer.chrome_full_version(Emulation.Chrome154)  # "157.0.8103.38" (presented over Chrome154's TLS)
+wafer.chrome_full_version(Emulation.Chrome154)  # "158.0.8127.88" (presented over Chrome154's TLS)
 wafer.emulation_family(Emulation.Edge148)     # "edge"
 wafer.emulation_is_mobile(Emulation.SafariIos26_2)  # True
 wafer.build_fingerprint_envelope(Emulation.Chrome154, user_agent="...")  # full dict
@@ -355,7 +355,7 @@ and limitations.
 
 ## Challenge Detection
 
-Wafer identifies 24 WAF challenge/block types from status, headers, and body.
+Wafer identifies 25 WAF challenge/block types from status, headers, and body.
 **Detection is not the same as solving** - the "Solved by" column shows how each
 type is actually handled: `inline` (over HTTP, no browser), `browser` (needs a
 configured `browser_solver`), or `detect-only` (raises `ChallengeDetected`; no
@@ -365,6 +365,7 @@ solver - you must handle it yourself).
 |-----|-----------|-----------|
 | Cloudflare | `cf-mitigated` header, managed challenge HTML | browser |
 | Akamai | `_abck` cookie patterns, sensor script references, a refusal page setting `bm_so`, the bm-verify interstitial (`/_sec/verify?provider=interstitial`) | browser; the interstitial inline |
+| Akamai access denial (`akamai_denied`) | HTTP 403 from the Akamai edge (`x-reference-error`) with Mouser's denial title, no PerimeterX cookie or markup | browser, one attempt; a persistent denial is raised without rotating |
 | DataDome | `datadome` cookie, challenge page markers | browser |
 | PerimeterX / HUMAN | `_px` cookies, captcha div, press-and-hold | browser |
 | Imperva / Incapsula | `reese84`/`___utmvc` cookie, `_Incapsula_Resource` script, 200 "Pardon Our Interruption" interstitial | inline (native-TLS) + browser under load |
@@ -1103,7 +1104,7 @@ wafer/
   _sync.py          # SyncSession -wraps wreq.blocking.Client
   _async.py         # AsyncSession -wraps wreq.Client
   _response.py      # WaferResponse wrapper
-  _challenge.py     # Challenge detection (24 WAF/challenge/block types)
+  _challenge.py     # Challenge detection (25 WAF/challenge/block types)
   _brave.py         # Brave Search structural detection and URL identity
   _solvers.py       # Inline solvers (ACW, PoW, Amazon, TMD, Reddit)
   _cookies.py       # JSON disk cache with TTL and LRU

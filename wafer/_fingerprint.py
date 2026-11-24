@@ -289,18 +289,26 @@ _CHROME_BUILDS: dict[int, tuple[int, int]] = {
     # 154.0.8037.93 is the build the Chrome154 profile was wire-verified
     # against (2026-10-05, Google Chrome on macOS).
     154: (8037, 93),
-    # 155-157 are presented over the Chrome154 profile (see
+    # 155-158 are presented over the Chrome154 profile (see
     # _WIRE_IDENTICAL_RELEASES). 155 and 156 are macOS's last stable builds;
     # 157.0.8103.38 is in the stable history of macOS, Linux and Windows, and
     # is what Linux stable reported in its client hints (2026-11-03).
+    # 158.0.8127.88 is the one stable build served to all three on
+    # 2026-11-24: all of Linux's rollout, a quarter of macOS's and Windows'.
     155: (8059, 86),
     156: (8078, 81),
     157: (8103, 38),
+    158: (8127, 88),
 }
 
-# Fallback for versions outside the lookup table.
+# Fallback for versions outside the lookup table. Below it, wreq's old
+# profiles (Chrome100-129) follow the 130-era rate of about 61 builds a major.
+# Above it, builds come from the newest real entries: Chrome's build numbers
+# rose 19-25 a major from 154 to 158, so the 61 step put 159 near 8492 when the
+# real 159 is 8154 (versionhistory, 2026-11-24).
 _FULL_VERSION_ANCHOR = (130, 6723, 58)
 _CHROME_BUILDS_DEFAULT_MAJOR = max(_CHROME_BUILDS)
+_NEWER_BUILD_SPAN = 4
 
 
 def _full_version(major: int) -> str:
@@ -308,6 +316,13 @@ def _full_version(major: int) -> str:
     if major in _CHROME_BUILDS:
         build, patch = _CHROME_BUILDS[major]
         return f"{major}.0.{build}.{patch}"
+    newest = _CHROME_BUILDS_DEFAULT_MAJOR
+    base = newest - _NEWER_BUILD_SPAN
+    if major > newest and base in _CHROME_BUILDS:
+        newest_build, newest_patch = _CHROME_BUILDS[newest]
+        step = (newest_build - _CHROME_BUILDS[base][0]) / _NEWER_BUILD_SPAN
+        build = round(newest_build + (major - newest) * step)
+        return f"{major}.0.{build}.{newest_patch}"
     anchor_major, anchor_build, anchor_patch = _FULL_VERSION_ANCHOR
     build = anchor_build + (major - anchor_major) * 61
     return f"{major}.0.{build}.{anchor_patch}"
@@ -640,8 +655,8 @@ _CHROME_ACCEPT = (
 )
 # Chrome's navigation Accept names image/jxl once JPEG XL decoding is on by
 # default. Measured 2026-11-03 at tls.peet.ws: Chrome for Testing 154 sends
-# _CHROME_ACCEPT; Google Chrome 156 (macOS) and 157 (Linux) send this. 155 was
-# not captured; it gets the older form.
+# _CHROME_ACCEPT; Google Chrome 156 (macOS) and 157 (Linux) send this, and so
+# does 158 (macOS, 2026-11-24). 155 was not captured; it gets the older form.
 _CHROME_ACCEPT_JXL = (
     "text/html,application/xhtml+xml,application/xml;q=0.9,image/jxl,"
     "image/avif,image/webp,image/apng,*/*;q=0.8,"
@@ -935,9 +950,14 @@ _EMULATION_BY_VERSION: dict[int, Emulation] = {
 # 156.0.8078.80 (macOS) and 157.0.8103.38 (Linux) both send JA4
 # t13d1517h2_8daaf6152771_cb7bf5808d99 and Akamai HTTP/2
 # 1:65536;2:0;4:6291456;6:262144|15663105|0|m,a,s,p, exactly Chrome154's.
-# 155 was not captured; it lies between two identical releases.
+# 155 was not captured; it lies between two identical releases. Measured
+# 2026-11-24: Google Chrome 158.0.8127.38 (macOS, headless=new, a fresh
+# profile) sends the same JA4, the same peetprint
+# (fc97c1cdfb1409c9a9326c1b726d1dee), the same Akamai HTTP/2 and frames, and
+# the same navigation header order and Accept as wafer's Chrome154 wire; JA3
+# differs only by Chrome's per-connection extension shuffle.
 _WIRE_IDENTICAL_RELEASES: dict[int, tuple[int, ...]] = {
-    154: (155, 156, 157),
+    154: (155, 156, 157, 158),
 }
 _PROFILE_FOR_RELEASE: dict[int, int] = {
     release: profile
@@ -1073,7 +1093,10 @@ class FingerprintManager:
             initial = CHROME_PROFILES[0][1]
         self._current = initial
         self._pinned = False
-        self._rotation_index = 0
+        # True while the only pin is a BrowserSolver preflight's alignment:
+        # the first request carries the browser's identity, but no solve has
+        # earned cookies bound to it, so rotation may still leave it.
+        self._preflight_only = False
         # Identity overrides set after a browser solve (pin_to_browser).
         # They let the replayed UA + client hints match the EXACT Chrome
         # version of the solving browser even when wreq has no matching
@@ -1091,6 +1114,13 @@ class FingerprintManager:
     @property
     def pinned(self) -> bool:
         return self._pinned
+
+    @property
+    def locks_rotation(self) -> bool:
+        """Whether rotation must keep this identity: pinned by a browser solve
+        whose cookies are bound to it. A preflight alignment alone does not
+        lock it (see :meth:`pin_to_browser`)."""
+        return self._pinned and not self._preflight_only
 
     @property
     def ua_override(self) -> str | None:
@@ -1126,6 +1156,7 @@ class FingerprintManager:
 
     def pin(self) -> None:
         """Pin current fingerprint (cookies are bound to this TLS identity)."""
+        self._preflight_only = False
         if not self._pinned:
             self._pinned = True
             logger.debug("Fingerprint pinned to %s", self._current)
@@ -1135,6 +1166,8 @@ class FingerprintManager:
         user_agent: str,
         major_version: int,
         full_version: str | None = None,
+        *,
+        preflight: bool = False,
     ) -> None:
         """Align the replay identity to a browser that just solved a challenge.
 
@@ -1160,10 +1193,12 @@ class FingerprintManager:
         exact = emulation_for_version(major_version)
         self._current = exact or CHROME_PROFILES[0][1]
         self._pinned = True
-        self._rotation_index = 0
         self._ua_override = user_agent
         self._ch_version_override = major_version
         self._ch_full_version_override = full_version
+        # A preflight aligns the first request to the browser before anything
+        # is solved; a solve's pin (preflight=False) binds its cookies.
+        self._preflight_only = preflight
         if exact is None:
             # The solving browser (Patchright's Chromium) is NEWER than any wreq
             # Emulation. TLS pins the newest profile and the UA/hints follow the
@@ -1195,19 +1230,34 @@ class FingerprintManager:
     def rotate(self) -> Emulation:
         """Rotate to a different Chrome profile. Returns the new Emulation.
 
-        No-op if pinned.  Cycles through all Chrome profiles except current.
+        No-op if pinned. Steps to the next Chrome profile in
+        ``CHROME_PROFILES`` order (newest first, wrapping), or to the newest
+        when the current profile is another family's (the ladder's Firefox or
+        Edge rung). Picking by an index into the list without the current
+        profile skipped one: from the Edge rung it went 154, then 152.
         """
-        if self._pinned:
+        if self.locks_rotation:
             logger.debug("Fingerprint is pinned, skipping rotation")
             return self._current
+        if self._pinned:
+            # Only a preflight's alignment: leaving it drops the browser's UA
+            # and client-hint overrides, which describe the profile left behind.
+            self._pinned = False
+            self._preflight_only = False
+            self._ua_override = None
+            self._ch_version_override = None
+            self._ch_full_version_override = None
 
-        candidates = [em for _, em in CHROME_PROFILES if em != self._current]
-        if not candidates:
+        profiles = [em for _, em in CHROME_PROFILES]
+        if not profiles or profiles == [self._current]:
             logger.warning("No alternative Chrome profiles for rotation")
             return self._current
 
-        self._current = candidates[self._rotation_index % len(candidates)]
-        self._rotation_index += 1
+        if self._current in profiles:
+            nxt = profiles[(profiles.index(self._current) + 1) % len(profiles)]
+        else:
+            nxt = profiles[0]
+        self._current = nxt
         logger.debug("Rotated fingerprint to %s", self._current)
         return self._current
 
@@ -1215,7 +1265,7 @@ class FingerprintManager:
         """Full identity reset: new fingerprint, clear pinning and overrides."""
         self._current = emulation or CHROME_PROFILES[0][1]
         self._pinned = False
-        self._rotation_index = 0
+        self._preflight_only = False
         self._ua_override = None
         self._ch_version_override = None
         self._ch_full_version_override = None

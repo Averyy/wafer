@@ -218,13 +218,19 @@ SyncSession(
 
     # Embed mode (both modes select a random Referer from embed_referers)
     embed: str | None = None,           # "xhr", "xhr-jquery", or "iframe"
-    embed_origin: str | None = None,    # Origin header value
+    embed_origin: str | None = None,    # Origin header value; one that does not
+                                        # parse as a URL, or has a control
+                                        # character, raises ValueError here
     embed_referers: list[str] | None = None,  # random Referer picked per request
 
     # Browser solver (requires [browser] extra)
     browser_solver=None,  # BrowserSolver instance or None
     solve_origin: str | None = None,  # origin page the auto-solve navigates to
-                                      # mint the WAF token (for JSON/XHR APIs)
+                                      # mint the WAF token (for JSON/XHR APIs);
+                                      # must be a URL the browser will load
+                                      # (http(s), a host, no userinfo, port 0
+                                      # or whitespace), or ValueError here;
+                                      # "" is unset
 )
 ```
 
@@ -453,7 +459,7 @@ session.mint_recaptcha_v3(sitekey: str, action: str, *, origin=None, referer=Non
 
 ### Per-request kwargs
 
-- `headers: dict[str, str]` - merged over session headers AND embed mode headers (per-request wins over both)
+- `headers: dict[str, str]` - merged over session headers AND embed mode headers (per-request wins over both). A `Referer` or `Origin` is sent exactly as given, even one that does not parse as a URL (an unclosed `[` host, a bad port). Such a `Referer` gives `Sec-Fetch-Site: cross-site` (logged at WARNING); `Origin` never sets `Sec-Fetch-Site`. Neither is used as the page an API refusal is solved on if the browser would refuse it (it does not parse, or has whitespace, userinfo or port 0); the next of `Referer`, `Origin`, `embed_origin` is. No browser sends such a header, so validate values you take from users.
 - `params: dict[str, str]` - appended to URL as query string
 - `timeout: int | float | timedelta` - TOTAL deadline for the whole call, covering ALL retries, rotations, backoff/rate-limit/`Retry-After` waits, and any browser solve (including time spent waiting on a shared solver). No single wait or hostile `Retry-After` can push the call past this deadline. Identical to the session-level `timeout` (both are a total budget). **This differs from requests/httpx, where `timeout=` bounds each attempt.** Without `attempt_timeout`, one hanging attempt may consume the entire budget, so `max_retries`/`max_rotations` never fire. Each attempt is clamped to the remaining budget, and the browser solve is bounded by the remaining budget too (the session-default `timeout` applies when none is passed per-request), on top of the solver's own `solve_timeout`.
 - `attempt_timeout: int | float | timedelta` - caps each INDIVIDUAL attempt (overrides the session-level `attempt_timeout` for this call). An attempt that hits this cap is a retryable failure: the loop retries, then consumes rotation budget (fresh TLS identity - hangs are often fingerprint-linked WAF tarpits), until budgets or the total `timeout` deadline are exhausted, then raises `WaferTimeout`. With `attempt_timeout` alone (no `timeout`), the total is unbounded and attempts are limited only by `max_retries`/`max_rotations`. Canonical combo:
@@ -651,7 +657,7 @@ wafer.full_version(major: int) -> str
 wafer.chrome_full_version(emulation) -> str | None
 # Exact four-part Chrome version wafer emits for that Emulation's
 # high-entropy client hints. Returns None for non-Chrome profiles.
-# Chrome154 -> "157.0.8103.38" (the version presented over it, see Chrome
+# Chrome154 -> "158.0.8127.88" (the version presented over it, see Chrome
 # below); an older profile -> its own build ("153.0.8010.53").
 
 wafer.emulation_family(emulation) -> str | None
@@ -760,6 +766,8 @@ Default mode (`max_rotations > 0`):
 - 429 without challenge -> raises `RateLimited` after exhausting rotations
 - 200 with empty body -> retries; if the host already served a real body this session, also rotates to a fresh identity (within `max_rotations`); raises `EmptyResponse` once retries+rotations are exhausted (see "Stateful request replay")
 - Connection error (refused/reset/TLS failure) -> raises `ConnectionFailed` after exhausting retries. When the host resolved only to `0.0.0.0` / `::`, `.reason` says so: the resolver refused the name (sinkhole, blocklist, filtered DNS) rather than the host being unreachable. Pin the address with `resolve=` or use another resolver.
+- A request URL that does not parse at all (an unclosed `[` host) -> `ValueError` ("... is not a URL") before anything is sent. One that parses with a port out of range goes to the transport -> `ConnectionFailed`.
+- A 3xx whose `Location` is not a URL (an unclosed `[` host, a bad port), with `follow_redirects=True` -> raises `ConnectionFailed` at once, no retry (Fetch treats it as a network error); `.reason` quotes the Location. With `follow_redirects=False` the 3xx is returned.
 - Certificate verification failure -> wafer first tries to complete the chain via the leaf's Authority Information Access URL (see "What Wafer Handles"), then retries like any other connection error and raises `ConnectionFailed` once retries are exhausted. A certificate that is expired, revoked, self-signed, or issued for a different hostname is never accepted; there is no option to disable verification.
 - Server hang past the total `timeout` deadline -> raises `WaferTimeout` (a timeout on any transport - the wreq path, the native-TLS Imperva bypass, or the Opera Mini path, whether during connect or read - is always bounded by your budget and surfaced as `WaferTimeout`, never `ConnectionFailed`)
 - 5xx -> returns response after exhausting retries
@@ -785,7 +793,7 @@ The deterministic ladder (starting from the default Chrome family):
 2. **Firefox** (rotation 2) - `Emulation.Firefox152`: Gecko TLS/H2, Firefox Accept, `Accept-Language: en-US,en;q=0.5`, NO sec-ch-ua.
 3. **Safari** (rotation 3) - wafer's Safari 26 custom TlsOptions/Http2Options profile, no client hints.
 4. **Edge** (rotation 4) - `Emulation.Edge148`: Chromium TLS but the `"Microsoft Edge"` sec-ch-ua brand + Edge build.
-5. **Chrome version cycling** (rotation 5+) - returns to the Chrome family and cycles Chrome versions on subsequent rotations.
+5. **Chrome version cycling** (rotation 5+) - returns to the Chrome family at its newest profile, then steps to each older one in turn on subsequent rotations (154, 153, 152, ...).
 
 The rung you reach is bounded by `max_rotations`: the full
 Chrome->Firefox->Safari->Edge ladder needs `max_rotations>=4` (Safari needs
@@ -793,7 +801,14 @@ Chrome->Firefox->Safari->Edge ladder needs `max_rotations>=4` (Safari needs
 `max_rotations=2` you get one cross-family jump (a fresh Chrome session, then
 Firefox) before wafer raises. A higher budget tries more identities against
 the same host. A fingerprint pinned after earning browser-bound challenge
-state does not rotate because its cookies are bound to that identity. Reddit
+state does not rotate because its cookies are bound to that identity. A
+session created with a preflighted `browser_solver` starts on the browser's
+UA and client hints (`browser_identity`), but nothing is bound to that yet, so
+it still rotates (Chrome, then Firefox at the default `max_rotations=2`); only
+a browser solve's own pin stops rotation. Two exceptions: with your own
+`User-Agent` in `headers=` (it must equal the preflighted browser's) the
+identity is yours and is kept; a session started on another family
+(`emulation=Firefox152`) is not aligned to the Chrome browser at all. Reddit
 browser recovery and challenge-absent Cloudflare passthrough do not pin. A
 session started on a non-Chrome `emulation=` walks the same ladder, skipping
 its own starting family; `profile=` identities (Safari/iOS
@@ -947,10 +962,10 @@ capabilities and trade-offs.
 ### Chrome (default, no profile= needed)
 
 - Default wreq TLS + HTTP/2 profile is `Emulation.Chrome154`, presented as
-  Chrome **157**, the current stable release: `Chrome/157.0.0.0` UA,
-  `sec-ch-ua` 157, full version `157.0.8103.38` in the high-entropy hints, and
-  Chrome 157's navigation `Accept` (it names `image/jxl`). Real Chrome 154
-  through 157 send the same TLS ClientHello and HTTP/2 settings (measured), so
+  Chrome **158**, the current stable release: `Chrome/158.0.0.0` UA,
+  `sec-ch-ua` 158, full version `158.0.8127.88` in the high-entropy hints, and
+  Chrome 158's navigation `Accept` (it names `image/jxl`). Real Chrome 154
+  through 158 send the same TLS ClientHello and HTTP/2 settings (measured), so
   wafer claims the current release over the newest profile wreq ships. Some
   WAFs weigh an outdated Chrome: in one measured window eBay's Akamai refused
   cold requests claiming Chrome 154 from Linux and served the same requests
@@ -972,7 +987,7 @@ capabilities and trade-offs.
 - On 403/challenge: rotates across families (Chrome -> Firefox -> Safari -> Edge -> Chrome versions), swapping the header envelope each switch (see "Rotation escalation")
 - All features enabled: challenge detection, retry, rotation, browser solving
 - Pass `emulation=wreq.Emulation.Chrome154` to select that specific profile
-  (it is still presented as Chrome 157; an older profile presents its own
+  (it is still presented as Chrome 158; an older profile presents its own
   version)
 
 ### Safari (`profile=Profile.SAFARI`)
@@ -1073,7 +1088,7 @@ These are all automatic. Do not write code to handle these yourself:
 
 ## Challenge Types
 
-Wafer identifies 24 WAF/challenge/block types automatically. When a challenge cannot be
+Wafer identifies 25 WAF/challenge/block types automatically. When a challenge cannot be
 solved, `ChallengeDetected.challenge_type` and `resp.challenge_type` contain
 one of these strings:
 
@@ -1082,6 +1097,10 @@ one of these strings:
 "akamai"       - Akamai Bot Manager (its bm-verify interstitial, a 200 page
                  that posts a token and a trivial proof of work, is answered
                  inline with no browser; the rest need a BrowserSolver)
+"akamai_denied" - explicit Akamai HTTP 403 denial observed on Mouser. A configured
+                 browser gets one attempt. If access is still denied, the session
+                 raises ChallengeDetected with the response, or returns the marked
+                 403 in inspection mode (max_rotations=0). No fingerprint rotation.
 "datadome"     - DataDome
 "perimeterx"   - PerimeterX / HUMAN Security
 "imperva"      - Imperva / Incapsula
@@ -1530,7 +1549,7 @@ assert solver.runtime_ready is False
 # BrowserSolver (or restart the process).
 # Startup checks the browser's four-part version against
 # chrome_full_version(DEFAULT_EMULATION). A browser of a release wafer
-# presents over the same TLS (154-157 today) is logged at DEBUG; any other
+# presents over the same TLS (154-158 today) is logged at DEBUG; any other
 # version logs a WARNING. Either way the difference is accepted,
 # not rejected: Chrome auto-updates ahead of the newest available emulation, so
 # the installed browser is authoritative for browser-bound clearance replay.
@@ -1573,9 +1592,9 @@ result: SolveResult | None = solver.solve(url, challenge_type)
 # solve/render does not accept cookies= is simply not given them.
 # result.cookies: list[dict] - browser cookies
 # result.user_agent: str - browser's User-Agent (version-reduced, e.g.
-#   "...Chrome/157.0.0.0...")
+#   "...Chrome/158.0.0.0...")
 # result.browser_version: str | None - browser's full build (e.g.
-#   "157.0.8103.38"); the version-reduced user_agent hides it
+#   "158.0.8127.38"); the version-reduced user_agent hides it
 # result.extras: dict | None - WAF-specific data
 # result.response: CapturedResponse | None - passthrough content (see below)
 # result.challenge_absent: bool - no transferable clearance identity was
@@ -1679,7 +1698,12 @@ impossible after a browser solve. In these cases the solver captures the page
 content directly and returns it as the response. This is transparent -
 `session.get()` returns a normal `WaferResponse`. No special handling needed.
 Applies to Kasada, AWS WAF, and any challenge where the browser lands on the
-real page after solving.
+real page after solving. Only a `GET` gets the browser's page: the browser
+loads the URL with a GET, which is not the answer to a POST or HEAD, so those
+are retried over HTTP with the cookies the solve earned (a Kasada-signed API
+call, remade in the page itself, is the exception). A page with no server
+status (no document response, which does not happen on a normal load) is not
+passed through either.
 
 Cloudflare has an additional challenge-absent pass-through: wreq may receive a
 Cloudflare 403 while the real browser receives the normal page immediately and
@@ -1849,7 +1873,8 @@ def mint_recaptcha_v3(self, sitekey: str, action: str, *,
   `recaptcha/enterprise/reload` endpoints and `enterprise.js`.
 - **Errors:** raises `TokenMintFailed` (a `WaferError`) if a token can't be
   extracted (missing anchor token, missing reload token, or a non-200 from
-  Google). It **never silently returns None**. `.stage` is `"anchor"`,
+  Google), and (`stage="anchor"`) for an `origin`/`referer` with no host or one
+  that does not parse as a URL. It **never silently returns None**. `.stage` is `"anchor"`,
   `"reload"`, or `"apijs"`; `.status_code` is the failing HTTP status when known.
 
 **Caveat:** producing a token does not prove the site will accept it. Google's
@@ -1875,7 +1900,9 @@ resp = await session.post("https://api.other.com/data", json=body)
 
 `Sec-Fetch-Site` is computed automatically (`same-origin`, `same-site`, or
 `cross-site`) from `embed_origin` vs request URL. Random Referer picked per
-request from `embed_referers`.
+request from `embed_referers`. An opaque `embed_origin` such as `"null"` (what
+a sandboxed frame sends) is allowed and is cross-site to everything; one that
+does not parse as a URL raises `ValueError` at construction.
 
 For Chrome, Edge and Firefox emulations (the default and every rotation rung),
 an embed session sends the complete header set and header order of that

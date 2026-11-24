@@ -130,6 +130,29 @@ def test_native_prepare_builds_clean_request():
     assert body == b"Area=Ottawa"
 
 
+@pytest.mark.parametrize(
+    ("emulation", "token"),
+    [
+        ("Chrome154", "Chrome/158.0.0.0 Safari/537.36"),
+        ("Edge148", "Edg/148.0.0.0"),
+        ("Firefox152", "Firefox/152.0"),
+    ],
+)
+def test_native_user_agent_is_the_presented_browsers(emulation, token):
+    # The native path keeps the session's own browser UA, the one its cookies
+    # were earned under; Edge and Firefox sessions used to send Chrome's.
+    from wreq import Emulation
+
+    from wafer._fingerprint import FingerprintManager
+
+    session, _ = make_sync_session([])
+    session._fingerprint = FingerprintManager(getattr(Emulation, emulation))
+    ua = session._native_user_agent({})
+    assert token in ua
+    if emulation == "Firefox152":
+        assert "Chrome/" not in ua
+
+
 # ---------------------------------------------------------------------------
 # Fake transport for integration tests
 # ---------------------------------------------------------------------------

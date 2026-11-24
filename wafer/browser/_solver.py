@@ -52,6 +52,8 @@ from urllib.parse import parse_qs, unquote, urlparse, urlsplit
 
 from wafer._brave import is_brave_challenge
 from wafer._challenge import (
+    ChallengeType,
+    is_akamai_denial,
     is_ebay_splash_challenge,
     loads_cf_challenge_platform,
 )
@@ -63,6 +65,7 @@ from wafer._solvers import (
     is_reddit_captcha_gate,
     is_reddit_verification,
 )
+from wafer._urls import valid_browser_url
 from wafer.browser._pump import bind_page, idle, unbind_page
 
 logger = logging.getLogger("wafer")
@@ -209,28 +212,8 @@ def _navigation_budget_ms(deadline: float) -> int:
     return max(1, int(min(remaining_ms * 0.5, _MAX_NAVIGATION_MS)))
 
 
-def _valid_browser_url(value: str) -> bool:
-    """Whether a value is structurally safe for a browser navigation."""
-
-    if (
-        not isinstance(value, str)
-        or not value
-        or len(value) > 8192
-        or any(ord(char) <= 0x20 or ord(char) == 0x7F for char in value)
-    ):
-        return False
-    try:
-        parsed = urlparse(value)
-        port = parsed.port
-    except (TypeError, ValueError):
-        return False
-    return (
-        parsed.scheme in {"http", "https"}
-        and bool(parsed.hostname)
-        and parsed.username is None
-        and parsed.password is None
-        and port != 0
-    )
+# The check before every navigation; the session picks its pages with it too.
+_valid_browser_url = valid_browser_url
 
 
 _SEED_COOKIE_FIELDS = (
@@ -5670,6 +5653,22 @@ class BrowserSolver:
                         max_size,
                     )
 
+                if solved and not main_documents:
+                    # goto() can supply the only status. Without either source
+                    # the DOM would be passed through as a synthetic 200 (a
+                    # long denial page included), so no page is passed through
+                    # below and the replay gets the server's real answer. An
+                    # Akamai denial with no confirmed document is no solve.
+                    if navigation_response is not None:
+                        main_documents.append((
+                            str(navigation_response.url),
+                            int(navigation_response.status),
+                            navigation_response,
+                        ))
+                    elif challenge_type == "akamai_denied":
+                        logger.info("No browser document confirmed after Akamai denial")
+                        return None
+
                 cookies = context.cookies()
                 captured = None
                 passthrough_without_clearance = False
@@ -5817,11 +5816,18 @@ class BrowserSolver:
                 # when cookie replay is unreliable (TLS-bound).
                 # The browser needs time to redirect after cookie
                 # update, so retry up to 5s for real content.
+                # Only for a GET with a server status: the browser loaded the
+                # page with a GET, which is not the answer to a POST (or a
+                # HEAD), and a page no document response confirmed has no
+                # status to return. Either way the replay sends the caller's
+                # own request with the cookies earned.
                 if (
                     solved
                     and challenge_type != "tmd"
                     and captured is None
                     and nav_target == url
+                    and passthrough_method == "GET"
+                    and main_documents
                 ):
                     # Cap the passthrough wait at the overall deadline so
                     # a near-deadline solve can't overshoot the caller's
@@ -5867,6 +5873,14 @@ class BrowserSolver:
                             # Not content (a 404, an error page): let the
                             # replay return the server's real status.
                             break
+                        if landed_status is None:
+                            # A client-side path change: the DOM came from the
+                            # last document served. Unless that answered 2xx
+                            # there is no status to return (it went out as a
+                            # made-up 200), so the replay gets the real one.
+                            last = main_documents[-1][1] if main_documents else None
+                            if not isinstance(last, int) or not 200 <= last < 300:
+                                break
                         if is_cookie_gate(html):
                             # It will not clear by itself; the replay writes
                             # its cookie inline.
@@ -5921,6 +5935,22 @@ class BrowserSolver:
                         idle(1)
 
                 if solved:
+                    # The generic wait can finish on a quiet denial. Cookies
+                    # from that page are not evidence of a successful solve.
+                    # Use the last main document: a later 200 supersedes the 403.
+                    document = (
+                        main_documents[-1][2] if main_documents else navigation_response
+                    )
+                    if _response_status(document) == 403:
+                        headers, _ = _response_headers(document)
+                        if challenge_type == "akamai_denied" or (
+                            headers.get("x-reference-error")
+                            and is_akamai_denial(
+                                403, headers, self._bounded_page_content(page, max_size)
+                            )
+                        ):
+                            logger.info("Browser main document still denied (HTTP 403)")
+                            return None
                     logger.info(
                         "Browser solved challenge_type=%s (cookie_count=%d)",
                         challenge_type or "unknown",
@@ -6512,7 +6542,9 @@ class BrowserSolver:
             and _is_passthrough_challenge_html(html)
         ):
             challenge = detect_challenge(403, headers, html, url=url)
-        if challenge is None:
+        # render() already has the settled document and its real response.
+        # Preserve an explicit refusal for the session's caller.
+        if challenge is None or challenge is ChallengeType.AKAMAI_DENIED:
             return False
         logger.info(
             "Render landed on a %s challenge; solving in place",

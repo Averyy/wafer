@@ -90,6 +90,7 @@ from wafer._solvers import (
     reddit_cookie_name_summary,
     reddit_has_cookie_evidence,
 )
+from wafer._urls import valid_browser_url
 
 logger = logging.getLogger("wafer")
 
@@ -134,6 +135,44 @@ _TURNSTILE_PAGE_HOST_RE = re.compile(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?")
 # within the request's budget, and how much of its document is read.
 _TURNSTILE_PAGE_CHECK_SECONDS = 15.0
 _TURNSTILE_PAGE_CHECK_BYTES = 2_000_000
+
+
+def _check_origin_param(name: str, value: str | None, *, page: bool) -> None:
+    """Refuse an ``embed_origin``/``solve_origin`` that cannot be used.
+
+    Both are session settings, so a bad one is refused when the session is
+    built instead of on every request. None or ``""`` is unset. A value that
+    does not parse (an unclosed ``[`` host, a port that is not a number or is
+    out of range) is refused for both. ``embed_origin`` is sent as the
+    ``Origin`` header as given, so one with a control character or a lone
+    surrogate, which no request could carry, is refused too; an opaque origin
+    such as ``"null"`` stays allowed. ``solve_origin`` is a page the browser
+    loads, so it must pass the check the solver makes before every
+    navigation (``valid_browser_url``: http(s), a host, no userinfo, no port
+    0, no whitespace or control characters).
+    """
+    if not value:
+        return
+    hint = "an http(s) URL such as 'https://www.example.com/'"
+    try:
+        parsed = urlsplit(value)
+        parsed.port  # noqa: B018 - raises for a malformed port
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise ValueError(f"{name}={value!r} is not a URL ({exc}); use {hint}") from None
+    if page:
+        if not valid_browser_url(value):
+            raise ValueError(f"{name}={value!r} is not a page URL; use {hint}")
+        return
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        unsendable = True
+    else:
+        unsendable = any(ord(char) < 0x20 or ord(char) == 0x7F for char in value)
+    if unsendable:
+        raise ValueError(
+            f"{name}={value!r} cannot be sent as the Origin header; use {hint}"
+        )
 
 
 def _browser_solve_timeout(remaining: float) -> float:
@@ -762,6 +801,17 @@ def _canonicalize_url_host(url: str) -> str:
     return parsed._replace(netloc=f"{userinfo}{canon}{portpart}").geturl()
 
 
+def _check_request_url(url) -> None:
+    """Refuse a request URL that does not parse at all (an unclosed ``[``
+    host): no transport can send it, and every step that reads its host used
+    to raise its own bare ValueError. A URL that parses but has a port out of
+    range goes to the transport, which refuses it (ConnectionFailed)."""
+    try:
+        urlsplit(url)
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise ValueError(f"{url!r} is not a URL ({exc})") from None
+
+
 class BaseSession:
     """Shared logic for sync and async sessions. No I/O."""
 
@@ -1004,6 +1054,57 @@ class BaseSession:
         # treated this way (could legitimately be an empty endpoint).
         self._body_capable_domains: set[str] = set()
 
+        _check_origin_param("embed_origin", embed_origin, page=False)
+        _check_origin_param("solve_origin", solve_origin, page=True)
+
+        # Validated before the browser solver is touched below (a shared
+        # solver's proxy is aligned to this session's), so a refused session
+        # leaves it as it was.
+        # SSRF-safe DNS pinning: a pre-validated host->IP map. wafer connects
+        # the socket to exactly these IPs while TLS SNI + cert validation still
+        # key on the original hostname, closing the TOCTOU rebinding window
+        # between a caller's public-IP check and wafer's connect. Passed
+        # through to wreq's DnsOptions on the wreq path (see
+        # _build_client_kwargs) and honored by the native-TLS path (see
+        # _native_transport). Keys are canonicalized (_canonical_host: case /
+        # trailing-dot / IDNA) and the request URL host is canonicalized the
+        # same way before dispatch, so a case/dot/IDN variant of the host can't
+        # miss the pin and fall through to real DNS. IPs are validated up front
+        # so a later _rebuild_client (fingerprint rotation) can never raise on
+        # a bad address. An explicitly listed host with no IPs is a caller bug
+        # that would silently reopen the hole, so it raises rather than
+        # falling through to real DNS.
+        self._resolve: dict[str, list[str]] = {}
+        if resolve:
+            # A proxy resolves the target host itself, so the pin would be
+            # silently ignored through one (both transports skip pinning when
+            # a proxy is set). For an SSRF guard that is a fail-open: refuse
+            # the unsatisfiable contract loudly instead of pretending to pin.
+            if proxy:
+                raise ValueError(
+                    "resolve= (SSRF DNS pinning) cannot be combined with a "
+                    "proxy: the proxy resolves the target host, so the pin "
+                    "would be silently ignored. Pass one or the other."
+                )
+            from ipaddress import ip_address
+
+            for host, addrs in resolve.items():
+                norm = _canonical_host(host)
+                if not norm:
+                    raise ValueError("resolve host must be a non-empty string")
+                # Materialize before the empty check so a single-use iterable
+                # (generator) can't slip past it and store [] -which would
+                # silently fall through to real DNS and reopen the hole.
+                addrs = list(addrs)
+                if not addrs:
+                    raise ValueError(
+                        f"resolve[{host!r}] has no IP addresses; a pinned "
+                        "host must map to at least one IP"
+                    )
+                for a in addrs:
+                    ip_address(a)  # validate now; raises ValueError if bad
+                self._resolve[norm] = addrs
+
         # Embed mode: "xhr" or "iframe"
         # embed_origin without embed= defaults to "xhr"
         if embed_origin and embed is None:
@@ -1084,8 +1185,11 @@ class BaseSession:
                 "would break the iOS Safari identity"
             )
         if browser_solver is not None:
-            self._align_browser_proxy(proxy)
+            # The identity check only reads the solver and may refuse the
+            # session; the proxy alignment can configure a shared solver, so
+            # it runs once nothing else can refuse.
             self._align_preflight_browser_identity()
+            self._align_browser_proxy(proxy)
 
         # Per-session origin page for the AUTO-SOLVE browser path. When the
         # session's request URL is a JSON/XHR API that can't be top-navigated
@@ -1113,51 +1217,6 @@ class BaseSession:
         # call that doesn't pass an explicit v=, so the api.js fetch
         # happens at most once per mode per session.
         self._recaptcha_v: dict[str, str] = {}
-
-        # SSRF-safe DNS pinning: a pre-validated host->IP map. wafer connects
-        # the socket to exactly these IPs while TLS SNI + cert validation still
-        # key on the original hostname, closing the TOCTOU rebinding window
-        # between a caller's public-IP check and wafer's connect. Passed
-        # through to wreq's DnsOptions on the wreq path (see
-        # _build_client_kwargs) and honored by the native-TLS path (see
-        # _native_transport). Keys are canonicalized (_canonical_host: case /
-        # trailing-dot / IDNA) and the request URL host is canonicalized the
-        # same way before dispatch, so a case/dot/IDN variant of the host can't
-        # miss the pin and fall through to real DNS. IPs are validated up front
-        # so a later _rebuild_client (fingerprint rotation) can never raise on
-        # a bad address. An explicitly listed host with no IPs is a caller bug
-        # that would silently reopen the hole, so it raises rather than
-        # falling through to real DNS.
-        self._resolve: dict[str, list[str]] = {}
-        if resolve:
-            # A proxy resolves the target host itself, so the pin would be
-            # silently ignored through one (both transports skip pinning when
-            # a proxy is set). For an SSRF guard that is a fail-open: refuse
-            # the unsatisfiable contract loudly instead of pretending to pin.
-            if proxy:
-                raise ValueError(
-                    "resolve= (SSRF DNS pinning) cannot be combined with a "
-                    "proxy: the proxy resolves the target host, so the pin "
-                    "would be silently ignored. Pass one or the other."
-                )
-            from ipaddress import ip_address
-
-            for host, addrs in resolve.items():
-                norm = _canonical_host(host)
-                if not norm:
-                    raise ValueError("resolve host must be a non-empty string")
-                # Materialize before the empty check so a single-use iterable
-                # (generator) can't slip past it and store [] -which would
-                # silently fall through to real DNS and reopen the hole.
-                addrs = list(addrs)
-                if not addrs:
-                    raise ValueError(
-                        f"resolve[{host!r}] has no IP addresses; a pinned "
-                        "host must map to at least one IP"
-                    )
-                for a in addrs:
-                    ip_address(a)  # validate now; raises ValueError if bad
-                self._resolve[norm] = addrs
 
         # Native-TLS fallback (urllib/OpenSSL) for WAFs that fingerprint
         # the BoringSSL stack wreq is built on (Imperva/Incapsula). Lazily
@@ -1267,6 +1326,29 @@ class BaseSession:
             raise
         return solver
 
+    def _identity_locked(self) -> bool:
+        """Whether rotation must keep the current identity: a browser solve
+        pinned it, and the cookies it earned are bound to it. A preflight's
+        alignment of the first request is not such a pin, so a preflighted
+        session still climbs the cross-family ladder (on www.ebay.ca from
+        Linux, Chrome was refused and Firefox served; the preflight pin kept
+        every rotation on Chrome)."""
+        return self._fingerprint is not None and self._fingerprint.locks_rotation
+
+    def _rotation_keeps_cookies(self, rotation_index: int) -> bool:
+        """Whether a rotation keeps the domain's cookies.
+
+        A solve's pin keeps them: they are bound to the identity it keeps. A
+        preflight's pin keeps them on rotation 1, a fresh TLS session on the
+        same identity, which is the browser's that a shared ``cache_dir``'s
+        cookies may have been earned under; from rotation 2 the identity
+        changes and they go, as for any other session.
+        """
+        fp = self._fingerprint
+        if fp is None or not fp.pinned:
+            return False
+        return fp.locks_rotation or rotation_index <= 1
+
     def _align_preflight_browser_identity(self) -> None:
         """Pin transport identity to an already-preflighted Chrome instance.
 
@@ -1315,8 +1397,22 @@ class BaseSession:
                 "Ignoring preflight browser identity with no Chrome UA version"
             )
             return
+        if emulation_family(self._fingerprint.current) != "chrome":
+            # The preflighted browser is Chrome. A session started on another
+            # family (emulation=Firefox152, Edge148) keeps the identity its
+            # caller chose; pinning it to Chrome sent Chrome TLS, UA and hints
+            # under Firefox's Accept-Language. A solve aligns it later if one
+            # is needed.
+            return
 
-        self._fingerprint.pin_to_browser(user_agent, major_version, browser_version)
+        # With no caller UA the pin only aligns the first request: nothing is
+        # bound to it, so rotation may leave it. A caller who set the
+        # browser's exact UA asserted that identity, and rotating would send
+        # it over another family's TLS, so that pin locks like a solve's.
+        self._fingerprint.pin_to_browser(
+            user_agent, major_version, browser_version,
+            preflight=explicit_ua is None,
+        )
         logger.info(
             "Pre-aligned transport identity to preflight Chrome %s",
             major_version,
@@ -1771,11 +1867,15 @@ class BaseSession:
     def _hint_origin(url: str) -> str | None:
         """Origin key for Accept-CH, or None outside a secure context, where
         Chrome ignores Accept-CH."""
-        parsed = urlparse(url)
+        try:
+            parsed = urlparse(url)
+            explicit_port = parsed.port
+        except ValueError:
+            return None
         host = (parsed.hostname or "").lower().rstrip(".")
         if parsed.scheme != "https" and host not in ("localhost", "127.0.0.1", "::1"):
             return None
-        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        port = explicit_port or (443 if parsed.scheme == "https" else 80)
         return f"{parsed.scheme}://{host}:{port}"
 
     @staticmethod
@@ -1853,15 +1953,37 @@ class BaseSession:
     @staticmethod
     def _sec_fetch_relation(initiator: str, url: str) -> str:
         """``same-origin``, ``same-site`` or ``cross-site`` for a request to
-        ``url`` made from a page at ``initiator``."""
-        origin = urlparse(initiator)
-        request = urlparse(url)
+        ``url`` made from a page at ``initiator``.
+
+        An initiator that does not parse (an unclosed ``[`` host, a port that
+        is not a number or is out of range, as a caller's ``Referer`` can
+        carry) names no page, which Fetch treats as an opaque origin: never
+        same-origin or same-site with anything, so ``cross-site``. That is
+        what an initiator that parses to no host (``"not a url"``) already
+        got.
+        """
+        try:
+            origin = urlparse(initiator)
+            origin_port = origin.port
+        except ValueError:
+            logger.warning(
+                "Referer %.200r is not a URL; sending Sec-Fetch-Site: cross-site",
+                initiator,
+            )
+            return "cross-site"
+        try:
+            request = urlparse(url)
+            request_port = request.port
+        except ValueError:
+            # The request URL itself is not one wreq can send; it fails there
+            # with ConnectionFailed, as it does with no Referer at all.
+            return "cross-site"
         origin_host = origin.hostname or ""
         request_host = request.hostname or ""
 
         # Same origin: same scheme + host + port
-        origin_port = origin.port or (443 if origin.scheme == "https" else 80)
-        request_port = request.port or (443 if request.scheme == "https" else 80)
+        origin_port = origin_port or (443 if origin.scheme == "https" else 80)
+        request_port = request_port or (443 if request.scheme == "https" else 80)
         if (
             origin.scheme == request.scheme
             and origin_host == request_host
@@ -2402,14 +2524,30 @@ class BaseSession:
             self._fingerprint.rotate()
             # rotate() may have crossed back into the Chrome family from a
             # Firefox/Edge rung; resync the header envelope to match.
-            self.headers = (
-                dict(self._chrome_headers)
-                if self._user_headers and self._chrome_headers is not None
-                else (
-                    family_headers(emulation_family(self._fingerprint.current))
-                    or dict(DEFAULT_HEADERS)
-                )
+            self._sync_headers_to_fingerprint()
+
+    def _sync_headers_to_fingerprint(self) -> None:
+        """Make the header envelope match the current fingerprint's family.
+
+        Every move of the TLS identity to another family has to bring the
+        family's navigation headers with it (see _switch_to_emulation): a
+        retirement's reset, or a solve's pin, returning from the ladder's
+        Firefox rung to Chrome used to keep Firefox's Accept and
+        ``Accept-Language: ...;q=0.5`` under Chrome's TLS, UA and client
+        hints. A caller's own ``headers=`` set stays (full-replace contract),
+        and the profile identities (Safari, iOS Safari, Dart, Opera Mini) keep
+        theirs.
+        """
+        if self._fingerprint is None or self._profile in _IDENTITY_PROFILES:
+            return
+        self.headers = (
+            dict(self._chrome_headers)
+            if self._user_headers and self._chrome_headers is not None
+            else (
+                family_headers(emulation_family(self._fingerprint.current))
+                or dict(DEFAULT_HEADERS)
             )
+        )
 
     def _rotation_delay(self) -> float:
         """Delay before a rotation retry: rate limiter interval + 1s.
@@ -2537,6 +2675,10 @@ class BaseSession:
         - Absolute URLs (https://...)
         - Protocol-relative URLs (//host/path)
         - Relative URLs (/path, path)
+
+        Raises ValueError for a Location that is not a URL (an unclosed "["
+        host, a port that is not a number or is out of range), which Fetch
+        treats as a network error.
         """
         location = location.strip()
         if location.startswith("//"):
@@ -2546,6 +2688,7 @@ class BaseSession:
         resolved = urljoin(base_url, location)
         # Ensure path is not empty (some servers omit it)
         parsed = urlparse(resolved)
+        parsed.port  # noqa: B018 - raises for a malformed port
         if not parsed.path:
             resolved = parsed._replace(path="/").geturl()
         return resolved
@@ -3093,9 +3236,13 @@ class BaseSession:
         ):
             if not candidate:
                 continue
-            parsed = urlsplit(candidate)
-            if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            # A value that names no page the browser would load (it does not
+            # parse, has no host, or carries whitespace, userinfo or port 0,
+            # which the solver refuses before navigating) is passed over for
+            # the next candidate.
+            if not valid_browser_url(candidate):
                 continue
+            parsed = urlsplit(candidate)
             # A bare origin gets the root path; its query, if any, stays the
             # query (appending "/" to the string would put it in the query).
             return urlunsplit(parsed._replace(path=parsed.path or "/"))
@@ -3137,8 +3284,10 @@ class BaseSession:
                 headers.get("origin"),
                 self._embed_origin,
             ]
-        # As in _caller_page, the first HTTP(S) candidate decides; one that
-        # fails the checks is not passed over for the next.
+        # In _caller_page's order, but the first HTTP(S) candidate decides:
+        # one that fails the checks is not passed over for the next, as the
+        # page check is a request the caller did not make. (_caller_page
+        # skips a candidate that names no usable page.)
         raw = next(
             (
                 c
@@ -3349,8 +3498,12 @@ class BaseSession:
         """Pick a User-Agent for the native path.
 
         Prefer a caller-supplied UA, then the session identity's UA
-        (Safari/iOS Safari/Dart set one in self.headers), then a host Chrome UA
-        derived from the current fingerprint version.
+        (Safari/iOS Safari/Dart set one in self.headers), then the UA of the
+        browser the session presents (desktop Chrome, Edge or Firefox: the one
+        its cookies were earned under), then a host Chrome UA. An Edge or
+        Firefox session used to send a Chrome UA here. A mobile profile gets
+        its family's desktop UA and wreq's Safari and Opera profiles a Chrome
+        UA: ``emulation_user_agent`` does not build theirs.
         """
         if extra_headers:
             for k, v in extra_headers.items():
@@ -3359,15 +3512,18 @@ class BaseSession:
         for k, v in self.headers.items():
             if k.lower() == "user-agent" and v:
                 return v
-        from wafer._fingerprint import host_user_agent
+        from wafer._fingerprint import _CHROME_BUILDS_DEFAULT_MAJOR, host_user_agent
 
         if self._fingerprint is not None and self._fingerprint.ua_override:
             return self._fingerprint.ua_override
-        major = None
         if self._fingerprint is not None:
-            major = presented_chrome_version(self._fingerprint.current)
-        if major is None:
-            major = presented_chrome_version(DEFAULT_EMULATION) or 157
+            presented = emulation_user_agent(self._fingerprint.current)
+            if presented:
+                return presented
+        major = (
+            presented_chrome_version(DEFAULT_EMULATION)
+            or _CHROME_BUILDS_DEFAULT_MAJOR
+        )
         return host_user_agent(major)
 
     def _native_prepare(

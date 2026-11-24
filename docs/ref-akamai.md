@@ -1,9 +1,11 @@
 # Akamai Bot Manager
 
 Akamai answers a request it distrusts in several shapes. wafer detects each in
-`wafer/_challenge.py` and classifies all of them `akamai`; one is answered
-inline over the transport, the rest go to the browser (`wafer/browser/_akamai.py`,
-`wait_for_akamai`).
+`wafer/_challenge.py`. Its interstitials are `akamai`: one is answered inline
+over the transport, the rest go to the browser (`wafer/browser/_akamai.py`,
+`wait_for_akamai`). Mouser's explicit edge refusal is `akamai_denied`
+(`is_akamai_denial`); its one browser attempt is the generic wait, not
+`wait_for_akamai`.
 
 ## Status
 
@@ -12,8 +14,48 @@ inline over the transport, the rest go to the browser (`wafer/browser/_akamai.py
 | bm-verify interstitial: 200, about 2.2 KB, posts a token and a proof of work | www.amazon.co.uk | `is_akamai_interstitial` (body, any status) | **Inline**, no browser (`parse_akamai_interstitial`) |
 | Script refusal: small 403/429 "Error Page" that sets `bm_s`/`bm_so` and loads `/<random>?v=<uuid>` | www.ebay.ca, homedepot.com | Set-Cookie `bm_so`/`sbsd_o` on a 403/429 (header fast path) | Browser: one retried navigation after the script posts |
 | Behavioral challenge (`sec-if-cpt`, `behavioral-content`) | homedepot.com, chewy.com | Body markers, with or without `_abck` | Browser |
+| Explicit 403 denial | www.mouser.com | AkamaiGHost, a nonempty `x-reference-error`, the English denial title, and no PerimeterX cookie or markup (PerimeterX's block page has the same title) | A configured browser can return a subsequent real document. A persistent denial is reported to the caller. |
 | Sensor challenge (`_abck` + `bmSz` / `sensor_data`) | various | Set-Cookie + body markers on a non-200 | Browser |
 | API refusal: 206 JSON, `Server: AkamaiGHost`, `data.GenericError` and `error` list | homedepot.com federation gateway | `is_akamai_api_refusal`, before accepting JSON | Browser on caller's page, then cookie replay; no rotations |
+
+## Explicit denial (Mouser)
+
+Mouser's edge answers some requests with its own denial page instead of an
+interstitial: HTTP 403, about 14 KB, `Server: AkamaiGHost`, an
+`x-reference-error` reference, the title "Access to this page has been
+denied.", an empty `m-captcha` element, and only analytics (GTM, mPulse) and
+Akamai's sensor script. The Opera Mini and Dart identities get it on their
+first request. Sessions with those identities skip challenge detection, so
+for them it is not `akamai_denied`: Opera Mini returns the 403 at once, and
+Dart takes the ordinary 403 path, one more request per rotation up to
+`max_rotations`. A Chrome or Firefox identity gets it after
+about 40 requests. Before 2026-11-20 it read as `generic_js`. The browser's
+generic wait could still pass the next real page through, but a browser left
+on the 403 was reported as solved with the denial's cookies.
+
+Now `is_akamai_denial` makes it `akamai_denied`. With a browser, there is one
+solve: the generic wait, and a later 2xx page is passed through. A solve
+returns no result, so its cookies are not replayed, when its last main
+document is a 403 and either the solve was `akamai_denied` or that 403 is this
+denial page (any challenge type). After that, or with no browser, the session
+does not rotate. It raises `ChallengeDetected("akamai_denied")`, or returns the
+403 under `max_rotations=0`. `render()` does not solve the page in place; the
+session's `render()` raises `ChallengeDetected("akamai_denied")`.
+
+Live, 2026-11-24, macOS, Chrome identity with a browser solver, product pages
+5 s apart:
+- The first request drew the behavioral page and was solved in the browser.
+  Requests 1-40 then answered 200 over plain HTTP in about 6 s each.
+- Request 41, at 269 s, got the denial. It was classified `akamai_denied`, and
+  the browser loaded the real product page and passed it through (192 KB,
+  4.6 s in the browser, 10.8 s for the request).
+- On 2026-11-20 the same denial read as `generic_js` took 59 s in the browser.
+  The wait is the same generic wait, so the difference is not this change's.
+- A browser that stays denied, seen in fetchaller's linux/amd64 image (Chrome for
+  Testing 158) the same day: its first, cold request got the denial outright.
+  The browser's main document stayed a 403, so the solve returned no result
+  and the request raised in 5.8 s, with no rotation.
+- The no-browser path has not been seen live; `tests/test_browser.py` covers it.
 
 ## API refusal
 

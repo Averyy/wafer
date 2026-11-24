@@ -23,6 +23,7 @@ from wafer._base import (
     _callable_accepts_keyword,
     _canonicalize_url_host,
     _CapExceeded,
+    _check_request_url,
     _connection_failure_reason,
     _content_length_over_cap,
     _decode_headers,
@@ -236,6 +237,7 @@ class AsyncSession(BaseSession):
             self._switch_to_chrome()
         if self._fingerprint is not None:
             self._fingerprint.reset()
+            self._sync_headers_to_fingerprint()
         if self._cookie_cache:
             await asyncio.to_thread(self._clear_cached_cookies, domain)
         self._client = self._publish_under_generation(
@@ -1321,6 +1323,9 @@ class AsyncSession(BaseSession):
                 self._fingerprint.pin_to_browser(
                     result.user_agent, chrome_ver, full_ver
                 )
+                # The pin moves the TLS identity to Chrome; a session the
+                # ladder had put on Firefox needs Chrome's headers with it.
+                self._sync_headers_to_fingerprint()
 
         # A real solve changes the replay identity and needs a rebuilt client,
         # on the same jar (see _rebuild_client).
@@ -1961,6 +1966,7 @@ class AsyncSession(BaseSession):
 
     async def request(self, method: str, url: str, **kwargs) -> WaferResponse:
         """Send an HTTP request with retry, backoff, and challenge handling."""
+        _check_request_url(url)
         # Cookies a browser solve earned, held back from cache_dir until the
         # retry answers. Whatever no answer rejected is written however the
         # call ends: a timeout or an exhausted retry right after a solve must
@@ -2382,15 +2388,15 @@ class AsyncSession(BaseSession):
                             )
                             await asyncio.sleep(self._clamp_delay(delay, deadline))
                             continue
-                        pinned = (
-                            self._fingerprint is not None and self._fingerprint.pinned
-                        )
+                        pinned = self._identity_locked()
                         # Mirror the 403 path: clear cookies (unless pinned)
                         # and advance the cross-family ladder / fingerprint_pool
                         # rather than only cycling Chrome versions. Going
                         # through _advance_rotation keeps self.headers coherent
                         # with the TLS identity for non-Chrome sessions.
-                        if self._cookie_cache and not pinned:
+                        if self._cookie_cache and not self._rotation_keeps_cookies(
+                            state.rotation_retries
+                        ):
                             await asyncio.to_thread(self._clear_cached_cookies, domain)
                         if not pinned:
                             self._advance_rotation(state.rotation_retries)
@@ -2471,7 +2477,16 @@ class AsyncSession(BaseSession):
                 if location:
                     if redirects_followed >= self.max_redirects:
                         raise TooManyRedirects(current_url, self.max_redirects)
-                    new_url = self._resolve_redirect_url(current_url, location)
+                    try:
+                        new_url = self._resolve_redirect_url(current_url, location)
+                    except ValueError:
+                        # Fetch makes this a network error; retrying the same
+                        # hop would get the same Location.
+                        raise ConnectionFailed(
+                            current_url,
+                            f"HTTP {status} redirect Location is not a URL: "
+                            f"{location[:200]!r}",
+                        ) from None
                     redirects_followed += 1
                     # Record the hop: the 3xx status and the URL that
                     # returned it (requests-style history chain).
@@ -2846,8 +2861,10 @@ class AsyncSession(BaseSession):
                     # fingerprint is pinned (browser-solve matched the
                     # emulation to the browser's TLS identity, so the
                     # cookies belong to THIS fingerprint).
-                    pinned = self._fingerprint is not None and self._fingerprint.pinned
-                    if self._cookie_cache and not pinned:
+                    pinned = self._identity_locked()
+                    if self._cookie_cache and not self._rotation_keeps_cookies(
+                        state.rotation_retries
+                    ):
                         await asyncio.to_thread(self._clear_cached_cookies, domain)
                     if not pinned:
                         # Cross-family ladder (or fingerprint_pool when set).
@@ -3084,7 +3101,9 @@ class AsyncSession(BaseSession):
                 # the clearance identity and repeats the refused API call.
                 if (
                     self._browser_solver is None and challenge in JS_ONLY_CHALLENGES
-                ) or akamai_api_refusal or challenge is ChallengeType.BRAVE:
+                ) or akamai_api_refusal or challenge in (
+                    ChallengeType.AKAMAI_DENIED, ChallengeType.BRAVE,
+                ):
                     self._enforce_final_cap(raw_content, current_url, max_response_size)
                     if self.max_rotations == 0:
                         return self._make_response(
@@ -3216,8 +3235,10 @@ class AsyncSession(BaseSession):
                     # Clear domain cookies on rotation unless the
                     # fingerprint is pinned (browser-solve matched the
                     # emulation, so cookies belong to THIS fingerprint).
-                    pinned = self._fingerprint is not None and self._fingerprint.pinned
-                    if self._cookie_cache and not pinned:
+                    pinned = self._identity_locked()
+                    if self._cookie_cache and not self._rotation_keeps_cookies(
+                        state.rotation_retries
+                    ):
                         await asyncio.to_thread(self._clear_cached_cookies, domain)
                     if not pinned:
                         # Cross-family ladder (or fingerprint_pool when set).
@@ -3269,10 +3290,10 @@ class AsyncSession(BaseSession):
                     # a different fingerprint often gets the real body back.
                     if domain in self._body_capable_domains and state.can_rotate:
                         state.use_rotation()
-                        pinned = (
-                            self._fingerprint is not None and self._fingerprint.pinned
-                        )
-                        if self._cookie_cache and not pinned:
+                        pinned = self._identity_locked()
+                        if self._cookie_cache and not self._rotation_keeps_cookies(
+                            state.rotation_retries
+                        ):
                             await asyncio.to_thread(self._clear_cached_cookies, domain)
                         if not pinned:
                             self._advance_rotation(state.rotation_retries)

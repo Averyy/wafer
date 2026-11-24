@@ -88,7 +88,10 @@ def imperva_embedder(
             for k, v in headers.items():
                 if k.lower() != want or not v:
                     continue
-                p = urlparse(v)
+                try:
+                    p = urlparse(v)
+                except ValueError:
+                    continue  # an unclosed "[" host names no page
                 if p.scheme not in ("http", "https"):
                     continue
                 h = (p.hostname or "").lower()

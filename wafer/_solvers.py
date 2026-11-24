@@ -549,8 +549,25 @@ _AMAZON_DOMAIN_RE = re.compile(
 
 def _is_amazon_domain(url: str) -> bool:
     """Check if URL points to a known Amazon domain (SSRF protection)."""
-    hostname = urlparse(url).hostname or ""
-    return bool(_AMAZON_DOMAIN_RE.search(hostname))
+    try:
+        parsed = urlparse(url)
+        parsed.port  # noqa: B018 - a malformed port is no target either
+    except ValueError:
+        return False
+    return bool(_AMAZON_DOMAIN_RE.search(parsed.hostname or ""))
+
+
+def _amazon_target(page_url: str, ref: str) -> str | None:
+    """The absolute Amazon URL a page's link or form names, or None.
+
+    The page is the server's: a reference that does not parse (an unclosed
+    "[" host) names no target, as one off Amazon does not.
+    """
+    try:
+        abs_url = urljoin(page_url, ref)
+    except ValueError:
+        return None
+    return abs_url if _is_amazon_domain(abs_url) else None
 
 
 class _FormParser(HTMLParser):
@@ -609,15 +626,15 @@ def parse_amazon_captcha(body: str, page_url: str) -> dict | None:
     # Strategy 1: "Continue shopping" link
     for href, text in parser.links:
         if "continue shopping" in text.lower():
-            abs_url = urljoin(page_url, href)
-            if _is_amazon_domain(abs_url):
+            abs_url = _amazon_target(page_url, href)
+            if abs_url is not None:
                 return {"method": "GET", "url": abs_url, "params": {}}
 
     # Strategy 2: Form with action + hidden fields
     for form in parser.forms:
         action = form["action"]
-        abs_url = urljoin(page_url, action) if action else page_url
-        if _is_amazon_domain(abs_url):
+        abs_url = _amazon_target(page_url, action) if action else page_url
+        if abs_url is not None and _is_amazon_domain(abs_url):
             return {
                 "method": form["method"],
                 "url": abs_url,

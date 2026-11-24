@@ -201,7 +201,10 @@ def is_radware_challenge_redirect(location: str) -> bool:
     """
     if not location:
         return False
-    parsed = urlparse(location)
+    try:
+        parsed = urlparse(location)
+    except ValueError:  # an unclosed "[" host: no hop to anywhere
+        return False
     # Only a web redirect can be a challenge hop. ``urlparse`` resolves
     # userinfo correctly - "https://validate.perfdrive.com@evil.com/" has
     # hostname evil.com and is rejected here, which is the direction that
@@ -247,6 +250,7 @@ class ChallengeType(enum.Enum):
 
     CLOUDFLARE = "cloudflare"
     AKAMAI = "akamai"
+    AKAMAI_DENIED = "akamai_denied"
     DATADOME = "datadome"
     PERIMETERX = "perimeterx"
     IMPERVA = "imperva"
@@ -291,6 +295,7 @@ TERMINAL_CHALLENGES = frozenset({ChallengeType.CLOUDFLARE_BLOCK})
 # same IP rarely helps, and each failed attempt poisons the IP for
 # the subsequent browser solve.
 JS_ONLY_CHALLENGES = frozenset({
+    ChallengeType.AKAMAI_DENIED,
     ChallengeType.BRAVE,
     ChallengeType.AWSWAF,
     ChallengeType.CLOUDFLARE,
@@ -600,6 +605,36 @@ _REDDIT_VERIFICATION_TITLE_RE = re.compile(
 )
 
 
+_AKAMAI_DENIAL_TITLE = re.compile(
+    r"<title>\s*Access to this page has been denied\.\s*</title>", re.IGNORECASE
+)
+
+
+# PerimeterX's block and captcha pages, by body.
+_PX_BODY_MARKERS = ("perimeterx", "human.security", "press & hold", "px-captcha")
+
+
+def is_akamai_denial(status_code: int, headers: dict[str, str], body: str) -> bool:
+    """Mouser's explicit Akamai edge refusal, as distinct from its behavioral page.
+
+    PerimeterX's block page has the same title, and a site can serve it
+    through Akamai's edge; one carrying PerimeterX's cookies or markup is
+    left to PerimeterX detection, which can solve it.
+    """
+    if not (
+        status_code == 403
+        and headers.get("server", "").lower() == "akamaighost"
+        and bool(headers.get("x-reference-error", "").strip())
+        and _AKAMAI_DENIAL_TITLE.search(body) is not None
+    ):
+        return False
+    set_cookie = headers.get("set-cookie", "")
+    if _has_cookie(set_cookie, "_px3") or _has_cookie(set_cookie, "_pxhd"):
+        return False
+    body_lower = body.lower()
+    return not any(marker in body_lower for marker in _PX_BODY_MARKERS)
+
+
 def detect_challenge(
     status_code: int, headers: dict[str, str], body: str, url: str | None = None
 ) -> ChallengeType | None:
@@ -616,6 +651,12 @@ def detect_challenge(
         ChallengeType enum member, or None if no challenge detected.
     """
     set_cookie = headers.get("set-cookie", "")
+
+    # A branded denial can set ordinary edge cookies and load scripts.
+    # Identify the actual document before those generic signals.
+    if is_akamai_denial(status_code, headers, body):
+        logger.info("Access denied by Akamai (HTTP 403)")
+        return ChallengeType.AKAMAI_DENIED
 
     if url is not None and is_google_searchguard(body, url):
         logger.info("Challenge detected: searchguard")
@@ -848,12 +889,7 @@ def detect_challenge(
             return ChallengeType.DATADOME
 
         # PerimeterX body markers (also 429 — DigiKey returns 429 with PX challenge)
-        if (
-            "perimeterx" in body_lower
-            or "human.security" in body_lower
-            or "press & hold" in body_lower
-            or "px-captcha" in body_lower
-        ):
+        if any(marker in body_lower for marker in _PX_BODY_MARKERS):
             logger.info("Challenge detected (body): perimeterx")
             return ChallengeType.PERIMETERX
 

@@ -850,6 +850,78 @@ class TestBrowserSolverInit:
 # ---------------------------------------------------------------------------
 
 
+_MOUSER_DENIAL = (
+    Path(__file__).parent / "fixtures" / "mouser_akamai_denial_2026-11-20.html"
+)
+_MOUSER_DENIAL_HEADERS = {
+    "content-type": "text/html",
+    "server": "AkamaiGHost",
+    "x-reference-error": "redacted",
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("make_session", [make_sync_session, make_async_session])
+async def test_mouser_denied_after_browser_stops_without_rotating(make_session):
+    url = "https://www.mouser.com/"
+    denial = MockResponse(403, _MOUSER_DENIAL_HEADERS, _MOUSER_DENIAL.read_text())
+    solver = MockBrowserSolver(results=[None])
+    session, client = make_session([denial], browser_solver=solver, max_rotations=2)
+    with pytest.raises(ChallengeDetected) as error:
+        if make_session is make_async_session:
+            await session.get(url)
+        else:
+            session.get(url)
+    assert error.value.response.status_code == 403
+    assert error.value.challenge_type == "akamai_denied"
+    assert error.value.response.rotations == 0
+    assert client.request_count == 1
+    assert solver.solve_calls == [(url, "akamai_denied")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("make_session", [make_sync_session, make_async_session])
+async def test_a_preflighted_session_still_climbs_the_ladder(make_session):
+    # www.ebay.ca from fetchaller's Linux image, 2026-11-24: Akamai refused
+    # Chrome and served Firefox 152. A preflighted solver pins the session to
+    # the browser's identity at construction, and that pin kept every rotation
+    # on Chrome, so a session with a solver never reached Firefox and failed.
+    url = "https://www.ebay.ca/sch/i.html?_nkw=usb+c+cable"
+    body = (
+        Path(__file__).parent / "fixtures" / "ebay_akamai_refusal_2026-11-03.html"
+    ).read_text()
+
+    def refusal():
+        return MockResponse(
+            403,
+            {"content-type": "text/html", "server": "AkamaiGHost",
+             "set-cookie": "bm_so=abc; Path=/"},
+            body,
+        )
+
+    results = MockResponse(200, {"content-type": "text/html"}, "<html>results</html>")
+    solver = MockBrowserSolver(results=[None])
+    solver.browser_identity = (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/158.0.0.0 Safari/537.36",
+        "158.0.8127.88",
+    )
+    session, client = make_session(
+        [refusal(), refusal(), results], browser_solver=solver, max_rotations=2
+    )
+    session._align_preflight_browser_identity()
+    assert session._fingerprint.pinned
+    with patch("time.sleep"), patch("asyncio.sleep"):
+        if make_session is make_async_session:
+            resp = await session.get(url)
+        else:
+            resp = session.get(url)
+    assert resp.status_code == 200
+    assert client.request_count == 3
+    assert repr(session.emulation) == "Profile.Firefox152"
+    assert solver.solve_calls == []
+
+
 class TestSyncBrowserSolveIntegration:
     @patch("time.sleep")
     def test_tmd_browser_shell_is_replayed_through_transport(self, mock_sleep):
@@ -6673,12 +6745,16 @@ class TestPostSolvePassthroughLanding:
     _CLEARANCE = [{"name": "cf_clearance", "value": "x", "domain": ".fcc.report"}]
     _HTML = "<html><body>" + "filing content " * 200 + "</body></html>"
 
-    def _solve(self, requested, page_url, documents=()):
+    def _solve(
+        self, requested, page_url, documents=(), challenge_type="cloudflare",
+        goto_status=200, replay=None,
+    ):
         solver, context, page, response = (
             TestBrowserSolverFailClosed._cloudflare_navigation(
                 response_url=requested,
                 page_url=page_url,
                 cookies=self._CLEARANCE,
+                status=goto_status,
             )
         )
         page.content.return_value = self._HTML
@@ -6708,7 +6784,7 @@ class TestPostSolvePassthroughLanding:
                         }
                         doc.headers_array.return_value = []
                     handler(doc)
-            return response
+            return response if goto_status is not None else None
 
         page.goto.side_effect = goto
         try:
@@ -6717,7 +6793,9 @@ class TestPostSolvePassthroughLanding:
                 patch.object(solver, "_setup_headless_patches"),
                 patch.object(solver, "_dispatch_challenge", return_value=True),
             ):
-                return solver._solve_on_worker(requested, "cloudflare", timeout=5)
+                return solver._solve_on_worker(
+                    requested, challenge_type, timeout=5, replay=replay
+                )
         finally:
             solver.close()
 
@@ -6743,6 +6821,114 @@ class TestPostSolvePassthroughLanding:
         result = self._solve(url, url, documents=[(url, 404)])
         assert result is not None
         assert result.response is None
+
+    @pytest.mark.parametrize("initial_type", ["akamai_denied", "generic_js"])
+    def test_mouser_denial_never_yields_a_successful_solve(self, initial_type):
+        url = "https://www.mouser.com/"
+        self._HTML = _MOUSER_DENIAL.read_text()
+        result = self._solve(
+            url, url, [(url, 403, self._HTML.encode(), _MOUSER_DENIAL_HEADERS)],
+            challenge_type=initial_type,
+        )
+        assert result is None
+
+    @pytest.mark.parametrize("initial_type", ["cloudflare", "akamai", "generic_js"])
+    def test_another_final_403_still_leaves_cookies_for_the_replay(
+        self, initial_type
+    ):
+        # Only Mouser's denial page fails a solve. Akamai's stock "Access
+        # Denied" page carries the same edge headers and is left to the
+        # replay, as every other non-2xx landing is.
+        url = "https://fcc.report/FCC-ID/2AC7Z-ESPWROOM32"
+        stock = (
+            "<html><head><title>Access Denied</title></head><body>"
+            "You don't have permission to access this server. "
+            "Reference #18.1a2b3c4d.1795217585.acfc864c</body></html>"
+        )
+        self._HTML = stock
+        result = self._solve(
+            url, url, [(url, 403, stock.encode(), _MOUSER_DENIAL_HEADERS)],
+            challenge_type=initial_type,
+        )
+        assert result is not None
+        assert result.response is None
+        assert result.cookies
+
+    @pytest.mark.parametrize("method", ["POST", "HEAD"])
+    @pytest.mark.parametrize("initial_type", ["generic_js", "akamai_denied"])
+    def test_a_non_get_request_is_replayed_not_given_the_get_page(
+        self, initial_type, method
+    ):
+        # The browser loads the URL with a GET; that page is not the answer
+        # to the caller's POST, so the cookies go to the replay instead.
+        url = "https://fcc.report/FCC-ID/2AC7Z-ESPWROOM32"
+        result = self._solve(
+            url, url, [(url, 200)], challenge_type=initial_type,
+            replay={"method": method, "body": None, "content_type": ""},
+        )
+        assert result is not None
+        assert result.response is None
+        assert result.cookies
+
+    @pytest.mark.parametrize("initial_type", ["generic_js", "datadome", "akamai"])
+    def test_no_document_status_is_no_synthetic_200(self, initial_type):
+        # No document event and no goto() response: the page has no server
+        # status, so it is not passed through as a 200 (a denial DOM
+        # included); the replay gets the real one.
+        url = "https://www.mouser.com/"
+        self._HTML = _MOUSER_DENIAL.read_text()
+        result = self._solve(url, url, challenge_type=initial_type, goto_status=None)
+        assert result is not None
+        assert result.response is None
+        assert result.cookies
+
+    def test_an_in_place_path_change_after_a_403_is_no_200(self):
+        # The only document answered 403, then the page changed its path in
+        # place on the same origin: the new path has no status of its own,
+        # and the DOM is the 403's, so nothing is passed through as a 200.
+        requested = "https://fcc.report/FCC-ID/2AC7Z-ESPWROOM32"
+        result = self._solve(
+            requested, "https://fcc.report/FCC-ID/other",
+            [(requested, 403)], challenge_type="generic_js",
+        )
+        assert result is not None
+        assert result.response is None
+        assert result.cookies
+
+    def test_an_in_place_path_change_after_a_200_still_passes(self):
+        requested = "https://fcc.report/FCC-ID/2AC7Z-ESPWROOM32"
+        result = self._solve(
+            requested, "https://fcc.report/FCC-ID/other",
+            [(requested, 200)], challenge_type="generic_js",
+        )
+        assert result.response is not None
+        assert result.response.status == 200
+
+    def test_goto_status_alone_still_passes_a_page_through(self):
+        url = "https://fcc.report/FCC-ID/2AC7Z-ESPWROOM32"
+        result = self._solve(url, url, challenge_type="generic_js", goto_status=200)
+        assert result.response is not None
+        assert result.response.status == 200
+
+    def test_later_200_supersedes_mouser_denial(self):
+        url = "https://www.mouser.com/"
+        result = self._solve(
+            url, url, [(url, 403), (url, 200)], challenge_type="akamai_denied",
+        )
+        assert result.response.status == 200
+        assert result.response.body == self._HTML.encode()
+
+    @pytest.mark.parametrize("goto_status", [None, 403])
+    def test_mouser_denial_without_document_event(self, goto_status, caplog):
+        url = "https://www.mouser.com/"
+        self._HTML = _MOUSER_DENIAL.read_text()
+        with caplog.at_level(logging.INFO, logger="wafer"):
+            result = self._solve(
+                url, url, challenge_type="akamai_denied", goto_status=goto_status,
+            )
+        assert result is None
+        assert "akamai_denied passthrough" not in caplog.text
+        assert "Browser solved" not in caplog.text
 
     def test_landing_on_a_cookie_gate_is_not_content(self):
         from wafer.browser._solver import _is_passthrough_challenge_html
@@ -13428,6 +13614,22 @@ class TestInPlaceChallengeClassification:
             solver.close()
         assert without_headers == "generic_js"
         assert d.call_args[0][1] == "akamai"
+
+    def test_render_preserves_explicit_mouser_denial(self):
+        url = "https://www.mouser.com/"
+        body = _MOUSER_DENIAL.read_text()
+        response = self._document_setting(url, 403, [])
+        response.all_headers.return_value.update(_MOUSER_DENIAL_HEADERS)
+        solver = self._solver()
+        try:
+            with patch.object(solver, "_dispatch_challenge") as dispatch:
+                assert not solver._solve_challenge_in_place(
+                    MagicMock(), url, body, time.monotonic() + 30, 403,
+                    response=response,
+                )
+                dispatch.assert_not_called()
+        finally:
+            solver.close()
 
     def test_a_200_pages_cookies_stay_out_of_the_blocking_status_fallback(self):
         # Akamai sets _abck on every page; at a 403 the server never sent,

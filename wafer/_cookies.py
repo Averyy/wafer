@@ -17,8 +17,12 @@ logger = logging.getLogger("wafer")
 
 
 def extract_domain(url: str) -> str | None:
-    """Extract hostname from a URL."""
-    return urlparse(url).hostname
+    """Extract hostname from a URL, or None for one that does not parse (an
+    unclosed ``[`` host): the transport then refuses the request itself."""
+    try:
+        return urlparse(url).hostname
+    except ValueError:
+        return None
 
 
 def registrable_domain(host: str) -> str:
