@@ -11,6 +11,7 @@ from wafer._challenge import (
     TERMINAL_CHALLENGES,
     ChallengeType,
     detect_challenge,
+    loads_cf_challenge_platform,
 )
 from wafer._solvers import is_reddit_verification
 
@@ -77,6 +78,11 @@ class TestCloudflare:
 _CF_BLOCK_FIXTURE = (
     pathlib.Path(__file__).parent / "fixtures" / "cloudflare_waf_block_1020.html"
 )
+_CF_JSD_BLOCK_FIXTURE = (
+    pathlib.Path(__file__).parent
+    / "fixtures"
+    / "cloudflare_waf_block_jsd_2026-11-24.html"
+)
 
 
 class TestCloudflareBlock:
@@ -124,6 +130,71 @@ class TestCloudflareBlock:
         """The defect this classification exists to fix."""
         body = _CF_BLOCK_FIXTURE.read_text()
         assert detect_challenge(403, {}, body) != ChallengeType.GENERIC_JS
+
+    def test_block_page_with_js_detections_beacon(self):
+        """A zone's /api block (2026-11-24): Cloudflare injects its
+        JS-detections beacon into the block page, which read as generic_js."""
+        body = _CF_JSD_BLOCK_FIXTURE.read_text()
+        assert "/cdn-cgi/challenge-platform/scripts/jsd/main.js" in body
+        headers = _h(server="cloudflare", content_type="text/html; charset=UTF-8")
+        assert detect_challenge(403, headers, body) is ChallengeType.CLOUDFLARE_BLOCK
+
+    def test_beacon_does_not_hide_a_challenge_script(self):
+        """A page that also loads the challenge proper is still solvable."""
+        body = _CF_JSD_BLOCK_FIXTURE.read_text().replace(
+            "</body>",
+            '<script src="/cdn-cgi/challenge-platform/h/g/orchestrate/chl_page/'
+            'v1?ray=1"></script></body>',
+        )
+        assert detect_challenge(403, {}, body) is not ChallengeType.CLOUDFLARE_BLOCK
+
+    @pytest.mark.parametrize(
+        "text,loads",
+        [
+            ("/cdn-cgi/challenge-platform/scripts/jsd/main.js?ray=a5f8", False),
+            ("/cdn-cgi/challenge-platform/h/b/orchestrate/chl_page/v1", True),
+            ("/cdn-cgi/challenge-platform/h/g/scripts/jsd/x/main.js", True),
+            ("challenge-platform", True),
+            ("/cdn-cgi/challenge-platform/scripts/jsd/main.js "
+             "/cdn-cgi/challenge-platform/h/b/turnstile/if/ov2", True),
+            ("<html>no cloudflare here</html>", False),
+        ],
+    )
+    def test_loads_cf_challenge_platform(self, text, loads):
+        assert loads_cf_challenge_platform(text) is loads
+
+    def test_short_page_with_beacon_is_not_a_browser_challenge(self):
+        """The beacon closes every HTML page on a JS-detections zone; a real
+        page under the 10 KB scan window was rejected as a challenge."""
+        from wafer.browser._cloudflare import _page_is_challenge
+        from wafer.browser._solver import _is_passthrough_challenge_html
+
+        beacon = (
+            "<script>var u='/cdn-cgi/challenge-platform/scripts/jsd/main.js"
+            "?ray=a5f8e4701f5ef57f';</script>"
+        )
+        page = f"<html><title>Example page</title><body>data{beacon}</body></html>"
+        assert not _is_passthrough_challenge_html(page)
+        interstitial = (
+            "<html><title>Just a moment...</title><body>"
+            '<script src="/cdn-cgi/challenge-platform/h/b/orchestrate/chl_page/'
+            'v1"></script></body></html>'
+        )
+        assert _is_passthrough_challenge_html(interstitial)
+
+        class _Page:
+            def __init__(self, title, html):
+                self._title, self._html = title, html
+
+            def title(self):
+                return self._title
+
+            def content(self):
+                return self._html
+
+        beacon_only = f"<html><body>{beacon}</body></html>"
+        assert not _page_is_challenge(_Page("Just a moment...", beacon_only))
+        assert _page_is_challenge(_Page("Just a moment...", interstitial))
 
     def test_block_is_terminal_and_not_js_solvable(self):
         assert ChallengeType.CLOUDFLARE_BLOCK in TERMINAL_CHALLENGES

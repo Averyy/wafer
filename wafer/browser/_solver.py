@@ -51,7 +51,10 @@ from dataclasses import dataclass, field
 from urllib.parse import parse_qs, unquote, urlparse, urlsplit
 
 from wafer._brave import is_brave_challenge
-from wafer._challenge import is_ebay_splash_challenge
+from wafer._challenge import (
+    is_ebay_splash_challenge,
+    loads_cf_challenge_platform,
+)
 from wafer._cookies import browser_cookie_matches_host, registrable_domain
 from wafer._errors import ResponseTooLarge, TooManyRedirects
 from wafer._fingerprint import chrome_full_version
@@ -443,7 +446,7 @@ def _is_passthrough_challenge_html(html: str) -> bool:
         or "reese84" in head
         or "just a moment" in head
         or "cf_chl" in head
-        or "challenge-platform" in head
+        or loads_cf_challenge_platform(head)
         or "chl_page" in head
         # Reddit's network-security copy can occur near the end of a ~190 KiB
         # Shreddit response, so it must not be limited to the generic 10 KiB
@@ -6769,6 +6772,14 @@ class BrowserSolver:
             )
 
             return wait_for_cloudflare(
+                self, page, timeout_ms, documents=documents
+            )
+        elif challenge_type == "cloudflare_block":
+            # Sent to the page the blocked request comes from, never the
+            # blocked URL: the page's own Turnstile earns the site's session.
+            from wafer.browser._cloudflare import wait_for_page_turnstile
+
+            return wait_for_page_turnstile(
                 self, page, timeout_ms, documents=documents
             )
         elif challenge_type == "akamai":

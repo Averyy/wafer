@@ -4,6 +4,45 @@ All notable changes to wafer. Versions come from git tags (`hatch-vcs`); each
 release is on [PyPI](https://pypi.org/project/wafer-py/) and
 [GitHub Releases](https://github.com/Averyy/wafer/releases).
 
+## 0.7.16 - 2026-11-24
+
+### Fixed
+
+- A Cloudflare block page carrying Cloudflare's JS-detections beacon
+  (`/cdn-cgi/challenge-platform/scripts/jsd/main.js`, injected into every page
+  of a zone with JS detections on, its block page included) is
+  `cloudflare_block` again, not `generic_js`. The beacon also no longer makes
+  the browser reject a short real page as a challenge.
+- A 403 whose only scripts are the ones Cloudflare injects (the JS-detections
+  loader, the Web Analytics beacon, `/cdn-cgi/scripts/` helpers) is no longer
+  read as a `generic_js` challenge: it is the origin refusing, and is handled
+  as a plain 403.
+
+### Added
+
+- A refusal the site's own page clears gets one recovery when a
+  `browser_solver` is set and the request names a page on the same site
+  (`solve_origin`, `Referer`, `Origin` or `embed_origin`): Cloudflare's block
+  page, or the origin's own 403 behind Cloudflare. wafer fetches the page over
+  HTTP, and only if it runs Turnstile does the browser run the page's widget,
+  wait for the page's own cookie, and the request get retried over HTTP with
+  the cookies it earned. The page must share the refused URL's site, scheme
+  and port, and with `resolve=` set its host must be pinned; the page fetch
+  follows no redirect under `follow_redirects=False`. A page that shows no
+  Turnstile, or whose recovery did not clear the refusal, is left alone by the
+  session for 10 minutes. A block
+  that survives is raised as `RequestBlocked` (or returned under
+  `max_rotations=0`); with no such page or no browser it is raised on the first
+  response, as before.
+
+## 0.7.15 - 2026-11-16
+
+### Fixed
+
+- TMD punishments with `action=captcharecaptcha` route to the reCAPTCHA solver
+  whatever the action's case, so a `captchaRecaptcha` spelling no longer falls
+  to the slider solver for its whole budget.
+
 ## 0.7.14 - 2026-11-06
 
 ### Fixed

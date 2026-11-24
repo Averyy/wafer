@@ -27,6 +27,103 @@ from wafer._solvers import (
 
 logger = logging.getLogger("wafer")
 
+# Cloudflare's challenge platform, minus its JS-detections beacon. A zone with
+# JS detections on (Bot Fight Mode, Bot Management) injects
+# /cdn-cgi/challenge-platform/scripts/jsd/main.js into every HTML document it
+# serves, its own WAF block page included (seen 2026-11-24).
+# The beacon is telemetry: it runs no challenge and clears nothing. A block
+# page carrying it was read as a JS challenge, and a short real page carrying
+# it as a challenge left in the browser.
+_CF_CHALLENGE_PLATFORM_RE = re.compile(r"challenge-platform(?!/scripts/jsd/)")
+
+
+def loads_cf_challenge_platform(text: str) -> bool:
+    """Whether *text* references Cloudflare's challenge platform for anything
+    other than the JS-detections beacon. Case-sensitive: pass lowercased text
+    when the source may vary in case.
+    """
+    return _CF_CHALLENGE_PLATFORM_RE.search(text) is not None
+
+
+# Scripts Cloudflare adds to documents it proxies, whatever the origin sent:
+# the JS-detections loader (sets window.__CF$cv$params and loads the jsd
+# beacon), the Web Analytics beacon, and its /cdn-cgi/scripts/ helpers (email
+# obfuscation, Rocket Loader). An origin answering a missing session with
+# Werkzeug's stock 403 carries only the first two (2026-11-24), and the
+# generic-JS fallback read that as a JS challenge.
+_CF_INJECTED_SCRIPT_MARKERS = (
+    "__cf$cv$params",
+    "static.cloudflareinsights.com/beacon.min.js",
+    "/cdn-cgi/scripts/",
+)
+_SCRIPT_OPEN_RE = re.compile(r"<script\b")
+_SCRIPT_ELEMENT_RE = re.compile(r"<script\b[^>]*>.*?</script\s*>", re.DOTALL)
+
+
+def has_page_script(body_lower: str) -> bool:
+    """Whether a lowercased document has a script of its own, the ones
+    Cloudflare injects aside. An unclosed or unrecognized ``<script`` counts.
+    """
+    opened = len(_SCRIPT_OPEN_RE.findall(body_lower))
+    if not opened:
+        return False
+    injected = sum(
+        1
+        for element in _SCRIPT_ELEMENT_RE.finditer(body_lower)
+        if any(marker in element.group(0) for marker in _CF_INJECTED_SCRIPT_MARKERS)
+    )
+    return opened > injected
+
+
+# A Turnstile sitekey (production keys start 0x4AAAAAA; the 1x/2x/3x test keys
+# never run on a live site).
+_TURNSTILE_SITEKEY_RE = re.compile(r"\b0x4AAAAAA[0-9A-Za-z_-]{8,}")
+
+
+def page_runs_turnstile(
+    status_code: int, headers: dict[str, str], body: str | None
+) -> bool:
+    """Whether a page, fetched over HTTP, runs a Turnstile widget of its own.
+
+    A page that loads the widget with its own script names it only
+    indirectly: pages seen 2026-11-24 carried the sitekey in an inline config
+    and allowed challenges.cloudflare.com in their CSP's frame-src, with the
+    api.js URL only in a separate script. Any of the sitekey, the widget's
+    class, or challenges.cloudflare.com in the CSP or the document counts.
+    Only a 2xx document qualifies.
+    """
+    if not 200 <= status_code < 300:
+        return False
+    csp = next(
+        (
+            str(v)
+            for k, v in headers.items()
+            if str(k).lower() == "content-security-policy"
+        ),
+        "",
+    )
+    if "challenges.cloudflare.com" in csp.lower():
+        return True
+    if not body:
+        return False
+    if _TURNSTILE_SITEKEY_RE.search(body) is not None:
+        return True
+    lowered = body.lower()
+    return "challenges.cloudflare.com" in lowered or "cf-turnstile" in lowered
+
+
+def is_cloudflare_origin_refusal(status_code: int, headers: dict[str, str]) -> bool:
+    """A 403 that came through Cloudflare (``cf-ray``) without being one of
+    Cloudflare's own pages: the origin refusing. On a zone whose pages run
+    Turnstile it can be the same missing session as the edge's block page:
+    an edge that lets a request through on a clearance minted on another of
+    the site's subdomains leaves the origin to answer 403 itself.
+    """
+    return status_code == 403 and any(
+        str(k).lower() == "cf-ray" for k in headers
+    )
+
+
 # JS hooks unique to the modern reese "Pardon Our Interruption" interstitial -
 # the page that carries the reese84 sensor. They never appear on real content
 # pages, so they hold at any body size. Shared with the browser solver, which
@@ -723,11 +820,13 @@ def detect_challenge(
         # loads /cdn-cgi/challenge-platform/... to run the challenge. That
         # pair — error stylesheet present, challenge script absent — is what
         # separates "the request matched a rule" from "prove you're a
-        # browser", and only the second one is solvable.
+        # browser", and only the second one is solvable. The JS-detections
+        # beacon Cloudflare injects into the block page is not a challenge
+        # script (see loads_cf_challenge_platform).
         if (
             status_code == 403
             and "/cdn-cgi/styles/cf.errors.css" in body_lower
-            and "challenge-platform" not in body_lower
+            and not loads_cf_challenge_platform(body_lower)
             and "cf_chl" not in body_lower
         ):
             logger.info("Challenge detected (body): cloudflare_block")
@@ -796,8 +895,10 @@ def detect_challenge(
             logger.info("Challenge detected (body): recaptcha")
             return ChallengeType.RECAPTCHA
 
-        # Generic JS fallback — 403/429 with script tag + small body
-        if "<script" in body_lower and len(body) < 50_000:
+        # Generic JS fallback — 403/429 with a script of the page's own +
+        # small body. Cloudflare's injected scripts are not the page's: an
+        # origin's plain 403 carrying only those is a refusal, not a challenge.
+        if len(body) < 50_000 and has_page_script(body_lower):
             logger.info("Challenge detected: generic_js")
             return ChallengeType.GENERIC_JS
 

@@ -74,8 +74,10 @@ the finished document. These are render regression targets, not WAF targets.
 ## Terminal Blocks (nothing to solve)
 
 Denials, not challenges. wafer classifies these as `cloudflare_block` and raises
-`RequestBlocked` on the first response with zero rotations. They are regression
-targets for that classification, not solve targets.
+`RequestBlocked` with zero rotations: on the first response, or after one browser
+solve on the page the request names when the site's own page clears the block
+(see `docs/ref-cloudflare.md`). They are regression targets for that
+classification.
 
 | URL | Challenge Type | Status | Notes |
 |---|---|---|---|

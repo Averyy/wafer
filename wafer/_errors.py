@@ -48,14 +48,23 @@ class RequestBlocked(ChallengeDetected):
     none of its retry or rotation budget before raising this.
 
     What does help is changing the request itself: a different path, origin,
-    or egress address.
+    or egress address, or state the site's own pages establish. A rule can
+    block requests until they carry the site's session cookie, which its
+    pages earn by running Turnstile in place (a zone whose ``/api/*`` routes
+    need the session cookie its widget pages set).
+    With a browser solver, wafer tries that once before raising: when the
+    request names a page on the same site (``solve_origin``, else its
+    ``Referer``, ``Origin`` or the session's ``embed_origin``) and a fetch of
+    that page shows it runs Turnstile, the browser runs the page's widget and
+    the request is retried with the cookies it earned. This is raised when no
+    such page exists, the page runs no Turnstile, or the block survives.
     """
 
     def _message(self) -> str:
         return (
             f"{self.challenge_type} blocked the request to {self.url} "
-            f"(HTTP {self.status_code}); a WAF rule denied it, so retrying, "
-            "rotating identity, and browser solving all return the same answer"
+            f"(HTTP {self.status_code}); a WAF rule denied it, so retrying "
+            "and rotating identity return the same answer"
         )
 
 

@@ -4,6 +4,7 @@ import datetime
 import json
 import logging
 import time
+from urllib.parse import urljoin, urlsplit
 
 import wreq.blocking
 import wreq.exceptions
@@ -11,6 +12,8 @@ from wreq import Method
 
 from wafer._base import (
     _RENDER_CHALLENGE_BUDGET,
+    _TURNSTILE_PAGE_CHECK_BYTES,
+    _TURNSTILE_PAGE_CHECK_SECONDS,
     BaseSession,
     _browser_attempt_key,
     _browser_attempt_timeout,
@@ -39,7 +42,9 @@ from wafer._challenge import (
     ChallengeType,
     detect_challenge,
     is_akamai_api_refusal,
+    is_cloudflare_origin_refusal,
     is_kasada_api_refusal,
+    page_runs_turnstile,
 )
 from wafer._cookies import (
     browser_cookie_matches_host,
@@ -736,6 +741,87 @@ class SyncSession(BaseSession):
             except Exception:
                 logger.debug("TMD homepage fetch failed")
 
+        return False
+
+    def _page_runs_turnstile(
+        self, page: str, url: str, deadline: float | None
+    ) -> bool:
+        """Whether *page* runs a Turnstile widget of its own, read over HTTP.
+
+        One GET of the page before a browser is spent on it, so a refusal
+        whose page has no widget to run (a real ban, where the page is refused
+        too) costs a request, not a browser visit. See ``page_runs_turnstile``.
+        A redirect is followed only as far as ``_turnstile_page_redirects``
+        allows and only to where ``_turnstile_page_target`` lets wafer go for
+        *url*; any other redirect ends the check with no.
+        """
+        target = page
+        for _hop in range(self._turnstile_page_redirects() + 1):
+            # The same pacing, DNS pin and cookie bookkeeping as the loop's
+            # own requests: this is a request to the site like any other.
+            target_domain = extract_domain(target) or target
+            try:
+                if self._rate_limiter:
+                    self._rate_limiter.wait_sync(
+                        target_domain,
+                        max_wait=(
+                            deadline - time.monotonic()
+                            if deadline is not None
+                            else None
+                        ),
+                    )
+                # The budget is read after the pacing wait, which can spend it.
+                request_kwargs = {}
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return False
+                    request_kwargs["timeout"] = datetime.timedelta(
+                        seconds=min(remaining, _TURNSTILE_PAGE_CHECK_SECONDS)
+                    )
+                resp = self._client.get(
+                    _canonicalize_url_host(target) if self._resolve else target,
+                    headers=self._build_headers(target, {"Referer": ""}),
+                    **request_kwargs,
+                )
+                self._record_response_cookie_scopes(target, resp)
+                if self._rate_limiter:
+                    self._rate_limiter.record(target_domain)
+                status = resp.status.as_int()
+                headers = _decode_headers(resp.headers)
+                location = headers.get("location", "")
+                if 300 <= status < 400 and location:
+                    target = self._turnstile_page_target(
+                        urljoin(target, location), url
+                    )
+                    if target is None:
+                        break
+                    continue
+                # The CSP alone can answer, before any of the body is read.
+                runs = page_runs_turnstile(status, headers, None)
+                if not runs and 200 <= status < 300:
+                    try:
+                        content = _read_body_capped(
+                            resp, _TURNSTILE_PAGE_CHECK_BYTES
+                        )
+                    except _CapExceeded:
+                        content = b""
+                    body = content.decode(
+                        resolve_charset(headers, content), errors="replace"
+                    )
+                    runs = page_runs_turnstile(status, headers, body)
+            except Exception as exc:
+                logger.debug(
+                    "Turnstile page check failed (%s)", type(exc).__name__
+                )
+                return False
+            logger.info(
+                "Page %s %s (HTTP %d)",
+                urlsplit(page).path or "/",
+                "runs Turnstile" if runs else "shows no Turnstile",
+                status,
+            )
+            return runs
         return False
 
     def _try_browser_solve(
@@ -1838,6 +1924,8 @@ class SyncSession(BaseSession):
         # One browser solve per (challenge type, host): a redirect onto
         # another host behind the same WAF needs that host's own clearance.
         browser_attempted: set[tuple[str, str]] = set()
+        # The page a Turnstile recovery went to, per refusal key (None: none).
+        turnstile_tried: dict[tuple[str, str], str | None] = {}
         critical_ch_retried = False
         reddit_bootstrap_attempted = False
         # The bootstrap ran and earned the anonymous cookie set this request.
@@ -2383,6 +2471,61 @@ class SyncSession(BaseSession):
                     or self._reddit_web_gate_is_final(current_url, extra_headers)
                 )
             )
+            # A refusal the site's own page can clear (see
+            # _turnstile_recovery_page): Cloudflare's block page, or the
+            # origin's own 403 behind Cloudflare. The page is checked over
+            # HTTP first; only one that runs Turnstile gets the browser, once,
+            # and then the retry with what it earned. What that retry gets
+            # stands: a block is raised below, an origin 403 takes the usual
+            # 403 path.
+            turnstile_refusal = challenge is ChallengeType.CLOUDFLARE_BLOCK or (
+                challenge is None
+                and body is not None
+                and self._profile not in (Profile.OPERA_MINI, Profile.DART)
+                and _is_challengeable_content_type(content_type)
+                and is_cloudflare_origin_refusal(status, headers)
+            )
+            if turnstile_refusal:
+                refusal_key = _browser_attempt_key(
+                    ChallengeType.CLOUDFLARE_BLOCK, current_url
+                )
+                if refusal_key in turnstile_tried:
+                    if turnstile_tried[refusal_key] is not None:
+                        # The page's solve did not change the answer.
+                        self._note_turnstile_miss(turnstile_tried[refusal_key])
+                else:
+                    turnstile_tried[refusal_key] = None
+                    turnstile_page = self._turnstile_recovery_page(
+                        current_url, extra_headers
+                    )
+                    if turnstile_page is not None:
+                        if not self._page_runs_turnstile(
+                            turnstile_page, current_url, deadline
+                        ):
+                            self._note_turnstile_miss(turnstile_page)
+                        else:
+                            turnstile_tried[refusal_key] = turnstile_page
+                            browser_attempted.add(refusal_key)
+                            logger.info(
+                                "%s (HTTP %d); solving the Turnstile on the "
+                                "page the request comes from",
+                                "Cloudflare block"
+                                if challenge is not None
+                                else "Origin refusal behind Cloudflare",
+                                status,
+                            )
+                            turnstile_result = self._try_browser_solve(
+                                ChallengeType.CLOUDFLARE_BLOCK,
+                                current_url,
+                                deadline,
+                                embedder=turnstile_page,
+                                max_size=max_response_size,
+                                defer_cache=pending_browser_cookies,
+                            )
+                            if turnstile_result is not False:
+                                continue
+                            self._note_turnstile_miss(turnstile_page)
+
             if challenge is not None and (
                 challenge in TERMINAL_CHALLENGES or reddit_blocked
             ):

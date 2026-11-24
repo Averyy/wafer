@@ -1055,10 +1055,26 @@ and `.status_code`; see [reCAPTCHA v3 token minting](#recaptcha-v3-token-minting
 `RequestBlocked` subclasses `ChallengeDetected`, so existing handlers still
 catch it. Catch it separately to tell "try again later" from "this will never
 work as-is": a challenge can be solved, a block cannot, and only changing the
-request itself (path, origin, egress address) changes the answer. Its
-`.challenge_type` is `"cloudflare_block"`, which is also what
-`resp.challenge_type` carries when `max_rotations=0` returns the block instead
-of raising.
+request itself (path, origin, egress address, or state the site's own pages
+set) changes the answer. Its `.challenge_type` is `"cloudflare_block"`, which
+is also what `resp.challenge_type` carries when `max_rotations=0` returns the
+block instead of raising.
+
+Some Cloudflare blocks wait for the site's own session cookie, which its pages
+earn by running Turnstile in place; behind the edge, the origin can refuse the
+same way with its own 403. With a `browser_solver`, such a refusal on a request
+that names a page on the same site (`solve_origin`, `Referer`, `Origin` or
+`embed_origin`) gets one recovery when that page runs Turnstile (checked with
+one HTTP fetch of the page): a browser solve on the page, then one retry with
+the cookies it earned. A page that showed no Turnstile, or whose solve did not
+help, is left alone by the session for 10 minutes:
+
+```python
+resp = session.get(
+    "https://www.example.org/api/data",
+    headers={"Referer": "https://www.example.org/page-with-the-widget"},
+)
+```
 
 `ConnectionFailed.reason` names a sinkholed DNS answer when that is the cause -
 a host that resolves only to `0.0.0.0` / `::` was refused by the resolver, not

@@ -124,6 +124,17 @@ def _browser_attempt_key(challenge, url: str) -> tuple[str, str]:
 # own. An explicit timeout= always wins.
 _RENDER_CHALLENGE_BUDGET = 150.0
 
+# How long a page whose Turnstile recovery came to nothing is left alone (see
+# BaseSession._turnstile_recovery_page).
+_TURNSTILE_PAGE_RETRY_SECONDS = 600.0
+# A host the page check will contact: plain ASCII DNS labels, nothing a URL
+# parser could read two ways (see BaseSession._turnstile_page_target).
+_TURNSTILE_PAGE_HOST_RE = re.compile(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?")
+# The HTTP check of that page before a browser goes to it: its own time cap
+# within the request's budget, and how much of its document is read.
+_TURNSTILE_PAGE_CHECK_SECONDS = 15.0
+_TURNSTILE_PAGE_CHECK_BYTES = 2_000_000
+
 
 def _browser_solve_timeout(remaining: float) -> float:
     """Reserve part of a request deadline for cookie replay after solving.
@@ -1089,6 +1100,12 @@ class BaseSession:
         # navigation target for every challenge; the Imperva-specific embedder
         # heuristic still runs as a fallback when solve_origin is None.
         self._solve_origin = solve_origin
+
+        # Pages a Turnstile recovery (see _turnstile_recovery_page) came to
+        # nothing on, by the monotonic time it did: not tried again for
+        # _TURNSTILE_PAGE_RETRY_SECONDS, so a refusal that is the site's real
+        # answer costs one page check per window rather than per request.
+        self._turnstile_page_misses: dict[str, float] = {}
 
         # Cache of scraped reCAPTCHA api.js release versions (the ``v``
         # token), keyed by mode -- "std" for api.js, "ent" for
@@ -3083,6 +3100,135 @@ class BaseSession:
             # query (appending "/" to the string would put it in the query).
             return urlunsplit(parsed._replace(path=parsed.path or "/"))
         return None
+
+    def _turnstile_recovery_page(self, url, extra_headers):
+        """The page a refusal of *url* may be cleared on, or None.
+
+        A zone can refuse requests until they carry state the site's own pages
+        establish: a Cloudflare zone whose own pages run Turnstile can refuse
+        ``/api/*`` until the ``session`` cookie those pages get, by posting
+        the widget's token to the site, exists (2026-11-24). The edge answers
+        with its block page; with a clearance minted on another of the site's
+        subdomains it lets the request through and the origin answers 403
+        itself. A browser sent to the refused URL gets the refusal and nothing
+        to solve, so the solve runs on the page the request comes from: the
+        session's ``solve_origin``, else the caller's ``Referer``, ``Origin``
+        or ``embed_origin`` (see ``_caller_page``). Only a page on the refused
+        URL's site, scheme and port qualifies (and, with ``resolve=`` set,
+        only a pinned host: see ``_turnstile_page_target``), as only that
+        site's cookies reach the retry; never the refused URL itself; and not
+        a page whose recovery came to nothing within
+        ``_TURNSTILE_PAGE_RETRY_SECONDS``.
+        """
+        if self._browser_solver is None:
+            return None
+        # The raw candidates, in _caller_page's order, each validated as the
+        # caller wrote it: parsing first would strip tabs and newlines (and
+        # can raise) before the check could see them.
+        if self._solve_origin:
+            candidates = [self._solve_origin]
+        else:
+            headers = {
+                str(k).lower(): v
+                for k, v in self._caller_headers(extra_headers).items()
+            }
+            candidates = [
+                headers.get("referer"),
+                headers.get("origin"),
+                self._embed_origin,
+            ]
+        # As in _caller_page, the first HTTP(S) candidate decides; one that
+        # fails the checks is not passed over for the next.
+        raw = next(
+            (
+                c
+                for c in candidates
+                if isinstance(c, str)
+                and c.strip().lower().startswith(("http://", "https://"))
+            ),
+            None,
+        )
+        page = self._turnstile_page_target(raw, url) if raw else None
+        if page is None:
+            return None
+        # Never the refused URL itself, however it is spelled.
+        if page == (self._turnstile_page_target(url, url) or url.split("#", 1)[0]):
+            return None
+        missed = self._turnstile_page_misses.get(page)
+        if (
+            missed is not None
+            and time.monotonic() - missed < _TURNSTILE_PAGE_RETRY_SECONDS
+        ):
+            return None
+        return page
+
+    def _turnstile_page_target(self, target: str, url: str) -> str | None:
+        """The URL wafer may send its own request to, for *target* (the
+        recovery page, or a redirect from it) on behalf of a request to
+        *url*, or None.
+
+        The page check and the browser solve are requests the caller did not
+        make, to a host the caller's ``Referer``/``Origin`` named, so they stay
+        inside the caller's own guards: the refused URL's site, scheme and
+        port, and, with ``resolve=`` set, only a host it pins. An unpinned
+        host would go to system DNS, which ``resolve=`` exists to keep wafer
+        away from (a same-site name resolving to an internal address).
+
+        What is checked is what is sent: the URL is rebuilt from the parts
+        that passed, and anything a WHATWG parser (wreq's, Chrome's) could read
+        differently from ``urlsplit`` is refused outright. A backslash is the
+        sharp case: ``http://127.0.0.1:8080\\@www.example.org/`` is
+        www.example.org to ``urlsplit`` and 127.0.0.1:8080 to a browser. So
+        are userinfo, whitespace and control characters, non-ASCII, and a host
+        outside ``[a-z0-9.-]`` (IPv6 literals included).
+        """
+        if (
+            not isinstance(target, str)
+            or not target
+            or not target.isascii()
+            or "\\" in target
+            or any(ch <= " " or ch == "\x7f" for ch in target)
+        ):
+            return None
+        try:
+            parts, url_parts = urlsplit(target), urlsplit(url)
+            port, url_port = parts.port, url_parts.port
+            _ = parts.hostname, url_parts.hostname
+        except (TypeError, ValueError):
+            return None
+        scheme = (parts.scheme or "").lower()
+        if scheme not in ("http", "https") or "@" in parts.netloc:
+            return None
+        host = (parts.hostname or "").lower().rstrip(".")
+        if not host or _TURNSTILE_PAGE_HOST_RE.fullmatch(host) is None:
+            return None
+        if scheme != (url_parts.scheme or "").lower():
+            return None
+        default = 443 if scheme == "https" else 80
+        effective = default if port is None else port
+        url_effective = default if url_port is None else url_port
+        if effective != url_effective:
+            return None
+        url_host = (url_parts.hostname or "").lower().rstrip(".")
+        if registrable_domain(host) != registrable_domain(url_host):
+            return None
+        if self._resolve and _canonical_host(host) not in self._resolve:
+            return None
+        netloc = host if effective == default else f"{host}:{effective}"
+        return urlunsplit((scheme, netloc, parts.path or "/", parts.query, ""))
+
+    def _turnstile_page_redirects(self) -> int:
+        """How many redirects the page check follows: none when the session
+        follows none (the caller checks every hop itself), else up to three
+        within ``max_redirects``.
+        """
+        if not self.follow_redirects:
+            return 0
+        return max(0, min(3, self.max_redirects))
+
+    def _note_turnstile_miss(self, page: str) -> None:
+        """Record that a Turnstile recovery on *page* did not clear the refusal."""
+        self._turnstile_page_misses[page] = time.monotonic()
 
     def _kasada_embedder(self, challenge, url, extra_headers, method, content_type):
         """The page a Kasada-signed API call is made from, or None.
