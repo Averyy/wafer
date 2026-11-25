@@ -65,7 +65,10 @@ makes Chrome resend once with them. A plain navigation sends no
 - Later requests carry the automatic Referer (the last URL fetched on that
   host) with `Sec-Fetch-Site: same-origin` (a link click). A caller's Referer
   sets the relation the same way (PSL-lite aware); a caller's
-  `Sec-Fetch-Site` is kept. Profiles without Fetch Metadata (Dart, OkHttp,
+  `Sec-Fetch-Site` is kept. A caller's Referer that does not parse (an
+  unclosed `[` host, a bad port) names no page, which Fetch treats as an
+  opaque origin: `cross-site`, the same as one naming no host (2026-11-24; it
+  used to raise ValueError). Profiles without Fetch Metadata (Dart, OkHttp,
   Safari before 16.4) get none. Before 2026-09-27 wafer sent the Referer beside
   `none`, an impossible combination.
 - Reddit's verification form goes out as its script submits it: `same-origin`,

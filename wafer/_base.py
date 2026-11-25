@@ -11,6 +11,7 @@ import socket
 import subprocess
 import threading
 import time
+import weakref
 from collections import OrderedDict
 from dataclasses import replace
 from html import unescape
@@ -118,6 +119,35 @@ def _browser_attempt_key(challenge, url: str) -> tuple[str, str]:
     return (challenge.value, (urlparse(url).hostname or "").lower())
 
 
+# How a request's browser attempt ended, as ChallengeDetected.browser_outcome
+# reports it (see its docstring). "passthrough" is internal: the browser's
+# page was returned, so nothing is raised.
+_BROWSER_OUTCOMES = ("refused", "cleared", "failed")
+
+
+def _solver_report_outcome(report: dict, reported: bool) -> str | None:
+    """The outcome of a solve that returned None, from the report the solver
+    filled in (``BrowserSolver.solve(report=...)``), or None when the solver
+    takes no report (a custom ``browser_solver``)."""
+    if not reported:
+        return None
+    if report.get("timed_out"):
+        return "failed"
+    outcome = report.get("outcome")
+    if outcome in _BROWSER_OUTCOMES:
+        return outcome
+    if "navigated" not in report:
+        return None
+    # A solve that loaded the page and came back with nothing reached the
+    # site's answer; one that never loaded it reached none.
+    return "refused" if report["navigated"] else "failed"
+
+
+def _attempt_url_key(url: str) -> str:
+    """A URL as browser attempts are matched to the refusal: no fragment."""
+    return url.split("#", 1)[0]
+
+
 # How long session.render() lets a render run once it lands on a challenge
 # whose in-place solve can outrun the session timeout (a reCAPTCHA that
 # escalates to image grids: 61.6s over two rounds, up to 112s over three, on
@@ -128,6 +158,39 @@ _RENDER_CHALLENGE_BUDGET = 150.0
 # How long a page whose Turnstile recovery came to nothing is left alone (see
 # BaseSession._turnstile_recovery_page).
 _TURNSTILE_PAGE_RETRY_SECONDS = 600.0
+# Those pages, per browser solver (see BaseSession._turnstile_page_misses):
+# id(solver) -> (weak reference to it, its misses). Keyed by identity, not
+# equality (a WeakKeyDictionary compares keys with __eq__, so two solvers that
+# compare equal would share one memory). The entry goes when the solver does.
+_TURNSTILE_MISSES_BY_SOLVER: dict[int, tuple[Any, dict[str, float]]] = {}
+_TURNSTILE_MISSES_LOCK = threading.Lock()
+
+
+def _turnstile_misses_for(solver) -> dict[str, float] | None:
+    """The Turnstile recovery misses of *solver*, created on first use, or
+    None for an object that cannot be weakly referenced."""
+    key = id(solver)
+    with _TURNSTILE_MISSES_LOCK:
+        entry = _TURNSTILE_MISSES_BY_SOLVER.get(key)
+        if entry is not None and entry[0]() is solver:
+            return entry[1]
+
+        def _forget(ref, key=key):
+            # Runs when the solver is collected, possibly from a garbage
+            # collection on a thread holding the lock, so it takes none. The
+            # id cannot be reused before this returns; the check guards an
+            # entry already replaced for a later object.
+            current = _TURNSTILE_MISSES_BY_SOLVER.get(key)
+            if current is not None and current[0] is ref:
+                _TURNSTILE_MISSES_BY_SOLVER.pop(key, None)
+
+        try:
+            ref = weakref.ref(solver, _forget)
+        except TypeError:
+            return None
+        misses: dict[str, float] = {}
+        _TURNSTILE_MISSES_BY_SOLVER[key] = (ref, misses)
+        return misses
 # A host the page check will contact: plain ASCII DNS labels, nothing a URL
 # parser could read two ways (see BaseSession._turnstile_page_target).
 _TURNSTILE_PAGE_HOST_RE = re.compile(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?")
@@ -339,6 +402,23 @@ def _tmd_browser_attempt_timeout(remaining: float, attempts_left: int) -> float:
     if attempts_left <= 0:
         return 0.0
     return _tmd_browser_solve_timeout(remaining) / attempts_left
+
+
+def _callable_names_keyword(callable_obj, keyword: str) -> bool:
+    """Whether a solver callable names *keyword* as a parameter of its own.
+
+    Stricter than ``_callable_accepts_keyword``: a ``**kwargs`` wrapper (an
+    ``asolve`` forwarding to a ``solve`` that predates the keyword) does not
+    count, as passing it on would turn a solve into a ``TypeError``.
+    """
+    try:
+        parameter = inspect.signature(callable_obj).parameters.get(keyword)
+    except (TypeError, ValueError):
+        return False
+    return parameter is not None and parameter.kind in {
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    }
 
 
 def _callable_accepts_keyword(callable_obj, keyword: str) -> bool:
@@ -567,13 +647,15 @@ def _content_length_over_cap(resp, cap: int) -> int | None:
     return None
 
 
-def _read_body_capped(resp, cap: int) -> bytes:
+def _read_body_capped(resp, cap: int, *, truncate: bool = False) -> bytes:
     """Read a wreq Response body, aborting early once ``cap`` is exceeded.
 
     Streams chunks via ``resp.stream()`` and stops the moment the running
     total passes ``cap`` (the body is never fully buffered past the cap -
     the memory-safety win). Raises ``_CapExceeded`` carrying the bytes seen
-    so far; the caller wraps it in ``ResponseTooLarge`` with the URL.
+    so far; the caller wraps it in ``ResponseTooLarge`` with the URL. With
+    ``truncate``, returns the first ``cap`` bytes instead, for a caller that
+    only inspects the start of the body.
 
     Note: ``stream()`` yields binary chunks (read-only ``memoryview`` since
     wreq 0.13, ``bytes`` before) interleaved with HTTP-trailer ``HeaderMap``
@@ -586,11 +668,13 @@ def _read_body_capped(resp, cap: int) -> bytes:
                 continue  # HTTP trailers (HeaderMap), not body bytes
             buf += chunk
             if len(buf) > cap:
+                if truncate:
+                    return bytes(buf[:cap])
                 raise _CapExceeded(len(buf))
     return bytes(buf)
 
 
-async def _aread_body_capped(resp, cap: int) -> bytes:
+async def _aread_body_capped(resp, cap: int, *, truncate: bool = False) -> bytes:
     """Async twin of ``_read_body_capped`` - same early-abort semantics."""
     buf = bytearray()
     async with resp.stream() as streamer:
@@ -599,6 +683,8 @@ async def _aread_body_capped(resp, cap: int) -> bytes:
                 continue  # HTTP trailers (HeaderMap), not body bytes
             buf += chunk
             if len(buf) > cap:
+                if truncate:
+                    return bytes(buf[:cap])
                 raise _CapExceeded(len(buf))
     return bytes(buf)
 
@@ -1209,6 +1295,9 @@ class BaseSession:
         # nothing on, by the monotonic time it did: not tried again for
         # _TURNSTILE_PAGE_RETRY_SECONDS, so a refusal that is the site's real
         # answer costs one page check per window rather than per request.
+        # Every kind of miss is kept here; only a solve that passed and left
+        # the request refused is also shared on the solver (see
+        # _turnstile_shared_misses).
         self._turnstile_page_misses: dict[str, float] = {}
 
         # Cache of scraped reCAPTCHA api.js release versions (the ``v``
@@ -3303,12 +3392,11 @@ class BaseSession:
         # Never the refused URL itself, however it is spelled.
         if page == (self._turnstile_page_target(url, url) or url.split("#", 1)[0]):
             return None
-        missed = self._turnstile_page_misses.get(page)
-        if (
-            missed is not None
-            and time.monotonic() - missed < _TURNSTILE_PAGE_RETRY_SECONDS
-        ):
-            return None
+        now = time.monotonic()
+        shared = self._turnstile_shared_misses or {}
+        for missed in (self._turnstile_page_misses.get(page), shared.get(page)):
+            if missed is not None and now - missed < _TURNSTILE_PAGE_RETRY_SECONDS:
+                return None
         return page
 
     def _turnstile_page_target(self, target: str, url: str) -> str | None:
@@ -3375,9 +3463,126 @@ class BaseSession:
             return 0
         return max(0, min(3, self.max_redirects))
 
-    def _note_turnstile_miss(self, page: str) -> None:
-        """Record that a Turnstile recovery on *page* did not clear the refusal."""
-        self._turnstile_page_misses[page] = time.monotonic()
+    @property
+    def _turnstile_shared_misses(self) -> dict[str, float] | None:
+        """Pages where a Turnstile recovery's solve passed and the request was
+        still refused, kept on the browser solver: every session sharing the
+        solver skips them, so a caller that builds a session per fetch around
+        one solver (fetchaller) pays once per window too. Sessions that share
+        a solver share its proxy (``_align_browser_proxy``), so the miss means
+        the same for each. None without a solver, or for one that cannot be
+        weakly referenced.
+
+        Only that kind is shared. A page that showed no Turnstile, or a solve
+        that failed or timed out, stays with the session: in fetchaller's
+        Linux image a solve can time out under host CPU load, and a shared
+        timeout would have every fetch skip the right page for the rest of
+        the window after the load dropped (Avery, 2026-11-25).
+        """
+        solver = self._browser_solver
+        if solver is None:
+            return None
+        return _turnstile_misses_for(solver)
+
+    @staticmethod
+    def _new_browser_attempt(log: list) -> dict:
+        """A record for one browser attempt of a request, kept in its *log*
+        (see ``_browser_outcome``); ``_try_browser_solve`` fills it in."""
+        attempt: dict = {}
+        log.append(attempt)
+        return attempt
+
+    @staticmethod
+    def _browser_outcome(log: list, url: str) -> str | None:
+        """How the request's latest browser attempt for *url* ended, as
+        ``ChallengeDetected.browser_outcome`` reports it. An attempt that ran
+        on another page (``solve_origin``, an embedder, the caller's page) is
+        ``"other_page"`` unless it reached no verdict at all (``"failed"``).
+        """
+        key = _attempt_url_key(url)
+        for attempt in reversed(log):
+            if attempt.get("url") != key:
+                continue
+            result = attempt.get("result")
+            if result == "failed":
+                return "failed"
+            if not attempt.get("on_url", True):
+                return "other_page"
+            return result if result in _BROWSER_OUTCOMES else None
+        return None
+
+    def _render_after_cleared_allowed(
+        self, log: list, challenge, url: str, method, kwargs: dict
+    ) -> bool:
+        """Whether a challenge that survived its browser solve may be read by
+        loading *url* in the browser instead (``_render_after_cleared``).
+
+        Only when the browser got past the challenge at this very URL
+        (``"cleared"``) and the HTTP retry with what it earned was refused: a
+        solve can hand back only cookies (the page under 1 KB, a redirect to
+        another site, a slow load), and a render reads the page a browser
+        shows there. Only for a plain GET, which a navigation reproduces, once
+        per request, and not for Reddit or Brave, whose browser paths are
+        their own.
+        """
+        from wafer._challenge import ChallengeType
+
+        if self._browser_solver is None or any(
+            a.get("render_fallback") for a in log
+        ):
+            return False
+        if challenge in (ChallengeType.REDDIT, ChallengeType.BRAVE):
+            return False
+        if str(method).upper() != "GET" or kwargs.get("multipart") is not None:
+            return False
+        body, _ = self._extract_native_body(kwargs)
+        if body:
+            return False
+        return self._browser_outcome(log, url) == "cleared"
+
+    def _render_landing_allowed(self, url: str, landed: str | None) -> bool:
+        """Whether ``_render_after_cleared`` may return the page the browser
+        ended on, *landed*, for a request to *url*: one on the same origin
+        (scheme, host, effective port), as a solve's own passthrough is, and
+        under ``follow_redirects=False`` only *url* itself.
+        """
+        if not landed:
+            return False
+        if not self.follow_redirects:
+            return _attempt_url_key(landed) == _attempt_url_key(url)
+        try:
+            a, b = urlsplit(url), urlsplit(landed)
+            a_port, b_port = a.port, b.port
+        except ValueError:
+            return False
+        scheme = (a.scheme or "").lower()
+        if scheme != (b.scheme or "").lower():
+            return False
+        default = 443 if scheme == "https" else 80
+        return (a.hostname or "").lower() == (b.hostname or "").lower() and (
+            default if a_port is None else a_port
+        ) == (default if b_port is None else b_port)
+
+    def _note_turnstile_miss(self, page: str, *, solved: bool = False) -> None:
+        """Record that a Turnstile recovery on *page* did not clear the
+        refusal. *solved*: its solve passed and the retry was still refused,
+        the one kind shared on the solver (``_turnstile_shared_misses``).
+        Entries past the window are dropped here, as a solver's memory can
+        outlive many sessions.
+        """
+        now = time.monotonic()
+        stores = [self._turnstile_page_misses]
+        shared = self._turnstile_shared_misses if solved else None
+        if shared is not None:
+            stores.append(shared)
+        with _TURNSTILE_MISSES_LOCK:
+            for misses in stores:
+                for stale in [
+                    p for p, at in misses.items()
+                    if now - at >= _TURNSTILE_PAGE_RETRY_SECONDS
+                ]:
+                    misses.pop(stale, None)
+                misses[page] = now
 
     def _kasada_embedder(self, challenge, url, extra_headers, method, content_type):
         """The page a Kasada-signed API call is made from, or None.

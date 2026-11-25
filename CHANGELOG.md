@@ -4,6 +4,57 @@ All notable changes to wafer. Versions come from git tags (`hatch-vcs`); each
 release is on [PyPI](https://pypi.org/project/wafer-py/) and
 [GitHub Releases](https://github.com/Averyy/wafer/releases).
 
+## 0.7.18 - 2026-11-25
+
+### Fixed
+
+- The Turnstile page check before a Cloudflare refusal recovery no longer
+  takes a `Content-Security-Policy` that allows challenges.cloudflare.com as
+  proof on its own. A site that sends the same CSP on every page had every
+  page it named pass the check. A page without a widget then cost a browser
+  solve, an 8 s wait for a widget that never came, and the same block. The
+  page's own document has to name Turnstile now: a sitekey, `cf-turnstile`,
+  or challenges.cloudflare.com in the body, or the CSP together with the word
+  "turnstile" in the body.
+- That check judges a page longer than its 2 MB read limit on the first 2 MB.
+  Before, such a page counted as having no Turnstile.
+- When the browser got past a challenge at the URL but handed back only
+  cookies (its page under 1 KB, a redirect to another site, a slow load) and
+  the HTTP retry with them was refused, `get()` raised, although a render
+  could read the page. A plain GET now reads it in the browser once and
+  returns that page if the browser ended on the request's origin (with
+  `follow_redirects=False`, on the URL itself); a render that settles on the
+  challenge raises with `browser_outcome="refused"`, and one that ends on
+  another origin with `"cleared"`. Its cookies are not written to
+  `cache_dir`, since the HTTP retry was refused with them.
+
+### Added
+
+- `ChallengeDetected.browser_outcome` (also on `RequestBlocked`): how the
+  request's browser attempt for the URL ended. `"refused"`: the browser loaded
+  the URL and the site refused it, so a `render()` repeats that. `"cleared"`:
+  it got past the challenge but the HTTP retry was refused and wafer could not
+  read the page in the browser either. `"other_page"`: it ran on another page
+  (`solve_origin`, an embedder, the caller's page). `"failed"`: no verdict
+  (busy, no time, launch failure, crash). `None`: no attempt, or a custom
+  `browser_solver` that does not report. `BrowserSolver.solve()` takes an
+  optional `report` dict for this; it is sent only to a solver that names
+  the keyword.
+
+### Changed
+
+- A page whose Turnstile recovery solve passed but left the request refused
+  is now skipped for 10 minutes by every session that shares the
+  `browser_solver`, not only by the session that tried it. A caller that
+  builds a session per fetch around one solver paid a browser solve on every
+  such refused fetch. A page that showed no Turnstile, and a solve that failed
+  or timed out, are still remembered per session: a solve timed out by host
+  CPU load must not make every session skip the right page.
+- The session's log line after a browser solve now reads `Browser solve
+  applied challenge_type=... (N cookies injected)`. It used to repeat the
+  solver's own `Browser solved challenge_type=... (cookie_count=N)` line, so
+  one solve logged twice.
+
 ## 0.7.17 - 2026-11-24
 
 ### Fixed

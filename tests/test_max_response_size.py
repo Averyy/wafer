@@ -77,6 +77,19 @@ class TestHelpers:
         with pytest.raises(_CapExceeded):
             asyncio.run(_aread_body_capped(r, 30))
 
+    def test_read_body_capped_truncate_returns_the_start(self):
+        data = bytes(range(100))
+        r = _FakeResp(data, chunk_size=16)
+        assert _read_body_capped(r, 50, truncate=True) == data[:50]
+        # Under the cap, the whole body, as without truncate.
+        r = _FakeResp(data, chunk_size=16)
+        assert _read_body_capped(r, 100, truncate=True) == data
+
+    def test_aread_body_capped_truncate_returns_the_start(self):
+        data = bytes(range(80))
+        r = _FakeResp(data, chunk_size=8)
+        assert asyncio.run(_aread_body_capped(r, 30, truncate=True)) == data[:30]
+
 
 class TestSyncSessionCap:
     @patch("time.sleep")

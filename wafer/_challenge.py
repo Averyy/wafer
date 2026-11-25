@@ -85,14 +85,27 @@ def page_runs_turnstile(
 ) -> bool:
     """Whether a page, fetched over HTTP, runs a Turnstile widget of its own.
 
-    A page that loads the widget with its own script names it only
-    indirectly: pages seen 2026-11-24 carried the sitekey in an inline config
-    and allowed challenges.cloudflare.com in their CSP's frame-src, with the
-    api.js URL only in a separate script. Any of the sitekey, the widget's
-    class, or challenges.cloudflare.com in the CSP or the document counts.
+    The evidence has to be in the document. A page that loads the widget with
+    its own script names it only indirectly: pages seen 2026-11-24 carried
+    the sitekey in an inline config, with the api.js URL only in a separate
+    script (``/static/turnstile.js``). The sitekey, the widget's class, or
+    challenges.cloudflare.com in the document counts.
+
+    The CSP alone does not. That zone sends the same CSP, naming
+    challenges.cloudflare.com, on every page, its home page included, which
+    has no widget (2026-11-25), so the CSP says only that the site runs
+    Turnstile somewhere. It counts only together with the word "turnstile" in
+    the document (a page whose own widget script carries the sitekey).
     Only a 2xx document qualifies.
     """
-    if not 200 <= status_code < 300:
+    if not 200 <= status_code < 300 or not body:
+        return False
+    if _TURNSTILE_SITEKEY_RE.search(body) is not None:
+        return True
+    lowered = body.lower()
+    if "challenges.cloudflare.com" in lowered or "cf-turnstile" in lowered:
+        return True
+    if "turnstile" not in lowered:
         return False
     csp = next(
         (
@@ -102,14 +115,7 @@ def page_runs_turnstile(
         ),
         "",
     )
-    if "challenges.cloudflare.com" in csp.lower():
-        return True
-    if not body:
-        return False
-    if _TURNSTILE_SITEKEY_RE.search(body) is not None:
-        return True
-    lowered = body.lower()
-    return "challenges.cloudflare.com" in lowered or "cf-turnstile" in lowered
+    return "challenges.cloudflare.com" in csp.lower()
 
 
 def is_cloudflare_origin_refusal(status_code: int, headers: dict[str, str]) -> bool:

@@ -11,6 +11,25 @@ class ChallengeDetected(WaferError):
     ``response`` carries the final challenge ``WaferResponse`` (body,
     headers, status code) when one was in hand at raise time, else None.
 
+    ``browser_outcome`` says how the request's browser attempt for ``url``
+    ended, so a caller can tell whether loading the URL in a browser itself
+    (``session.render``) could still help:
+
+    - ``"refused"``: wafer's browser loaded this URL and the site refused it
+      (the challenge did not clear, or the page was still denied). A render
+      of the URL repeats that.
+    - ``"cleared"``: wafer's browser got past the challenge at this URL, but
+      what it earned did not get the request through over HTTP, and wafer
+      could not read the page in the browser either (no time left, or not a
+      plain GET). A render with more time may read it.
+    - ``"other_page"``: the browser ran on another page (``solve_origin``, an
+      embedder, the page the request names), not on this URL.
+    - ``"failed"``: the browser reached no verdict: the shared solver was
+      busy, no time was left, or it failed to launch or crashed.
+    - ``None``: wafer has no report of a browser attempt at this URL. None
+      was made (no ``browser_solver``, or it was not reached), or a custom
+      ``browser_solver`` that does not report outcomes ran it.
+
     Caution: ``response`` may carry a full WAF challenge page with
     embedded tokens/sensor data -- do not log its body or headers
     unscrubbed.
@@ -22,11 +41,13 @@ class ChallengeDetected(WaferError):
         url: str,
         status_code: int,
         response=None,
+        browser_outcome: str | None = None,
     ):
         self.challenge_type = challenge_type
         self.url = url
         self.status_code = status_code
         self.response = response
+        self.browser_outcome = browser_outcome
         super().__init__(self._message())
 
     def _message(self) -> str:

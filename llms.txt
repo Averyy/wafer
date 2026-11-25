@@ -684,7 +684,8 @@ wafer.build_fingerprint_envelope(emulation, user_agent: str | None = None, *,
 
 ```
 WaferError (base)
-  +- ChallengeDetected    .challenge_type: str, .url: str, .status_code: int, .response: WaferResponse | None
+  +- ChallengeDetected    .challenge_type: str, .url: str, .status_code: int, .response: WaferResponse | None,
+  |                       .browser_outcome: str | None ("refused"|"cleared"|"other_page"|"failed")
   |    +- RequestBlocked  same attributes; a WAF rule denied the request outright
   +- RateLimited          .url: str, .retry_after: float | None, .response: WaferResponse | None
   +- ConnectionFailed     .url: str, .reason: str
@@ -697,6 +698,37 @@ WaferError (base)
 ```
 
 `except WaferError` catches everything including WaferTimeout.
+
+`ChallengeDetected.browser_outcome` (also on `RequestBlocked`) says how the
+request's browser attempt for `.url` ended, so you can tell whether loading the
+URL in a browser yourself (`session.render(url)`) could still help:
+
+- `"refused"`: wafer's browser loaded this URL and the site refused it (the
+  challenge did not clear, or the page stayed denied). A render repeats that;
+  skip it.
+- `"cleared"`: the browser got past the challenge at this URL, but what it
+  earned did not get the request through over HTTP, and wafer could not read
+  the page in the browser either (no time left, a non-GET request, or a custom
+  `browser_solver` without `render()`). A render with more time may read it.
+- `"other_page"`: the browser ran on another page (`solve_origin`, an embedder,
+  the page the request names), not this URL. A render of the URL is a
+  different attempt.
+- `"failed"`: no verdict: the shared solver was busy, no time was left, or the
+  browser failed to launch or crashed.
+- `None`: no browser attempt at this URL (no `browser_solver`, wafer gave up
+  before reaching one), or a custom `browser_solver` that does not report
+  outcomes. Older wafers never set it: read it with
+  `getattr(e, "browser_outcome", None)`.
+
+When the browser got past the challenge at the URL itself but the HTTP retry
+with its cookies is refused (a solve hands back only cookies when its page is
+under 1 KB, redirects to another site, or loads slowly), wafer loads the URL in
+the browser once more and returns that page, for a plain GET with no body,
+within the request's timeout. The page is returned only if the browser ended on
+the request's origin (with `follow_redirects=False`, on the URL itself); a page
+on another origin is left to you, as `"cleared"`. Cookies from that browser read
+are not written to `cache_dir`: the HTTP retry was just refused with them. So a
+`get()` that raises `"cleared"` already tried that read.
 
 `RequestBlocked` separates a denial from a challenge. A challenge asks the
 client to prove it is a browser, so retrying, rotating identity, or solving in
@@ -721,7 +753,9 @@ another of the site's subdomains gets the request past the edge, as the
 origin's own 403. With a `browser_solver` set, either one on a request that
 names a page on the same registrable domain gets one recovery: wafer fetches
 that page over HTTP, and if it runs Turnstile (a Turnstile sitekey,
-`cf-turnstile`, or challenges.cloudflare.com in the document or its CSP), the
+`cf-turnstile`, or challenges.cloudflare.com in the document; a CSP naming
+challenges.cloudflare.com counts only with "turnstile" in the document too,
+since a site sends the same CSP on every page), the
 browser loads the page, waits for its widget and for the page's own cookie, and
 the request is retried over HTTP with the cookies it earned (the site's session
 cookie included, not only WAF cookies). The page is `solve_origin` when set,
@@ -740,7 +774,12 @@ makes the call:
 stands: a surviving block is raised (or returned under `max_rotations=0`) as
 above, and an origin 403 is handled like any other 403. A page that shows no
 Turnstile, or whose recovery did not clear the refusal, is not tried again by
-that session for 10 minutes (per session: a new session checks it again), so a refusal that is the site's real answer costs
+that session for 10 minutes. A page whose solve passed but left the request
+refused is also skipped for 10 minutes by every session sharing that
+`browser_solver` (a new session built around the same solver skips it too; a
+different solver checks again). A page with no Turnstile, or a solve that
+failed or timed out, is remembered by that session only, so a new session
+checks it again. A refusal that is the site's real answer costs
 one page fetch per window, not a browser visit per request. With no such page
 or no browser solver, the block is raised on the first response. Later
 requests reuse the cookie over plain HTTP until the site expires it.
@@ -789,7 +828,7 @@ hints so the headers remain coherent with the TLS fingerprint.
 
 The deterministic ladder (starting from the default Chrome family):
 
-1. **Fresh TLS session** (rotation 1) - rebuilds the wreq client (new TLS session, empty cookie jar) with the SAME family. Also clears that domain's disk cookie cache (if `cache_dir` is set).
+1. **Fresh TLS session** (rotation 1) - rebuilds the wreq client (new TLS session, empty cookie jar) with the SAME family. Also clears that domain's disk cookie cache (if `cache_dir` is set), except for a session aligned to a preflighted `browser_solver`, whose identity has not changed: it keeps that domain's cookies (they may be the browser's, earned under this identity).
 2. **Firefox** (rotation 2) - `Emulation.Firefox152`: Gecko TLS/H2, Firefox Accept, `Accept-Language: en-US,en;q=0.5`, NO sec-ch-ua.
 3. **Safari** (rotation 3) - wafer's Safari 26 custom TlsOptions/Http2Options profile, no client hints.
 4. **Edge** (rotation 4) - `Emulation.Edge148`: Chromium TLS but the `"Microsoft Edge"` sec-ch-ua brand + Edge build.
@@ -878,6 +917,9 @@ without `Sec-Fetch-*` headers. The request method, body, and caller-supplied
   back mid-flow would just get re-challenged). Other hosts are unaffected.
 - **Any method/body:** GET with `params=`, POST with `form=`/`json=`/`body=`
   all work; the body and `Content-Type` are preserved.
+- **User-Agent:** a caller `User-Agent` in `headers=` wins; otherwise the
+  session's own browser's (desktop Chrome, Edge or Firefox), the one its
+  cookies were earned under.
 - **Token escalation:** when the native path also requires a `reese84` token
   and `browser_solver` is configured, wafer obtains the token in the browser
   and reuses it for the session. A host already assigned to the native path

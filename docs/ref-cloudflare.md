@@ -98,12 +98,22 @@ passes `_turnstile_page_target` or the check ends with no.
 
 1. The page is fetched over HTTP first (`_page_runs_turnstile`, redirects as above, 2 MB,
    15 s within the request's budget, through the rate limiter, DNS pins and cookie-scope
-   bookkeeping like any request). Only a 2xx page that names Turnstile
+   bookkeeping like any request). Only a 2xx page whose document names Turnstile
    (`page_runs_turnstile`: a `0x4AAAAAA` sitekey, `cf-turnstile`, or challenges.cloudflare.com
-   in the document or its CSP) gets the browser. The pages measured carry the sitekey inline
-   and challenges.cloudflare.com in their CSP's `frame-src`; the api.js URL itself is only in a
-   separate site script. A real ban costs this fetch, not a browser visit: the page is refused
-   too.
+   in the body) gets the browser. The pages measured carry the sitekey inline; the api.js URL
+   itself is only in a separate site script (`/static/turnstile.js`). A real ban costs this
+   fetch, not a browser visit: the page is refused too.
+
+   The CSP alone does not count. The measured zone sends the same CSP, naming
+   challenges.cloudflare.com in `script-src` and `frame-src`, on every page. Its home page
+   (170 KB, no sitekey, no `cf-turnstile`, no "turnstile" anywhere in the body) has no widget:
+   in 0.7.17, where the CSP answered on its own, a refused `/api` call with the home page as
+   Referer passed the check, spent a browser solve on it, saw no widget in 8 s, and stayed
+   blocked after 11 s (fetchaller 3.8.16, 2026-11-25). The CSP still counts together with the
+   word "turnstile" in the document, for a page whose widget script also holds the sitekey.
+   No live page has needed that case yet: the widget pages measured carry the sitekey inline.
+   The body is always read, up to 2 MB; a longer page is judged on its first 2 MB (it used
+   to count as no).
 2. One browser solve on the page (challenge type `cloudflare_block`, below), keyed per request
    on the URL's host for both kinds of refusal, so a request that turns from one into the other
    is not solved twice.
@@ -111,10 +121,23 @@ passes `_turnstile_page_target` or the check ends with no.
    under `max_rotations=0`); a surviving origin 403 takes the usual 403 path.
 
 A page that shows no Turnstile, or whose recovery did not clear the refusal (solve False, or
-the retry refused again), goes into the session's `_turnstile_page_misses` and is not used again
-for `_TURNSTILE_PAGE_RETRY_SECONDS` (600 s): a refusal that is the site's real answer costs one
-page fetch per window. The memory is per session; a caller that builds a session per fetch
-(fetchaller) pays the page check on every refused fetch that names a page. The solve's cookies go through `defer_cache`, so a failed recovery
+the retry refused again), goes into the session's `_turnstile_page_misses` and is not used
+again for `_TURNSTILE_PAGE_RETRY_SECONDS` (600 s): a refusal that is the site's real answer
+costs one page fetch per window.
+
+One kind of miss is also shared on the browser solver (`_turnstile_shared_misses`): a solve
+that passed while the retry was still refused. Every session sharing the solver skips that
+page, so a caller that builds a session per fetch around one solver (fetchaller) pays for it
+once per window too. Sessions that share a solver share its proxy, so that miss means the same
+for each. The store (`_TURNSTILE_MISSES_BY_SOLVER`) is keyed by the solver's identity through
+a weak reference, so it goes with the solver, and two solvers that compare equal are still
+two. A solver that cannot be weakly referenced shares nothing. A page that showed no Turnstile,
+or a solve that failed or timed out, stays with the session (Avery, 2026-11-25): in
+fetchaller's Linux image a solve can time out under host CPU load, and a shared timeout would
+have every fetch skip the right page for the rest of the window after the load dropped. A
+failed solve also clears the request's record of the page, so the request's next refusal is
+not read as a solve that passed. Entries past the window are dropped on the next miss. The
+solve's cookies go through `defer_cache`, so a failed recovery
 persists nothing to `cache_dir`. With no such page, or no browser, a block is raised on the
 first response and an origin 403 is an ordinary 403.
 

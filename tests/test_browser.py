@@ -6747,7 +6747,7 @@ class TestPostSolvePassthroughLanding:
 
     def _solve(
         self, requested, page_url, documents=(), challenge_type="cloudflare",
-        goto_status=200, replay=None,
+        goto_status=200, replay=None, report=None, dispatch=True,
     ):
         solver, context, page, response = (
             TestBrowserSolverFailClosed._cloudflare_navigation(
@@ -6791,13 +6791,66 @@ class TestPostSolvePassthroughLanding:
             with (
                 patch.object(solver, "_create_context", return_value=context),
                 patch.object(solver, "_setup_headless_patches"),
-                patch.object(solver, "_dispatch_challenge", return_value=True),
+                patch.object(solver, "_dispatch_challenge", return_value=dispatch),
             ):
                 return solver._solve_on_worker(
-                    requested, challenge_type, timeout=5, replay=replay
+                    requested, challenge_type, timeout=5, replay=replay,
+                    report=report,
                 )
         finally:
             solver.close()
+
+    def test_report_a_challenge_that_did_not_clear_as_refused(self):
+        url = "https://fcc.report/FCC-ID/2AC7Z-ESPWROOM32"
+        report = {}
+        assert self._solve(
+            url, url, documents=[(url, 403)], report=report, dispatch=False
+        ) is None
+        assert report == {"navigated": True, "outcome": "refused"}
+
+    def test_report_a_denial_that_survived_as_refused(self):
+        url = "https://www.mouser.com/"
+        self._HTML = _MOUSER_DENIAL.read_text()
+        report = {}
+        result = self._solve(
+            url, url, [(url, 403, self._HTML.encode(), _MOUSER_DENIAL_HEADERS)],
+            challenge_type="akamai_denied", goto_status=403, report=report,
+        )
+        assert result is None
+        assert report["navigated"] is True
+        assert report["outcome"] == "refused"
+
+    def test_a_solve_reports_nothing_on_success(self):
+        url = "https://fcc.report/FCC-ID/2AC7Z-ESPWROOM32"
+        report = {}
+        assert self._solve(url, url, documents=[(url, 200)], report=report)
+        assert "outcome" not in report
+
+    def test_report_a_launch_failure_as_never_navigated(self):
+        solver = BrowserSolver(solve_timeout=5)
+        report = {}
+        try:
+            with patch.object(
+                solver, "_ensure_browser", side_effect=RuntimeError("no chrome")
+            ):
+                assert solver._solve_on_worker(
+                    "https://example.com/", "cloudflare", timeout=5, report=report
+                ) is None
+        finally:
+            solver.close()
+        assert report.get("navigated") is not True
+
+    def test_solve_marks_the_report_before_anything_else(self):
+        solver = BrowserSolver(solve_timeout=5)
+        report = {"outcome": "stale"}
+        try:
+            with patch.object(solver, "_worker_lost", return_value=True):
+                assert solver.solve(
+                    "https://example.com/", "cloudflare", report=report
+                ) is None
+        finally:
+            solver.close()
+        assert report["navigated"] is False
 
     def test_same_origin_landing_is_passed_through(self):
         url = "https://fcc.report/FCC-ID/2AC7Z-ESPWROOM32"

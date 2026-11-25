@@ -33,6 +33,11 @@ BLOCK_BODY = (
     / "cloudflare_waf_block_jsd_2026-11-24.html"
 ).read_text()
 DATA = '{"id":42,"name":"example"}'
+# The shape of the measured zone's CSP, sent on every page (2026-11-25).
+SITE_CSP = (
+    "default-src 'self'; script-src 'self' https://challenges.cloudflare.com "
+    "https://static.cloudflareinsights.com; frame-src https://challenges.cloudflare.com"
+)
 ORIGIN_403_BODY = (
     pathlib.Path(__file__).parent / "fixtures" / "cloudflare_origin_403_2026-11-24.html"
 ).read_text()
@@ -202,14 +207,30 @@ class TestSyncFlow:
         assert _urls(client) == [API, PAGE, API]
 
     @patch("time.sleep")
-    def test_a_page_with_a_csp_naming_turnstile(self, _sleep):
+    def test_a_site_wide_csp_alone_gets_no_browser(self, _sleep):
+        # The zone sends this CSP on every page, its widgetless home page
+        # included (2026-11-25): it does not say this page runs Turnstile.
         page = MockResponse(
             200,
-            {
-                "content-type": "text/html",
-                "content-security-policy": "frame-src https://challenges.cloudflare.com;",
-            },
+            {"content-type": "text/html", "content-security-policy": SITE_CSP},
             "<html><body>" + "x" * 2000 + "</body></html>",
+        )
+        solver = MockBrowserSolver(result=_session_cookie())
+        session, client = make_sync_session(
+            [_block(), page, _block()], browser_solver=solver, use_cookie_jar=True
+        )
+        with pytest.raises(RequestBlocked):
+            session.get(API, headers={"Referer": PAGE})
+        assert solver.solve_kwargs == []
+        assert _urls(client) == [API, PAGE]
+        assert PAGE in session._turnstile_page_misses
+
+    @patch("time.sleep")
+    def test_a_csp_with_the_pages_own_turnstile_script(self, _sleep):
+        page = MockResponse(
+            200,
+            {"content-type": "text/html", "content-security-policy": SITE_CSP},
+            '<html><script src="/static/turnstile.js?v=1" defer></script></html>',
         )
         solver = MockBrowserSolver(result=_session_cookie())
         session, _ = make_sync_session(
@@ -270,6 +291,172 @@ class TestSyncFlow:
         session._turnstile_page_misses[PAGE] -= 601
         assert session.get(API, headers={"Referer": PAGE}).status_code == 200
         assert _urls(client) == [API, PAGE, API, PAGE, API]
+
+    @patch("time.sleep")
+    def test_a_solve_that_passed_and_stayed_blocked_is_shared(self, _sleep):
+        # A caller that builds a session per fetch around one solver.
+        solver = MockBrowserSolver(result=_session_cookie())
+        first, first_client = make_sync_session(
+            [_block(), _widget_page(), _block()],
+            browser_solver=solver,
+            use_cookie_jar=True,
+        )
+        with pytest.raises(RequestBlocked):
+            first.get(API, headers={"Referer": PAGE})
+        second, second_client = make_sync_session(
+            [_block()], browser_solver=solver, use_cookie_jar=True
+        )
+        with pytest.raises(RequestBlocked):
+            second.get(API, headers={"Referer": PAGE})
+        assert _urls(first_client) == [API, PAGE, API]
+        assert _urls(second_client) == [API]
+        assert len(solver.solve_kwargs) == 1
+        # Another solver has its own memory.
+        third, third_client = make_sync_session(
+            [_block(), _widget_page(), _block()],
+            browser_solver=MockBrowserSolver(result=_session_cookie()),
+            use_cookie_jar=True,
+        )
+        with pytest.raises(RequestBlocked):
+            third.get(API, headers={"Referer": PAGE})
+        assert _urls(third_client) == [API, PAGE, API]
+
+    @patch("time.sleep")
+    def test_a_page_without_turnstile_stays_with_the_session(self, _sleep):
+        solver = MockBrowserSolver(result=_session_cookie())
+        for _ in range(2):
+            session, client = make_sync_session(
+                [_block(), _plain_page()], browser_solver=solver, use_cookie_jar=True
+            )
+            with pytest.raises(RequestBlocked):
+                session.get(API, headers={"Referer": PAGE})
+            # Each new session checks the page again.
+            assert _urls(client) == [API, PAGE]
+        assert solver.solve_kwargs == []
+
+    @patch("time.sleep")
+    def test_a_failed_solve_stays_with_the_session(self, _sleep):
+        # In fetchaller's image a solve can time out under host CPU load;
+        # sharing that would skip the right page once the load dropped.
+        solver = MockBrowserSolver(result=None)
+        for _ in range(2):
+            session, client = make_sync_session(
+                [_block(), _widget_page()], browser_solver=solver, use_cookie_jar=True
+            )
+            with pytest.raises(RequestBlocked):
+                session.get(API, headers={"Referer": PAGE})
+            assert _urls(client) == [API, PAGE]
+            assert PAGE in session._turnstile_page_misses
+        assert len(solver.solve_kwargs) == 2
+        assert PAGE not in (
+            make_sync_session([], browser_solver=solver)[0]._turnstile_shared_misses
+        )
+
+    @patch("time.sleep")
+    def test_a_failed_solve_is_not_later_read_as_passed(self, _sleep):
+        # An origin 403 behind Cloudflare takes the usual 403 path after the
+        # failed solve; its next refusal must not be noted as a passed solve.
+        origin_403 = MockResponse(
+            403,
+            {"server": "cloudflare", "cf-ray": "8f0", "content-type": "text/html"},
+            ORIGIN_403_BODY,
+        )
+        solver = MockBrowserSolver(result=None)
+        session, client = make_sync_session(
+            [origin_403, _widget_page()] + [origin_403] * 4,
+            browser_solver=solver,
+            use_cookie_jar=True,
+            max_retries=2,
+        )
+        resp = session.get(API, headers={"Referer": PAGE})
+        assert resp.status_code == 403
+        # The refusal came back after the failed solve, and was not noted as
+        # a solve that passed.
+        assert _urls(client).count(API) >= 2
+        assert len(solver.solve_kwargs) == 1
+        assert PAGE in session._turnstile_page_misses
+        assert PAGE not in session._turnstile_shared_misses
+
+    @pytest.mark.asyncio
+    async def test_an_async_session_shares_it_too(self):
+        solver = MockBrowserSolver(result=_session_cookie())
+        first, _ = make_sync_session(
+            [_block(), _widget_page(), _block()],
+            browser_solver=solver,
+            use_cookie_jar=True,
+        )
+        with patch("time.sleep"), pytest.raises(RequestBlocked):
+            first.get(API, headers={"Referer": PAGE})
+        second, client = make_async_session(
+            [_block()], browser_solver=solver, use_cookie_jar=True
+        )
+        with patch("asyncio.sleep"), pytest.raises(RequestBlocked):
+            await second.get(API, headers={"Referer": PAGE})
+        assert _urls(client) == [API]
+
+    def test_entries_past_the_window_are_dropped(self):
+        session, _ = make_sync_session([], browser_solver=MockBrowserSolver())
+        session._note_turnstile_miss("https://www.example.org/old", solved=True)
+        session._turnstile_shared_misses["https://www.example.org/old"] -= 601
+        session._turnstile_page_misses["https://www.example.org/old"] -= 601
+        session._note_turnstile_miss(PAGE, solved=True)
+        assert list(session._turnstile_shared_misses) == [PAGE]
+        assert list(session._turnstile_page_misses) == [PAGE]
+
+    def test_a_solver_that_cannot_be_weakly_referenced_keeps_it_per_session(self):
+        solver = object()  # no __weakref__ slot
+        first, _ = make_sync_session([], browser_solver=solver)
+        second, _ = make_sync_session([], browser_solver=solver)
+        first._note_turnstile_miss(PAGE, solved=True)
+        assert first._turnstile_shared_misses is None
+        assert PAGE in first._turnstile_page_misses
+        assert PAGE not in second._turnstile_page_misses
+
+    def test_an_unhashable_solver_is_shared_too(self):
+        class Unhashable(MockBrowserSolver):
+            __hash__ = None
+
+        solver = Unhashable()
+        first, _ = make_sync_session([], browser_solver=solver)
+        second, _ = make_sync_session([], browser_solver=solver)
+        first._note_turnstile_miss(PAGE, solved=True)
+        assert PAGE in second._turnstile_shared_misses
+
+    def test_solvers_that_compare_equal_are_not_one_solver(self):
+        import gc
+
+        class Equal(MockBrowserSolver):
+            def __eq__(self, other):
+                return isinstance(other, Equal)
+
+            def __hash__(self):
+                return 0
+
+        a, b = Equal(), Equal()
+        first, _ = make_sync_session([], browser_solver=a)
+        second, _ = make_sync_session([], browser_solver=b)
+        first._note_turnstile_miss(PAGE, solved=True)
+        second._note_turnstile_miss(API, solved=True)
+        assert list(first._turnstile_shared_misses) == [PAGE]
+        assert list(second._turnstile_shared_misses) == [API]
+        # The first solver going does not take the second's memory with it.
+        del first, a
+        gc.collect()
+        assert list(second._turnstile_shared_misses) == [API]
+
+    def test_the_memory_goes_with_the_solver(self):
+        import gc
+
+        from wafer._base import _TURNSTILE_MISSES_BY_SOLVER
+
+        solver = MockBrowserSolver()
+        key = id(solver)
+        session, _ = make_sync_session([], browser_solver=solver)
+        session._note_turnstile_miss(PAGE, solved=True)
+        assert key in _TURNSTILE_MISSES_BY_SOLVER
+        del session, solver
+        gc.collect()
+        assert key not in _TURNSTILE_MISSES_BY_SOLVER
 
     @patch("time.sleep")
     def test_a_page_redirect_within_the_site_is_followed(self, _sleep):
@@ -475,6 +662,42 @@ class TestPageCheckIsAnOrdinaryRequest:
         assert resp.status_code == 200
         assert _urls(client)[1] == "https://www.example.org/map"
         assert limiter.calls.count(("record", "www.example.org")) == 3
+
+    @staticmethod
+    def _big_page(sitekey_first):
+        sitekey = '<script>C={sitekey:"0x4AAAAAAAexampleKey00"}</script>'
+        filler = "<p>" + "x" * 500 + "</p>"
+        body = sitekey + filler if sitekey_first else filler + sitekey
+        return MockResponse(200, {"content-type": "text/html"}, body)
+
+    @pytest.mark.parametrize("sitekey_first,runs", [(True, True), (False, False)])
+    def test_a_page_past_the_cap_is_judged_on_its_start(self, sitekey_first, runs):
+        import time as _time
+
+        session, _ = make_sync_session(
+            [self._big_page(sitekey_first)], browser_solver=MockBrowserSolver()
+        )
+        with patch("wafer._sync._TURNSTILE_PAGE_CHECK_BYTES", 200):
+            assert (
+                session._page_runs_turnstile(PAGE, API, _time.monotonic() + 5)
+                is runs
+            )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("sitekey_first,runs", [(True, True), (False, False)])
+    async def test_a_page_past_the_cap_is_judged_on_its_start_async(
+        self, sitekey_first, runs
+    ):
+        import time as _time
+
+        session, _ = make_async_session(
+            [self._big_page(sitekey_first)], browser_solver=MockBrowserSolver()
+        )
+        with patch("wafer._async._TURNSTILE_PAGE_CHECK_BYTES", 200):
+            assert (
+                await session._page_runs_turnstile(PAGE, API, _time.monotonic() + 5)
+                is runs
+            )
 
 
 class TestPageCheckStaysInsideTheCallersGuards:
@@ -772,6 +995,22 @@ class TestAsyncFlow:
         assert _urls(client) == [API, PAGE]
 
     @pytest.mark.asyncio
+    async def test_a_site_wide_csp_alone_gets_no_browser(self):
+        page = MockResponse(
+            200,
+            {"content-type": "text/html", "content-security-policy": SITE_CSP},
+            "<html><body>" + "x" * 2000 + "</body></html>",
+        )
+        solver = MockBrowserSolver(result=_session_cookie())
+        session, client = make_async_session(
+            [_block(), page], browser_solver=solver, use_cookie_jar=True
+        )
+        with patch("asyncio.sleep"), pytest.raises(RequestBlocked):
+            await session.get(API, headers={"Referer": PAGE})
+        assert solver.solve_kwargs == []
+        assert _urls(client) == [API, PAGE]
+
+    @pytest.mark.asyncio
     async def test_no_page_to_clear_it_on(self):
         solver = MockBrowserSolver(result=_session_cookie())
         session, client = make_async_session(
@@ -837,12 +1076,19 @@ class TestClassification:
                 'api.js"></script>',
                 True,
             ),
+            # A site-wide CSP alone: the measured home page, no widget.
+            (200, {"Content-Security-Policy": SITE_CSP}, "", False),
+            (200, {"Content-Security-Policy": SITE_CSP}, "<html>home</html>", False),
+            (200, {"content-security-policy": SITE_CSP}, None, False),
+            # The CSP with the page's own widget script.
             (
                 200,
-                {"Content-Security-Policy": "frame-src https://challenges.cloudflare.com"},
-                "",
+                {"Content-Security-Policy": SITE_CSP},
+                '<script src="/static/Turnstile.js?v=1"></script>',
                 True,
             ),
+            # The word with no CSP behind it.
+            (200, {}, '<script src="/static/turnstile.js"></script>', False),
             (200, {}, "<html>nothing</html>", False),
             # Cloudflare's own beacon path is not Turnstile.
             (200, {}, "/cdn-cgi/challenge-platform/scripts/jsd/main.js", False),

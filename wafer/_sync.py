@@ -15,10 +15,12 @@ from wafer._base import (
     _TURNSTILE_PAGE_CHECK_BYTES,
     _TURNSTILE_PAGE_CHECK_SECONDS,
     BaseSession,
+    _attempt_url_key,
     _browser_attempt_key,
     _browser_attempt_timeout,
     _browser_solve_timeout,
     _callable_accepts_keyword,
+    _callable_names_keyword,
     _canonicalize_url_host,
     _CapExceeded,
     _check_request_url,
@@ -29,6 +31,7 @@ from wafer._base import (
     _is_binary_content_type,
     _is_challengeable_content_type,
     _read_body_capped,
+    _solver_report_outcome,
     _tmd_browser_attempt_count,
     _tmd_browser_attempt_timeout,
     _tmd_punish_url_from_body,
@@ -799,15 +802,15 @@ class SyncSession(BaseSession):
                     if target is None:
                         break
                     continue
-                # The CSP alone can answer, before any of the body is read.
-                runs = page_runs_turnstile(status, headers, None)
-                if not runs and 200 <= status < 300:
-                    try:
-                        content = _read_body_capped(
-                            resp, _TURNSTILE_PAGE_CHECK_BYTES
-                        )
-                    except _CapExceeded:
-                        content = b""
+                # Only the document can answer (see page_runs_turnstile): a
+                # site's CSP is the same on every page.
+                runs = False
+                if 200 <= status < 300:
+                    # A page past the cap is judged on its first
+                    # _TURNSTILE_PAGE_CHECK_BYTES, not read as no Turnstile.
+                    content = _read_body_capped(
+                        resp, _TURNSTILE_PAGE_CHECK_BYTES, truncate=True
+                    )
                     body = content.decode(
                         resolve_charset(headers, content), errors="replace"
                     )
@@ -840,6 +843,8 @@ class SyncSession(BaseSession):
         render_challenge_budget: float | None = None,
         defer_cache: list | None = None,
         state_only: bool = False,
+        attempt: dict | None = None,
+        persist: bool = True,
     ) -> WaferResponse | bool:
         """Attempt browser-based challenge solving.
 
@@ -868,6 +873,9 @@ class SyncSession(BaseSession):
                 with the solve path. A render whose settled document is still
                 a challenge comes back with ``challenge_type`` set and none of
                 its cookies kept.
+            persist: False keeps the cookies out of ``cache_dir`` entirely,
+                passthrough included (``_render_after_cleared``: they are
+                the ones the HTTP retry was just refused with).
             defer_cache: a list that receives the ``(cache_domain, entries)``
                 to persist instead of writing them to ``cache_dir``, for a
                 caller that retries and persists only once the retry proves
@@ -886,6 +894,15 @@ class SyncSession(BaseSession):
         """
         from wafer.browser import format_cookie_str
 
+        def _mark(result: str | None) -> None:
+            # How this attempt ended, for ChallengeDetected.browser_outcome
+            # (see BaseSession._browser_outcome).
+            if attempt is not None:
+                attempt["result"] = result
+
+        if attempt is not None:
+            attempt["url"] = _attempt_url_key(url)
+            attempt["on_url"] = True
         solve_timeout: float | None = None
         if deadline is not None:
             remaining = deadline - time.monotonic()
@@ -901,6 +918,7 @@ class SyncSession(BaseSession):
                     url,
                     challenge.value,
                 )
+                _mark("failed")
                 return False
 
         # solve_origin generalizes the Imperva embedder to every challenge:
@@ -914,6 +932,8 @@ class SyncSession(BaseSession):
         # caching so the token lands on the API host's registrable domain.
         if use_solve_origin and self._solve_origin:
             embedder = self._solve_origin
+        if attempt is not None:
+            attempt["on_url"] = embedder is None
         if challenge is ChallengeType.BRAVE:
             replay = self._brave_browser_replay(replay)
         solve_kwargs = {
@@ -926,6 +946,12 @@ class SyncSession(BaseSession):
             "max_size",
         ):
             solve_kwargs["max_size"] = max_size
+        # A BrowserSolver says why a solve came back empty (refused, or no
+        # verdict); a solver that does not name the keyword is not sent it.
+        report: dict = {}
+        reported = not render and _callable_names_keyword(
+            self._browser_solver.solve, "report"
+        )
         # The browser starts with the caller's own cookies for the site, as
         # the session's requests carry them (see _browser_seed_cookies).
         seeded = self._browser_seed_cookies(url, embedder)
@@ -968,6 +994,11 @@ class SyncSession(BaseSession):
             result = self._browser_solver.render(url, **render_kwargs)
             browser_attempts = 0
         for browser_attempt in range(browser_attempts):
+            # A fresh report per solve: one that timed out may still be
+            # writing its own after the next attempt has started.
+            report = {}
+            if reported:
+                solve_kwargs["report"] = report
             if deadline is not None:
                 if challenge is ChallengeType.TMD:
                     solve_timeout = _tmd_browser_attempt_timeout(
@@ -997,6 +1028,7 @@ class SyncSession(BaseSession):
                     browser_attempts,
                 )
         if result is None:
+            _mark(_solver_report_outcome(report, reported))
             return False
         if challenge is ChallengeType.BRAVE:
             from wafer.browser._brave import capture_brave_response
@@ -1008,6 +1040,7 @@ class SyncSession(BaseSession):
                 captured, captured.url, url, max_size,
                 allow_pow_reload=not getattr(result, "challenge_absent", False),
             ) is None:
+                _mark("refused")
                 return False
 
         domain = extract_domain(url) or ""
@@ -1034,9 +1067,13 @@ class SyncSession(BaseSession):
             logger.warning(
                 "Reddit browser solve produced no authoritative cookie evidence"
             )
+            _mark("refused")
             return False
         if not target_cookies and result.response is None:
             logger.warning("Browser solve produced no cookies scoped to %s", reg)
+            # The browser got through, but nothing it earned is the site's
+            # (e.g. it was sent to another site): a render may read the page.
+            _mark("cleared")
             return False
 
         challenge_absent_passthrough = (
@@ -1084,10 +1121,11 @@ class SyncSession(BaseSession):
                     leftover.value,
                     len(target_cookies),
                 )
+                _mark("refused")
                 return rendered
 
         # Persist browser cookies to disk cache
-        if self._cookie_cache and domain and target_cookies:
+        if persist and self._cookie_cache and domain and target_cookies:
             cache_domain = (
                 REDDIT_CACHE_DOMAIN
                 if challenge == ChallengeType.REDDIT
@@ -1216,6 +1254,7 @@ class SyncSession(BaseSession):
         # Passthrough: browser got validated real content.
         if passthrough:
             if state_only:
+                _mark("cleared" if target_cookies else "refused")
                 return bool(target_cookies)
             self._cap_browser_body(result, max_size)
             response = self._browser_passthrough_response(result)
@@ -1237,14 +1276,85 @@ class SyncSession(BaseSession):
                     len(target_cookies),
                     len(response.content),
                 )
+            _mark("passthrough")
             return response
 
+        # The solver has already logged "Browser solved" with the browser's
+        # own cookie count; this is what reached the session's jar.
         logger.info(
-            "Browser solved challenge_type=%s (cookie_count=%d)",
+            "Browser solve applied challenge_type=%s (%d cookies injected)",
             challenge.value,
             len(target_cookies),
         )
+        _mark("cleared")
         return True
+
+    def _render_after_cleared(
+        self,
+        log: list,
+        challenge,
+        url: str,
+        method,
+        kwargs: dict,
+        deadline: float | None,
+        max_size: int | None,
+        start_time: float,
+        history: list,
+    ) -> WaferResponse | None:
+        """The page at *url*, read in the browser, when a solve there got past
+        the challenge but the HTTP retry with what it earned was refused (see
+        ``_render_after_cleared_allowed``), else None.
+
+        A solve hands back only cookies when the page it reached is not one
+        it passes through (under 1 KB, a redirect to another site, a slow
+        load); a refused retry then left the page unread although the browser
+        had reached it. A render that settles on the challenge marks the
+        attempt ``"refused"``; one that produces no document leaves it
+        ``"cleared"``.
+        """
+        if not self._render_after_cleared_allowed(log, challenge, url, method, kwargs):
+            return None
+        # A custom browser_solver need not render.
+        if not callable(getattr(self._browser_solver, "render", None)):
+            return None
+        attempt = self._new_browser_attempt(log)
+        attempt["render_fallback"] = True
+        logger.info(
+            "%s refused the retry after the browser cleared it; reading the "
+            "page in the browser",
+            challenge.value,
+        )
+        rendered = self._try_browser_solve(
+            ChallengeType.GENERIC_JS,
+            url,
+            deadline,
+            max_size=max_size,
+            use_solve_origin=False,
+            render=True,
+            attempt=attempt,
+            # The HTTP retry was refused with these cookies: other sessions
+            # sharing cache_dir must not load them.
+            persist=False,
+        )
+        if not isinstance(rendered, WaferResponse):
+            attempt["result"] = "cleared"
+            return None
+        if rendered.challenge_type is not None:
+            attempt["result"] = "refused"
+            return None
+        if not self._render_landing_allowed(url, rendered.url):
+            # The browser follows redirects; a get() returns another origin's
+            # page only by following them itself, and none at all under
+            # follow_redirects=False. A render remains the caller's call.
+            logger.info(
+                "Browser read of %s ended on another page; not returning it",
+                urlsplit(url).path or "/",
+            )
+            attempt["result"] = "cleared"
+            return None
+        rendered.elapsed = time.monotonic() - start_time
+        rendered.history = history
+        return rendered
 
     def _try_native_tls(
         self,
@@ -1493,6 +1603,8 @@ class SyncSession(BaseSession):
                 url,
                 result.status_code,
                 response=result,
+                # The browser loaded the URL and settled on the challenge.
+                browser_outcome="refused",
             )
         return result
 
@@ -1930,6 +2042,9 @@ class SyncSession(BaseSession):
         # One browser solve per (challenge type, host): a redirect onto
         # another host behind the same WAF needs that host's own clearance.
         browser_attempted: set[tuple[str, str]] = set()
+        # How each browser attempt of this request ended, for
+        # ChallengeDetected.browser_outcome (BaseSession._browser_outcome).
+        browser_attempt_log: list[dict] = []
         # The page a Turnstile recovery went to, per refusal key (None: none).
         turnstile_tried: dict[tuple[str, str], str | None] = {}
         critical_ch_retried = False
@@ -2037,6 +2152,9 @@ class SyncSession(BaseSession):
                         current_url,
                         native_resp.status_code,
                         response=native_resp,
+                        browser_outcome=self._browser_outcome(
+                            browser_attempt_log, current_url
+                        ),
                     )
 
             # TLS session rotation for unlinkable requests
@@ -2507,7 +2625,9 @@ class SyncSession(BaseSession):
                 if refusal_key in turnstile_tried:
                     if turnstile_tried[refusal_key] is not None:
                         # The page's solve did not change the answer.
-                        self._note_turnstile_miss(turnstile_tried[refusal_key])
+                        self._note_turnstile_miss(
+                            turnstile_tried[refusal_key], solved=True
+                        )
                 else:
                     turnstile_tried[refusal_key] = None
                     turnstile_page = self._turnstile_recovery_page(
@@ -2536,10 +2656,15 @@ class SyncSession(BaseSession):
                                 embedder=turnstile_page,
                                 max_size=max_response_size,
                                 defer_cache=pending_browser_cookies,
+                                attempt=self._new_browser_attempt(browser_attempt_log),
                             )
                             if turnstile_result is not False:
                                 continue
+                            # A failed or timed-out solve stays with this
+                            # session; a later refusal of this request must
+                            # not read it as a solve that passed.
                             self._note_turnstile_miss(turnstile_page)
+                            turnstile_tried[refusal_key] = None
 
             if challenge is not None and (
                 challenge in TERMINAL_CHALLENGES or reddit_blocked
@@ -2572,6 +2697,9 @@ class SyncSession(BaseSession):
                     current_url,
                     status,
                     response=blocked,
+                    browser_outcome=self._browser_outcome(
+                        browser_attempt_log, current_url
+                    ),
                 )
 
             # 429 without detected challenge → rate limit retry
@@ -2850,6 +2978,7 @@ class SyncSession(BaseSession):
                             else None
                         ),
                         defer_cache=pending_browser_cookies,
+                        attempt=self._new_browser_attempt(browser_attempt_log),
                     )
                     if isinstance(browser_result, WaferResponse):
                         self._record_success(domain)
@@ -2871,6 +3000,14 @@ class SyncSession(BaseSession):
                 ) or akamai_api_refusal or challenge in (
                     ChallengeType.AKAMAI_DENIED, ChallengeType.BRAVE,
                 ):
+                    rendered = self._render_after_cleared(
+                        browser_attempt_log, challenge, current_url, method, kwargs,
+                        deadline, max_response_size, start_time, history,
+                    )
+                    if rendered is not None:
+                        self._record_success(domain)
+                        self._record_url(current_url)
+                        return rendered
                     self._enforce_final_cap(raw_content, current_url, max_response_size)
                     if self.max_rotations == 0:
                         return self._make_response(
@@ -2902,6 +3039,9 @@ class SyncSession(BaseSession):
                             state=state,
                             history=history,
                             raw=resp,
+                        ),
+                        browser_outcome=self._browser_outcome(
+                            browser_attempt_log, current_url
                         ),
                     )
 
@@ -2937,6 +3077,7 @@ class SyncSession(BaseSession):
                             ),
                             max_size=max_response_size,
                             defer_cache=pending_browser_cookies,
+                            attempt=self._new_browser_attempt(browser_attempt_log),
                         )
                         if isinstance(browser_result, WaferResponse):
                             self._record_success(domain)
@@ -2948,6 +3089,14 @@ class SyncSession(BaseSession):
                             self._record_success(domain)
                             continue
                     if challenge:
+                        rendered = self._render_after_cleared(
+                            browser_attempt_log, challenge, current_url, method, kwargs,
+                            deadline, max_response_size, start_time, history,
+                        )
+                        if rendered is not None:
+                            self._record_success(domain)
+                            self._record_url(current_url)
+                            return rendered
                         self._enforce_final_cap(
                             raw_content, current_url, max_response_size
                         )
@@ -2981,6 +3130,9 @@ class SyncSession(BaseSession):
                                 state=state,
                                 history=history,
                                 raw=resp,
+                            ),
+                            browser_outcome=self._browser_outcome(
+                                browser_attempt_log, current_url
                             ),
                         )
                     return self._make_response(

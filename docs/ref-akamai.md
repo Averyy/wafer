@@ -216,3 +216,18 @@ To find such a cause, capture the refused client's and stock **Google Chrome
 stable**'s wire at tls.peet.ws in the same environment (Chrome for Testing is
 not what users run), then change one thing at a time from the plain client:
 platform, header order, claimed version.
+
+### Rotation around a refusal the browser draws too (2026-11-24)
+
+From fetchaller's linux/amd64 image, www.ebay.ca refused every cold Chrome
+request: wafer's, and stock Google Chrome stable 158's in the same container,
+on the first load and on the reload after the script posted. Firefox 152 was
+served. So the browser cannot clear it there, and the page comes from the
+cross-family ladder. A session created with a preflighted `browser_solver`
+used to be pinned to the browser's identity for its whole life, so its
+rotations never left Chrome. fetchaller's `max_rotations=2` went Chrome,
+Chrome, retire, browser, and failed in 43.8 s. A preflight's pin no longer
+locks rotation (`locks_rotation`): the same request now reaches Firefox at
+rotation 2 and returns the results in 5.7 s. Only a browser solve's pin, whose
+cookies are bound to the identity, still keeps it.
+

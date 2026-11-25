@@ -160,13 +160,15 @@ session = SyncSession(
 
     # Embed mode (see below)
     embed="xhr",  # or "xhr-jquery" or "iframe"
-    embed_origin="https://embedder.example.com",
+    embed_origin="https://embedder.example.com",  # ValueError here if it does
+                                                  # not parse or has a control char
     embed_referers=["https://embedder.example.com/page"],
 
     # Browser solver (see below)
     browser_solver=None,
     solve_origin=None,   # origin page the auto-solve navigates to mint the WAF
-                         # token (for JSON/XHR APIs that can't be top-navigated)
+                         # token (for JSON/XHR APIs that can't be top-navigated);
+                         # must be a URL the browser will load, or ValueError here
 )
 ```
 
@@ -399,6 +401,17 @@ When a challenge is detected, wafer escalates automatically:
 4. Cross-family fingerprint rotation: fresh current family -> Firefox -> Safari -> Edge
 5. Raises `ChallengeDetected` if all attempts fail
 
+When the browser got past the challenge at the URL but the HTTP retry with its
+cookies is still refused, a plain GET is read in the browser once more and that
+page is returned if the browser ended on the request's origin (with
+`follow_redirects=False`, on the URL itself). A solve hands back only cookies
+when the page it reached is under 1 KB, redirects to another site, or loads
+slowly. The read's cookies are not written to `cache_dir`. `ChallengeDetected`
+carries `browser_outcome`: `"refused"` (the browser was refused at this URL, so
+`session.render(url)` would repeat it), `"cleared"` (it got through but neither
+the retry nor the browser read worked), `"other_page"` (it ran on another
+page), `"failed"` (no verdict: busy, no time, crash), or `None` (no attempt).
+
 A terminal block skips all of it. A Cloudflare WAF *block* page is a denial, not
 a challenge: nothing is issued to solve, and no identity answers it differently.
 Wafer raises `RequestBlocked` on the first response, spending no budget.
@@ -536,11 +549,11 @@ Each family switch also swaps the HTTP header envelope (Accept,
 Accept-Language, sec-ch-ua) so the headers stay coherent with the new TLS
 fingerprint:
 
-1. **Fresh TLS session** (rotation 1) -rebuilds the wreq client (new TLS session, empty cookie jar) on the *same* family. Often enough when the 403 is from a stale session or tainted cookies.
+1. **Fresh TLS session** (rotation 1) -rebuilds the wreq client (new TLS session, empty cookie jar) on the *same* family. Often enough when the 403 is from a stale session or tainted cookies. A session aligned to a preflighted browser keeps the cookies here, since its identity has not changed (see Browser Solving).
 2. **Firefox** (rotation 2) -`Emulation.Firefox152`: Gecko TLS/H2, no sec-ch-ua.
 3. **Safari** (rotation 3) -wafer's wire-verified Safari 26 (custom TlsOptions/Http2Options).
 4. **Edge** (rotation 4) -`Emulation.Edge148`: Chromium TLS, "Microsoft Edge" brand.
-5. **Chrome version cycling** (rotation 5+) -returns to Chrome and cycles versions.
+5. **Chrome version cycling** (rotation 5+) -returns to the newest Chrome, then steps to each older version in turn (154, 153, 152, ...).
 
 The rung you reach is bounded by `max_rotations`: the **full**
 Chrome->Firefox->Safari->Edge ladder needs `max_rotations>=4` (Safari `>=3`,
@@ -550,8 +563,13 @@ higher budget tries more identities against the same host. A session started
 on a non-Chrome `emulation=` walks the same ladder, skipping its own starting
 family; `profile=` identities (Safari/iOS Safari/Dart/Opera Mini) keep their
 own special-casing and are not forced into the ladder. A fingerprint pinned
-after earning browser-bound challenge state does not rotate. Reddit browser
-recovery and challenge-absent Cloudflare passthrough do not pin.
+after earning browser-bound challenge state does not rotate. A session created
+with a preflighted `browser_solver` starts on the browser's UA and client hints,
+but nothing is bound to them yet, so it still climbs the ladder (on a site that
+refuses Chrome and serves Firefox, that is what gets the page); with your own
+`User-Agent` in `headers=` the identity is yours and is kept, and a session
+started on another family is not aligned to the Chrome browser at all. Reddit
+browser recovery and challenge-absent Cloudflare passthrough do not pin.
 
 ### Fingerprint pool
 
@@ -702,7 +720,10 @@ Uses [Patchright](https://github.com/Kaliiiiiiiiii-Vinyzu/patchright-python)
 (patched Playwright) with the installed Chrome. Chrome can auto-update ahead
 of wreq's newest emulation; version skew is logged and accepted. Solve paths
 that earn browser-bound challenge state align the session's User-Agent/client
-hints to the launched browser. Reddit recovery and challenge-absent Cloudflare
+hints to the launched browser. A solver that has run `preflight()` publishes
+its identity, and a Chrome session created with it sends that UA and those
+client hints from its first request (it can still rotate; see the ladder
+above). Reddit recovery and challenge-absent Cloudflare
 or Brave passthrough do not pin the session. The browser instance persists until
 its idle timeout and solver operations are serialized. A solver passed to a
 session remains caller-owned: call `solver.close()` when it is no longer
@@ -1036,6 +1057,7 @@ except ChallengeDetected as e:
     print(e.url)
     print(e.status_code)
     print(e.response)        # final WaferResponse (body/headers), or None
+    print(e.browser_outcome) # "refused" | "cleared" | "other_page" | "failed" | None
 except WaferTimeout as e:
     print(e.timeout_secs)    # deadline exceeded
 except RateLimited as e:
@@ -1068,7 +1090,9 @@ that names a page on the same site (`solve_origin`, `Referer`, `Origin` or
 `embed_origin`) gets one recovery when that page runs Turnstile (checked with
 one HTTP fetch of the page): a browser solve on the page, then one retry with
 the cookies it earned. A page that showed no Turnstile, or whose solve did not
-help, is left alone by the session for 10 minutes:
+help, is left alone by the session for 10 minutes; a page whose solve passed
+but left the request refused is skipped by every session sharing that
+`browser_solver`:
 
 ```python
 resp = session.get(
@@ -1076,6 +1100,14 @@ resp = session.get(
     headers={"Referer": "https://www.example.org/page-with-the-widget"},
 )
 ```
+
+Malformed URLs: a caller `Referer` or `Origin` that does not parse is sent as
+given (with `Sec-Fetch-Site: cross-site` and a WARNING) and never raises. A
+request URL that does not parse at all (an unclosed `[` host) raises
+`ValueError` before anything is sent; one with a port out of range raises
+`ConnectionFailed` from the transport. A 3xx whose `Location` is not a URL
+raises `ConnectionFailed` when followed, and is returned with
+`follow_redirects=False`.
 
 `ConnectionFailed.reason` names a sinkholed DNS answer when that is the cause -
 a host that resolves only to `0.0.0.0` / `::` was refused by the resolver, not
