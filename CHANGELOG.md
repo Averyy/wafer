@@ -4,6 +4,20 @@ All notable changes to wafer. Versions come from git tags (`hatch-vcs`); each
 release is on [PyPI](https://pypi.org/project/wafer-py/) and
 [GitHub Releases](https://github.com/Averyy/wafer/releases).
 
+## 0.7.19 - 2026-11-25
+
+### Fixed
+
+- A generic browser solve that lands on a Cloudflare challenge now runs
+  Cloudflare's handler, which waits for `cf_clearance`, instead of the generic
+  wait. `browser_prime()` is the usual caller. The generic wait reports
+  success once the network goes quiet. A fast machine gets there after the
+  challenge has cleared, a slow one in the middle of it. In a Linux container,
+  `browser_prime("https://www.digikey.com/")` returned True with one cookie
+  and no clearance, and the next request paid for the real solve (10 s).
+  Only Cloudflare's own `cf-mitigated: challenge` header reroutes the solve;
+  a bare 403 keeps the generic wait.
+
 ## 0.7.18 - 2026-11-25
 
 ### Fixed

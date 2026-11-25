@@ -45,6 +45,21 @@ session with Werkzeug's stock 403 (1,685 bytes) carries only the first two, and 
 the document's own scripts; an unclosed or unrecognized `<script` still counts. Fixture:
 `tests/fixtures/cloudflare_origin_403_2026-11-24.html`.
 
+### A generic solve can land on a challenge
+
+`browser_prime()`, and a body the transport could only call `generic_js`, send the browser
+a generic solve. The generic wait reports success once the network goes quiet. On
+www.digikey.com, which from 2026-11-25 (about 17:56 UTC) answers every request without a
+clearance with `cf-mitigated: challenge` (cType `non-interactive`; stock Google Chrome 158
+with a fresh profile was challenged on its first navigation too), macOS reached that point
+after the challenge had cleared. fetchaller's emulated Linux image reached it in the middle,
+so the prime returned True with one cookie and no `cf_clearance`. A generic solve whose
+newest main-frame document carries `cf-mitigated: challenge` now dispatches
+`wait_for_cloudflare` (`_landed_on_cloudflare_challenge` in `wafer/browser/_solver.py`). The
+header is the only trigger; a bare 403 is not, since other WAFs' refusals use it too. After
+the change the image's prime earned `cf_clearance` in 12.5 s (macOS 4.4 s), and the first
+JSON call needed no solve.
+
 ## A block the site's own page clears
 
 A block is usually final, and wafer spends no retry or rotation on it. But the rule behind

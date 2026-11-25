@@ -527,6 +527,43 @@ def _main_document_response(records: list[tuple], landed):
     return None
 
 
+def _landed_on_cloudflare_challenge(records: list[tuple], navigation_response) -> bool:
+    """Whether a solve's newest main-frame document is a Cloudflare challenge.
+
+    A generic solve (``browser_prime``, or a body the transport could only
+    call ``generic_js``) can land on one. The generic wait then reports
+    success once the network goes quiet, which a fast machine reaches after
+    the challenge has cleared and a slow one in the middle of it: in
+    fetchaller's emulated Linux image www.digikey.com's prime returned True
+    with one cookie and no ``cf_clearance`` (2026-11-25), while macOS cleared
+    it in that time. Only Cloudflare's own ``cf-mitigated: challenge`` marker
+    counts, never a bare 403, so other WAFs' refusals keep the generic wait.
+
+    With no document recorded, the navigation's own response is the document,
+    and it is added to *records* (the solve's live list) when it is the
+    challenge: Cloudflare's handler reads that list, and with it empty it
+    takes a challenge that sets no clearance for "no challenge here" after 3s.
+    """
+    from wafer.browser._cloudflare import _marked_challenge
+
+    if records:
+        return _marked_challenge(records[-1])
+    if navigation_response is None:
+        return False
+    try:
+        entry = (
+            str(navigation_response.url),
+            int(navigation_response.status),
+            navigation_response,
+        )
+    except Exception:
+        return False
+    if not _marked_challenge(entry):
+        return False
+    records.append(entry)
+    return True
+
+
 # Each response's header read, failed or not, so it happens once.
 _HEADER_READS: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
 
@@ -5655,13 +5692,27 @@ class BrowserSolver:
                     1,
                     int((overall_deadline - time.monotonic()) * 1000),
                 )
+                dispatch_type = challenge_type
+                if challenge_type == "generic_js" and _landed_on_cloudflare_challenge(
+                    main_documents, navigation_response
+                ):
+                    logger.info(
+                        "Browser landed on a Cloudflare challenge; "
+                        "solving it as cloudflare"
+                    )
+                    dispatch_type = "cloudflare"
                 dispatch_result = self._dispatch_challenge(
                     page,
-                    challenge_type,
+                    dispatch_type,
                     dispatch_ms,
                     challenge_url=url,
                     documents=main_documents,
                 )
+                if dispatch_type != challenge_type and dispatch_result is None:
+                    # Cloudflare's "no challenge here after all": the page
+                    # moved on by itself, which the generic wait reports as
+                    # success.
+                    dispatch_result = True
                 challenge_absent = (
                     challenge_type == "cloudflare"
                     and dispatch_result is None
